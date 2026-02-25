@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use crate::diff::{ChangeKind, SymbolChange};
 
 /// Tracks symbol-level changes during a coding session to detect patterns
-/// such as hotspots (frequently edited symbols) and anti-patterns
-/// (thrashing, dead ends).
+/// such as hotspots (frequently edited symbols), anti-patterns
+/// (thrashing, dead ends), and co-change pairs.
 pub struct ChangeTracker {
     /// Number of times each symbol has been edited.
     edit_counts: HashMap<String, u32>,
     /// Chronological record of (symbol_name, change_kind, timestamp).
     session_changes: Vec<(String, String, u64)>,
+    /// Track symbols changed in the same "batch" (within a single file event).
+    batch_changes: Vec<(Vec<String>, u64)>,
+    /// Co-change pair counts: (sym_a, sym_b) sorted lexicographically -> count.
+    co_change_pairs: HashMap<(String, String), u32>,
 }
 
 impl ChangeTracker {
@@ -16,6 +20,8 @@ impl ChangeTracker {
         Self {
             edit_counts: HashMap::new(),
             session_changes: Vec::new(),
+            batch_changes: Vec::new(),
+            co_change_pairs: HashMap::new(),
         }
     }
 
@@ -81,6 +87,39 @@ impl ChangeTracker {
 
         dead_ends
     }
+
+    /// Record a batch of symbols that changed together (e.g., in a single file save).
+    /// For each pair of symbols in the batch, increment the co-change count.
+    pub fn record_batch(&mut self, changed_symbols: Vec<String>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // For each pair of symbols in the batch, increment co-change count
+        for i in 0..changed_symbols.len() {
+            for j in (i + 1)..changed_symbols.len() {
+                let pair = if changed_symbols[i] < changed_symbols[j] {
+                    (changed_symbols[i].clone(), changed_symbols[j].clone())
+                } else {
+                    (changed_symbols[j].clone(), changed_symbols[i].clone())
+                };
+                *self.co_change_pairs.entry(pair).or_insert(0) += 1;
+            }
+        }
+
+        self.batch_changes.push((changed_symbols, now));
+    }
+
+    /// Get all co-change pairs that have been observed at least `min_count` times.
+    /// Returns Vec<(sym_a, sym_b, count)>.
+    pub fn get_co_change_pairs(&self, min_count: u32) -> Vec<(&str, &str, u32)> {
+        self.co_change_pairs
+            .iter()
+            .filter(|(_, count)| **count >= min_count)
+            .map(|((a, b), count)| (a.as_str(), b.as_str(), *count))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +180,41 @@ mod tests {
         let dead_ends = tracker.detect_dead_ends();
         assert_eq!(dead_ends.len(), 1);
         assert!(dead_ends.contains(&"tempHelper".to_string()));
+    }
+
+    #[test]
+    fn test_co_change_detection() {
+        let mut tracker = ChangeTracker::new();
+
+        // Simulate 3 batches where funcA and funcB always change together
+        tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string()]);
+        tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string(), "funcC".to_string()]);
+        tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string()]);
+
+        // funcA-funcB should have count 3 (appeared together in all 3 batches)
+        let pairs = tracker.get_co_change_pairs(3);
+        assert!(
+            pairs.iter().any(|(a, b, c)| (*a == "funcA" && *b == "funcB" && *c >= 3)
+                || (*a == "funcB" && *b == "funcA" && *c >= 3)),
+            "Expected funcA-funcB co-change pair with count >= 3, got: {:?}",
+            pairs
+        );
+
+        // funcA-funcC should have count 1 (only appeared together in batch 2)
+        let pairs_low = tracker.get_co_change_pairs(1);
+        assert!(
+            pairs_low.iter().any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
+                || (*a == "funcC" && *b == "funcA")),
+            "Expected funcA-funcC co-change pair at threshold 1, got: {:?}",
+            pairs_low
+        );
+
+        // funcA-funcC should NOT appear at threshold 2 (only count 1)
+        let pairs_high = tracker.get_co_change_pairs(2);
+        assert!(
+            !pairs_high.iter().any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
+                || (*a == "funcC" && *b == "funcA")),
+            "funcA-funcC should not appear at threshold 2"
+        );
     }
 }

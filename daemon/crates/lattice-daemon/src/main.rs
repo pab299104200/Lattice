@@ -6,10 +6,14 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+use lattice_core::diff;
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::graph::CodeGraph;
+use lattice_core::graph::model::EdgeKind;
 use lattice_core::indexer::Indexer;
+use lattice_core::intelligence::ChangeTracker;
 use lattice_core::memory::MemoryStore;
+use lattice_core::parser;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, VectorStore};
@@ -177,6 +181,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             // Keep the _watcher alive so it keeps watching
             let _watcher_handle = _watcher;
+            let mut change_tracker = ChangeTracker::new();
 
             while let Some(event) = rx.recv().await {
                 let rel_path = event
@@ -190,12 +195,49 @@ async fn main() -> Result<()> {
 
                 let mut idx = indexer_clone.lock().await;
 
+                // Capture old symbols before re-indexing (for diff)
+                let old_symbols: Vec<lattice_core::symbols::Symbol> = idx.graph().all_nodes().iter()
+                    .filter(|n| n.file == rel_path)
+                    .map(|n| lattice_core::symbols::Symbol {
+                        id: n.id.clone(),
+                        kind: n.kind,
+                        name: n.name.clone(),
+                        signature: n.signature.clone(),
+                        body: n.body.clone(),
+                        file: n.file.clone(),
+                        line: n.line,
+                        end_line: n.end_line,
+                        is_exported: n.is_exported,
+                        language: n.language,
+                        references: vec![],
+                        imports: vec![],
+                    })
+                    .collect();
+
                 match event.kind {
                     FileEventKind::Created | FileEventKind::Modified => {
                         if let Ok(content) = std::fs::read_to_string(&event.path) {
                             if let Err(e) = idx.index_file_content(&rel_path, &content) {
                                 tracing::warn!("Failed to re-index {}: {}", rel_path, e);
                                 continue;
+                            }
+
+                            // Diff symbols and record co-changes
+                            if let Ok(new_parsed) = parser::parse_file(&rel_path, &content) {
+                                let changes = diff::diff_symbols(&old_symbols, &new_parsed.symbols);
+                                if !changes.is_empty() {
+                                    let changed_names: Vec<String> = changes.iter()
+                                        .map(|c| c.name.clone())
+                                        .collect();
+
+                                    // Record changes individually
+                                    for change in &changes {
+                                        change_tracker.record_change(change);
+                                    }
+
+                                    // Record as a batch for co-change detection
+                                    change_tracker.record_batch(changed_names);
+                                }
                             }
                         }
                     }
@@ -205,7 +247,24 @@ async fn main() -> Result<()> {
                 }
 
                 // Update engine with new graph
-                let new_graph = idx.graph().clone();
+                let mut new_graph = idx.graph().clone();
+
+                // Add CoChanges edges for any pairs that reach threshold
+                let co_pairs = change_tracker.get_co_change_pairs(3);
+                for (sym_a, sym_b, _count) in &co_pairs {
+                    // Find the SymbolIds for these symbols
+                    let id_a = new_graph.all_node_ids().iter()
+                        .find(|id| id.name == *sym_a)
+                        .cloned()
+                        .cloned();
+                    let id_b = new_graph.all_node_ids().iter()
+                        .find(|id| id.name == *sym_b)
+                        .cloned()
+                        .cloned();
+                    if let (Some(a), Some(b)) = (id_a, id_b) {
+                        new_graph.add_edge(&a, &b, EdgeKind::CoChanges);
+                    }
+                }
 
                 // Re-embed changed nodes if embedding engine is available
                 if let Some(ref emb_engine) = emb_engine_clone {
