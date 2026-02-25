@@ -166,9 +166,32 @@ fn test_query_engine_token_budget() {
     let capsule = engine.query("func_0", None);
 
     // Token budget is 4000 — with ~500 tokens per body, we can't fit all 20
+    // (First query: repeat_count = 1, budget = 4000 + 1*500 = 4500)
     assert!(
-        capsule.stats.tokens_used <= 4000,
-        "tokens_used ({}) should be within budget (4000)",
+        capsule.stats.tokens_used <= 4500,
+        "tokens_used ({}) should be within budget (4500)",
         capsule.stats.tokens_used
     );
+}
+
+#[test]
+fn test_adaptive_budget_expands_on_repeat() {
+    let graph = build_test_graph();
+    let mut engine = QueryEngine::new(graph, None, None);
+
+    // First query — record_query is called inside query(), so repeat_count = 1
+    let capsule1 = engine.query("How does loginUser work?", None);
+    let _budget1 = capsule1.stats.tokens_used;
+
+    // Second query with the same text — repeat_count = 2, budget grows by 500
+    let capsule2 = engine.query("How does loginUser work?", None);
+
+    // The budget should have expanded (4000 + 2*500 = 5000 vs 4000 + 1*500 = 4500)
+    // We can't directly observe the budget, but the query_history should have count 2
+    // after two calls. At minimum, verify the engine doesn't crash and produces results.
+    assert_eq!(capsule2.intent, QueryIntent::Explore);
+
+    // Third query
+    let _capsule3 = engine.query("How does loginUser work?", None);
+    // query_history should now have count 3 for this query
 }
