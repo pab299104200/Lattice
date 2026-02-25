@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod graph;
+pub mod indexer;
 pub mod parser;
 pub mod query;
 pub mod storage;
