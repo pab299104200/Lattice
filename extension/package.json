@@ -23,8 +23,30 @@
       {
         "command": "lattice.showDependents",
         "title": "Lattice: Show Dependents"
+      },
+      {
+        "command": "lattice.clearMemory",
+        "title": "Lattice: Clear Memory"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lattice",
+          "title": "Lattice",
+          "icon": "resources/lattice-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "lattice": [
+        {
+          "type": "webview",
+          "id": "lattice.sidebar",
+          "name": "Lattice"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

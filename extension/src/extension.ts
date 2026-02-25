@@ -3,6 +3,7 @@ import { DaemonManager } from './daemon';
 import { StatusBarProvider } from './statusbar';
 import { LatticeCodeLensProvider } from './codelens';
 import { LatticeHoverProvider } from './hover';
+import { LatticeSidebarProvider } from './sidebar';
 
 let daemon: DaemonManager | undefined;
 
@@ -108,6 +109,14 @@ export async function activate(context: vscode.ExtensionContext) {
         hoverProvider
     );
     context.subscriptions.push(hoverRegistration);
+
+    // Sidebar panel
+    const sidebarProvider = new LatticeSidebarProvider(daemon);
+    const sidebarRegistration = vscode.window.registerWebviewViewProvider(
+        LatticeSidebarProvider.viewType,
+        sidebarProvider
+    );
+    context.subscriptions.push(sidebarProvider, sidebarRegistration);
 
     context.subscriptions.push(reindexCmd, statusCmd, showDependentsCmd);
 }
