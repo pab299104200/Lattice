@@ -9,6 +9,7 @@ pub mod intelligence;
 pub mod memory;
 pub mod parser;
 pub mod query;
+pub mod security;
 pub mod storage;
 pub mod symbols;
 pub mod watcher;

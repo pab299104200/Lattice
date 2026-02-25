@@ -31,3 +31,4 @@ notify = "7"
 ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
 ndarray = "0.16"
 tokenizers = "0.20"
+ignore = "0.4"
