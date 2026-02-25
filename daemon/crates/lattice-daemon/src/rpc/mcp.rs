@@ -1,10 +1,14 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde_json::{json, Value};
 
+use lattice_core::indexer::Indexer;
 use lattice_core::memory::{Memory, MemoryType, MemoryStore};
 use lattice_core::query::QueryEngine;
-use lattice_core::symbols::SymbolId;
+use lattice_core::storage::GraphStore;
+use lattice_core::watcher::should_index_file;
 
 use super::server::RequestHandler;
 
@@ -12,13 +16,28 @@ use super::server::RequestHandler;
 /// to the appropriate tool implementations.
 pub struct McpHandler {
     engine: Arc<Mutex<QueryEngine>>,
+    indexer: Arc<Mutex<Indexer>>,
     memory_store: Arc<Mutex<MemoryStore>>,
+    graph_store: Arc<Mutex<GraphStore>>,
+    workspace_root: PathBuf,
 }
 
 impl McpHandler {
-    /// Create a new McpHandler with the given QueryEngine and MemoryStore.
-    pub fn new(engine: Arc<Mutex<QueryEngine>>, memory_store: Arc<Mutex<MemoryStore>>) -> Self {
-        Self { engine, memory_store }
+    /// Create a new McpHandler with all shared state.
+    pub fn new(
+        engine: Arc<Mutex<QueryEngine>>,
+        indexer: Arc<Mutex<Indexer>>,
+        memory_store: Arc<Mutex<MemoryStore>>,
+        graph_store: Arc<Mutex<GraphStore>>,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self {
+            engine,
+            indexer,
+            memory_store,
+            graph_store,
+            workspace_root,
+        }
     }
 
     // ── MCP Protocol Methods ──────────────────────────────────────────
@@ -263,11 +282,36 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
 
         let engine = self.engine.lock().await;
-        // Find the symbol by searching all nodes for a matching name and file
-        let symbol = find_node_by_name_and_file(&engine, name, file);
 
-        match symbol {
-            Some(node) => Ok(wrap_tool_result(node)),
+        // Direct graph lookup: find node matching name and file
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                let dependents = engine.graph().get_dependents(&n.id);
+                let dependencies = engine.graph().get_dependencies(&n.id);
+                Ok(wrap_tool_result(json!({
+                    "symbol": n.name,
+                    "kind": format!("{:?}", n.kind),
+                    "file": n.file,
+                    "line": n.line,
+                    "end_line": n.end_line,
+                    "source": n.body,
+                    "signature": n.signature,
+                    "is_exported": n.is_exported,
+                    "dependents": dependents.iter().map(|(dep, edge)| json!({
+                        "symbol": dep.name,
+                        "file": dep.file,
+                        "edge": format!("{:?}", edge)
+                    })).collect::<Vec<_>>(),
+                    "dependencies": dependencies.iter().map(|(dep, edge)| json!({
+                        "symbol": dep.name,
+                        "file": dep.file,
+                        "edge": format!("{:?}", edge)
+                    })).collect::<Vec<_>>()
+                })))
+            }
             None => Ok(wrap_tool_result(json!({
                 "error": format!("Symbol '{}' not found in '{}'", name, file)
             }))),
@@ -283,15 +327,29 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
 
         let engine = self.engine.lock().await;
-        let symbol_id = find_symbol_id(&engine, name, file);
 
-        match symbol_id {
-            Some(id) => {
-                let dependents = get_dependents_from_engine(&engine, &id);
+        // Find the actual node by name and file
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                let dependents = engine.graph().get_dependents(&n.id);
+                let dep_values: Vec<Value> = dependents.iter().map(|(dep, edge)| {
+                    json!({
+                        "symbol": dep.name,
+                        "kind": format!("{:?}", dep.kind),
+                        "file": dep.file,
+                        "line": dep.line,
+                        "edge": format!("{:?}", edge)
+                    })
+                }).collect();
+
                 Ok(wrap_tool_result(json!({
                     "symbol": name,
                     "file": file,
-                    "dependents": dependents
+                    "dependents": dep_values,
+                    "count": dep_values.len()
                 })))
             }
             None => Ok(wrap_tool_result(json!({
@@ -309,15 +367,28 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
 
         let engine = self.engine.lock().await;
-        let symbol_id = find_symbol_id(&engine, name, file);
 
-        match symbol_id {
-            Some(id) => {
-                let dependencies = get_dependencies_from_engine(&engine, &id);
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                let dependencies = engine.graph().get_dependencies(&n.id);
+                let dep_values: Vec<Value> = dependencies.iter().map(|(dep, edge)| {
+                    json!({
+                        "symbol": dep.name,
+                        "kind": format!("{:?}", dep.kind),
+                        "file": dep.file,
+                        "line": dep.line,
+                        "edge": format!("{:?}", edge)
+                    })
+                }).collect();
+
                 Ok(wrap_tool_result(json!({
                     "symbol": name,
                     "file": file,
-                    "dependencies": dependencies
+                    "dependencies": dep_values,
+                    "count": dep_values.len()
                 })))
             }
             None => Ok(wrap_tool_result(json!({
@@ -336,17 +407,32 @@ impl McpHandler {
         let hops = args["hops"].as_u64().unwrap_or(3) as usize;
 
         let engine = self.engine.lock().await;
-        let symbol_id = find_symbol_id(&engine, name, file);
 
-        match symbol_id {
-            Some(id) => {
-                let neighbors = get_n_hop_neighbors(&engine, &id, hops);
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                // Use transitive dependents (incoming edges only)
+                let affected = engine.graph().get_transitive_dependents(&n.id, hops);
+                let affected_files: HashSet<&str> = affected.iter().map(|a| a.file.as_str()).collect();
+
+                let affected_values: Vec<Value> = affected.iter().map(|a| {
+                    json!({
+                        "symbol": a.name,
+                        "kind": format!("{:?}", a.kind),
+                        "file": a.file,
+                        "line": a.line
+                    })
+                }).collect();
+
                 Ok(wrap_tool_result(json!({
                     "symbol": name,
                     "file": file,
                     "hops": hops,
-                    "affected_symbols": neighbors,
-                    "count": neighbors.len()
+                    "affected_symbols": affected_values,
+                    "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
+                    "count": affected_values.len()
                 })))
             }
             None => Ok(wrap_tool_result(json!({
@@ -362,7 +448,24 @@ impl McpHandler {
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
 
         let engine = self.engine.lock().await;
-        let results = search_symbols_in_engine(&engine, pattern, limit);
+        let pattern_lower = pattern.to_lowercase();
+
+        // Direct graph search: case-insensitive substring match on name
+        let mut results: Vec<Value> = engine.graph().all_nodes().into_iter()
+            .filter(|n| n.name.to_lowercase().contains(&pattern_lower))
+            .map(|n| {
+                json!({
+                    "symbol": n.name,
+                    "kind": format!("{:?}", n.kind),
+                    "file": n.file,
+                    "line": n.line,
+                    "is_exported": n.is_exported,
+                    "signature": n.signature
+                })
+            })
+            .collect();
+
+        results.truncate(limit);
 
         Ok(wrap_tool_result(json!({
             "pattern": pattern,
@@ -377,7 +480,27 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
 
         let engine = self.engine.lock().await;
-        let symbols = get_file_symbols(&engine, file);
+
+        // Direct graph lookup: all symbols in the file
+        let file_nodes = engine.file_symbols(file);
+        let symbols: Vec<Value> = file_nodes.iter().map(|n| {
+            let dependents = engine.graph().get_dependents(&n.id);
+            let dependent_files: HashSet<&str> = dependents.iter()
+                .map(|(d, _)| d.file.as_str())
+                .collect();
+
+            json!({
+                "symbol": n.name,
+                "kind": format!("{:?}", n.kind),
+                "file": n.file,
+                "line": n.line,
+                "end_line": n.end_line,
+                "is_exported": n.is_exported,
+                "signature": n.signature,
+                "dependent_count": dependents.len(),
+                "dependent_files": dependent_files.len()
+            })
+        }).collect();
 
         Ok(wrap_tool_result(json!({
             "file": file,
@@ -472,6 +595,183 @@ impl McpHandler {
             "rules": []
         })))
     }
+
+    // ── Daemon Method Handlers ────────────────────────────────────────
+
+    /// Handle `lattice/file_symbols` — symbols in a specific file with dependent counts.
+    async fn handle_file_symbols(&self, params: &Value) -> Result<Value, (i32, String)> {
+        let file = params["file"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: file".to_string()))?;
+
+        let engine = self.engine.lock().await;
+        let file_nodes = engine.file_symbols(file);
+
+        let symbols: Vec<Value> = file_nodes.iter().map(|n| {
+            let dependents = engine.graph().get_dependents(&n.id);
+            let dependent_files: HashSet<&str> = dependents.iter()
+                .map(|(d, _)| d.file.as_str())
+                .collect();
+
+            json!({
+                "name": n.name,
+                "line": n.line,
+                "dependentCount": dependents.len(),
+                "fileCount": dependent_files.len()
+            })
+        }).collect();
+
+        Ok(json!({ "symbols": symbols }))
+    }
+
+    /// Handle `lattice/symbol_info` — detailed info about a single symbol.
+    async fn handle_symbol_info(&self, params: &Value) -> Result<Value, (i32, String)> {
+        let name = params["name"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: name".to_string()))?;
+        let file = params["file"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: file".to_string()))?;
+        let _line = params["line"].as_u64().unwrap_or(0);
+
+        let engine = self.engine.lock().await;
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                let dependents = engine.graph().get_dependents(&n.id);
+                let cross_repo_count = 0usize; // Cross-repo is 0 for single workspace
+
+                // Top 3 callers: dependents that call this symbol
+                let top_callers: Vec<String> = dependents.iter()
+                    .take(3)
+                    .map(|(d, _)| format!("{}:{}", d.file, d.name))
+                    .collect();
+
+                // Hotspot score from edit_count
+                let hotspot = n.edit_count as f64;
+
+                Ok(json!({
+                    "name": n.name,
+                    "dependentCount": dependents.len(),
+                    "crossRepoCount": cross_repo_count,
+                    "topCallers": top_callers,
+                    "hotspot": hotspot,
+                    "lastModified": n.last_modified.to_string()
+                }))
+            }
+            None => Err((-32602, format!("Symbol '{}' not found in '{}'", name, file))),
+        }
+    }
+
+    /// Handle `lattice/dependents` — list of dependent symbols.
+    async fn handle_dependents(&self, params: &Value) -> Result<Value, (i32, String)> {
+        let name = params["name"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: name".to_string()))?;
+        let file = params["file"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: file".to_string()))?;
+
+        let engine = self.engine.lock().await;
+        let node = engine.graph().all_nodes().into_iter()
+            .find(|n| n.name == name && n.file == file);
+
+        match node {
+            Some(n) => {
+                let dependents = engine.graph().get_dependents(&n.id);
+                let dep_values: Vec<Value> = dependents.iter().map(|(dep, edge)| {
+                    json!({
+                        "name": dep.name,
+                        "file": dep.file,
+                        "line": dep.line,
+                        "edge": format!("{:?}", edge)
+                    })
+                }).collect();
+
+                Ok(json!(dep_values))
+            }
+            None => Err((-32602, format!("Symbol '{}' not found in '{}'", name, file))),
+        }
+    }
+
+    /// Handle `lattice/clear_memory` or `lattice/clear` — clear all memories.
+    async fn handle_clear_memory(&self) -> Result<Value, (i32, String)> {
+        let store = self.memory_store.lock().await;
+        let cleared = store.clear_all()
+            .map_err(|e| (-32603, format!("Failed to clear memories: {}", e)))?;
+
+        Ok(json!({
+            "status": "ok",
+            "cleared": cleared
+        }))
+    }
+
+    /// Handle `lattice/reindex` — re-scan all files and rebuild graph.
+    async fn handle_reindex(&self) -> Result<Value, (i32, String)> {
+        let workspace_root = self.workspace_root.clone();
+
+        // Re-scan the workspace
+        let mut files_indexed = 0usize;
+        let mut errors = Vec::new();
+
+        {
+            let mut indexer = self.indexer.lock().await;
+            // Walk the workspace directory
+            let entries = walk_directory(&workspace_root);
+            for entry_path in &entries {
+                let rel_path = entry_path
+                    .strip_prefix(&workspace_root)
+                    .unwrap_or(entry_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+
+                if !should_index_file(&rel_path) {
+                    continue;
+                }
+
+                match std::fs::read_to_string(entry_path) {
+                    Ok(content) => {
+                        if let Err(e) = indexer.index_file_content(&rel_path, &content) {
+                            errors.push(format!("{}: {}", rel_path, e));
+                        } else {
+                            files_indexed += 1;
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", rel_path, e));
+                    }
+                }
+            }
+
+            // Update the engine with the new graph
+            let new_graph = indexer.graph().clone();
+            let stats = new_graph.stats();
+
+            // Save to graph store
+            {
+                let gs = self.graph_store.lock().await;
+                if let Err(e) = gs.save_graph(&new_graph) {
+                    tracing::warn!("Failed to save graph to store: {}", e);
+                }
+            }
+
+            // Update the query engine
+            {
+                let mut engine = self.engine.lock().await;
+                engine.update_graph(new_graph);
+            }
+
+            Ok(json!({
+                "status": "ok",
+                "files_indexed": files_indexed,
+                "nodes": stats.node_count,
+                "edges": stats.edge_count,
+                "errors": errors.len()
+            }))
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -486,14 +786,23 @@ impl RequestHandler for McpHandler {
             "tools/list" => Ok(self.handle_tools_list()),
             "tools/call" => self.handle_tools_call(&params).await,
             "ping" => Ok(json!({})),
-            "lattice/status" => Ok(json!({
-                "status": "running",
-                "version": env!("CARGO_PKG_VERSION")
-            })),
-            "lattice/reindex" => Ok(json!({
-                "status": "placeholder",
-                "message": "Reindexing not yet implemented."
-            })),
+            "lattice/status" => {
+                let engine = self.engine.lock().await;
+                let stats = engine.graph().stats();
+                Ok(json!({
+                    "status": "running",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "workspace": self.workspace_root.to_string_lossy(),
+                    "nodes": stats.node_count,
+                    "edges": stats.edge_count,
+                    "files": stats.file_count
+                }))
+            }
+            "lattice/reindex" => self.handle_reindex().await,
+            "lattice/file_symbols" => self.handle_file_symbols(&params).await,
+            "lattice/symbol_info" => self.handle_symbol_info(&params).await,
+            "lattice/dependents" => self.handle_dependents(&params).await,
+            "lattice/clear_memory" | "lattice/clear" => self.handle_clear_memory().await,
             _ => Err((-32601, format!("Method not found: {}", method))),
         }
     }
@@ -511,193 +820,24 @@ fn wrap_tool_result(value: Value) -> Value {
     })
 }
 
-/// Find a graph node by name and file, returning it as a JSON Value.
-fn find_node_by_name_and_file(engine: &QueryEngine, name: &str, file: &str) -> Option<Value> {
-    // We need to access the graph through the engine.
-    // The engine exposes query() which returns capsules, but for direct lookup
-    // we search all nodes via a targeted query.
-    // Since QueryEngine holds the graph privately, we use keyword search.
-    let capsule = engine.query(name, None);
-
-    // Look through pivots and context for a matching symbol
-    for pivot in &capsule.pivots {
-        if pivot.symbol == name && pivot.file == file {
-            return Some(json!({
-                "symbol": pivot.symbol,
-                "kind": pivot.kind,
-                "file": pivot.file,
-                "line": pivot.line,
-                "source": pivot.source,
-                "score": pivot.score
-            }));
+/// Recursively walk a directory, collecting all file paths.
+fn walk_directory(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip excluded directories
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if lattice_core::watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                        continue;
+                    }
+                }
+                files.extend(walk_directory(&path));
+            } else if path.is_file() {
+                files.push(path);
+            }
         }
     }
-
-    for ctx in &capsule.context {
-        if ctx.symbol == name && ctx.file == file {
-            return Some(json!({
-                "symbol": ctx.symbol,
-                "kind": ctx.kind,
-                "file": ctx.file,
-                "line": ctx.line,
-                "signature": ctx.skeleton,
-                "score": ctx.score
-            }));
-        }
-    }
-
-    None
-}
-
-/// Find a SymbolId by name and file. Since the engine encapsulates the graph,
-/// we construct a plausible SymbolId (byte_offset 0 is used for lookup).
-fn find_symbol_id(_engine: &QueryEngine, name: &str, file: &str) -> Option<SymbolId> {
-    // We construct the SymbolId. The graph's get_node uses exact SymbolId matching,
-    // so we need a byte_offset. Since we don't know it, we use 0 as a convention
-    // and rely on the engine's query path for actual lookups.
-    Some(SymbolId {
-        file: file.to_string(),
-        name: name.to_string(),
-        byte_offset: 0,
-    })
-}
-
-/// Get dependents of a symbol through the engine's query capabilities.
-fn get_dependents_from_engine(engine: &QueryEngine, _id: &SymbolId) -> Vec<Value> {
-    // Use a query to find the symbol and its dependents
-    let capsule = engine.query(&format!("what depends on {}", _id.name), None);
-    capsule
-        .pivots
-        .iter()
-        .map(|p| {
-            json!({
-                "symbol": p.symbol,
-                "kind": p.kind,
-                "file": p.file,
-                "line": p.line
-            })
-        })
-        .chain(capsule.context.iter().map(|c| {
-            json!({
-                "symbol": c.symbol,
-                "kind": c.kind,
-                "file": c.file,
-                "line": c.line
-            })
-        }))
-        .collect()
-}
-
-/// Get dependencies of a symbol through the engine's query capabilities.
-fn get_dependencies_from_engine(engine: &QueryEngine, _id: &SymbolId) -> Vec<Value> {
-    let capsule = engine.query(&format!("dependencies of {}", _id.name), None);
-    capsule
-        .pivots
-        .iter()
-        .map(|p| {
-            json!({
-                "symbol": p.symbol,
-                "kind": p.kind,
-                "file": p.file,
-                "line": p.line
-            })
-        })
-        .chain(capsule.context.iter().map(|c| {
-            json!({
-                "symbol": c.symbol,
-                "kind": c.kind,
-                "file": c.file,
-                "line": c.line
-            })
-        }))
-        .collect()
-}
-
-/// Get N-hop neighbors through the engine's query capabilities.
-fn get_n_hop_neighbors(engine: &QueryEngine, _id: &SymbolId, _hops: usize) -> Vec<Value> {
-    let capsule = engine.query(&format!("blast radius of {}", _id.name), None);
-    capsule
-        .pivots
-        .iter()
-        .map(|p| {
-            json!({
-                "symbol": p.symbol,
-                "kind": p.kind,
-                "file": p.file,
-                "line": p.line
-            })
-        })
-        .chain(capsule.context.iter().map(|c| {
-            json!({
-                "symbol": c.symbol,
-                "kind": c.kind,
-                "file": c.file,
-                "line": c.line
-            })
-        }))
-        .collect()
-}
-
-/// Search for symbols by name pattern.
-fn search_symbols_in_engine(engine: &QueryEngine, pattern: &str, limit: usize) -> Vec<Value> {
-    let capsule = engine.query(pattern, None);
-    let mut results: Vec<Value> = capsule
-        .pivots
-        .iter()
-        .map(|p| {
-            json!({
-                "symbol": p.symbol,
-                "kind": p.kind,
-                "file": p.file,
-                "line": p.line,
-                "score": p.score
-            })
-        })
-        .chain(capsule.context.iter().map(|c| {
-            json!({
-                "symbol": c.symbol,
-                "kind": c.kind,
-                "file": c.file,
-                "line": c.line,
-                "score": c.score
-            })
-        }))
-        .collect();
-    results.truncate(limit);
-    results
-}
-
-/// Get all symbols in a file.
-fn get_file_symbols(engine: &QueryEngine, file: &str) -> Vec<Value> {
-    // Query for the file name to find relevant symbols
-    let capsule = engine.query(file, None);
-    capsule
-        .pivots
-        .iter()
-        .filter(|p| p.file == file)
-        .map(|p| {
-            json!({
-                "symbol": p.symbol,
-                "kind": p.kind,
-                "file": p.file,
-                "line": p.line,
-                "source": p.source
-            })
-        })
-        .chain(
-            capsule
-                .context
-                .iter()
-                .filter(|c| c.file == file)
-                .map(|c| {
-                    json!({
-                        "symbol": c.symbol,
-                        "kind": c.kind,
-                        "file": c.file,
-                        "line": c.line,
-                        "signature": c.skeleton
-                    })
-                }),
-        )
-        .collect()
+    files
 }
