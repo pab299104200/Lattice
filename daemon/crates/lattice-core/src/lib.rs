@@ -1,5 +1,6 @@
 //! Lattice core library — parsing, graph, query engine, memory.
 
+pub mod embeddings;
 pub mod error;
 pub mod graph;
 pub mod indexer;
