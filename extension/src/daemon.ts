@@ -157,10 +157,24 @@ export class DaemonManager implements vscode.Disposable {
             const workspaceFolders = vscode.workspace.workspaceFolders;
             const cwd = workspaceFolders?.[0]?.uri.fsPath ?? this.extensionPath;
 
+            // Ensure MinGW DLLs are findable if built with GNU toolchain
+            const env = { ...process.env };
+            const mingwPaths = ['D:\\mingw64\\bin', 'C:\\mingw64\\bin'];
+            for (const p of mingwPaths) {
+                if (fs.existsSync(p) && !env.PATH?.includes(p)) {
+                    env.PATH = p + ';' + (env.PATH ?? '');
+                }
+            }
+            // Also ensure cargo bin is on PATH
+            const cargoBin = path.join(process.env.USERPROFILE ?? '', '.cargo', 'bin');
+            if (fs.existsSync(cargoBin) && !env.PATH?.includes(cargoBin)) {
+                env.PATH = cargoBin + ';' + (env.PATH ?? '');
+            }
+
             this.process = cp.spawn(binaryPath, ['--stdio'], {
                 cwd,
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env },
+                env,
             });
 
             let started = false;
