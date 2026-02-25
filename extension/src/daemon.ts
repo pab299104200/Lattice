@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
+import * as crypto from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 
@@ -88,6 +89,39 @@ export class DaemonManager implements vscode.Disposable {
     }
 
     /**
+     * Verify the daemon binary's SHA-256 hash before spawning.
+     * Looks for a .sha256 file alongside the binary.
+     * Returns true if verification passes or is skipped (dev mode).
+     */
+    private verifyBinary(binaryPath: string): boolean {
+        const hashFile = binaryPath + '.sha256';
+        if (!fs.existsSync(hashFile)) {
+            // No hash file = development mode, skip verification
+            console.log('Lattice: No .sha256 file found, skipping binary verification (dev mode)');
+            return true;
+        }
+
+        try {
+            const expectedHash = fs.readFileSync(hashFile, 'utf8').trim().split(/\s+/)[0];
+            const binaryContent = fs.readFileSync(binaryPath);
+            const actualHash = crypto.createHash('sha256').update(binaryContent).digest('hex');
+
+            if (actualHash !== expectedHash) {
+                vscode.window.showErrorMessage(
+                    `Lattice: Binary verification failed!\nExpected: ${expectedHash}\nActual: ${actualHash}`
+                );
+                return false;
+            }
+
+            console.log('Lattice: Binary SHA-256 verified');
+            return true;
+        } catch (e) {
+            console.error('Lattice: Binary verification error:', e);
+            return true; // Allow startup on verification errors (file read issues etc.)
+        }
+    }
+
+    /**
      * Start the daemon process.
      */
     public async start(): Promise<void> {
@@ -103,6 +137,11 @@ export class DaemonManager implements vscode.Disposable {
             throw new Error(
                 'Lattice daemon binary not found. Searched: extension/bin/, PATH, ../daemon/target/debug/'
             );
+        }
+
+        if (!this.verifyBinary(binaryPath)) {
+            this.setStatus('error');
+            return;
         }
 
         return this.spawn(binaryPath);
