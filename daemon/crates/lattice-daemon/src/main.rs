@@ -1,3 +1,5 @@
+mod rpc;
+
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
