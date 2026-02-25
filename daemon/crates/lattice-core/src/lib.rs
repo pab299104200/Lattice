@@ -12,5 +12,6 @@ pub mod query;
 pub mod storage;
 pub mod symbols;
 pub mod watcher;
+pub mod workspace;
 
 pub use error::LatticeError;
