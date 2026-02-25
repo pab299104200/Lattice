@@ -152,7 +152,14 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let engine = QueryEngine::new(graph, vector_store_opt);
+    // Open a second MemoryStore connection for the QueryEngine (std::sync::Mutex)
+    // so it can be used in the synchronous query() method
+    let memory_store_for_engine = {
+        let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
+            .expect("Failed to open memory store for query engine");
+        Arc::new(std::sync::Mutex::new(ms))
+    };
+    let engine = QueryEngine::new(graph, vector_store_opt, Some(memory_store_for_engine));
     let engine = Arc::new(Mutex::new(engine));
     let embedding_engine_for_watcher = embedding_engine.clone();
     let indexer = Arc::new(Mutex::new(indexer));

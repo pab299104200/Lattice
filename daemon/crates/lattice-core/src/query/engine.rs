@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::graph::model::{CodeGraph, GraphNode};
+use crate::memory::MemoryStore;
 use crate::storage::VectorStore;
 use crate::symbols::SymbolId;
 
@@ -24,15 +26,22 @@ struct ScoredCandidate<'a> {
 pub struct QueryEngine {
     graph: CodeGraph,
     vector_store: Option<VectorStore>,
+    memory_store: Option<Arc<Mutex<MemoryStore>>>,
     query_history: HashMap<String, usize>,
 }
 
 impl QueryEngine {
-    /// Create a new QueryEngine with a code graph and optional vector store.
-    pub fn new(graph: CodeGraph, vector_store: Option<VectorStore>) -> Self {
+    /// Create a new QueryEngine with a code graph, optional vector store,
+    /// and optional memory store.
+    pub fn new(
+        graph: CodeGraph,
+        vector_store: Option<VectorStore>,
+        memory_store: Option<Arc<Mutex<MemoryStore>>>,
+    ) -> Self {
         Self {
             graph,
             vector_store,
+            memory_store,
             query_history: HashMap::new(),
         }
     }
@@ -41,7 +50,9 @@ impl QueryEngine {
     ///
     /// If `embedding` is provided and a vector store is available, semantic search
     /// is used. Otherwise, falls back to keyword matching on node names/signatures.
-    pub fn query(&self, query_text: &str, embedding: Option<&[f32]>) -> ContextCapsule {
+    pub fn query(&mut self, query_text: &str, embedding: Option<&[f32]>) -> ContextCapsule {
+        // Record the query for frequency tracking (adaptive budget)
+        self.record_query(query_text);
         // Step 1: Detect intent
         let intent = detect_intent(query_text);
         let params = IntentParams::for_intent(intent);
@@ -107,11 +118,12 @@ impl QueryEngine {
         // Sort by descending score
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Step 5: Budget allocation
+        // Step 5: Budget allocation (adaptive: repeated queries expand context)
+        let repeat_count = self.query_history.get(query_text).copied().unwrap_or(0);
         let mut pivots = Vec::new();
         let mut context = Vec::new();
         let mut tokens_used: usize = 0;
-        let budget = params.base_token_budget;
+        let budget = params.base_token_budget + (repeat_count * 500);
 
         for candidate in &candidates {
             if tokens_used >= budget {
@@ -178,13 +190,30 @@ impl QueryEngine {
         let tokens_saved = total_tokens_if_all.saturating_sub(tokens_used);
         let nodes_included = pivots.len() + context.len();
 
-        // Step 6: Assemble capsule
+        // Step 6: Retrieve relevant memories
+        let memories = if let Some(ref ms) = self.memory_store {
+            let store = ms.lock().unwrap();
+            let results = store.search_by_keyword(query_text).unwrap_or_default();
+            results.into_iter().take(5).map(|m| {
+                serde_json::json!({
+                    "content": m.content,
+                    "type": m.memory_type.as_str(),
+                    "stale": m.is_stale,
+                    "stale_reason": m.stale_reason,
+                    "confidence": m.confidence,
+                })
+            }).collect()
+        } else {
+            vec![]
+        };
+
+        // Step 7: Assemble capsule
         ContextCapsule {
             query: query_text.to_string(),
             intent,
             pivots,
             context,
-            memories: Vec::new(),
+            memories,
             stats: CapsuleStats {
                 tokens_used,
                 tokens_saved,

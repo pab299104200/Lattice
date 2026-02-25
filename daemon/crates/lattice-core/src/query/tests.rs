@@ -100,7 +100,7 @@ fn build_test_graph() -> CodeGraph {
 #[test]
 fn test_query_engine_produces_capsule() {
     let graph = build_test_graph();
-    let engine = QueryEngine::new(graph, None);
+    let mut engine = QueryEngine::new(graph, None, None);
 
     let capsule = engine.query("How does loginUser work?", None);
 
@@ -162,7 +162,7 @@ fn test_query_engine_token_budget() {
         graph.add_edge(&from_id, &to_id, EdgeKind::Calls);
     }
 
-    let engine = QueryEngine::new(graph, None);
+    let mut engine = QueryEngine::new(graph, None, None);
     let capsule = engine.query("func_0", None);
 
     // Token budget is 4000 — with ~500 tokens per body, we can't fit all 20

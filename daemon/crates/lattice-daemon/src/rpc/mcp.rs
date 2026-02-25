@@ -266,7 +266,7 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
 
-        let engine = self.engine.lock().await;
+        let mut engine = self.engine.lock().await;
         let capsule = engine.query(query, None);
         serde_json::to_value(&capsule)
             .map(|v| wrap_tool_result(v))
