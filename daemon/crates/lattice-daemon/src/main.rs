@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::MemoryStore;
@@ -52,7 +53,6 @@ async fn main() -> Result<()> {
     vector_store
         .initialize(384) // default embedding dimension
         .expect("Failed to initialize vector store");
-    let _vector_store = Arc::new(Mutex::new(vector_store));
 
     // ── Try to load existing graph from graph_store, or create new ──
     let graph = {
@@ -104,9 +104,57 @@ async fn main() -> Result<()> {
         stats.file_count
     );
 
+    // ── Try to load ONNX embedding model and embed graph nodes ───────
+    let model_path = lattice_dir.join("models").join("model.onnx");
+    let embedding_engine: Option<Arc<EmbeddingEngine>> = if model_path.exists() {
+        match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
+            Ok(eng) => {
+                tracing::info!("ONNX embedding model loaded from {}", model_path.display());
+                Some(Arc::new(eng))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load ONNX model: {}. Semantic search disabled.", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!(
+            "No ONNX model found at {}. Run scripts/download-model.sh to enable semantic search.",
+            model_path.display()
+        );
+        None
+    };
+
+    // Embed all graph nodes into the vector store if embedding engine is available
+    if let Some(ref emb_engine) = embedding_engine {
+        let mut embedded_count = 0usize;
+        for node in graph.all_nodes() {
+            let text = format!("{} {}", node.name, node.signature);
+            match emb_engine.embed(&text) {
+                Ok(vec) => {
+                    if let Err(e) = vector_store.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec) {
+                        tracing::debug!("Failed to store embedding for {}: {}", node.name, e);
+                    } else {
+                        embedded_count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to embed {}: {}", node.name, e);
+                }
+            }
+        }
+        tracing::info!("Embedded {} graph nodes into vector store", embedded_count);
+    }
+
     // ── Create QueryEngine ───────────────────────────────────────────
-    let engine = QueryEngine::new(graph, None);
+    let vector_store_opt = if embedding_engine.is_some() {
+        Some(vector_store)
+    } else {
+        None
+    };
+    let engine = QueryEngine::new(graph, vector_store_opt);
     let engine = Arc::new(Mutex::new(engine));
+    let embedding_engine_for_watcher = embedding_engine.clone();
     let indexer = Arc::new(Mutex::new(indexer));
 
     // ── Start file watcher ───────────────────────────────────────────
@@ -115,6 +163,7 @@ async fn main() -> Result<()> {
         let engine_clone = Arc::clone(&engine);
         let indexer_clone = Arc::clone(&indexer);
         let graph_store_clone = Arc::clone(&graph_store);
+        let emb_engine_clone = embedding_engine_for_watcher;
         let ws_root = workspace_root.clone();
 
         // Spawn a task that listens for FileEvents and incrementally re-indexes
@@ -150,7 +199,23 @@ async fn main() -> Result<()> {
 
                 // Update engine with new graph
                 let new_graph = idx.graph().clone();
-                {
+
+                // Re-embed changed nodes if embedding engine is available
+                if let Some(ref emb_engine) = emb_engine_clone {
+                    let file_nodes: Vec<_> = new_graph.all_nodes().into_iter()
+                        .filter(|n| n.file == rel_path)
+                        .collect();
+                    let mut eng = engine_clone.lock().await;
+                    for node in &file_nodes {
+                        let text = format!("{} {}", node.name, node.signature);
+                        if let Ok(vec) = emb_engine.embed(&text) {
+                            if let Some(vs) = eng.vector_store() {
+                                let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
+                            }
+                        }
+                    }
+                    eng.update_graph(new_graph.clone());
+                } else {
                     let mut eng = engine_clone.lock().await;
                     eng.update_graph(new_graph.clone());
                 }

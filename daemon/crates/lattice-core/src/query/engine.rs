@@ -199,6 +199,11 @@ impl QueryEngine {
         &self.graph
     }
 
+    /// Get a reference to the vector store (if available).
+    pub fn vector_store(&self) -> &Option<VectorStore> {
+        &self.vector_store
+    }
+
     /// Find a symbol by name (searches all nodes).
     pub fn find_symbol(&self, name: &str) -> Option<&GraphNode> {
         self.graph.all_nodes().into_iter()

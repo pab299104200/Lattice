@@ -21,6 +21,9 @@ Thumbs.db
 *.lattice.db-wal
 *.lattice.db-shm
 
+# ONNX models (downloaded separately)
+daemon/models/
+
 # Secrets
 .env
 *.pem
