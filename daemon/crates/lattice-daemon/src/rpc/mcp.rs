@@ -589,10 +589,37 @@ impl McpHandler {
     }
 
     async fn tool_get_project_rules(&self, _args: &Value) -> Result<Value, (i32, String)> {
+        let engine = self.engine.lock().await;
+        let all_nodes = engine.graph().all_nodes();
+
+        // Collect unique file paths from the graph
+        let files: Vec<String> = {
+            let mut file_set = HashSet::new();
+            for node in &all_nodes {
+                file_set.insert(node.file.clone());
+            }
+            file_set.into_iter().collect()
+        };
+
+        let detector = lattice_core::intelligence::RulesDetector::new();
+        let rules = detector.detect_rules(&files);
+
+        let rule_values: Vec<Value> = rules
+            .iter()
+            .map(|r| {
+                json!({
+                    "description": r.description,
+                    "confidence": r.confidence,
+                    "occurrences": r.occurrences,
+                    "example_files": r.example_files
+                })
+            })
+            .collect();
+
         Ok(wrap_tool_result(json!({
-            "status": "placeholder",
-            "message": "Project rules not yet implemented. Will be available in a future release.",
-            "rules": []
+            "status": "ok",
+            "rules": rule_values,
+            "count": rule_values.len()
         })))
     }
 
