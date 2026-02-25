@@ -194,6 +194,24 @@ impl QueryEngine {
         }
     }
 
+    /// Get the underlying graph for direct operations.
+    pub fn graph(&self) -> &CodeGraph {
+        &self.graph
+    }
+
+    /// Find a symbol by name (searches all nodes).
+    pub fn find_symbol(&self, name: &str) -> Option<&GraphNode> {
+        self.graph.all_nodes().into_iter()
+            .find(|n| n.name == name)
+    }
+
+    /// Find all symbols in a file.
+    pub fn file_symbols(&self, file: &str) -> Vec<&GraphNode> {
+        self.graph.all_nodes().into_iter()
+            .filter(|n| n.file == file)
+            .collect()
+    }
+
     /// Replace the code graph with a new one.
     pub fn update_graph(&mut self, graph: CodeGraph) {
         self.graph = graph;

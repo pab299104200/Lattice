@@ -42,6 +42,7 @@ pub struct GraphStats {
 }
 
 /// In-memory dependency graph backed by petgraph.
+#[derive(Clone)]
 pub struct CodeGraph {
     graph: DiGraph<GraphNode, EdgeKind>,
     index: HashMap<SymbolId, NodeIndex>,
@@ -188,6 +189,37 @@ impl CodeGraph {
                         result.push(&self.graph[neighbor]);
                         queue.push_back((neighbor, depth + 1));
                     }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// BFS traversal following only incoming edges (dependents) up to `hops` hops.
+    /// Returns all transitive dependents, excluding the start node.
+    pub fn get_transitive_dependents(&self, id: &SymbolId, hops: usize) -> Vec<&GraphNode> {
+        let idx = match self.index.get(id) {
+            Some(&idx) => idx,
+            None => return Vec::new(),
+        };
+
+        let mut visited = HashSet::new();
+        visited.insert(idx);
+        let mut queue = VecDeque::new();
+        queue.push_back((idx, 0usize));
+        let mut result = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
+
+            // Only follow incoming edges (reverse direction = dependents)
+            for neighbor in self.graph.neighbors_directed(current, Direction::Incoming) {
+                if visited.insert(neighbor) {
+                    result.push(&self.graph[neighbor]);
+                    queue.push_back((neighbor, depth + 1));
                 }
             }
         }

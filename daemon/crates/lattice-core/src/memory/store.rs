@@ -252,6 +252,15 @@ impl MemoryStore {
         Ok(updated as u64)
     }
 
+    /// Delete all memories and return the number deleted.
+    pub fn clear_all(&self) -> Result<usize, LatticeError> {
+        let count = self
+            .conn
+            .execute("DELETE FROM memories", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear memories: {}", e)))?;
+        Ok(count)
+    }
+
     /// Soft-delete a memory by setting is_invalidated = 1.
     pub fn invalidate(&self, id: &str) -> Result<(), LatticeError> {
         self.conn
