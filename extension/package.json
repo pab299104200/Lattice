@@ -19,6 +19,10 @@
       {
         "command": "lattice.showStatus",
         "title": "Lattice: Show Status"
+      },
+      {
+        "command": "lattice.showDependents",
+        "title": "Lattice: Show Dependents"
       }
     ]
   },

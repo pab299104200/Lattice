@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { DaemonManager } from './daemon';
 import { StatusBarProvider } from './statusbar';
+import { LatticeCodeLensProvider } from './codelens';
 
 let daemon: DaemonManager | undefined;
 
@@ -56,7 +57,50 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    context.subscriptions.push(reindexCmd, statusCmd);
+    // CodeLens provider
+    const codeLensProvider = new LatticeCodeLensProvider(daemon);
+    const codeLensRegistration = vscode.languages.registerCodeLensProvider(
+        { scheme: 'file' },
+        codeLensProvider
+    );
+    context.subscriptions.push(codeLensProvider, codeLensRegistration);
+
+    // Output channel for dependent results
+    const outputChannel = vscode.window.createOutputChannel('Lattice');
+    context.subscriptions.push(outputChannel);
+
+    const showDependentsCmd = vscode.commands.registerCommand(
+        'lattice.showDependents',
+        async (filePath: string, symbolName: string) => {
+            if (!daemon || daemon.getStatus() !== 'running') {
+                vscode.window.showWarningMessage('Lattice: Daemon is not running');
+                return;
+            }
+            try {
+                const result = await daemon.sendRequest('lattice/dependents', {
+                    path: filePath,
+                    symbol: symbolName,
+                });
+                const dependents = result as { dependents?: Array<{ file: string; line: number; name: string }> };
+                outputChannel.clear();
+                outputChannel.appendLine(`Dependents of "${symbolName}" (${filePath}):`);
+                outputChannel.appendLine('---');
+                if (dependents?.dependents && dependents.dependents.length > 0) {
+                    for (const dep of dependents.dependents) {
+                        outputChannel.appendLine(`  ${dep.file}:${dep.line} — ${dep.name}`);
+                    }
+                } else {
+                    outputChannel.appendLine('  No dependents found.');
+                }
+                outputChannel.show(true);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                vscode.window.showErrorMessage(`Lattice: Failed to get dependents — ${msg}`);
+            }
+        }
+    );
+
+    context.subscriptions.push(reindexCmd, statusCmd, showDependentsCmd);
 }
 
 export function deactivate() {
