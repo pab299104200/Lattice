@@ -212,3 +212,34 @@ fn test_graph_stats() {
     assert_eq!(stats.edge_count, 1);
     assert_eq!(stats.file_count, 2);
 }
+
+#[test]
+fn test_build_graph_from_parsed_files() {
+    use crate::parser::parse_file;
+    use crate::graph::builder::GraphBuilder;
+
+    let auth_source = r#"
+import { hashPassword } from './crypto';
+
+export function loginUser(username: string, password: string): Promise<User> {
+    const hashed = hashPassword(password);
+    return authenticate(username, hashed);
+}
+"#;
+    let crypto_source = r#"
+export function hashPassword(plain: string): string {
+    return bcrypt.hash(plain, 10);
+}
+"#;
+
+    let auth_parsed = parse_file("src/auth.ts", auth_source).unwrap();
+    let crypto_parsed = parse_file("src/crypto.ts", crypto_source).unwrap();
+
+    let mut builder = GraphBuilder::new();
+    builder.add_file(auth_parsed);
+    builder.add_file(crypto_parsed);
+    let graph = builder.build();
+
+    assert!(graph.node_count() >= 2);
+    assert!(graph.stats().edge_count > 0);
+}
