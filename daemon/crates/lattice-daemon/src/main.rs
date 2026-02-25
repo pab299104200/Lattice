@@ -6,6 +6,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use lattice_core::graph::CodeGraph;
+use lattice_core::memory::MemoryStore;
 use lattice_core::query::QueryEngine;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
@@ -22,7 +23,12 @@ async fn main() -> Result<()> {
     let graph = CodeGraph::new();
     let engine = QueryEngine::new(graph, None);
     let engine = Arc::new(Mutex::new(engine));
-    let handler = Arc::new(McpHandler::new(engine));
+
+    let memory_store = MemoryStore::open_in_memory()
+        .expect("Failed to open memory store");
+    let memory_store = Arc::new(Mutex::new(memory_store));
+
+    let handler = Arc::new(McpHandler::new(engine, memory_store));
     let server = StdioServer::new(handler);
     server.run().await?;
 

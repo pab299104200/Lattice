@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde_json::{json, Value};
 
+use lattice_core::memory::{Memory, MemoryType, MemoryStore};
 use lattice_core::query::QueryEngine;
 use lattice_core::symbols::SymbolId;
 
@@ -11,12 +12,13 @@ use super::server::RequestHandler;
 /// to the appropriate tool implementations.
 pub struct McpHandler {
     engine: Arc<Mutex<QueryEngine>>,
+    memory_store: Arc<Mutex<MemoryStore>>,
 }
 
 impl McpHandler {
-    /// Create a new McpHandler with the given QueryEngine.
-    pub fn new(engine: Arc<Mutex<QueryEngine>>) -> Self {
-        Self { engine }
+    /// Create a new McpHandler with the given QueryEngine and MemoryStore.
+    pub fn new(engine: Arc<Mutex<QueryEngine>>, memory_store: Arc<Mutex<MemoryStore>>) -> Self {
+        Self { engine, memory_store }
     }
 
     // ── MCP Protocol Methods ──────────────────────────────────────────
@@ -171,10 +173,15 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "The memory content to store"
                             },
-                            "tags": {
+                            "memory_type": {
+                                "type": "string",
+                                "description": "Type of memory: observation, decision, exploration, pattern, or anti_pattern (default: observation)",
+                                "enum": ["observation", "decision", "exploration", "pattern", "anti_pattern"]
+                            },
+                            "linked_symbols": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Tags for categorizing the memory"
+                                "description": "Symbol names this memory is linked to"
                             }
                         },
                         "required": ["content"]
@@ -379,18 +386,82 @@ impl McpHandler {
         })))
     }
 
-    async fn tool_store_memory(&self, _args: &Value) -> Result<Value, (i32, String)> {
+    async fn tool_store_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let content = args["content"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: content".to_string()))?;
+
+        let memory_type_str = args["memory_type"].as_str().unwrap_or("observation");
+        let memory_type = MemoryType::from_str(memory_type_str);
+
+        let linked_symbols: Vec<String> = args["linked_symbols"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let memory = Memory {
+            id: String::new(),
+            content: content.to_string(),
+            memory_type: memory_type.clone(),
+            confidence: 1.0,
+            linked_symbols: linked_symbols.clone(),
+            source_query: None,
+            created_at: 0,
+            last_accessed: 0,
+            access_count: 0,
+            is_stale: false,
+            stale_reason: None,
+        };
+
+        let store = self.memory_store.lock().await;
+        let id = store.store(memory)
+            .map_err(|e| (-32603, format!("Failed to store memory: {}", e)))?;
+
         Ok(wrap_tool_result(json!({
-            "status": "placeholder",
-            "message": "Memory storage not yet implemented. Will be available in a future release."
+            "status": "stored",
+            "id": id,
+            "memory_type": memory_type.as_str(),
+            "linked_symbols": linked_symbols
         })))
     }
 
-    async fn tool_recall_memories(&self, _args: &Value) -> Result<Value, (i32, String)> {
+    async fn tool_recall_memories(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let query = args["query"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: query".to_string()))?;
+        let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+
+        let store = self.memory_store.lock().await;
+        let mut memories = store.search_by_keyword(query)
+            .map_err(|e| (-32603, format!("Failed to recall memories: {}", e)))?;
+
+        memories.truncate(limit);
+
+        let memory_values: Vec<Value> = memories
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "memory_type": m.memory_type.as_str(),
+                    "confidence": m.confidence,
+                    "linked_symbols": m.linked_symbols,
+                    "is_stale": m.is_stale,
+                    "stale_reason": m.stale_reason,
+                    "created_at": m.created_at,
+                    "access_count": m.access_count
+                })
+            })
+            .collect();
+
         Ok(wrap_tool_result(json!({
-            "status": "placeholder",
-            "message": "Memory recall not yet implemented. Will be available in a future release.",
-            "memories": []
+            "query": query,
+            "memories": memory_values,
+            "count": memory_values.len()
         })))
     }
 
