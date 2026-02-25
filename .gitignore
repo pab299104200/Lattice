@@ -1,0 +1,27 @@
+# Rust
+daemon/target/
+**/*.rs.bk
+
+# Node
+extension/node_modules/
+extension/out/
+extension/*.vsix
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Lattice data
+.lattice/
+*.lattice.db
+*.lattice.db-wal
+*.lattice.db-shm
+
+# Secrets
+.env
+*.pem
+*.key
