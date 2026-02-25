@@ -1,5 +1,5 @@
 use super::parse_file;
-use crate::symbols::SymbolKind;
+use crate::symbols::{Language, SymbolKind};
 
 #[test]
 fn test_parse_typescript_function() {
@@ -188,4 +188,157 @@ export const MAX_RETRIES = 3;
         .expect("Should find constant");
     assert_eq!(const_sym.name, "MAX_RETRIES");
     assert!(const_sym.is_exported);
+}
+
+// ==================== Python Tests ====================
+
+#[test]
+fn test_parse_python_function() {
+    let source = r#"
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+
+def _private_helper(x):
+    return x + 1
+"#;
+
+    let result = parse_file("test.py", source).expect("Failed to parse");
+    assert_eq!(result.language, Language::Python);
+
+    let greet = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "greet")
+        .expect("Should find 'greet'");
+    assert_eq!(greet.kind, SymbolKind::Function);
+    assert!(greet.is_exported, "greet should be exported (no leading _)");
+    assert!(
+        greet.signature.contains("greet"),
+        "Signature should contain 'greet': {}",
+        greet.signature
+    );
+    assert!(
+        greet.signature.contains("name: str"),
+        "Signature should contain params: {}",
+        greet.signature
+    );
+    // Signature should not end with ':'
+    assert!(
+        !greet.signature.ends_with(':'),
+        "Signature should not end with colon: {}",
+        greet.signature
+    );
+
+    let private = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "_private_helper")
+        .expect("Should find '_private_helper'");
+    assert!(
+        !private.is_exported,
+        "_private_helper should not be exported"
+    );
+}
+
+#[test]
+fn test_parse_python_class() {
+    let source = r#"
+class UserService:
+    def __init__(self, db):
+        self.db = db
+
+    def get_user(self, user_id: str):
+        return self.db.find(user_id)
+
+    def save_user(self, user):
+        self.db.save(user)
+"#;
+
+    let result = parse_file("service.py", source).expect("Failed to parse");
+
+    let class_sym = result
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .expect("Should find a class symbol");
+    assert_eq!(class_sym.name, "UserService");
+    assert!(class_sym.is_exported);
+
+    let methods: Vec<_> = result
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Method)
+        .collect();
+    assert!(
+        methods.len() >= 3,
+        "Should find at least 3 methods (__init__, get_user, save_user), found {}",
+        methods.len()
+    );
+
+    // Check qualified method names
+    let method_names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        method_names.contains(&"UserService.__init__"),
+        "Should have UserService.__init__"
+    );
+    assert!(
+        method_names.contains(&"UserService.get_user"),
+        "Should have UserService.get_user"
+    );
+}
+
+#[test]
+fn test_parse_python_imports() {
+    let source = r#"
+import os
+from pathlib import Path
+from collections import OrderedDict, defaultdict
+"#;
+
+    let result = parse_file("app.py", source).expect("Failed to parse");
+
+    assert!(
+        result.imports.len() >= 3,
+        "Should find at least 3 imports, found {}",
+        result.imports.len()
+    );
+
+    // Plain import
+    let os_import = result
+        .imports
+        .iter()
+        .find(|i| i.source == "os")
+        .expect("Should find os import");
+    assert!(
+        os_import.names.contains(&"os".to_string()),
+        "Should contain 'os'"
+    );
+
+    // From import (single)
+    let pathlib_import = result
+        .imports
+        .iter()
+        .find(|i| i.source == "pathlib")
+        .expect("Should find pathlib import");
+    assert!(
+        pathlib_import.names.contains(&"Path".to_string()),
+        "Should contain 'Path'"
+    );
+
+    // From import (multiple)
+    let collections_import = result
+        .imports
+        .iter()
+        .find(|i| i.source == "collections")
+        .expect("Should find collections import");
+    assert!(
+        collections_import.names.contains(&"OrderedDict".to_string()),
+        "Should contain 'OrderedDict', got: {:?}",
+        collections_import.names
+    );
+    assert!(
+        collections_import.names.contains(&"defaultdict".to_string()),
+        "Should contain 'defaultdict', got: {:?}",
+        collections_import.names
+    );
 }

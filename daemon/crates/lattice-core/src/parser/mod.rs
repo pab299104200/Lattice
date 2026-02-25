@@ -1,3 +1,4 @@
+pub mod python;
 pub mod typescript;
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ pub fn parse_file(file_path: &str, source: &str) -> Result<ParsedFile, LatticeEr
         Language::TypeScript | Language::JavaScript => {
             typescript::parse(file_path, source, language)
         }
+        Language::Python => python::parse(file_path, source),
         _ => Err(LatticeError::Parse {
             file: file_path.to_string(),
             message: format!("Unsupported language: {:?}", language),

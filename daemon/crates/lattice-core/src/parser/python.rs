@@ -1,0 +1,379 @@
+use tree_sitter::{Node, Parser};
+
+use crate::error::LatticeError;
+use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Parse a Python source file and extract symbols.
+pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> {
+    let mut parser = Parser::new();
+
+    let ts_language = tree_sitter_python::LANGUAGE.into();
+
+    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
+        file: file_path.to_string(),
+        message: format!("Failed to set Python language: {}", e),
+    })?;
+
+    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
+        file: file_path.to_string(),
+        message: "Failed to parse Python source".to_string(),
+    })?;
+
+    let root = tree.root_node();
+    let source_bytes = source.as_bytes();
+
+    let mut symbols = Vec::new();
+    let mut imports = Vec::new();
+
+    extract_from_node(root, source_bytes, file_path, &mut symbols, &mut imports);
+
+    Ok(ParsedFile {
+        file: file_path.to_string(),
+        language: Language::Python,
+        symbols,
+        imports,
+    })
+}
+
+/// Walk root-level children and dispatch to extractors.
+fn extract_from_node(
+    node: Node,
+    source: &[u8],
+    file_path: &str,
+    symbols: &mut Vec<Symbol>,
+    imports: &mut Vec<ImportInfo>,
+) {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                if let Some(sym) = extract_function(child, source, file_path) {
+                    symbols.push(sym);
+                }
+            }
+            "class_definition" => {
+                let mut class_symbols = extract_class(child, source, file_path);
+                symbols.append(&mut class_symbols);
+            }
+            "decorated_definition" => {
+                // A decorated definition wraps a function or class
+                extract_decorated(child, source, file_path, symbols);
+            }
+            "import_statement" => {
+                if let Some(imp) = extract_import(child, source) {
+                    imports.push(imp);
+                }
+            }
+            "import_from_statement" => {
+                if let Some(imp) = extract_import_from(child, source) {
+                    imports.push(imp);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract a decorated definition (e.g., @staticmethod def ...).
+fn extract_decorated(
+    node: Node,
+    source: &[u8],
+    file_path: &str,
+    symbols: &mut Vec<Symbol>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                if let Some(sym) = extract_function(child, source, file_path) {
+                    symbols.push(sym);
+                }
+            }
+            "class_definition" => {
+                let mut class_symbols = extract_class(child, source, file_path);
+                symbols.append(&mut class_symbols);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract a Python function definition.
+fn extract_function(
+    node: Node,
+    source: &[u8],
+    file_path: &str,
+) -> Option<Symbol> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source);
+    let body_text = node_text(node, source);
+
+    // Signature = first line of the def, strip trailing ":"
+    let signature = build_python_signature(node, source);
+
+    // is_exported: name doesn't start with '_'
+    let is_exported = !name.starts_with('_');
+
+    let references = extract_references_from_body(node, source);
+
+    Some(Symbol {
+        id: SymbolId {
+            file: file_path.to_string(),
+            name: name.clone(),
+            byte_offset: node.start_byte(),
+        },
+        kind: SymbolKind::Function,
+        name,
+        signature,
+        body: body_text,
+        file: file_path.to_string(),
+        line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        is_exported,
+        language: Language::Python,
+        references,
+        imports: vec![],
+    })
+}
+
+/// Build a Python function signature: first line of def, strip trailing ':'
+fn build_python_signature(node: Node, source: &[u8]) -> String {
+    let full_text = node_text(node, source);
+    let first_line = full_text.lines().next().unwrap_or("").trim();
+    // Strip trailing colon
+    first_line.trim_end_matches(':').trim().to_string()
+}
+
+/// Extract a Python class definition and its methods.
+fn extract_class(
+    node: Node,
+    source: &[u8],
+    file_path: &str,
+) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return symbols,
+    };
+    let class_name = node_text(name_node, source);
+    let body_text = node_text(node, source);
+
+    let is_exported = !class_name.starts_with('_');
+
+    // Signature: first line, strip trailing ':'
+    let signature = body_text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_string();
+
+    symbols.push(Symbol {
+        id: SymbolId {
+            file: file_path.to_string(),
+            name: class_name.clone(),
+            byte_offset: node.start_byte(),
+        },
+        kind: SymbolKind::Class,
+        name: class_name.clone(),
+        signature,
+        body: body_text,
+        file: file_path.to_string(),
+        line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        is_exported,
+        language: Language::Python,
+        references: vec![],
+        imports: vec![],
+    });
+
+    // Extract methods from the class body
+    if let Some(body_node) = node.child_by_field_name("body") {
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            match child.kind() {
+                "function_definition" => {
+                    if let Some(method) = extract_method(child, source, file_path, &class_name) {
+                        symbols.push(method);
+                    }
+                }
+                "decorated_definition" => {
+                    // Decorated methods in a class
+                    let mut dec_cursor = child.walk();
+                    for dec_child in child.children(&mut dec_cursor) {
+                        if dec_child.kind() == "function_definition" {
+                            if let Some(method) = extract_method(dec_child, source, file_path, &class_name) {
+                                symbols.push(method);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    symbols
+}
+
+/// Extract a method from a class body.
+fn extract_method(
+    node: Node,
+    source: &[u8],
+    file_path: &str,
+    class_name: &str,
+) -> Option<Symbol> {
+    let name_node = node.child_by_field_name("name")?;
+    let method_name = node_text(name_node, source);
+    let body_text = node_text(node, source);
+    let signature = build_python_signature(node, source);
+    let references = extract_references_from_body(node, source);
+
+    let qualified_name = format!("{}.{}", class_name, method_name);
+
+    Some(Symbol {
+        id: SymbolId {
+            file: file_path.to_string(),
+            name: qualified_name.clone(),
+            byte_offset: node.start_byte(),
+        },
+        kind: SymbolKind::Method,
+        name: qualified_name,
+        signature,
+        body: body_text,
+        file: file_path.to_string(),
+        line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        is_exported: false,
+        language: Language::Python,
+        references,
+        imports: vec![],
+    })
+}
+
+/// Extract a plain `import X` statement.
+fn extract_import(node: Node, source: &[u8]) -> Option<ImportInfo> {
+    // `import os` or `import os.path` or `import os, sys`
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        if child.kind() == "dotted_name" {
+            names.push(node_text(child, source));
+        } else if child.kind() == "aliased_import" {
+            // import os as operating_system
+            if let Some(name_node) = child.child_by_field_name("name") {
+                names.push(node_text(name_node, source));
+            }
+        }
+    }
+
+    if names.is_empty() {
+        return None;
+    }
+
+    // For `import os`, the source is the module name itself
+    let source_path = names[0].clone();
+
+    Some(ImportInfo {
+        source: source_path,
+        names,
+        is_default: false,
+        is_wildcard: false,
+    })
+}
+
+/// Extract a `from X import Y` statement.
+fn extract_import_from(node: Node, source: &[u8]) -> Option<ImportInfo> {
+    // Find the module name (after "from")
+    let module_name = node.child_by_field_name("module_name")
+        .map(|n| node_text(n, source));
+
+    let source_path = module_name.unwrap_or_default();
+
+    let mut names = Vec::new();
+    let mut is_wildcard = false;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "dotted_name" => {
+                // This could be the module name (handled above) or an imported name
+                // Skip if it matches the source path
+                let text = node_text(child, source);
+                if text != source_path {
+                    names.push(text);
+                }
+            }
+            "aliased_import" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    names.push(node_text(name_node, source));
+                }
+            }
+            "wildcard_import" => {
+                is_wildcard = true;
+                names.push("*".to_string());
+            }
+            "import_prefix" => {
+                // relative import dots, skip
+            }
+            _ => {}
+        }
+    }
+
+    Some(ImportInfo {
+        source: source_path,
+        names,
+        is_default: false,
+        is_wildcard,
+    })
+}
+
+/// Extract references from a function/method body (call expression identifiers).
+fn extract_references_from_body(node: Node, source: &[u8]) -> Vec<String> {
+    let mut refs = Vec::new();
+
+    if let Some(body_node) = node.child_by_field_name("body") {
+        collect_call_identifiers(body_node, source, &mut refs);
+    }
+
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// Recursively collect identifiers from call expressions.
+fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>) {
+    if node.kind() == "call" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            match func_node.kind() {
+                "identifier" => {
+                    refs.push(node_text(func_node, source));
+                }
+                "attribute" => {
+                    // For a.b(), collect "a" (the object)
+                    if let Some(obj) = func_node.child_by_field_name("object") {
+                        if obj.kind() == "identifier" {
+                            refs.push(node_text(obj, source));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_call_identifiers(child, source, refs);
+    }
+}
+
+/// Get the text of a tree-sitter node.
+fn node_text(node: Node, source: &[u8]) -> String {
+    node.utf8_text(source).unwrap_or("").to_string()
+}
