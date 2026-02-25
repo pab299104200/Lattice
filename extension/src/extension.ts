@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { DaemonManager } from './daemon';
+import { StatusBarProvider } from './statusbar';
 
 let daemon: DaemonManager | undefined;
 
@@ -9,6 +10,10 @@ export async function activate(context: vscode.ExtensionContext) {
     // Create and start daemon manager
     daemon = new DaemonManager(context.extensionPath);
     context.subscriptions.push(daemon);
+
+    // Create status bar
+    const statusBar = new StatusBarProvider(daemon);
+    context.subscriptions.push(statusBar);
 
     daemon.onStatusChange((status) => {
         console.log(`[lattice] daemon status: ${status}`);
