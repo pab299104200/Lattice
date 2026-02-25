@@ -235,3 +235,38 @@ fn test_query_no_filters() {
     assert!(filter.language.is_none());
     assert_eq!(clean, "how does auth work?");
 }
+
+// ─── Detailed why_included tests ────────────────────────────────────
+
+#[test]
+fn test_why_included_has_detail() {
+    let graph = build_test_graph();
+    let mut engine = QueryEngine::new(graph, None, None);
+
+    let capsule = engine.query("How does loginUser work?", None);
+
+    for pivot in &capsule.pivots {
+        assert!(
+            pivot.why.contains("score:"),
+            "Pivot why should contain 'score:' — got '{}'",
+            pivot.why
+        );
+    }
+}
+
+#[test]
+fn test_context_relationship_has_edge_info() {
+    let graph = build_test_graph();
+    let mut engine = QueryEngine::new(graph, None, None);
+
+    let capsule = engine.query("How does loginUser work?", None);
+
+    // Check that context nodes have relationship info beyond generic labels
+    for ctx in &capsule.context {
+        assert!(
+            !ctx.relationship.is_empty(),
+            "Context relationship should not be empty for {}",
+            ctx.symbol
+        );
+    }
+}

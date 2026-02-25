@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::graph::model::{CodeGraph, GraphNode};
+use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
 use crate::storage::VectorStore;
 use crate::symbols::SymbolId;
 
 use super::capsule::{
-    CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent,
+    CapsuleStats, ContextCapsule, ContextNode, PivotNode,
 };
 use super::intent::{detect_intent, IntentParams};
 
@@ -18,7 +18,9 @@ const CHARS_PER_TOKEN: usize = 4;
 struct ScoredCandidate<'a> {
     node: &'a GraphNode,
     score: f64,
-    semantic_sim: f64,
+    _semantic_sim: f64,
+    /// How this node was reached (e.g., "semantic_match: 0.91" or "called_by: loginUser").
+    relationship_detail: String,
 }
 
 /// The query engine orchestrates intent detection, search, graph traversal,
@@ -64,16 +66,59 @@ impl QueryEngine {
         // Step 2: Semantic search or keyword fallback (use clean query for matching)
         let seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
 
-        // Step 3: Graph traversal — N hops from semantic hits
+        // Step 3: Graph traversal — N hops from semantic hits, tracking relationship paths
         let mut candidate_ids: HashMap<SymbolId, f64> = HashMap::new();
+        let mut relationship_paths: HashMap<SymbolId, String> = HashMap::new();
+
         for (id, sim) in &seed_hits {
             candidate_ids.insert(id.clone(), *sim);
+            relationship_paths.insert(
+                id.clone(),
+                format!("semantic_match: {:.2}", sim),
+            );
 
-            let neighbors = self.graph.n_hop_neighbors(id, params.hop_depth);
-            for neighbor in neighbors {
-                candidate_ids
-                    .entry(neighbor.id.clone())
-                    .or_insert(0.0);
+            // Build path-aware traversal from this seed hit
+            let seed_name = self.graph.get_node(id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| id.name.clone());
+
+            // 1 hop: direct dependencies and dependents
+            for (dep_node, edge_kind) in self.graph.get_dependencies(id) {
+                let edge_label = format_edge_kind(edge_kind);
+                candidate_ids.entry(dep_node.id.clone()).or_insert(0.0);
+                relationship_paths.entry(dep_node.id.clone()).or_insert_with(|| {
+                    format!("{}: {} (via {})", edge_label, seed_name, dep_node.name)
+                });
+
+                // 2 hops from dependencies
+                if params.hop_depth >= 2 {
+                    for (dep2_node, edge_kind2) in self.graph.get_dependencies(&dep_node.id) {
+                        candidate_ids.entry(dep2_node.id.clone()).or_insert(0.0);
+                        relationship_paths.entry(dep2_node.id.clone()).or_insert_with(|| {
+                            format!("{} -> {} -> {} (via {:?})",
+                                seed_name, dep_node.name, dep2_node.name, edge_kind2)
+                        });
+                    }
+                }
+            }
+
+            for (caller_node, edge_kind) in self.graph.get_dependents(id) {
+                let edge_label = format_edge_kind_reverse(edge_kind);
+                candidate_ids.entry(caller_node.id.clone()).or_insert(0.0);
+                relationship_paths.entry(caller_node.id.clone()).or_insert_with(|| {
+                    format!("{}: {}", edge_label, seed_name)
+                });
+
+                // 2 hops from dependents
+                if params.hop_depth >= 2 {
+                    for (caller2_node, edge_kind2) in self.graph.get_dependents(&caller_node.id) {
+                        candidate_ids.entry(caller2_node.id.clone()).or_insert(0.0);
+                        relationship_paths.entry(caller2_node.id.clone()).or_insert_with(|| {
+                            format!("{} -> {} -> {} (via {:?})",
+                                seed_name, caller_node.name, caller2_node.name, edge_kind2)
+                        });
+                    }
+                }
             }
         }
 
@@ -116,10 +161,15 @@ impl QueryEngine {
                     + recency * params.w_recency
                     + caller_norm * params.w_caller;
 
+                let rel_detail = relationship_paths.get(id)
+                    .cloned()
+                    .unwrap_or_else(|| classify_relationship(*semantic_sim));
+
                 candidates.push(ScoredCandidate {
                     node,
                     score,
-                    semantic_sim: *semantic_sim,
+                    _semantic_sim: *semantic_sim,
+                    relationship_detail: rel_detail,
                 });
             }
         }
@@ -152,7 +202,7 @@ impl QueryEngine {
                             file: candidate.node.file.clone(),
                             line: candidate.node.line,
                             skeleton: candidate.node.signature.clone(),
-                            relationship: classify_relationship(candidate.semantic_sim),
+                            relationship: candidate.relationship_detail.clone(),
                             score: candidate.score,
                         });
                         tokens_used += sig_tokens;
@@ -160,13 +210,19 @@ impl QueryEngine {
                     continue;
                 }
 
+                let centrality = self.graph.centrality(&candidate.node.id);
                 pivots.push(PivotNode {
                     symbol: candidate.node.name.clone(),
                     kind: format!("{:?}", candidate.node.kind),
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
                     source: candidate.node.body.clone(),
-                    why: classify_why(candidate.semantic_sim, intent),
+                    why: format!(
+                        "score: {:.2}, {}, centrality: {:.2}",
+                        candidate.score,
+                        candidate.relationship_detail,
+                        centrality,
+                    ),
                     score: candidate.score,
                 });
                 tokens_used += source_tokens;
@@ -183,7 +239,7 @@ impl QueryEngine {
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
                     skeleton: candidate.node.signature.clone(),
-                    relationship: classify_relationship(candidate.semantic_sim),
+                    relationship: candidate.relationship_detail.clone(),
                     score: candidate.score,
                 });
                 tokens_used += sig_tokens;
@@ -396,6 +452,34 @@ pub fn parse_query_filters(query: &str) -> (QueryFilter, String) {
     (filter, clean_parts.join(" "))
 }
 
+/// Format an edge kind for display in dependency direction (outgoing).
+/// e.g., Calls -> "calls", Imports -> "imports"
+fn format_edge_kind(kind: EdgeKind) -> String {
+    match kind {
+        EdgeKind::Calls => "calls".to_string(),
+        EdgeKind::Imports => "imports".to_string(),
+        EdgeKind::Implements => "implements".to_string(),
+        EdgeKind::Extends => "extends".to_string(),
+        EdgeKind::TypeRef => "type_ref_of".to_string(),
+        EdgeKind::Contains => "contains".to_string(),
+        EdgeKind::CoChanges => "co_changes_with".to_string(),
+    }
+}
+
+/// Format an edge kind for display in dependent direction (incoming / reverse).
+/// e.g., Calls -> "called_by", Imports -> "imported_by"
+fn format_edge_kind_reverse(kind: EdgeKind) -> String {
+    match kind {
+        EdgeKind::Calls => "called_by".to_string(),
+        EdgeKind::Imports => "imported_by".to_string(),
+        EdgeKind::Implements => "implemented_by".to_string(),
+        EdgeKind::Extends => "extended_by".to_string(),
+        EdgeKind::TypeRef => "type_referenced_by".to_string(),
+        EdgeKind::Contains => "contained_in".to_string(),
+        EdgeKind::CoChanges => "co_changes_with".to_string(),
+    }
+}
+
 /// Classify the relationship of a node based on its semantic similarity.
 fn classify_relationship(semantic_sim: f64) -> String {
     if semantic_sim > 0.8 {
@@ -409,21 +493,4 @@ fn classify_relationship(semantic_sim: f64) -> String {
     }
 }
 
-/// Classify why a node was selected as a pivot.
-fn classify_why(semantic_sim: f64, intent: QueryIntent) -> String {
-    let intent_str = match intent {
-        QueryIntent::Explore => "exploration target",
-        QueryIntent::FixBug => "likely bug location",
-        QueryIntent::Refactor => "refactoring candidate",
-        QueryIntent::AddFeature => "integration point",
-        QueryIntent::Unknown => "relevant symbol",
-    };
-
-    if semantic_sim > 0.8 {
-        format!("Direct semantic match — {}", intent_str)
-    } else if semantic_sim > 0.5 {
-        format!("High relevance — {}", intent_str)
-    } else {
-        format!("Graph-connected — {}", intent_str)
-    }
-}
+// classify_why was replaced by the detailed score/path-based why_included format in Fix 18.
