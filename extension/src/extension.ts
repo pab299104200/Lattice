@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { DaemonManager } from './daemon';
 import { StatusBarProvider } from './statusbar';
 import { LatticeCodeLensProvider } from './codelens';
+import { LatticeHoverProvider } from './hover';
 
 let daemon: DaemonManager | undefined;
 
@@ -99,6 +100,14 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }
     );
+
+    // Hover provider
+    const hoverProvider = new LatticeHoverProvider(daemon);
+    const hoverRegistration = vscode.languages.registerHoverProvider(
+        { scheme: 'file' },
+        hoverProvider
+    );
+    context.subscriptions.push(hoverRegistration);
 
     context.subscriptions.push(reindexCmd, statusCmd, showDependentsCmd);
 }
