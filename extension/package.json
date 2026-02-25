@@ -1,0 +1,40 @@
+{
+  "name": "lattice",
+  "displayName": "Lattice",
+  "description": "Local AI context engine — dependency graph analysis for 65-70% fewer tokens",
+  "version": "0.1.0",
+  "publisher": "lattice",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "lattice.reindex",
+        "title": "Lattice: Re-index Workspace"
+      },
+      {
+        "command": "lattice.showStatus",
+        "title": "Lattice: Show Status"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
