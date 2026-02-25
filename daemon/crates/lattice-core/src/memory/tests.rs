@@ -108,3 +108,47 @@ fn test_invalidate_memory() {
     let all = store.list_all().expect("Failed to list after invalidation");
     assert_eq!(all.len(), 0);
 }
+
+#[test]
+fn test_memory_decay_and_pruning() {
+    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
+
+    // Store a memory with old timestamp
+    store
+        .store(Memory {
+            id: "old-mem".to_string(),
+            content: "old observation".to_string(),
+            memory_type: MemoryType::Observation,
+            confidence: 0.5,
+            linked_symbols: vec![],
+            source_query: None,
+            created_at: 1000, // Very old
+            last_accessed: 1000, // Never accessed recently
+            access_count: 0,
+            is_stale: false,
+            stale_reason: None,
+        })
+        .expect("Failed to store memory");
+
+    // Decay should reduce confidence
+    let decayed = store.decay_old_memories(0, 0.1).expect("Failed to decay");
+    assert!(decayed > 0);
+
+    let memories = store.list_all().expect("Failed to list memories");
+    assert!(
+        memories[0].confidence < 0.5,
+        "Confidence should have decayed"
+    );
+
+    // Prune should remove low-confidence old memories
+    let pruned = store
+        .prune_old_memories(0.5, 0)
+        .expect("Failed to prune");
+    assert!(pruned > 0);
+
+    let remaining = store.list_all().expect("Failed to list remaining");
+    assert!(
+        remaining.is_empty(),
+        "Low confidence memory should be pruned"
+    );
+}

@@ -230,6 +230,11 @@ impl MemoryStore {
             });
         }
 
+        // Touch each returned memory to update last_accessed
+        for mem in &memories {
+            let _ = self.touch_memory(&mem.id);
+        }
+
         Ok(memories)
     }
 
@@ -269,6 +274,46 @@ impl MemoryStore {
                 params![id],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to invalidate memory: {}", e)))?;
+        Ok(())
+    }
+
+    /// Decay confidence of memories that haven't been accessed recently.
+    /// Reduces confidence by `decay_rate` for each memory not accessed in `stale_days` days.
+    pub fn decay_old_memories(&self, stale_days: u64, decay_rate: f64) -> Result<usize, LatticeError> {
+        let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
+        let count = self
+            .conn
+            .execute(
+                "UPDATE memories SET confidence = MAX(0.1, confidence - ?1)
+                 WHERE last_accessed < ?2 AND is_invalidated = 0 AND confidence > 0.1",
+                params![decay_rate, cutoff as i64],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to decay memories: {}", e)))?;
+        Ok(count)
+    }
+
+    /// Prune (archive) memories with low confidence that haven't been accessed in N days.
+    pub fn prune_old_memories(&self, min_confidence: f64, stale_days: u64) -> Result<usize, LatticeError> {
+        let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
+        let count = self
+            .conn
+            .execute(
+                "UPDATE memories SET is_invalidated = 1
+                 WHERE confidence < ?1 AND last_accessed < ?2 AND is_invalidated = 0",
+                params![min_confidence, cutoff as i64],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to prune memories: {}", e)))?;
+        Ok(count)
+    }
+
+    /// Update last_accessed timestamp when a memory is retrieved.
+    pub fn touch_memory(&self, id: &str) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "UPDATE memories SET last_accessed = ?1, access_count = access_count + 1 WHERE id = ?2",
+                params![now_epoch_secs() as i64, id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to touch memory: {}", e)))?;
         Ok(())
     }
 }
