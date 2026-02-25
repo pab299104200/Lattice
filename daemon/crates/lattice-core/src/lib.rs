@@ -6,5 +6,6 @@ pub mod parser;
 pub mod query;
 pub mod storage;
 pub mod symbols;
+pub mod watcher;
 
 pub use error::LatticeError;
