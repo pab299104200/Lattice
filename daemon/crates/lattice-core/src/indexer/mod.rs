@@ -78,4 +78,63 @@ impl Indexer {
         }
         self.graph = builder.build();
     }
+
+    /// Index a directory using parallel file parsing.
+    /// Files are parsed concurrently, then the graph is rebuilt once.
+    pub async fn index_directory_parallel(&mut self, dir: &std::path::Path) -> anyhow::Result<usize> {
+        let files = self.collect_indexable_files(dir)?;
+        let mut handles = Vec::new();
+
+        for (rel_path, content) in files {
+            handles.push(tokio::task::spawn_blocking(move || {
+                crate::parser::parse_file(&rel_path, &content)
+            }));
+        }
+
+        let mut count = 0;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(parsed)) => {
+                    self.parsed_files.insert(parsed.file.clone(), parsed);
+                    count += 1;
+                }
+                Ok(Err(e)) => tracing::warn!("Parse error: {}", e),
+                Err(e) => tracing::warn!("Task error: {}", e),
+            }
+        }
+
+        self.rebuild_graph();
+        Ok(count)
+    }
+
+    fn collect_indexable_files(&self, dir: &std::path::Path) -> anyhow::Result<Vec<(String, String)>> {
+        let mut files = Vec::new();
+        self.scan_files(dir, dir, &mut files)?;
+        Ok(files)
+    }
+
+    fn scan_files(&self, base: &std::path::Path, dir: &std::path::Path, files: &mut Vec<(String, String)>) -> anyhow::Result<()> {
+        let entries = std::fs::read_dir(dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !crate::watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                    self.scan_files(base, &path, files)?;
+                }
+            } else if path.is_file() {
+                let rel_path = path.strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if crate::watcher::should_index_file(&rel_path) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        files.push((rel_path, content));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }

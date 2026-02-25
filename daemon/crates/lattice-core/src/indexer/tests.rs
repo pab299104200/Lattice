@@ -150,3 +150,26 @@ fn test_lazy_queue_boost_priority() {
     let second = queue.dequeue().expect("should have second entry");
     assert_eq!(second.path, "src/other.ts");
 }
+
+#[tokio::test]
+async fn test_parallel_indexing() {
+    let dir = std::env::temp_dir().join("lattice_parallel_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+
+    // Create 10 test files
+    for i in 0..10 {
+        std::fs::write(
+            dir.join(format!("src/mod{}.ts", i)),
+            format!("export function func{}(): void {{}}", i),
+        )
+        .unwrap();
+    }
+
+    let mut indexer = Indexer::new(dir.clone());
+    let count = indexer.index_directory_parallel(&dir).await.unwrap();
+    assert_eq!(count, 10);
+    assert!(indexer.graph().node_count() >= 10);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
