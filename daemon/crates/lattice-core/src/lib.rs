@@ -3,6 +3,7 @@
 pub mod error;
 pub mod graph;
 pub mod parser;
+pub mod storage;
 pub mod symbols;
 
 pub use error::LatticeError;

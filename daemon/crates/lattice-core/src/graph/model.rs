@@ -261,6 +261,23 @@ impl CodeGraph {
             .collect()
     }
 
+    /// Get all edges as (from_node, to_node, edge_kind) triples.
+    pub fn all_edges(&self) -> Vec<(&GraphNode, &GraphNode, EdgeKind)> {
+        self.graph
+            .edge_indices()
+            .filter_map(|edge_idx| {
+                let (from_idx, to_idx) = self.graph.edge_endpoints(edge_idx)?;
+                let kind = *self.graph.edge_weight(edge_idx)?;
+                Some((&self.graph[from_idx], &self.graph[to_idx], kind))
+            })
+            .collect()
+    }
+
+    /// Get a mutable reference to a node by its petgraph NodeIndex.
+    pub fn get_node_mut_by_index(&mut self, idx: NodeIndex) -> Option<&mut GraphNode> {
+        self.graph.node_weight_mut(idx)
+    }
+
     /// Degree centrality: (in_degree + out_degree) / (total_nodes - 1).
     pub fn centrality(&self, id: &SymbolId) -> f64 {
         let idx = match self.index.get(id) {
