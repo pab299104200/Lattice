@@ -93,3 +93,60 @@ export function delta(): void {
     // Still only 1 file tracked
     assert_eq!(indexer.file_count(), 1);
 }
+
+// ---- Lazy indexer tests ----
+
+use super::lazy::{LazyIndexQueue, IndexPriority};
+
+#[test]
+fn test_lazy_queue_priority_ordering() {
+    let mut queue = LazyIndexQueue::new();
+    queue.enqueue("src/background.ts".to_string(), IndexPriority::Background);
+    queue.enqueue("src/import.ts".to_string(), IndexPriority::DirectImport);
+    queue.enqueue("src/editor.ts".to_string(), IndexPriority::OpenInEditor);
+
+    let first = queue.dequeue().expect("should have first entry");
+    assert_eq!(first.path, "src/editor.ts", "highest priority (OpenInEditor) should come first");
+    assert_eq!(first.priority, IndexPriority::OpenInEditor);
+
+    let second = queue.dequeue().expect("should have second entry");
+    assert_eq!(second.path, "src/import.ts", "DirectImport should come second");
+
+    let third = queue.dequeue().expect("should have third entry");
+    assert_eq!(third.path, "src/background.ts", "Background should come last");
+
+    assert!(queue.dequeue().is_none(), "queue should be empty");
+}
+
+#[test]
+fn test_lazy_queue_no_duplicates() {
+    let mut queue = LazyIndexQueue::new();
+    queue.enqueue("src/utils.ts".to_string(), IndexPriority::Background);
+    queue.enqueue("src/utils.ts".to_string(), IndexPriority::Background);
+
+    let entry = queue.dequeue().expect("should dequeue once");
+    assert_eq!(entry.path, "src/utils.ts");
+
+    // Second dequeue should return None since the file is already indexed
+    assert!(queue.dequeue().is_none(), "duplicate should not be dequeued");
+    assert!(queue.is_indexed("src/utils.ts"), "file should be marked as indexed");
+    assert_eq!(queue.indexed_count(), 1);
+}
+
+#[test]
+fn test_lazy_queue_boost_priority() {
+    let mut queue = LazyIndexQueue::new();
+    queue.enqueue("src/app.ts".to_string(), IndexPriority::Background);
+    queue.enqueue("src/other.ts".to_string(), IndexPriority::SameDirectory);
+
+    // Boost app.ts to OpenInEditor
+    queue.boost_priority("src/app.ts", IndexPriority::OpenInEditor);
+
+    // The boosted entry should come out first (highest priority)
+    let first = queue.dequeue().expect("should have first entry");
+    assert_eq!(first.path, "src/app.ts", "boosted entry should come first");
+    assert_eq!(first.priority, IndexPriority::OpenInEditor);
+
+    let second = queue.dequeue().expect("should have second entry");
+    assert_eq!(second.path, "src/other.ts");
+}
