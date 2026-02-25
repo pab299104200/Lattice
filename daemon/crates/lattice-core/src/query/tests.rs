@@ -2,7 +2,7 @@ use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 
 use super::capsule::QueryIntent;
-use super::engine::QueryEngine;
+use super::engine::{QueryEngine, parse_query_filters};
 use super::intent::detect_intent;
 
 // ─── Intent detection tests ─────────────────────────────────────────
@@ -194,4 +194,44 @@ fn test_adaptive_budget_expands_on_repeat() {
     // Third query
     let _capsule3 = engine.query("How does loginUser work?", None);
     // query_history should now have count 3 for this query
+}
+
+// ─── Query filter parsing tests ─────────────────────────────────────
+
+#[test]
+fn test_query_filter_parsing() {
+    let (filter, clean) = parse_query_filters("repo:frontend how does auth work?");
+    assert_eq!(filter.repo.as_deref(), Some("frontend"));
+    assert_eq!(clean, "how does auth work?");
+}
+
+#[test]
+fn test_query_with_language_filter() {
+    let (filter, clean) = parse_query_filters("lang:python find database models");
+    assert_eq!(filter.language.as_deref(), Some("python"));
+    assert_eq!(clean, "find database models");
+}
+
+#[test]
+fn test_query_with_file_filter() {
+    let (filter, clean) = parse_query_filters("file:auth.ts how does login work?");
+    assert_eq!(filter.file_pattern.as_deref(), Some("auth.ts"));
+    assert_eq!(clean, "how does login work?");
+}
+
+#[test]
+fn test_query_with_multiple_filters() {
+    let (filter, clean) = parse_query_filters("repo:backend lang:typescript find auth handlers");
+    assert_eq!(filter.repo.as_deref(), Some("backend"));
+    assert_eq!(filter.language.as_deref(), Some("typescript"));
+    assert_eq!(clean, "find auth handlers");
+}
+
+#[test]
+fn test_query_no_filters() {
+    let (filter, clean) = parse_query_filters("how does auth work?");
+    assert!(filter.repo.is_none());
+    assert!(filter.file_pattern.is_none());
+    assert!(filter.language.is_none());
+    assert_eq!(clean, "how does auth work?");
 }

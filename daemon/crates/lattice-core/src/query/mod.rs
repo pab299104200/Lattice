@@ -7,4 +7,4 @@ mod tests;
 
 pub use capsule::{ContextCapsule, ContextNode, CapsuleStats, PivotNode, QueryIntent};
 pub use intent::{detect_intent, IntentParams};
-pub use engine::QueryEngine;
+pub use engine::{QueryEngine, QueryFilter, parse_query_filters};

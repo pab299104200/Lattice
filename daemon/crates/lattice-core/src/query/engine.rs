@@ -53,12 +53,16 @@ impl QueryEngine {
     pub fn query(&mut self, query_text: &str, embedding: Option<&[f32]>) -> ContextCapsule {
         // Record the query for frequency tracking (adaptive budget)
         self.record_query(query_text);
-        // Step 1: Detect intent
-        let intent = detect_intent(query_text);
+
+        // Step 0: Parse query filters (repo:, file:, lang:)
+        let (filter, clean_query) = parse_query_filters(query_text);
+
+        // Step 1: Detect intent (use clean query without filter tokens)
+        let intent = detect_intent(&clean_query);
         let params = IntentParams::for_intent(intent);
 
-        // Step 2: Semantic search or keyword fallback
-        let seed_hits = self.find_seed_hits(query_text, embedding, &params);
+        // Step 2: Semantic search or keyword fallback (use clean query for matching)
+        let seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
 
         // Step 3: Graph traversal — N hops from semantic hits
         let mut candidate_ids: HashMap<SymbolId, f64> = HashMap::new();
@@ -73,13 +77,18 @@ impl QueryEngine {
             }
         }
 
-        // Step 4: Rank candidates
+        // Step 4: Rank candidates (apply query filters)
         let mut candidates: Vec<ScoredCandidate> = Vec::new();
         let all_node_ids: Vec<&SymbolId> = self.graph.all_node_ids();
         let nodes_evaluated = candidate_ids.len();
 
         for (id, semantic_sim) in &candidate_ids {
             if let Some(node) = self.graph.get_node(id) {
+                // Apply query filters — skip nodes that don't match
+                if !filter.matches(node) {
+                    continue;
+                }
+
                 let centrality = self.graph.centrality(id);
 
                 // Recency: normalize last_modified to 0..1 range based on max
@@ -331,6 +340,60 @@ impl QueryEngine {
         scored.truncate(top_k);
         scored
     }
+}
+
+/// Parsed query filters extracted from prefix tokens like `repo:name`, `file:pattern`, `lang:language`.
+#[derive(Default, Debug, Clone)]
+pub struct QueryFilter {
+    pub repo: Option<String>,
+    pub file_pattern: Option<String>,
+    pub language: Option<String>,
+}
+
+impl QueryFilter {
+    /// Returns true if the given graph node passes all active filters.
+    pub fn matches(&self, node: &GraphNode) -> bool {
+        if let Some(ref repo) = self.repo {
+            // Match repo name against the beginning of the file path
+            if !node.file.starts_with(repo) && !node.file.contains(&format!("/{}/", repo)) {
+                return false;
+            }
+        }
+        if let Some(ref pattern) = self.file_pattern {
+            if !node.file.contains(pattern) {
+                return false;
+            }
+        }
+        if let Some(ref lang) = self.language {
+            let lang_lower = lang.to_lowercase();
+            let node_lang = format!("{:?}", node.language).to_lowercase();
+            if node_lang != lang_lower {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Parse query filters like `repo:frontend how does auth work?`
+/// Returns (filter, clean_query) where clean_query has the filter tokens removed.
+pub fn parse_query_filters(query: &str) -> (QueryFilter, String) {
+    let mut filter = QueryFilter::default();
+    let mut clean_parts = Vec::new();
+
+    for word in query.split_whitespace() {
+        if let Some(repo) = word.strip_prefix("repo:") {
+            filter.repo = Some(repo.to_string());
+        } else if let Some(file) = word.strip_prefix("file:") {
+            filter.file_pattern = Some(file.to_string());
+        } else if let Some(lang) = word.strip_prefix("lang:") {
+            filter.language = Some(lang.to_string());
+        } else {
+            clean_parts.push(word);
+        }
+    }
+
+    (filter, clean_parts.join(" "))
 }
 
 /// Classify the relationship of a node based on its semantic similarity.
