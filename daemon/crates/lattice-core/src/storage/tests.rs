@@ -162,3 +162,27 @@ fn test_vector_delete_by_file() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "helper");
 }
+
+#[test]
+fn test_vector_store_cache_performance() {
+    let store = VectorStore::open_in_memory().unwrap();
+    store.initialize(384).unwrap();
+
+    // Insert 100 vectors
+    for i in 0..100 {
+        let mut vec = vec![0.0f32; 384];
+        vec[i % 384] = 1.0;
+        store.upsert_vector(&format!("file{}.ts", i), &format!("func{}", i), 0, &vec).unwrap();
+    }
+
+    store.load_cache().unwrap();
+
+    let query = vec![1.0f32; 384];
+    let results = store.search(&query, 5).unwrap();
+    assert_eq!(results.len(), 5);
+
+    // Delete and verify cache is updated
+    store.delete_by_file("file0.ts").unwrap();
+    let results2 = store.search(&query, 100).unwrap();
+    assert_eq!(results2.len(), 99);
+}

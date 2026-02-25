@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use rusqlite::{Connection, params};
 use crate::error::LatticeError;
 
@@ -12,9 +14,16 @@ CREATE TABLE IF NOT EXISTS vectors (
 CREATE INDEX IF NOT EXISTS idx_vectors_file ON vectors(file);
 "#;
 
+/// Cache key: (file, name, byte_offset).
+type CacheKey = (String, String, usize);
+
 /// Stores embedding vectors as BLOBs in SQLite with cosine similarity search.
+/// Maintains an in-memory cache for fast similarity lookups without SQLite overhead.
 pub struct VectorStore {
     conn: Connection,
+    /// In-memory vector cache for fast similarity search.
+    /// Loaded via `load_cache()`, updated on upsert/delete.
+    cache: RefCell<HashMap<CacheKey, Vec<f32>>>,
 }
 
 impl VectorStore {
@@ -26,7 +35,7 @@ impl VectorStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, cache: RefCell::new(HashMap::new()) })
     }
 
     /// Open an in-memory SQLite database (for tests).
@@ -34,7 +43,7 @@ impl VectorStore {
         let conn = Connection::open_in_memory()
             .map_err(|e| LatticeError::Storage(format!("Failed to open in-memory vector store: {}", e)))?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, cache: RefCell::new(HashMap::new()) })
     }
 
     /// Create the vectors table if it doesn't exist.
@@ -43,6 +52,31 @@ impl VectorStore {
         self.conn
             .execute_batch(CREATE_VECTORS_TABLE)
             .map_err(|e| LatticeError::Storage(format!("Failed to initialize vector schema: {}", e)))?;
+        Ok(())
+    }
+
+    /// Load all vectors from SQLite into the in-memory cache.
+    /// Call this after initialization to enable fast in-memory searches.
+    pub fn load_cache(&self) -> Result<(), LatticeError> {
+        let mut cache = self.cache.borrow_mut();
+        cache.clear();
+        let mut stmt = self.conn.prepare(
+            "SELECT file, name, byte_offset, embedding FROM vectors"
+        ).map_err(|e| LatticeError::Storage(format!("Failed to prepare cache load: {}", e)))?;
+
+        let rows = stmt.query_map([], |row| {
+            let file: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let offset: i64 = row.get(2)?;
+            let blob: Vec<u8> = row.get(3)?;
+            Ok((file, name, offset as usize, blob))
+        }).map_err(|e| LatticeError::Storage(format!("Failed to load cache: {}", e)))?;
+
+        for row in rows {
+            let (file, name, offset, blob) =
+                row.map_err(|e| LatticeError::Storage(format!("Failed to read cache row: {}", e)))?;
+            cache.insert((file, name, offset), bytes_to_f32_slice(&blob));
+        }
         Ok(())
     }
 
@@ -63,6 +97,12 @@ impl VectorStore {
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to upsert vector: {}", e)))?;
 
+        // Update in-memory cache
+        self.cache.borrow_mut().insert(
+            (file.to_string(), name.to_string(), byte_offset),
+            vector.to_vec(),
+        );
+
         Ok(())
     }
 
@@ -72,16 +112,39 @@ impl VectorStore {
             .execute("DELETE FROM vectors WHERE file = ?1", params![file])
             .map_err(|e| LatticeError::Storage(format!("Failed to delete vectors by file: {}", e)))?;
 
+        // Remove from in-memory cache
+        self.cache.borrow_mut().retain(|(f, _, _), _| f != file);
+
         Ok(())
     }
 
     /// Search for the top-k most similar vectors to the query using cosine similarity.
     /// Returns Vec<(name, file, byte_offset, similarity)> sorted by descending similarity.
+    ///
+    /// Uses the in-memory cache if populated; otherwise falls back to SQLite.
     pub fn search(
         &self,
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<(String, String, usize, f32)>, LatticeError> {
+        let cache = self.cache.borrow();
+        if !cache.is_empty() {
+            // Fast path: iterate in-memory cache
+            let mut results: Vec<(String, String, usize, f32)> = cache
+                .iter()
+                .map(|((file, name, offset), vec)| {
+                    let similarity = cosine_similarity(query, vec);
+                    (name.clone(), file.clone(), *offset, similarity)
+                })
+                .collect();
+
+            results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(top_k);
+            return Ok(results);
+        }
+        drop(cache);
+
+        // Slow path: query SQLite directly
         let mut stmt = self
             .conn
             .prepare("SELECT file, name, byte_offset, embedding FROM vectors")
