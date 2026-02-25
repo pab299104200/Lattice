@@ -1,6 +1,7 @@
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use super::graph_store::GraphStore;
+use crate::storage::VectorStore;
 
 fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
     SymbolId {
@@ -124,4 +125,40 @@ fn test_file_based_store() {
     // Clean up
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_dir(&tmp_dir);
+}
+
+#[test]
+fn test_vector_store_and_search() {
+    let store = VectorStore::open_in_memory().unwrap();
+    store.initialize(384).unwrap();
+
+    let vec_a = vec![1.0f32; 384];
+    let mut vec_b = vec![0.0f32; 384];
+    vec_b[0] = 1.0;
+    let vec_c = vec![-1.0f32; 384];
+
+    store.upsert_vector("src/auth.ts", "loginUser", 0, &vec_a).unwrap();
+    store.upsert_vector("src/crypto.ts", "hashPassword", 0, &vec_b).unwrap();
+    store.upsert_vector("src/other.ts", "unrelated", 0, &vec_c).unwrap();
+
+    let results = store.search(&vec_a, 2).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "loginUser"); // exact match first
+}
+
+#[test]
+fn test_vector_delete_by_file() {
+    let store = VectorStore::open_in_memory().unwrap();
+    store.initialize(384).unwrap();
+
+    let vec_a = vec![1.0f32; 384];
+    store.upsert_vector("src/auth.ts", "login", 0, &vec_a).unwrap();
+    store.upsert_vector("src/auth.ts", "logout", 10, &vec_a).unwrap();
+    store.upsert_vector("src/other.ts", "helper", 0, &vec_a).unwrap();
+
+    store.delete_by_file("src/auth.ts").unwrap();
+
+    let results = store.search(&vec_a, 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "helper");
 }
