@@ -137,4 +137,44 @@ impl Indexer {
         }
         Ok(())
     }
+
+    /// Re-index a file and return the list of changed symbols.
+    /// If a MemoryStore is provided, mark related memories as stale.
+    pub fn index_file_with_stale_detection(
+        &mut self,
+        rel_path: &str,
+        content: &str,
+        memory_store: Option<&crate::memory::MemoryStore>,
+    ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
+        let new_parsed = crate::parser::parse_file(rel_path, content)?;
+
+        // Get old symbols for this file
+        let old_symbols = self.parsed_files.get(rel_path)
+            .map(|f| f.symbols.clone())
+            .unwrap_or_default();
+
+        // Diff
+        let changes = crate::diff::diff_symbols(&old_symbols, &new_parsed.symbols);
+
+        // Mark stale memories for modified/removed symbols
+        if let Some(store) = memory_store {
+            for change in &changes {
+                if change.kind == crate::diff::ChangeKind::Modified
+                    || change.kind == crate::diff::ChangeKind::Removed
+                {
+                    let reason = format!(
+                        "{}() was {:?} in {}",
+                        change.name, change.kind, change.file
+                    );
+                    let _ = store.mark_stale_by_symbol(&change.name, &reason);
+                }
+            }
+        }
+
+        // Update index
+        self.parsed_files.insert(rel_path.to_string(), new_parsed);
+        self.rebuild_graph();
+
+        Ok(changes)
+    }
 }

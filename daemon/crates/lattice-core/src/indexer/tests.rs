@@ -173,3 +173,43 @@ async fn test_parallel_indexing() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_stale_memory_on_file_change() {
+    use crate::memory::{MemoryStore, Memory, MemoryType};
+
+    let store = MemoryStore::open_in_memory().unwrap();
+
+    // Store a memory linked to "loginUser"
+    store.store(Memory {
+        id: String::new(),
+        content: "loginUser uses bcrypt".to_string(),
+        memory_type: MemoryType::Observation,
+        confidence: 0.9,
+        linked_symbols: vec!["loginUser".to_string()],
+        source_query: None,
+        created_at: 0,
+        last_accessed: 0,
+        access_count: 0,
+        is_stale: false,
+        stale_reason: None,
+    }).unwrap();
+
+    let mut indexer = Indexer::new(PathBuf::from("/test"));
+
+    // Index original
+    indexer.index_file_content("src/auth.ts", r#"
+export function loginUser(): void { bcrypt(); }
+"#).unwrap();
+
+    // Re-index with changes — should mark memory stale
+    let changes = indexer.index_file_with_stale_detection(
+        "src/auth.ts",
+        r#"export function loginUser(): void { argon2(); }"#,
+        Some(&store),
+    ).unwrap();
+
+    assert!(!changes.is_empty());
+    let memories = store.list_all().unwrap();
+    assert!(memories[0].is_stale, "Memory should be marked stale after symbol modification");
+}
