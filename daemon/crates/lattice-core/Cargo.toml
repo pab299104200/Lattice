@@ -15,6 +15,5 @@ tree-sitter-python = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 petgraph = { workspace = true }
 rusqlite = { workspace = true }
-
-[dev-dependencies]
+notify = { workspace = true }
 tokio = { workspace = true }

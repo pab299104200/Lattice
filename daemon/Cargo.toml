@@ -27,3 +27,4 @@ tree-sitter-javascript = "0.23"
 petgraph = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
+notify = "7"
