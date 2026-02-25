@@ -59,7 +59,7 @@ export class DaemonManager implements vscode.Disposable {
      * Search order: extension/bin/, PATH, ../daemon/target/debug/
      */
     private resolveBinaryPath(): string | null {
-        const binaryName = process.platform === 'win32' ? 'lattice-daemon.exe' : 'lattice-daemon';
+        const binaryName = process.platform === 'win32' ? 'lattice.exe' : 'lattice';
 
         // 1. Check extension/bin/
         const extensionBin = path.join(this.extensionPath, 'bin', binaryName);
