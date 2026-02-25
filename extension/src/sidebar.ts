@@ -99,8 +99,10 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         this.webviewView.webview.html = this.getHtml();
-        // Send initial data after render
-        setTimeout(() => this.postUpdate(), 100);
+        // Send initial data after render — use increasing delays to catch webview readiness
+        setTimeout(() => this.postUpdate(), 200);
+        setTimeout(() => this.postUpdate(), 500);
+        setTimeout(() => this.postUpdate(), 1500);
     }
 
     private getHtml(): string {

@@ -10,19 +10,42 @@ let daemon: DaemonManager | undefined;
 export async function activate(context: vscode.ExtensionContext) {
     console.log('Lattice extension activating...');
 
-    // Create and start daemon manager
+    // Create daemon manager
     daemon = new DaemonManager(context.extensionPath);
     context.subscriptions.push(daemon);
 
-    // Create status bar
+    // Create UI providers (before daemon starts so they can receive status updates)
     const statusBar = new StatusBarProvider(daemon);
     context.subscriptions.push(statusBar);
 
-    daemon.onStatusChange((status) => {
+    const sidebarProvider = new LatticeSidebarProvider(daemon);
+    const sidebarRegistration = vscode.window.registerWebviewViewProvider(
+        LatticeSidebarProvider.viewType,
+        sidebarProvider
+    );
+    context.subscriptions.push(sidebarProvider, sidebarRegistration);
+
+    // When daemon becomes running, fetch stats and update UI
+    daemon.onStatusChange(async (status) => {
         console.log(`[lattice] daemon status: ${status}`);
+        if (status === 'running') {
+            try {
+                const result = await daemon!.sendRequest('lattice/status') as any;
+                if (result && typeof result === 'object') {
+                    const nodes = result.nodes ?? result.node_count ?? 0;
+                    const files = result.files ?? result.file_count ?? 0;
+                    const edges = result.edges ?? result.edge_count ?? 0;
+                    sidebarProvider.updateStats({ nodes, files, edges });
+                    statusBar.updateNodeCount(nodes);
+                    console.log(`[lattice] indexed: ${nodes} nodes, ${files} files, ${edges} edges`);
+                }
+            } catch (err) {
+                console.error('[lattice] failed to fetch stats:', err);
+            }
+        }
     });
 
-    // Start daemon (non-blocking — don't await so activation isn't held up)
+    // Start daemon (non-blocking)
     daemon.start().catch((err) => {
         console.error(`[lattice] failed to start daemon: ${err.message}`);
         vscode.window.showErrorMessage(`Lattice: Failed to start daemon — ${err.message}`);
@@ -37,6 +60,15 @@ export async function activate(context: vscode.ExtensionContext) {
         try {
             vscode.window.showInformationMessage('Lattice: Re-indexing workspace...');
             await daemon.sendRequest('lattice/reindex');
+            // Refresh stats after re-index
+            const result = await daemon.sendRequest('lattice/status') as any;
+            if (result && typeof result === 'object') {
+                const nodes = result.nodes ?? result.node_count ?? 0;
+                const files = result.files ?? result.file_count ?? 0;
+                const edges = result.edges ?? result.edge_count ?? 0;
+                sidebarProvider.updateStats({ nodes, files, edges });
+                statusBar.updateNodeCount(nodes);
+            }
             vscode.window.showInformationMessage('Lattice: Re-index complete');
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -109,14 +141,6 @@ export async function activate(context: vscode.ExtensionContext) {
         hoverProvider
     );
     context.subscriptions.push(hoverRegistration);
-
-    // Sidebar panel
-    const sidebarProvider = new LatticeSidebarProvider(daemon);
-    const sidebarRegistration = vscode.window.registerWebviewViewProvider(
-        LatticeSidebarProvider.viewType,
-        sidebarProvider
-    );
-    context.subscriptions.push(sidebarProvider, sidebarRegistration);
 
     context.subscriptions.push(reindexCmd, statusCmd, showDependentsCmd);
 }
