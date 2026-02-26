@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 
 use super::protocol::{parse_request, format_response, JsonRpcResponse};
 
+/// Trait for handling JSON-RPC requests.
 #[async_trait::async_trait]
 pub trait RequestHandler: Send + Sync {
     async fn handle(
@@ -12,6 +13,8 @@ pub trait RequestHandler: Send + Sync {
     ) -> Result<serde_json::Value, (i32, String)>;
 }
 
+/// A JSON-RPC server that communicates over stdio using newline-delimited JSON.
+/// Uses synchronous stdin (blocking thread) and stdout to avoid Windows pipe issues.
 pub struct StdioServer {
     handler: Arc<dyn RequestHandler>,
 }
@@ -21,52 +24,34 @@ impl StdioServer {
         Self { handler }
     }
 
-    fn disk_log(msg: &str) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("D:\\lattice\\debug.log")
-        {
-            let _ = writeln!(f, "[server] {}", msg);
-            let _ = f.flush();
-        }
-    }
-
+    /// Run the server loop.
     pub async fn run(&self) -> anyhow::Result<()> {
-        // CRITICAL: Set stdout and stdin to binary mode on Windows.
-        // Without this, \n gets translated to \r\n, doubling the \r\n in
-        // Content-Length headers (producing \r\r\n which breaks MCP parsing).
+        // Set stdout/stdin to binary mode on Windows to prevent \n -> \r\n translation.
         #[cfg(windows)]
         unsafe {
             extern "C" { fn _setmode(fd: i32, mode: i32) -> i32; }
             _setmode(0, 0x8000); // stdin  -> _O_BINARY
             _setmode(1, 0x8000); // stdout -> _O_BINARY
         }
-        Self::disk_log("StdioServer::run() entered (binary mode)");
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-        // Stdin reader in a blocking thread
+        // Stdin reader in a dedicated blocking thread.
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut reader = BufReader::new(stdin.lock());
             loop {
                 match read_message_sync(&mut reader) {
                     Ok(Some(msg)) => {
-                        Self::disk_log(&format!("sync read: {} bytes", msg.len()));
                         if tx.send(msg).is_err() { break; }
                     }
-                    Ok(None) => {
-                        Self::disk_log("sync stdin EOF");
-                        break;
-                    }
-                    Err(e) => {
-                        Self::disk_log(&format!("sync read error: {}", e));
-                        continue;
-                    }
+                    Ok(None) => break, // EOF
+                    Err(_) => continue,
                 }
             }
         });
 
+        // Process messages from the channel.
         while let Some(message) = rx.recv().await {
             let request = match parse_request(&message) {
                 Ok(req) => req,
@@ -82,24 +67,22 @@ impl StdioServer {
 
             let is_notification = request.id.is_null();
 
-            Self::disk_log(&format!("handling method={} id={}", request.method, request.id));
-
             let response = match self.handler.handle(&request.method, request.params).await {
                 Ok(result) => JsonRpcResponse::success(request.id, result),
                 Err((code, message)) => JsonRpcResponse::error(request.id, code, message),
             };
 
             if !is_notification {
-                Self::disk_log("sending response");
                 write_response_sync(&response);
             }
         }
 
-        Self::disk_log("server loop exited");
         Ok(())
     }
 }
 
+/// Read a single message from stdin.
+/// Supports both Content-Length framing (for clients that send it) and raw JSON lines.
 fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String>> {
     loop {
         let mut line = String::new();
@@ -113,6 +96,7 @@ fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String
             let length: usize = trimmed.split(':').nth(1)
                 .ok_or_else(|| anyhow::anyhow!("bad header"))?
                 .trim().parse()?;
+            // Skip remaining headers until blank line
             loop {
                 let mut hdr = String::new();
                 reader.read_line(&mut hdr)?;
@@ -122,33 +106,22 @@ fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String
             std::io::Read::read_exact(reader, &mut body)?;
             return Ok(Some(String::from_utf8(body)?));
         } else if trimmed.starts_with('{') {
+            // Raw JSON line
             return Ok(Some(trimmed.to_string()));
         }
+        // Skip unrecognized lines
     }
 }
 
-/// Write response as JSON line to stdout.
-/// MCP over stdio can use either Content-Length framing or newline-delimited JSON.
-/// We send both: Content-Length header + body + trailing newline.
-/// Clients that understand Content-Length will use that, others will read the JSON line.
+/// Write a JSON-RPC response as a newline-delimited JSON line to stdout.
 fn write_response_sync(response: &JsonRpcResponse) {
     let body = format_response(response);
-    // Just write the JSON followed by a newline — simplest possible format
     let mut frame: Vec<u8> = Vec::new();
     frame.extend_from_slice(body.as_bytes());
     frame.push(b'\n');
 
-    StdioServer::disk_log(&format!("writing {} bytes as JSON line", frame.len()));
-
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    match out.write_all(&frame) {
-        Ok(()) => {
-            match out.flush() {
-                Ok(()) => StdioServer::disk_log("write+flush OK"),
-                Err(e) => StdioServer::disk_log(&format!("flush error: {}", e)),
-            }
-        }
-        Err(e) => StdioServer::disk_log(&format!("write error: {}", e)),
-    }
+    let _ = out.write_all(&frame);
+    let _ = out.flush();
 }

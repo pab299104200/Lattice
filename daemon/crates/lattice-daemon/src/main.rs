@@ -23,28 +23,9 @@ use rpc::server::StdioServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // DEBUG: Write to a log file on disk — proves the process started regardless of stdio
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("D:\\lattice\\debug.log")
-        {
-            let _ = writeln!(f, "=== {} ===", chrono_now());
-            let _ = writeln!(f, "pid={}", std::process::id());
-            let _ = writeln!(f, "cwd={}", std::env::current_dir().unwrap_or_default().display());
-            let _ = writeln!(f, "args={:?}", std::env::args().collect::<Vec<_>>());
-            let _ = f.flush();
-        }
-    }
-
-    eprintln!("[lattice] process started, pid={}", std::process::id());
-    eprintln!("[lattice] cwd={}", std::env::current_dir().unwrap_or_default().display());
-    eprintln!("[lattice] args={:?}", std::env::args().collect::<Vec<_>>());
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr) // stderr for logs, stdout for JSON-RPC
+        .with_writer(std::io::stderr)
         .init();
 
     tracing::info!("Lattice daemon starting...");
@@ -287,7 +268,7 @@ async fn main() -> Result<()> {
     }
 
     // ── Create McpHandler and start StdioServer ──────────────────────
-    debug_log("creating McpHandler");
+    tracing::info!("Creating MCP handler");
     let handler = Arc::new(McpHandler::new(
         engine,
         indexer,
@@ -295,10 +276,10 @@ async fn main() -> Result<()> {
         graph_store,
         workspace_root,
     ));
-    debug_log("starting StdioServer.run()");
+    tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
     server.run().await?;
-    debug_log("StdioServer.run() exited");
+    tracing::info!("Stdio server exited");
 
     Ok(())
 }
@@ -322,23 +303,6 @@ fn parse_workspace_root() -> PathBuf {
     }
 
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("{}", secs)
-}
-
-fn debug_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open("D:\\lattice\\debug.log")
-    {
-        let _ = writeln!(f, "[{}] {}", chrono_now(), msg);
-        let _ = f.flush();
-    }
 }
 
 /// Walk the workspace directory and index all supported files.
