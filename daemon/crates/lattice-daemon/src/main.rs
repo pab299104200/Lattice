@@ -37,29 +37,43 @@ async fn main() -> Result<()> {
     // ── Create .lattice/ directory ───────────────────────────────────
     let lattice_dir = workspace_root.join(".lattice");
     if !lattice_dir.exists() {
-        std::fs::create_dir_all(&lattice_dir)?;
-        tracing::info!("Created .lattice/ directory");
+        let _ = std::fs::create_dir_all(&lattice_dir);
     }
 
-    // ── Open SQLite stores ───────────────────────────────────────────
-    let graph_store = GraphStore::open(&lattice_dir.join("graph.db"))
-        .expect("Failed to open graph store");
-    let graph_store = Arc::new(Mutex::new(graph_store));
+    // ── Open SQLite stores (fall back to in-memory if locked) ────────
+    let (graph_store, memory_store, vector_store, using_memory_db) = {
+        // Try file-based first, fall back to in-memory if another instance has the lock
+        let gs = GraphStore::open(&lattice_dir.join("graph.db"))
+            .or_else(|e| {
+                tracing::warn!("File DB locked ({}), using in-memory graph store", e);
+                GraphStore::open_in_memory()
+            })
+            .expect("Failed to open any graph store");
 
-    let memory_store = MemoryStore::open(&lattice_dir.join("memory.db"))
-        .expect("Failed to open memory store");
+        let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
+            .or_else(|e| {
+                tracing::warn!("File DB locked ({}), using in-memory memory store", e);
+                MemoryStore::open_in_memory()
+            })
+            .expect("Failed to open any memory store");
+
+        let vs = VectorStore::open(lattice_dir.join("vectors.db").to_string_lossy().as_ref())
+            .unwrap_or_else(|e| {
+                tracing::warn!("File DB locked ({}), using in-memory vector store", e);
+                VectorStore::open_in_memory().expect("Failed to open in-memory vector store")
+            });
+
+        // Check if we're using file or memory DBs
+        let is_file = lattice_dir.join("graph.db").exists();
+        (gs, ms, vs, is_file)
+    };
+
+    // initialize() is already called inside open() and open_in_memory()
+    let graph_store = Arc::new(Mutex::new(graph_store));
     let memory_store = Arc::new(Mutex::new(memory_store));
 
-    let vector_store = VectorStore::open(
-        lattice_dir.join("vectors.db").to_string_lossy().as_ref(),
-    )
-    .expect("Failed to open vector store");
-    vector_store
-        .initialize(384) // default embedding dimension
-        .expect("Failed to initialize vector store");
-
-    // ── Try to load existing graph from graph_store, or create new ──
-    let graph = {
+    // ── Try to load existing graph, or create new ───────────────────
+    let graph = if using_memory_db {
         let gs = graph_store.lock().await;
         match gs.load_graph() {
             Ok(g) if g.node_count() > 0 => {
@@ -75,6 +89,9 @@ async fn main() -> Result<()> {
                 CodeGraph::new()
             }
         }
+    } else {
+        tracing::info!("Using in-memory stores (another instance has the DB lock)");
+        CodeGraph::new()
     };
 
     // ── Create Indexer (don't index yet — do it in background) ───────
