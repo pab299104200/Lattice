@@ -36,8 +36,9 @@ export class LatticeCodeLensProvider implements vscode.CodeLensProvider {
         }
 
         try {
+            const relPath = vscode.workspace.asRelativePath(document.uri).replace(/\\/g, '/');
             const result = await this.daemon.sendRequest('lattice/file_symbols', {
-                path: document.uri.fsPath,
+                file: relPath,
             });
 
             const response = result as FileSymbolsResponse;

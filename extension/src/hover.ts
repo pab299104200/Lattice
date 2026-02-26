@@ -32,9 +32,10 @@ export class LatticeHoverProvider implements vscode.HoverProvider {
         }
 
         try {
+            const relPath = vscode.workspace.asRelativePath(document.uri).replace(/\\/g, '/');
             const result = await this.daemon.sendRequest('lattice/symbol_info', {
-                path: document.uri.fsPath,
-                symbol: word,
+                file: relPath,
+                name: word,
                 line: position.line,
                 character: position.character,
             });

@@ -112,8 +112,8 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             try {
                 const result = await daemon.sendRequest('lattice/dependents', {
-                    path: filePath,
-                    symbol: symbolName,
+                    file: filePath,
+                    name: symbolName,
                 });
                 const dependents = result as { dependents?: Array<{ file: string; line: number; name: string }> };
                 outputChannel.clear();
