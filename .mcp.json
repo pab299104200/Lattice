@@ -2,11 +2,8 @@
   "mcpServers": {
     "lattice": {
       "type": "stdio",
-      "command": "D:\\Users\\pbelcher\\OneDrive\\VSCode Projects\\AI Memory\\daemon\\target\\debug\\lattice.exe",
-      "args": ["--stdio"],
-      "env": {
-        "PATH": "D:\\mingw64\\bin;D:\\Users\\pbelcher\\.cargo\\bin;${PATH}"
-      }
+      "command": "D:\\lattice\\lattice.exe",
+      "args": ["--stdio"]
     }
   }
 }
