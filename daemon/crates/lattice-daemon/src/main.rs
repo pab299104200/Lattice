@@ -30,84 +30,21 @@ async fn main() -> Result<()> {
 
     tracing::info!("Lattice daemon starting...");
 
-    // ── Parse workspace root from args or use cwd ────────────────────
+    // ── Parse workspace root ─────────────────────────────────────────
     let workspace_root = parse_workspace_root();
-    tracing::info!("Workspace root: {}", workspace_root.display());
 
-    // ── Create .lattice/ directory ───────────────────────────────────
-    let lattice_dir = workspace_root.join(".lattice");
-    if !lattice_dir.exists() {
-        let _ = std::fs::create_dir_all(&lattice_dir);
-    }
-
-    // ── Open SQLite stores (fall back to in-memory if locked) ────────
-    let (graph_store, memory_store, vector_store, using_memory_db) = {
-        // Try file-based first, fall back to in-memory if another instance has the lock
-        let gs = GraphStore::open(&lattice_dir.join("graph.db"))
-            .or_else(|e| {
-                tracing::warn!("File DB locked ({}), using in-memory graph store", e);
-                GraphStore::open_in_memory()
-            })
-            .expect("Failed to open any graph store");
-
-        let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
-            .or_else(|e| {
-                tracing::warn!("File DB locked ({}), using in-memory memory store", e);
-                MemoryStore::open_in_memory()
-            })
-            .expect("Failed to open any memory store");
-
-        let vs = VectorStore::open(lattice_dir.join("vectors.db").to_string_lossy().as_ref())
-            .unwrap_or_else(|e| {
-                tracing::warn!("File DB locked ({}), using in-memory vector store", e);
-                VectorStore::open_in_memory().expect("Failed to open in-memory vector store")
-            });
-
-        // Check if we're using file or memory DBs
-        let is_file = lattice_dir.join("graph.db").exists();
-        (gs, ms, vs, is_file)
-    };
-
-    // initialize() is already called inside open() and open_in_memory()
-    let graph_store = Arc::new(Mutex::new(graph_store));
-    let memory_store = Arc::new(Mutex::new(memory_store));
-
-    // ── Try to load existing graph, or create new ───────────────────
-    let graph = if using_memory_db {
-        let gs = graph_store.lock().await;
-        match gs.load_graph() {
-            Ok(g) if g.node_count() > 0 => {
-                tracing::info!(
-                    "Loaded existing graph: {} nodes, {} edges",
-                    g.node_count(),
-                    g.edge_count()
-                );
-                g
-            }
-            _ => {
-                tracing::info!("No existing graph found, starting fresh");
-                CodeGraph::new()
-            }
-        }
-    } else {
-        tracing::info!("Using in-memory stores (another instance has the DB lock)");
-        CodeGraph::new()
-    };
-
-    // ── Create Indexer (don't index yet — do it in background) ───────
-    let indexer = Indexer::new(workspace_root.clone());
-
-    // ── Create QueryEngine with loaded graph (may be empty) ──────────
-    // Open a second MemoryStore connection for the QueryEngine (std::sync::Mutex)
-    let memory_store_for_engine = {
-        let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
-            .or_else(|_| MemoryStore::open_in_memory())
-            .expect("Failed to open any memory store for query engine");
-        Arc::new(std::sync::Mutex::new(ms))
-    };
-    let engine = QueryEngine::new(graph, None, Some(memory_store_for_engine));
+    // ── Create EMPTY engine + stores — start server IMMEDIATELY ──────
+    // Everything else happens in background so MCP handshake isn't delayed.
+    let graph = CodeGraph::new();
+    let ms = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
+    let memory_store = Arc::new(Mutex::new(ms));
+    let ms_for_engine = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
+    let engine = QueryEngine::new(graph, None, Some(Arc::new(std::sync::Mutex::new(ms_for_engine))));
     let engine = Arc::new(Mutex::new(engine));
-    let indexer = Arc::new(Mutex::new(indexer));
+    let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
+    let graph_store = Arc::new(Mutex::new(
+        GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
+    ));
 
     // ── Spawn background indexing task ────────────────────────────────
     {
@@ -115,10 +52,11 @@ async fn main() -> Result<()> {
         let indexer_bg = Arc::clone(&indexer);
         let graph_store_bg = Arc::clone(&graph_store);
         let ws_root = workspace_root.clone();
-        let lattice_dir_bg = lattice_dir.clone();
+        let lattice_dir_bg = ws_root.join(".lattice");
 
         tokio::spawn(async move {
             tracing::info!("Background indexing starting...");
+            let _ = std::fs::create_dir_all(&lattice_dir_bg);
             let security_filter = SecurityFilter::new(&ws_root);
 
             let files_indexed = {
