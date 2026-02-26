@@ -51,7 +51,38 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
             this.webviewView = undefined;
         });
 
+        // Refresh status from daemon every time view becomes visible
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this.refreshFromDaemon();
+            }
+        });
+
         this.renderHtml();
+        // Also fetch fresh data on first render
+        this.refreshFromDaemon();
+    }
+
+    /**
+     * Query the daemon for current status and stats, then push to webview.
+     */
+    private async refreshFromDaemon(): Promise<void> {
+        this.currentStatus = this.daemon.getStatus();
+        if (this.currentStatus === 'running') {
+            try {
+                const result = await this.daemon.sendRequest('lattice/status') as any;
+                if (result && typeof result === 'object') {
+                    this.stats = {
+                        nodes: result.nodes ?? result.node_count ?? 0,
+                        files: result.files ?? result.file_count ?? 0,
+                        edges: result.edges ?? result.edge_count ?? 0,
+                    };
+                }
+            } catch {
+                // ignore — just use cached stats
+            }
+        }
+        this.postUpdate();
     }
 
     /**
