@@ -101,7 +101,8 @@ async fn main() -> Result<()> {
     // Open a second MemoryStore connection for the QueryEngine (std::sync::Mutex)
     let memory_store_for_engine = {
         let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
-            .expect("Failed to open memory store for query engine");
+            .or_else(|_| MemoryStore::open_in_memory())
+            .expect("Failed to open any memory store for query engine");
         Arc::new(std::sync::Mutex::new(ms))
     };
     let engine = QueryEngine::new(graph, None, Some(memory_store_for_engine));
