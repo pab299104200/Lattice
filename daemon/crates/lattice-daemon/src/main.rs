@@ -121,17 +121,27 @@ async fn main() -> Result<()> {
 
     let embedding_engine_for_watcher: Option<Arc<EmbeddingEngine>> = None;
 
-    // ── Start file watcher ───────────────────────────────────────────
-    let watcher_result = watcher::start_watcher(workspace_root.clone());
-    if let Ok((_watcher, mut rx)) = watcher_result {
+    // ── Start file watcher entirely in background ───────────────────
+    {
         let engine_clone = Arc::clone(&engine);
         let indexer_clone = Arc::clone(&indexer);
         let graph_store_clone = Arc::clone(&graph_store);
         let emb_engine_clone = embedding_engine_for_watcher;
         let ws_root = workspace_root.clone();
 
-        // Spawn a task that listens for FileEvents and incrementally re-indexes
         tokio::spawn(async move {
+            // start_watcher can be slow on large dirs — run in spawn_blocking
+            let watcher_result = tokio::task::spawn_blocking({
+                let ws = ws_root.clone();
+                move || watcher::start_watcher(ws)
+            }).await;
+
+            let Ok(Ok((_watcher, mut rx))) = watcher_result else {
+                tracing::warn!("Failed to start file watcher");
+                return;
+            };
+            tracing::info!("File watcher started");
+
             // Keep the _watcher alive so it keeps watching
             let _watcher_handle = _watcher;
             let mut change_tracker = ChangeTracker::new();
@@ -248,10 +258,6 @@ async fn main() -> Result<()> {
                 }
             }
         });
-
-        tracing::info!("File watcher started");
-    } else {
-        tracing::warn!("Failed to start file watcher, running without live updates");
     }
 
     // ── Create McpHandler and start StdioServer ──────────────────────
