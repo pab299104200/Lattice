@@ -77,96 +77,93 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ── Create Indexer and index workspace directory ──────────────────
-    let security_filter = SecurityFilter::new(&workspace_root);
-    let mut indexer = Indexer::new(workspace_root.clone());
+    // ── Create Indexer (don't index yet — do it in background) ───────
+    let indexer = Indexer::new(workspace_root.clone());
 
-    // Walk workspace and index all supported files
-    let files_indexed = index_workspace(&workspace_root, &mut indexer, &security_filter);
-    tracing::info!("Indexed {} files", files_indexed);
-
-    // Use the indexer's graph if we indexed files, otherwise use the loaded one
-    let graph = if files_indexed > 0 {
-        let new_graph = indexer.graph().clone();
-        // Save to graph store
-        {
-            let gs = graph_store.lock().await;
-            if let Err(e) = gs.save_graph(&new_graph) {
-                tracing::warn!("Failed to save graph: {}", e);
-            }
-        }
-        new_graph
-    } else {
-        graph
-    };
-
-    let stats = graph.stats();
-    tracing::info!(
-        "Graph ready: {} nodes, {} edges, {} files",
-        stats.node_count,
-        stats.edge_count,
-        stats.file_count
-    );
-
-    // ── Try to load ONNX embedding model and embed graph nodes ───────
-    let model_path = lattice_dir.join("models").join("model.onnx");
-    let embedding_engine: Option<Arc<EmbeddingEngine>> = if model_path.exists() {
-        match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
-            Ok(eng) => {
-                tracing::info!("ONNX embedding model loaded from {}", model_path.display());
-                Some(Arc::new(eng))
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load ONNX model: {}. Semantic search disabled.", e);
-                None
-            }
-        }
-    } else {
-        tracing::info!(
-            "No ONNX model found at {}. Run scripts/download-model.sh to enable semantic search.",
-            model_path.display()
-        );
-        None
-    };
-
-    // Embed all graph nodes into the vector store if embedding engine is available
-    if let Some(ref emb_engine) = embedding_engine {
-        let mut embedded_count = 0usize;
-        for node in graph.all_nodes() {
-            let text = format!("{} {}", node.name, node.signature);
-            match emb_engine.embed(&text) {
-                Ok(vec) => {
-                    if let Err(e) = vector_store.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec) {
-                        tracing::debug!("Failed to store embedding for {}: {}", node.name, e);
-                    } else {
-                        embedded_count += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to embed {}: {}", node.name, e);
-                }
-            }
-        }
-        tracing::info!("Embedded {} graph nodes into vector store", embedded_count);
-    }
-
-    // ── Create QueryEngine ───────────────────────────────────────────
-    let vector_store_opt = if embedding_engine.is_some() {
-        Some(vector_store)
-    } else {
-        None
-    };
+    // ── Create QueryEngine with loaded graph (may be empty) ──────────
     // Open a second MemoryStore connection for the QueryEngine (std::sync::Mutex)
-    // so it can be used in the synchronous query() method
     let memory_store_for_engine = {
         let ms = MemoryStore::open(&lattice_dir.join("memory.db"))
             .expect("Failed to open memory store for query engine");
         Arc::new(std::sync::Mutex::new(ms))
     };
-    let engine = QueryEngine::new(graph, vector_store_opt, Some(memory_store_for_engine));
+    let engine = QueryEngine::new(graph, None, Some(memory_store_for_engine));
     let engine = Arc::new(Mutex::new(engine));
-    let embedding_engine_for_watcher = embedding_engine.clone();
     let indexer = Arc::new(Mutex::new(indexer));
+
+    // ── Spawn background indexing task ────────────────────────────────
+    {
+        let engine_bg = Arc::clone(&engine);
+        let indexer_bg = Arc::clone(&indexer);
+        let graph_store_bg = Arc::clone(&graph_store);
+        let ws_root = workspace_root.clone();
+        let lattice_dir_bg = lattice_dir.clone();
+
+        tokio::spawn(async move {
+            tracing::info!("Background indexing starting...");
+            let security_filter = SecurityFilter::new(&ws_root);
+
+            let files_indexed = {
+                let mut idx = indexer_bg.lock().await;
+                let count = index_workspace_inner(&ws_root, &mut idx, &security_filter);
+                tracing::info!("Indexed {} files", count);
+                count
+            };
+
+            if files_indexed > 0 {
+                let new_graph = {
+                    let idx = indexer_bg.lock().await;
+                    idx.graph().clone()
+                };
+                let stats = new_graph.stats();
+                tracing::info!(
+                    "Graph ready: {} nodes, {} edges, {} files",
+                    stats.node_count, stats.edge_count, stats.file_count
+                );
+
+                // Save to graph store
+                {
+                    let gs = graph_store_bg.lock().await;
+                    if let Err(e) = gs.save_graph(&new_graph) {
+                        tracing::warn!("Failed to save graph: {}", e);
+                    }
+                }
+
+                // Update engine with new graph
+                {
+                    let mut eng = engine_bg.lock().await;
+                    eng.update_graph(new_graph);
+                }
+            }
+
+            // Try to load ONNX embedding model
+            let model_path = lattice_dir_bg.join("models").join("model.onnx");
+            if model_path.exists() {
+                match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
+                    Ok(emb_engine) => {
+                        tracing::info!("ONNX embedding model loaded");
+                        let eng = engine_bg.lock().await;
+                        let nodes = eng.graph().all_nodes();
+                        let mut embedded = 0usize;
+                        for node in &nodes {
+                            let text = format!("{} {}", node.name, node.signature);
+                            if let Ok(_vec) = emb_engine.embed(&text) {
+                                embedded += 1;
+                            }
+                        }
+                        tracing::info!("Embedded {} nodes", embedded);
+                    }
+                    Err(e) => {
+                        tracing::info!("No ONNX model: {}", e);
+                    }
+                }
+            }
+
+            tracing::info!("Background indexing complete");
+        });
+    }
+
+    let embedding_engine_for_watcher: Option<Arc<EmbeddingEngine>> = None;
 
     // ── Start file watcher ───────────────────────────────────────────
     let watcher_result = watcher::start_watcher(workspace_root.clone());
@@ -338,7 +335,7 @@ fn parse_workspace_root() -> PathBuf {
 
 /// Walk the workspace directory and index all supported files.
 /// Returns the number of files successfully indexed.
-fn index_workspace(
+fn index_workspace_inner(
     root: &PathBuf,
     indexer: &mut Indexer,
     security_filter: &SecurityFilter,
