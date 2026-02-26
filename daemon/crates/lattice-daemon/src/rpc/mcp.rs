@@ -46,7 +46,9 @@ impl McpHandler {
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {}
+                "tools": {
+                    "listChanged": false
+                }
             },
             "serverInfo": {
                 "name": "lattice",
@@ -830,6 +832,11 @@ impl RequestHandler for McpHandler {
             "lattice/symbol_info" => self.handle_symbol_info(&params).await,
             "lattice/dependents" => self.handle_dependents(&params).await,
             "lattice/clear_memory" | "lattice/clear" => self.handle_clear_memory().await,
+            // MCP notifications — acknowledge silently
+            "notifications/initialized"
+            | "notifications/cancelled"
+            | "notifications/progress"
+            | "notifications/roots/list_changed" => Ok(json!({})),
             _ => Err((-32601, format!("Method not found: {}", method))),
         }
     }
