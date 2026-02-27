@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
 use crate::storage::VectorStore;
-use crate::symbols::SymbolId;
+use crate::symbols::{SymbolId, SymbolKind};
 
 use super::capsule::{
-    CapsuleStats, ContextCapsule, ContextNode, PivotNode,
+    CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent,
 };
 use super::intent::{detect_intent, IntentParams};
 
@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v18";
+const ENGINE_VERSION: &str = "v20";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -70,7 +70,99 @@ impl QueryEngine {
         let params = IntentParams::for_intent(intent);
 
         // Step 2: Semantic search or keyword fallback (use clean query for matching)
-        let seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
+        let mut seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
+
+        // Step 2b: File-path seeding for Explore intent.
+        // For understanding queries, augment seeds with top-centrality functions from
+        // files whose path matches query words. This finds implementation logic like
+        // begin_host_patching in patch_pipeline.py when the query mentions "patch" —
+        // even when function names don't match any query word directly.
+        if intent == QueryIntent::Explore {
+            let q_lower = clean_query.to_lowercase();
+            let q_cleaned: String = q_lower.chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+                .collect();
+            let q_words: Vec<&str> = q_cleaned.split_whitespace()
+                .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
+                .collect();
+
+            if !q_words.is_empty() {
+                let seed_ids: std::collections::HashSet<SymbolId> = seed_hits.iter()
+                    .map(|(id, _)| id.clone())
+                    .collect();
+
+                // Group functions by matching file, scored by centrality.
+                // Also track per-file query-word match count for prioritization.
+                let mut file_candidates: HashMap<String, Vec<(SymbolId, f64)>> = HashMap::new();
+                let mut file_match_counts: HashMap<String, usize> = HashMap::new();
+
+                for node in self.graph.all_nodes() {
+                    if seed_ids.contains(&node.id)
+                        || is_lattice_own_source(&node.file)
+                        || is_test_file(&node.file)
+                    {
+                        continue;
+                    }
+                    // Only seed functions/methods (implementation code, not schemas)
+                    if !matches!(node.kind, SymbolKind::Function | SymbolKind::Method) {
+                        continue;
+                    }
+
+                    // Check if file path matches any query word
+                    let file_lower = node.file.to_lowercase();
+                    let file_segments: Vec<&str> = file_lower
+                        .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                        .filter(|p| p.len() >= 3)
+                        .collect();
+
+                    let match_count: usize = q_words.iter()
+                        .filter(|w| {
+                            file_segments.iter().any(|seg| *seg == **w || seg.contains(**w) || w.contains(seg))
+                        })
+                        .count();
+
+                    if match_count == 0 { continue; }
+
+                    let centrality = self.graph.centrality(&node.id);
+                    file_candidates.entry(node.file.clone())
+                        .or_default()
+                        .push((node.id.clone(), centrality));
+                    file_match_counts.entry(node.file.clone())
+                        .and_modify(|c| { if match_count > *c { *c = match_count; } })
+                        .or_insert(match_count);
+                }
+
+                // Sort files by: query-word match count DESC (files matching more
+                // words are more relevant), then alphabetically for determinism.
+                // This ensures patch_deployment.py (matches "patch" + "deployment")
+                // gets processed before patch_download_nix.go (matches only "patch").
+                let max_per_file = 2;
+                let max_total = 15;
+                let mut added = 0;
+
+                let mut files: Vec<String> = file_candidates.keys().cloned().collect();
+                files.sort_by(|a, b| {
+                    let ma = file_match_counts.get(a).copied().unwrap_or(0);
+                    let mb = file_match_counts.get(b).copied().unwrap_or(0);
+                    mb.cmp(&ma).then_with(|| a.cmp(b))
+                });
+
+                for file in &files {
+                    if added >= max_total { break; }
+                    if let Some(candidates) = file_candidates.get_mut(file) {
+                        candidates.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.0.name.cmp(&b.0.name))
+                        });
+                        for (id, _centrality) in candidates.iter().take(max_per_file) {
+                            if added >= max_total { break; }
+                            seed_hits.push((id.clone(), 0.35));
+                            added += 1;
+                        }
+                    }
+                }
+            }
+        }
 
         // Step 3: Graph traversal — N hops from semantic hits, tracking relationship paths
         let mut candidate_ids: HashMap<SymbolId, f64> = HashMap::new();
@@ -153,6 +245,61 @@ impl QueryEngine {
             }
         }
 
+        // Step 3b: Deep intra-module call chain traversal for Explore intent.
+        // Pipeline-shaped code (create_deployment → begin_patching → advance → calculate)
+        // needs following Calls edges deeper than the standard 2 hops. We extend to
+        // 4 hops but only within the same directory (module boundary) to prevent
+        // cross-module noise from unrelated packages.
+        if intent == QueryIntent::Explore {
+            for (seed_id, seed_sim) in &seed_hits {
+                let seed_node = match self.graph.get_node(seed_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let seed_dir = std::path::Path::new(&seed_node.file)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                if seed_dir.is_empty() { continue; }
+                let seed_name = seed_node.name.clone();
+
+                // BFS: follow Calls edges within same directory, up to 4 hops
+                let mut current_layer: Vec<SymbolId> = vec![seed_id.clone()];
+                let mut visited: std::collections::HashSet<SymbolId> =
+                    std::collections::HashSet::new();
+                visited.insert(seed_id.clone());
+
+                for hop in 1..=4usize {
+                    let mut next_layer: Vec<SymbolId> = Vec::new();
+                    for id in &current_layer {
+                        for (dep, ek) in self.graph.get_dependencies(id) {
+                            if !matches!(ek, EdgeKind::Calls) { continue; }
+                            if visited.contains(&dep.id) { continue; }
+                            let dep_dir = std::path::Path::new(&dep.file)
+                                .parent()
+                                .and_then(|p| p.to_str())
+                                .unwrap_or("");
+                            if dep_dir != seed_dir { continue; }
+
+                            visited.insert(dep.id.clone());
+                            next_layer.push(dep.id.clone());
+
+                            // Only add candidates for hops 3-4 (hops 1-2 already covered)
+                            if hop >= 3 {
+                                let decay = seed_sim * if hop == 3 { 0.15 } else { 0.10 };
+                                candidate_ids.entry(dep.id.clone()).or_insert(decay);
+                                relationship_paths.entry(dep.id.clone()).or_insert_with(|| {
+                                    format!("deep_chain: {} ({} hops)", seed_name, hop)
+                                });
+                            }
+                        }
+                    }
+                    current_layer = next_layer;
+                    if current_layer.is_empty() { break; }
+                }
+            }
+        }
+
         // Step 4: Rank candidates (apply query filters)
         let mut candidates: Vec<ScoredCandidate> = Vec::new();
         let all_node_ids: Vec<&SymbolId> = self.graph.all_node_ids();
@@ -204,6 +351,27 @@ impl QueryEngine {
                 // because everything depends on them, but they're rarely what an LLM needs.
                 if is_test_file(&node.file) {
                     score *= 0.3;
+                }
+
+                // Schema deprioritization for Explore intent.
+                // "How does X work" queries need implementation logic, not type defs.
+                // Schemas/interfaces keyword-match well (DeploymentSchema matches
+                // "deployment") but don't help LLMs understand execution flow.
+                if intent == QueryIntent::Explore {
+                    match node.kind {
+                        SymbolKind::Interface | SymbolKind::TypeAlias => {
+                            score *= 0.3;
+                        },
+                        SymbolKind::Enum => {
+                            score *= 0.5;
+                        },
+                        SymbolKind::Class | SymbolKind::Struct => {
+                            if is_schema_heavy(&node.body) {
+                                score *= 0.4;
+                            }
+                        },
+                        _ => {}
+                    }
                 }
 
                 let rel_detail = relationship_paths.get(id)
@@ -1082,6 +1250,42 @@ fn line_overlap_ratio(a: &str, b: &str) -> f64 {
     let intersection = lines_a.intersection(&lines_b).count();
     let smaller = lines_a.len().min(lines_b.len());
     intersection as f64 / smaller as f64
+}
+
+/// Detect if a symbol's body is primarily field/type declarations (schema-heavy)
+/// vs implementation logic. Used to deprioritize data classes for Explore intent.
+/// Returns true if < 15% of non-empty, non-comment lines contain logic indicators.
+fn is_schema_heavy(body: &str) -> bool {
+    let lines: Vec<&str> = body.lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            !l.is_empty()
+            && !l.starts_with('#')
+            && !l.starts_with("//")
+            && !l.starts_with("/*")
+            && !l.starts_with('*')
+            && *l != "}" && *l != "{" && *l != ")" && *l != "]"
+        })
+        .collect();
+    if lines.len() < 3 { return false; }
+
+    let logic_count = lines.iter()
+        .filter(|l| {
+            l.contains("if ") || l.contains("for ") || l.contains("while ")
+            || l.contains("return ") || l.contains("await ") || l.contains("yield ")
+            || l.contains("raise ") || l.contains("throw ")
+            || l.contains("match ") || l.contains("else {") || l.contains("else:")
+            || (l.contains('(')
+                && !l.starts_with("class ") && !l.starts_with("def ")
+                && !l.starts_with("fn ") && !l.starts_with("func ")
+                && !l.starts_with("pub fn") && !l.starts_with("pub(")
+                && !l.starts_with("type ") && !l.starts_with("interface ")
+                && !l.starts_with("struct ") && !l.starts_with("enum "))
+        })
+        .count();
+
+    let logic_ratio = logic_count as f64 / lines.len() as f64;
+    logic_ratio < 0.15
 }
 
 /// Common English stop words filtered from keyword queries to avoid noisy matches.
