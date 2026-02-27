@@ -17,8 +17,11 @@ const ADD_FEATURE_KEYWORDS: &[&str] = &[
 ];
 
 /// Keywords that indicate an Explore intent.
+/// Includes both question words ("how", "what") and architectural nouns
+/// ("flow", "pipeline") that signal understanding-oriented queries.
 const EXPLORE_KEYWORDS: &[&str] = &[
     "how", "what", "explain", "describe", "show", "where", "understand", "overview",
+    "flow", "pipeline", "architecture", "trace", "lifecycle", "walkthrough",
 ];
 
 /// Per-intent tuning parameters.
@@ -45,7 +48,7 @@ impl IntentParams {
     pub fn for_intent(intent: QueryIntent) -> Self {
         match intent {
             QueryIntent::Explore => IntentParams {
-                semantic_k: 10,
+                semantic_k: 25,
                 hop_depth: 2,
                 w_semantic: 0.4,
                 w_centrality: 0.3,
@@ -94,7 +97,10 @@ impl IntentParams {
 }
 
 /// Detect the intent of a query based on keyword matching.
-/// Returns the intent with the highest keyword match count, or Unknown if none match.
+/// Returns the intent with the highest keyword match count.
+/// Falls back to Explore for keyword-heavy queries (4+ content words) since
+/// a long descriptive phrase without action verbs indicates understanding intent.
+/// Only returns Unknown for very short ambiguous queries.
 pub fn detect_intent(query: &str) -> QueryIntent {
     let lower = query.to_lowercase();
 
@@ -105,12 +111,25 @@ pub fn detect_intent(query: &str) -> QueryIntent {
         (QueryIntent::Explore, count_keyword_matches(&lower, EXPLORE_KEYWORDS)),
     ];
 
-    scores
+    if let Some((intent, _)) = scores
         .iter()
         .filter(|(_, count)| *count > 0)
         .max_by_key(|(_, count)| *count)
-        .map(|(intent, _)| *intent)
-        .unwrap_or(QueryIntent::Unknown)
+    {
+        return *intent;
+    }
+
+    // Fallback: keyword-heavy queries without action verbs are Explore.
+    // "authentication system JWT login token generation" = understanding intent.
+    let content_words = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3)
+        .count();
+    if content_words >= 4 {
+        return QueryIntent::Explore;
+    }
+
+    QueryIntent::Unknown
 }
 
 /// Count how many keywords from the list appear in the query text.

@@ -19,6 +19,9 @@ struct ScoredCandidate<'a> {
     node: &'a GraphNode,
     score: f64,
     _semantic_sim: f64,
+    /// Whether this node was a direct seed hit (keyword/semantic match)
+    /// vs reached only through graph traversal.
+    is_seed_hit: bool,
     /// How this node was reached (e.g., "semantic_match: 0.91" or "called_by: loginUser").
     relationship_detail: String,
 }
@@ -69,6 +72,9 @@ impl QueryEngine {
         // Step 3: Graph traversal — N hops from semantic hits, tracking relationship paths
         let mut candidate_ids: HashMap<SymbolId, f64> = HashMap::new();
         let mut relationship_paths: HashMap<SymbolId, String> = HashMap::new();
+        let seed_hit_ids: std::collections::HashSet<SymbolId> = seed_hits.iter()
+            .map(|(id, _)| id.clone())
+            .collect();
 
         for (id, sim) in &seed_hits {
             candidate_ids.insert(id.clone(), *sim);
@@ -77,23 +83,46 @@ impl QueryEngine {
                 format!("semantic_match: {:.2}", sim),
             );
 
-            // Build path-aware traversal from this seed hit
+            // Build path-aware traversal from this seed hit.
+            // Propagate decayed similarity so graph-traversed nodes get
+            // meaningful scores instead of 0.0.
             let seed_name = self.graph.get_node(id)
                 .map(|n| n.name.clone())
                 .unwrap_or_else(|| id.name.clone());
+            let decay_1hop = sim * 0.6;
+            let decay_2hop = sim * 0.3;
 
-            // 1 hop: direct dependencies and dependents
+            // 1 hop: direct dependencies (callees + contained members)
+            // Contains edges at hop 1 are fine — they discover the module/class
+            // that a seed function belongs to, which is key for finding siblings.
             for (dep_node, edge_kind) in self.graph.get_dependencies(id) {
                 let edge_label = format_edge_kind(edge_kind);
-                candidate_ids.entry(dep_node.id.clone()).or_insert(0.0);
+                candidate_ids.entry(dep_node.id.clone())
+                    .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
+                    .or_insert(decay_1hop);
                 relationship_paths.entry(dep_node.id.clone()).or_insert_with(|| {
                     format!("{}: {} (via {})", edge_label, seed_name, dep_node.name)
                 });
 
                 // 2 hops from dependencies
                 if params.hop_depth >= 2 {
-                    for (dep2_node, edge_kind2) in self.graph.get_dependencies(&dep_node.id) {
-                        candidate_ids.entry(dep2_node.id.clone()).or_insert(0.0);
+                    let hop2_deps = self.graph.get_dependencies(&dep_node.id);
+                    // Cap Contains expansion at hop 2 to prevent class member flooding.
+                    // e.g., WorkflowEngine reached at hop 1 via "password" test →
+                    // without cap, all 25 methods get included at hop 2.
+                    // Non-Contains edges (Calls, Imports) are uncapped.
+                    let mut contains_count = 0usize;
+                    let max_contains_at_hop2 = 5usize;
+                    for (dep2_node, edge_kind2) in &hop2_deps {
+                        if matches!(edge_kind2, EdgeKind::Contains) {
+                            contains_count += 1;
+                            if contains_count > max_contains_at_hop2 {
+                                continue;
+                            }
+                        }
+                        candidate_ids.entry(dep2_node.id.clone())
+                            .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
+                            .or_insert(decay_2hop);
                         relationship_paths.entry(dep2_node.id.clone()).or_insert_with(|| {
                             format!("{} -> {} -> {} (via {:?})",
                                 seed_name, dep_node.name, dep2_node.name, edge_kind2)
@@ -102,17 +131,32 @@ impl QueryEngine {
                 }
             }
 
+            // 1 hop: direct dependents (callers + containers)
+            // Contains dependents at hop 1 discover the class/module a method belongs to.
             for (caller_node, edge_kind) in self.graph.get_dependents(id) {
                 let edge_label = format_edge_kind_reverse(edge_kind);
-                candidate_ids.entry(caller_node.id.clone()).or_insert(0.0);
+                candidate_ids.entry(caller_node.id.clone())
+                    .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
+                    .or_insert(decay_1hop);
                 relationship_paths.entry(caller_node.id.clone()).or_insert_with(|| {
                     format!("{}: {}", edge_label, seed_name)
                 });
 
                 // 2 hops from dependents
                 if params.hop_depth >= 2 {
-                    for (caller2_node, edge_kind2) in self.graph.get_dependents(&caller_node.id) {
-                        candidate_ids.entry(caller2_node.id.clone()).or_insert(0.0);
+                    let hop2_callers = self.graph.get_dependents(&caller_node.id);
+                    let mut contains_count = 0usize;
+                    let max_contains_at_hop2 = 5usize;
+                    for (caller2_node, edge_kind2) in &hop2_callers {
+                        if matches!(edge_kind2, EdgeKind::Contains) {
+                            contains_count += 1;
+                            if contains_count > max_contains_at_hop2 {
+                                continue;
+                            }
+                        }
+                        candidate_ids.entry(caller2_node.id.clone())
+                            .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
+                            .or_insert(decay_2hop);
                         relationship_paths.entry(caller2_node.id.clone()).or_insert_with(|| {
                             format!("{} -> {} -> {} (via {:?})",
                                 seed_name, caller_node.name, caller2_node.name, edge_kind2)
@@ -129,8 +173,8 @@ impl QueryEngine {
 
         for (id, semantic_sim) in &candidate_ids {
             if let Some(node) = self.graph.get_node(id) {
-                // Apply query filters — skip nodes that don't match
-                if !filter.matches(node) {
+                // Skip Lattice's own source and apply query filters
+                if is_lattice_own_source(&node.file) || !filter.matches(node) {
                     continue;
                 }
 
@@ -156,10 +200,24 @@ impl QueryEngine {
                     .max(1);
                 let caller_norm = caller_count / max_callers as f64;
 
-                let score = semantic_sim * params.w_semantic
+                let mut score = semantic_sim * params.w_semantic
                     + centrality * params.w_centrality
                     + recency * params.w_recency
                     + caller_norm * params.w_caller;
+
+                // Cap score for nodes with no direct keyword/semantic match.
+                // These were pulled in only through graph traversal and shouldn't
+                // outrank direct matches just because they have high centrality.
+                if *semantic_sim < 0.01 {
+                    score = score.min(0.15);
+                }
+
+                // Demote test files — useful as context but shouldn't dominate pivots.
+                // Test fixtures like conftest.py:db() have artificially high centrality
+                // because everything depends on them, but they're rarely what an LLM needs.
+                if is_test_file(&node.file) {
+                    score *= 0.3;
+                }
 
                 let rel_detail = relationship_paths.get(id)
                     .cloned()
@@ -169,13 +227,18 @@ impl QueryEngine {
                     node,
                     score,
                     _semantic_sim: *semantic_sim,
+                    is_seed_hit: seed_hit_ids.contains(id),
                     relationship_detail: rel_detail,
                 });
             }
         }
 
-        // Sort by descending score
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by descending score, tiebreak by name for deterministic results
+        candidates.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node.name.cmp(&b.node.name))
+        });
 
         // Step 5: Budget allocation (adaptive: repeated queries expand context)
         let repeat_count = self.query_history.get(query_text).copied().unwrap_or(0);
@@ -183,29 +246,71 @@ impl QueryEngine {
         let mut context = Vec::new();
         let mut tokens_used: usize = 0;
         let budget = params.base_token_budget + (repeat_count * 500);
+        // Cap context nodes to prevent 3rd-degree noise from flooding results.
+        // Pivots (full source) are uncapped since they're budget-limited by token cost.
+        // Context (signatures) are cheap, so without a count cap they can explode to 100+.
+        let max_context_nodes: usize = 30;
 
         for candidate in &candidates {
             if tokens_used >= budget {
                 break;
             }
 
-            if candidate.score > 0.7 {
-                // Pivot: include full source
+            // Seed hits (direct keyword/semantic matches) need 0.20 to be pivots.
+            // Graph-traversed nodes need 0.35 — they're included because they
+            // call/are-called-by relevant symbols, but their full source may be
+            // off-topic (e.g., create_user calling get_password_hash).
+            let pivot_threshold = if candidate.is_seed_hit { 0.20 } else { 0.35 };
+
+            if candidate.score > pivot_threshold {
+                // Pivot: include full source for strong matches
                 let source_tokens = candidate.node.body.len() / CHARS_PER_TOKEN;
                 if tokens_used + source_tokens > budget {
                     // Try to fit as context instead
-                    let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
-                    if tokens_used + sig_tokens <= budget {
-                        context.push(ContextNode {
-                            symbol: candidate.node.name.clone(),
-                            kind: candidate.node.kind.short_code().to_string(),
-                            file: candidate.node.file.clone(),
-                            line: candidate.node.line,
-                            skeleton: candidate.node.signature.clone(),
-                            relationship: candidate.relationship_detail.clone(),
-                            score: candidate.score,
-                        });
-                        tokens_used += sig_tokens;
+                    if context.len() < max_context_nodes {
+                        let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
+                        if tokens_used + sig_tokens <= budget {
+                            context.push(ContextNode {
+                                symbol: candidate.node.name.clone(),
+                                kind: candidate.node.kind.short_code().to_string(),
+                                file: candidate.node.file.clone(),
+                                line: candidate.node.line,
+                                skeleton: candidate.node.signature.clone(),
+                                relationship: candidate.relationship_detail.clone(),
+                                score: candidate.score,
+                            });
+                            tokens_used += sig_tokens;
+                        }
+                    }
+                    continue;
+                }
+
+                // Near-duplicate detection: if another pivot has >80% line overlap,
+                // demote this one to context to save tokens. Common with copy-pasted
+                // handlers (e.g., authenticate_websocket_token in terminal.py + file_browser.py).
+                let is_duplicate = pivots.iter().any(|p: &PivotNode| {
+                    line_overlap_ratio(&p.source, &candidate.node.body) > 0.80
+                });
+
+                if is_duplicate {
+                    if context.len() < max_context_nodes {
+                        let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
+                        if tokens_used + sig_tokens <= budget {
+                            let dup_of = pivots.iter()
+                                .find(|p: &&PivotNode| line_overlap_ratio(&p.source, &candidate.node.body) > 0.80)
+                                .map(|p| p.symbol.clone())
+                                .unwrap_or_default();
+                            context.push(ContextNode {
+                                symbol: candidate.node.name.clone(),
+                                kind: candidate.node.kind.short_code().to_string(),
+                                file: candidate.node.file.clone(),
+                                line: candidate.node.line,
+                                skeleton: candidate.node.signature.clone(),
+                                relationship: format!("near_duplicate_of: {}", dup_of),
+                                score: candidate.score,
+                            });
+                            tokens_used += sig_tokens;
+                        }
                     }
                     continue;
                 }
@@ -219,8 +324,8 @@ impl QueryEngine {
                     score: candidate.score,
                 });
                 tokens_used += source_tokens;
-            } else if candidate.score > 0.3 {
-                // Context: include skeleton (signature only)
+            } else if candidate.score > 0.05 && context.len() < max_context_nodes {
+                // Context: include skeleton (signature only) for weaker matches
                 let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
                 if tokens_used + sig_tokens > budget {
                     continue;
@@ -237,7 +342,199 @@ impl QueryEngine {
                 });
                 tokens_used += sig_tokens;
             }
-            // Scores <= 0.3 are excluded
+            // Scores <= 0.05 or context cap reached → excluded
+        }
+
+        // Step 5b: Same-file sibling completion.
+        // If we already included 2+ symbols from the same file, include a few
+        // more siblings ranked by query relevance. Guards:
+        //  - Skip files with 10+ total symbols (grab-bag files like conftest.py)
+        //  - Cap at 5 siblings per file
+        //  - Rank candidate siblings by keyword overlap with query
+        //  - Separate 500-token mini-budget so siblings aren't blocked by main budget
+        {
+            let sibling_budget = 500usize;
+            let mut sibling_tokens_used = 0usize;
+            let max_siblings_per_file = 5usize;
+
+            // Collect files that have at least 2 included symbols
+            let mut file_counts: HashMap<String, usize> = HashMap::new();
+            for p in &pivots {
+                *file_counts.entry(p.file.clone()).or_insert(0) += 1;
+            }
+            for c in &context {
+                *file_counts.entry(c.file.clone()).or_insert(0) += 1;
+            }
+            let included_symbols: std::collections::HashSet<String> = pivots.iter()
+                .map(|p| p.symbol.clone())
+                .chain(context.iter().map(|c| c.symbol.clone()))
+                .collect();
+
+            let mut sibling_files: Vec<String> = file_counts.into_iter()
+                .filter(|(_, count)| *count >= 2)
+                .map(|(file, _)| file)
+                .collect();
+            // Sort for deterministic iteration — file processing order affects
+            // which siblings consume the shared mini-budget first.
+            sibling_files.sort();
+
+            // Reuse query words for ranking siblings
+            let sib_query_lower = clean_query.to_lowercase();
+            let sib_cleaned: String = sib_query_lower
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+                .collect();
+            let sib_words: Vec<&str> = sib_cleaned
+                .split_whitespace()
+                .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
+                .collect();
+
+            for file in &sibling_files {
+                // Skip large grab-bag files (conftest.py, utils, fixtures, etc.)
+                let total_in_file = self.graph.all_nodes().iter()
+                    .filter(|n| n.file == *file)
+                    .count();
+                if total_in_file >= 10 {
+                    continue;
+                }
+
+                // Collect candidate siblings with relevance scores
+                let mut candidates: Vec<(&GraphNode, f64)> = Vec::new();
+                for node in self.graph.all_nodes() {
+                    if node.file != *file || included_symbols.contains(&node.name) {
+                        continue;
+                    }
+                    // Score by keyword overlap with query — uses the same matching
+                    // strategy as keyword_fallback (bidirectional containment, prefix
+                    // matching, signature matching) so siblings like verify_agent_simple
+                    // get credit for "verification" containing "verify".
+                    let name_lower = node.name.to_lowercase();
+                    let name_parts = split_identifier(&name_lower);
+                    let sig_lower = node.signature.to_lowercase();
+                    let relevance: f64 = sib_words.iter()
+                        .filter(|w| {
+                            // Direct containment
+                            name_lower.contains(*w)
+                            // Part matches: word contains part OR part contains word
+                            || name_parts.iter().any(|p| {
+                                p.len() >= 3 && (
+                                    w.contains(p.as_str())
+                                    || p.contains(*w)
+                                    || w.starts_with(p.as_str())
+                                    || p.starts_with(*w)
+                                )
+                            })
+                            // Signature match
+                            || sig_lower.contains(*w)
+                        })
+                        .count() as f64;
+                    candidates.push((node, relevance));
+                }
+
+                // Sort by relevance descending, name ascending for determinism
+                candidates.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.name.cmp(&b.0.name))
+                });
+
+                let mut added = 0usize;
+                for (node, rel) in &candidates {
+                    if added >= max_siblings_per_file {
+                        break;
+                    }
+                    let sig_tokens = node.signature.len() / CHARS_PER_TOKEN;
+                    if sibling_tokens_used + sig_tokens > sibling_budget {
+                        continue;
+                    }
+                    context.push(ContextNode {
+                        symbol: node.name.clone(),
+                        kind: node.kind.short_code().to_string(),
+                        file: node.file.clone(),
+                        line: node.line,
+                        skeleton: node.signature.clone(),
+                        relationship: format!("same_file_sibling (relevance: {:.0})", rel),
+                        score: 0.06 + rel * 0.02, // slightly above context threshold
+                    });
+                    sibling_tokens_used += sig_tokens;
+                    added += 1;
+                }
+            }
+
+            tokens_used += sibling_tokens_used;
+        }
+
+        // Step 5c: Dependency completion from PIVOT nodes only.
+        // Pivots are high-confidence matches (score > 0.20). Their direct Calls
+        // dependencies are likely relevant helpers. Context nodes are weaker
+        // matches and their deps would amplify noise (e.g. vuln_matcher deps).
+        // Uses a separate 300-token mini-budget, capped at 5 total additions.
+        {
+            let dep_budget = 300usize;
+            let mut dep_tokens_used = 0usize;
+            let max_dep_additions = 5usize;
+            let mut dep_added = 0usize;
+
+            // Collect all currently included symbol names
+            let included_ids: std::collections::HashSet<String> = pivots.iter()
+                .map(|p| p.symbol.clone())
+                .chain(context.iter().map(|c| c.symbol.clone()))
+                .collect();
+
+            // Only iterate dependencies of PIVOT nodes (high-confidence)
+            let pivot_node_ids: Vec<SymbolId> = pivots.iter()
+                .filter_map(|p| {
+                    self.graph.all_nodes().iter()
+                        .find(|n| n.name == p.symbol && n.file == p.file)
+                        .map(|n| n.id.clone())
+                })
+                .collect();
+
+            for node_id in &pivot_node_ids {
+                if dep_added >= max_dep_additions {
+                    break;
+                }
+                // Sort dependencies by name for deterministic iteration order.
+                // petgraph's neighbors_directed() order isn't guaranteed stable.
+                let mut deps = self.graph.get_dependencies(node_id);
+                deps.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+
+                for (dep_node, edge_kind) in &deps {
+                    if dep_added >= max_dep_additions {
+                        break;
+                    }
+                    // Only follow Calls edges (not Imports, TypeRef, etc.)
+                    if !matches!(edge_kind, crate::graph::model::EdgeKind::Calls) {
+                        continue;
+                    }
+                    if included_ids.contains(&dep_node.name) {
+                        continue;
+                    }
+                    if is_lattice_own_source(&dep_node.file) || is_test_file(&dep_node.file) {
+                        continue;
+                    }
+                    let sig_tokens = dep_node.signature.len() / CHARS_PER_TOKEN;
+                    if dep_tokens_used + sig_tokens > dep_budget {
+                        continue;
+                    }
+                    let caller_name = self.graph.get_node(node_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    context.push(ContextNode {
+                        symbol: dep_node.name.clone(),
+                        kind: dep_node.kind.short_code().to_string(),
+                        file: dep_node.file.clone(),
+                        line: dep_node.line,
+                        skeleton: dep_node.signature.clone(),
+                        relationship: format!("called_by: {}", caller_name),
+                        score: 0.08,
+                    });
+                    dep_tokens_used += sig_tokens;
+                    dep_added += 1;
+                }
+            }
+
+            tokens_used += dep_tokens_used;
         }
 
         // Calculate tokens saved
@@ -360,68 +657,244 @@ impl QueryEngine {
         let mut scored: Vec<(SymbolId, f64)> = Vec::new();
 
         for node in self.graph.all_nodes() {
+            // Skip Lattice's own source code — never relevant to user queries
+            if is_lattice_own_source(&node.file) {
+                continue;
+            }
+
             let name_lower = node.name.to_lowercase();
             let sig_lower = node.signature.to_lowercase();
             let file_lower = node.file.to_lowercase();
 
-            let mut match_score: f64 = 0.0;
+            // Fast path: exact symbol name in query → high score.
+            // For long queries (5+ words), discount simple variables/constants
+            // since generic names like "token" match many unrelated things.
+            if query_words.iter().any(|w| *w == name_lower) {
+                let exact_score = if query_words.len() >= 5 {
+                    match node.kind {
+                        crate::symbols::SymbolKind::Variable
+                        | crate::symbols::SymbolKind::Constant => 0.5,
+                        _ => 1.0,
+                    }
+                } else {
+                    1.0
+                };
+                scored.push((node.id.clone(), exact_score));
+                continue;
+            }
+
+            let name_parts = split_identifier(&name_lower);
+
+            let mut best_word_score: f64 = 0.0;
             let mut words_matched = 0usize;
+            let mut has_file_match = false;
 
             for word in &query_words {
-                let mut word_score = 0.0;
+                let mut word_score: f64 = 0.0;
 
-                // Exact name match (highest signal)
-                if name_lower == *word {
-                    word_score += 1.0;
+                // Name starts with query word (e.g. word="login", name="loginUser")
+                if name_lower.starts_with(word) {
+                    word_score = 0.8;
                 }
-                // Name starts with query word
-                else if name_lower.starts_with(word) {
-                    word_score += 0.8;
+                // Query word starts with name (e.g. word="authentication", name="auth")
+                else if word.starts_with(&name_lower) && name_lower.len() >= 3 {
+                    word_score = 0.6;
                 }
-                // Name contains query word as a word boundary (e.g. "auth" in "authenticate_user")
+                // Name contains query word at a word boundary
                 else if name_lower.contains(word) {
-                    // Check if it's at a word boundary (after _, or camelCase boundary)
                     let is_boundary = name_lower.find(word).map(|pos| {
                         pos == 0 || name_lower.as_bytes().get(pos - 1) == Some(&b'_')
                     }).unwrap_or(false);
-                    word_score += if is_boundary { 0.7 } else { 0.4 };
+                    word_score = if is_boundary { 0.7 } else { 0.4 };
+                }
+                // Name part exactly matches query word or query word contains name part
+                else if name_parts.iter().any(|part| {
+                    part.len() >= 3 && (*word == part.as_str() || word.contains(part.as_str()))
+                }) {
+                    word_score = 0.5;
+                }
+                // Prefix match between name parts and query words
+                else if name_parts.iter().any(|part| {
+                    part.len() >= 3 && (word.starts_with(part.as_str()) || part.starts_with(word))
+                }) {
+                    word_score = 0.4;
+                }
+                // Signature-only match
+                else if sig_lower.contains(word) {
+                    word_score = 0.2;
                 }
 
-                // Signature match (lower weight)
-                if sig_lower.contains(word) && word_score < 0.3 {
-                    word_score += 0.2;
-                }
-
-                // File path match (boosts relevance — e.g. "auth" in "auth/login.py")
+                // File path match — contributes to word_score directly so that
+                // files like agent_auth.py can compete as seed hits when the
+                // query mentions "auth". Also sets has_file_match for bonus.
                 if file_lower.contains(word) {
-                    word_score += 0.3;
+                    // Exact word in path (e.g. "user" in "user_service.py")
+                    has_file_match = true;
+                    if word_score < 0.4 {
+                        word_score = 0.4;
+                    }
+                } else {
+                    // Split file path into parts and check bidirectional matching
+                    let file_parts: Vec<&str> = file_lower
+                        .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                        .filter(|p| p.len() >= 3)
+                        .collect();
+                    // Full containment: query word contains path part or vice versa
+                    // e.g. "authentication" contains "auth" from agent_auth.py
+                    if file_parts.iter().any(|part| word.contains(part) || part.contains(word)) {
+                        has_file_match = true;
+                        if word_score < 0.35 {
+                            word_score = 0.35;
+                        }
+                    }
+                    // Prefix match only (weaker)
+                    else if file_parts.iter().any(|part| {
+                        word.starts_with(part) || part.starts_with(word)
+                    }) {
+                        has_file_match = true;
+                        if word_score < 0.25 {
+                            word_score = 0.25;
+                        }
+                    }
                 }
 
                 if word_score > 0.0 {
                     words_matched += 1;
+                    if word_score > best_word_score {
+                        best_word_score = word_score;
+                    }
                 }
-                match_score += word_score;
             }
 
-            if words_matched == 0 {
+            if words_matched == 0 && !has_file_match {
                 continue;
             }
 
-            // Bonus for matching multiple query words
-            let coverage = words_matched as f64 / query_words.len() as f64;
-            match_score *= 0.5 + 0.5 * coverage;
+            // For long queries (5+ words), require at least 2 matched words.
+            // Single-word matches like SystemInfo→"system" or _build_candidate_products→"token"
+            // are almost always noise when the query has many terms.
+            if query_words.len() >= 5 && words_matched < 2 {
+                continue;
+            }
 
-            // Normalize to 0..1 range
-            let max_possible = query_words.len() as f64 * 1.3; // max per word ≈ 1.0 + 0.3
-            let normalized = (match_score / max_possible).min(1.0);
+            // Score based on best single-word match, with coverage bonus + file bonus.
+            // For long queries, increase the coverage weight so that symbols matching
+            // more query words are strongly preferred over single-concept matches.
+            let coverage = words_matched as f64 / query_words.len() as f64;
+            let file_bonus = if has_file_match { 0.15 } else { 0.0 };
+            let (base, cov_weight) = if query_words.len() >= 5 {
+                (0.4, 0.6) // long query: coverage matters more
+            } else {
+                (0.7, 0.3) // short query: best match dominates
+            };
+            let normalized = (best_word_score * (base + cov_weight * coverage) + file_bonus).min(1.0);
 
             if normalized > 0.05 {
                 scored.push((node.id.clone(), normalized));
             }
         }
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score descending, then by name ascending for deterministic ordering.
+        // Without a tiebreaker, symbols at the same score flap in/out across runs.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
         scored.truncate(top_k);
+
+        // File diversity: ensure at least one representative from each file
+        // that scored well (>0.3) but got crowded out of top_k. This prevents
+        // a single dominant concept (e.g. "user") from monopolizing all seed slots
+        // and missing files like agent_auth.py whose symbols only match via path.
+        if scored.len() == top_k {
+            let selected_files: std::collections::HashSet<&str> = scored.iter()
+                .map(|(id, _)| id.file.as_str())
+                .collect();
+
+            // Find best symbol per unrepresented file by scanning all nodes
+            let mut unrepresented: Vec<(SymbolId, f64)> = Vec::new();
+            for node in self.graph.all_nodes() {
+                if selected_files.contains(node.file.as_str())
+                    || is_lattice_own_source(&node.file)
+                {
+                    continue;
+                }
+                let name_lower = node.name.to_lowercase();
+                let file_lower = node.file.to_lowercase();
+                // Quick relevance check: does this file match any query word?
+                let file_parts: Vec<&str> = file_lower
+                    .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                    .filter(|p| p.len() >= 3)
+                    .collect();
+                let file_relevant = query_words.iter().any(|w| {
+                    file_lower.contains(w)
+                        || file_parts.iter().any(|part| w.contains(part) || part.contains(w))
+                });
+                if !file_relevant {
+                    continue;
+                }
+                // Compute score for this symbol
+                let mut best_ws: f64 = 0.0;
+                let mut wm = 0usize;
+                let name_parts = split_identifier(&name_lower);
+                for word in &query_words {
+                    let mut ws: f64 = 0.0;
+                    if name_lower.starts_with(word) { ws = 0.8; }
+                    else if word.starts_with(&name_lower) && name_lower.len() >= 3 { ws = 0.6; }
+                    else if name_lower.contains(word) { ws = 0.4; }
+                    else if name_parts.iter().any(|p| p.len() >= 3 && (word.contains(p.as_str()) || p.starts_with(word))) { ws = 0.5; }
+                    // File path contributes to word score
+                    if file_lower.contains(word) { ws = ws.max(0.4); }
+                    else if file_parts.iter().any(|part| word.contains(part) || part.contains(word)) { ws = ws.max(0.35); }
+                    if ws > 0.0 { wm += 1; if ws > best_ws { best_ws = ws; } }
+                }
+                if wm == 0 { continue; }
+                if query_words.len() >= 5 && wm < 2 { continue; }
+                let cov = wm as f64 / query_words.len() as f64;
+                let (div_base, div_cw) = if query_words.len() >= 5 { (0.4, 0.6) } else { (0.7, 0.3) };
+                let norm = (best_ws * (div_base + div_cw * cov) + 0.15).min(1.0);
+                if norm > 0.3 {
+                    unrepresented.push((node.id.clone(), norm));
+                }
+            }
+
+            // Group by file, take best per file
+            let mut best_per_file: HashMap<String, (SymbolId, f64)> = HashMap::new();
+            for (id, score) in unrepresented {
+                let file = id.file.clone();
+                let entry = best_per_file.entry(file).or_insert_with(|| (id.clone(), 0.0));
+                if score > entry.1 {
+                    *entry = (id, score);
+                }
+            }
+
+            // Swap in up to 5 unrepresented file representatives for the lowest seed hits
+            let mut swaps: Vec<(SymbolId, f64)> = best_per_file.into_values().collect();
+            // Sort by score desc, then file name asc for deterministic ordering
+            swaps.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.file.cmp(&b.0.file))
+            });
+            let max_swaps = 5.min(swaps.len());
+            for i in 0..max_swaps {
+                let swap_idx = scored.len() - 1 - i;
+                if swaps[i].1 > scored[swap_idx].1 * 0.6 {
+                    // Only swap if the unrepresented symbol is at least 60% of the
+                    // score it's replacing — don't evict high-quality hits
+                    scored[swap_idx] = swaps[i].clone();
+                }
+            }
+
+            // Re-sort after swaps
+            scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            });
+        }
+
         scored
     }
 }
@@ -522,6 +995,83 @@ fn classify_relationship(semantic_sim: f64) -> String {
 }
 
 // classify_why was replaced by the detailed score/path-based why_included format in Fix 18.
+
+/// Detect if a file path belongs to the Lattice daemon's own source code.
+/// These should be excluded from query results when the user is querying
+/// a different project's codebase — the daemon's own symbols are never relevant.
+fn is_lattice_own_source(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    lower.contains("/lattice-core/")
+        || lower.contains("/lattice-daemon/")
+        || lower.contains("/lattice/daemon/")
+        || lower.contains("/lattice/extension/")
+}
+
+/// Detect if a file path is a test file based on common naming conventions.
+/// Covers Python (test_*, *_test.py, conftest.py), JS/TS (*.test.*, *.spec.*),
+/// Go (*_test.go), and common test directories (tests/, __tests__/, test/).
+fn is_test_file(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    let filename = std::path::Path::new(&lower)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+
+    filename.starts_with("test_")
+        || filename.starts_with("test.")
+        || filename.contains("_test.")
+        || filename.contains(".test.")
+        || filename.contains(".spec.")
+        || filename == "conftest.py"
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+}
+
+/// Split an identifier into constituent words (handles snake_case and camelCase).
+/// e.g., "authenticate_user" → ["authenticate", "user"]
+///       "getUserAuth" → ["get", "user", "auth"]
+fn split_identifier(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    // First split on underscores
+    for segment in name.split('_') {
+        if segment.is_empty() {
+            continue;
+        }
+        // Then split camelCase
+        let mut current = String::new();
+        for ch in segment.chars() {
+            if ch.is_uppercase() && !current.is_empty() {
+                parts.push(current.to_lowercase());
+                current = String::new();
+            }
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            parts.push(current.to_lowercase());
+        }
+    }
+    parts
+}
+
+/// Compute the fraction of non-empty lines shared between two source strings.
+/// Used for near-duplicate detection (e.g., copy-pasted handlers in different files).
+/// Returns 0.0..1.0 where 1.0 means identical content.
+fn line_overlap_ratio(a: &str, b: &str) -> f64 {
+    let lines_a: std::collections::HashSet<&str> = a.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let lines_b: std::collections::HashSet<&str> = b.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines_a.is_empty() || lines_b.is_empty() {
+        return 0.0;
+    }
+    let intersection = lines_a.intersection(&lines_b).count();
+    let smaller = lines_a.len().min(lines_b.len());
+    intersection as f64 / smaller as f64
+}
 
 /// Common English stop words filtered from keyword queries to avoid noisy matches.
 const STOP_WORDS: &[&str] = &[

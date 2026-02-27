@@ -982,14 +982,10 @@ impl McpHandler {
         let engine = self.engine.lock().await;
         let all_nodes = engine.graph().all_nodes();
 
-        // Find source symbol
-        let from_node = all_nodes.iter().find(|n| {
-            n.name == from_name && from_file.map_or(true, |f| n.file == f)
-        });
+        // Find source symbol — supports exact, qualified (Class.method), and suffix matching
+        let from_node = find_symbol_fuzzy(&all_nodes, from_name, from_file);
         // Find target symbol
-        let to_node = all_nodes.iter().find(|n| {
-            n.name == to_name && to_file.map_or(true, |f| n.file == f)
-        });
+        let to_node = find_symbol_fuzzy(&all_nodes, to_name, to_file);
 
         let (from_node, to_node) = match (from_node, to_node) {
             (Some(f), Some(t)) => (f, t),
@@ -1242,6 +1238,43 @@ impl RequestHandler for McpHandler {
 }
 
 // ── Helper Functions ──────────────────────────────────────────────────
+
+/// Find a symbol by name with fuzzy matching.
+/// Supports:
+///   1. Exact match: "TokenBlacklist.is_blacklisted"
+///   2. Suffix match: "is_blacklisted" matches "TokenBlacklist.is_blacklisted"
+///   3. Unqualified match: "is_blacklisted" matches the method name part
+/// Optional file filter narrows results.
+fn find_symbol_fuzzy<'a>(
+    nodes: &'a [&lattice_core::graph::model::GraphNode],
+    name: &str,
+    file_filter: Option<&str>,
+) -> Option<&'a lattice_core::graph::model::GraphNode> {
+    let matches_file = |n: &&lattice_core::graph::model::GraphNode| {
+        file_filter.map_or(true, |f| n.file == f)
+    };
+
+    // 1. Exact match
+    if let Some(node) = nodes.iter().find(|n| n.name == name && matches_file(n)) {
+        return Some(node);
+    }
+
+    // 2. Suffix match: "is_blacklisted" matches "TokenBlacklist.is_blacklisted"
+    let dot_suffix = format!(".{}", name);
+    if let Some(node) = nodes.iter().find(|n| n.name.ends_with(&dot_suffix) && matches_file(n)) {
+        return Some(node);
+    }
+
+    // 3. Case-insensitive exact match
+    let name_lower = name.to_lowercase();
+    if let Some(node) = nodes.iter().find(|n| n.name.to_lowercase() == name_lower && matches_file(n)) {
+        return Some(node);
+    }
+
+    // 4. Case-insensitive suffix match
+    let dot_suffix_lower = format!(".{}", name_lower);
+    nodes.iter().find(|n| n.name.to_lowercase().ends_with(&dot_suffix_lower) && matches_file(n)).copied()
+}
 
 /// Wrap a tool result in the MCP content format.
 fn wrap_tool_result(value: Value) -> Value {

@@ -133,18 +133,43 @@ async fn main() -> Result<()> {
                     total
                 }).await.unwrap_or(0)
             } else {
-                // Single repo: use existing Indexer
-                let idx_clone = Arc::clone(&indexer_bg);
+                // Single repo: collect files, then index in batches with engine updates
                 let ws = ws_root.clone();
                 let sf = SecurityFilter::new(&ws);
-                tokio::task::spawn_blocking(move || {
-                    let mut idx = idx_clone.blocking_lock();
-                    index_workspace_inner(&ws, &mut idx, &sf)
-                }).await.unwrap_or(0)
+
+                // Collect all file paths first (fast, no lock needed)
+                let all_files = collect_indexable_files(&ws, &sf);
+                tracing::info!("Found {} files to index", all_files.len());
+
+                let mut total_indexed = 0usize;
+                for chunk in all_files.chunks(100) {
+                    {
+                        let mut idx = indexer_bg.lock().await;
+                        for path in chunk {
+                            let rel_path = path
+                                .strip_prefix(&ws)
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                if idx.index_file_content(&rel_path, &content).is_ok() {
+                                    total_indexed += 1;
+                                }
+                            }
+                        }
+                        // Push graph snapshot to engine after each batch
+                        let snapshot = idx.graph().clone();
+                        let mut eng = engine_bg.lock().await;
+                        eng.update_graph(snapshot);
+                    }
+                    tracing::info!("Indexed {}/{} files", total_indexed, all_files.len());
+                }
+                total_indexed
             };
             tracing::info!("Indexed {} files total", files_indexed);
 
-            if files_indexed > 0 {
+            // Final save to graph store
+            {
                 let new_graph = if let Some(wm) = &ws_manager_bg {
                     let wm = wm.lock().await;
                     wm.unified_graph()
@@ -159,18 +184,11 @@ async fn main() -> Result<()> {
                     stats.node_count, stats.edge_count, stats.file_count
                 );
 
-                // Save to graph store
                 {
                     let gs = graph_store_bg.lock().await;
                     if let Err(e) = gs.save_graph(&new_graph) {
                         tracing::warn!("Failed to save graph: {}", e);
                     }
-                }
-
-                // Update engine with new graph
-                {
-                    let mut eng = engine_bg.lock().await;
-                    eng.update_graph(new_graph);
                 }
             }
 
@@ -488,20 +506,6 @@ fn generate_session_id() -> String {
     )
 }
 
-/// Walk the workspace directory and index all supported files.
-/// Returns the number of files successfully indexed.
-fn index_workspace_inner(
-    root: &PathBuf,
-    indexer: &mut Indexer,
-    security_filter: &SecurityFilter,
-) -> usize {
-    let mut count = 0;
-    walk_and_index(root, root, security_filter, &mut count, &mut |rel_path, content| {
-        indexer.index_file_content(rel_path, content).is_ok()
-    });
-    count
-}
-
 /// Walk the workspace directory and index via WorkspaceManager.
 fn index_workspace_via_manager(
     root: &PathBuf,
@@ -515,6 +519,56 @@ fn index_workspace_via_manager(
         manager.index_file(&rn, rel_path, content).is_ok()
     });
     count
+}
+
+/// Collect all indexable file paths from a workspace root.
+/// Returns paths filtered by SecurityFilter and supported language extensions.
+fn collect_indexable_files(root: &PathBuf, security_filter: &SecurityFilter) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files_recursive(root, root, security_filter, &mut files);
+    files
+}
+
+/// Recursively collect indexable files into the output vec.
+fn collect_files_recursive(
+    dir: &PathBuf,
+    root: &PathBuf,
+    security_filter: &SecurityFilter,
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if security_filter.is_excluded_dir(dir_name) {
+                    continue;
+                }
+            }
+            collect_files_recursive(&path, root, security_filter, out);
+        } else if path.is_file() {
+            let rel_path = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if security_filter.is_excluded(&rel_path) {
+                continue;
+            }
+
+            if !watcher::should_index_file(&rel_path) {
+                continue;
+            }
+
+            out.push(path);
+        }
+    }
 }
 
 /// Recursively walk a directory and index files via a callback.

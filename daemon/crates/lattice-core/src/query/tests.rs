@@ -27,6 +27,26 @@ fn test_detect_add_feature_intent() {
     assert_eq!(detect_intent("Add OAuth support"), QueryIntent::AddFeature);
 }
 
+#[test]
+fn test_detect_keyword_heavy_explore() {
+    // Keyword-heavy queries without action verbs → Explore, not Unknown.
+    // "flow" is now an Explore keyword, but even without it the 4+ word fallback fires.
+    assert_eq!(
+        detect_intent("authentication system JWT login token generation password verification"),
+        QueryIntent::Explore,
+    );
+    // Short ambiguous queries without intent signals → Unknown.
+    assert_eq!(detect_intent("auth JWT"), QueryIntent::Unknown);
+}
+
+#[test]
+fn test_detect_explore_with_flow_keyword() {
+    assert_eq!(
+        detect_intent("user auth flow"),
+        QueryIntent::Explore,
+    );
+}
+
 // ─── Engine tests ───────────────────────────────────────────────────
 
 fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
@@ -167,9 +187,10 @@ fn test_query_engine_token_budget() {
 
     // Token budget is 4000 — with ~500 tokens per body, we can't fit all 20
     // (First query: repeat_count = 1, budget = 4000 + 1*500 = 4500)
+    // Plus up to 500 tokens for same-file sibling completion
     assert!(
-        capsule.stats.tokens_used <= 4500,
-        "tokens_used ({}) should be within budget (4500)",
+        capsule.stats.tokens_used <= 5000,
+        "tokens_used ({}) should be within budget (5000)",
         capsule.stats.tokens_used
     );
 }
