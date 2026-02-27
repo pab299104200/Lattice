@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v21";
+const ENGINE_VERSION: &str = "v22";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -77,6 +77,7 @@ impl QueryEngine {
         // files whose path matches query words. This finds implementation logic like
         // begin_host_patching in patch_pipeline.py when the query mentions "patch" —
         // even when function names don't match any query word directly.
+        // Seed scores are IDF-weighted: files matching rare query words score higher.
         if intent == QueryIntent::Explore {
             let q_lower = clean_query.to_lowercase();
             let q_cleaned: String = q_lower.chars()
@@ -91,35 +92,55 @@ impl QueryEngine {
                     .map(|(id, _)| id.clone())
                     .collect();
 
-                // Group functions by matching file, scored by centrality.
-                // Also track per-file query-word match count for prioritization.
-                let mut file_candidates: HashMap<String, Vec<(SymbolId, f64)>> = HashMap::new();
-                let mut file_match_counts: HashMap<String, usize> = HashMap::new();
+                // Compute IDF for file-path seed scoring
+                let all_fp_nodes = self.graph.all_nodes();
+                let fp_total = all_fp_nodes.len().max(1) as f64;
+                let fp_word_idf: HashMap<&str, f64> = q_words.iter()
+                    .map(|w| {
+                        let df = all_fp_nodes.iter()
+                            .filter(|n| {
+                                let nl = n.name.to_lowercase();
+                                nl.contains(*w) || n.signature.to_lowercase().contains(*w)
+                            })
+                            .count()
+                            .max(1);
+                        (*w, (fp_total / df as f64).ln().max(0.1))
+                    })
+                    .collect();
+                let fp_max_idf = fp_word_idf.values().cloned().fold(0.1f64, f64::max);
 
-                for node in self.graph.all_nodes() {
+                // Group functions by matching file, scored by centrality.
+                // Track per-file IDF-weighted match score for prioritization.
+                let mut file_candidates: HashMap<String, Vec<(SymbolId, f64)>> = HashMap::new();
+                let mut file_idf_scores: HashMap<String, f64> = HashMap::new();
+
+                for node in &all_fp_nodes {
                     if seed_ids.contains(&node.id)
                         || is_lattice_own_source(&node.file)
                         || is_test_file(&node.file)
                     {
                         continue;
                     }
-                    // Only seed functions/methods (implementation code, not schemas)
                     if !matches!(node.kind, SymbolKind::Function | SymbolKind::Method) {
                         continue;
                     }
 
-                    // Check if file path matches any query word
                     let file_lower = node.file.to_lowercase();
                     let file_segments: Vec<&str> = file_lower
                         .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
                         .filter(|p| p.len() >= 3)
                         .collect();
 
-                    let match_count: usize = q_words.iter()
-                        .filter(|w| {
-                            file_segments.iter().any(|seg| *seg == **w)
-                        })
-                        .count();
+                    // Compute IDF-weighted match score for this file
+                    let mut file_score: f64 = 0.0;
+                    let mut match_count: usize = 0;
+                    for w in &q_words {
+                        if file_segments.iter().any(|seg| seg == w) {
+                            let idf_f = fp_word_idf.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
+                            file_score += idf_f;
+                            match_count += 1;
+                        }
+                    }
 
                     if match_count == 0 { continue; }
 
@@ -127,28 +148,31 @@ impl QueryEngine {
                     file_candidates.entry(node.file.clone())
                         .or_default()
                         .push((node.id.clone(), centrality));
-                    file_match_counts.entry(node.file.clone())
-                        .and_modify(|c| { if match_count > *c { *c = match_count; } })
-                        .or_insert(match_count);
+                    file_idf_scores.entry(node.file.clone())
+                        .and_modify(|s| { if file_score > *s { *s = file_score; } })
+                        .or_insert(file_score);
                 }
 
-                // Sort files by: query-word match count DESC (files matching more
-                // words are more relevant), then alphabetically for determinism.
-                // This ensures patch_deployment.py (matches "patch" + "deployment")
-                // gets processed before patch_download_nix.go (matches only "patch").
+                // Sort files by IDF-weighted score DESC. Files matching rare words
+                // or multiple words rank higher than files matching one common word.
                 let max_per_file = 2;
                 let max_total = 15;
                 let mut added = 0;
 
                 let mut files: Vec<String> = file_candidates.keys().cloned().collect();
                 files.sort_by(|a, b| {
-                    let ma = file_match_counts.get(a).copied().unwrap_or(0);
-                    let mb = file_match_counts.get(b).copied().unwrap_or(0);
-                    mb.cmp(&ma).then_with(|| a.cmp(b))
+                    let sa = file_idf_scores.get(a).copied().unwrap_or(0.0);
+                    let sb = file_idf_scores.get(b).copied().unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(b))
                 });
 
                 for file in &files {
                     if added >= max_total { break; }
+                    let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
+                    // Convert file IDF score to seed similarity: scale to 0.15..0.50 range.
+                    // Max file_score is q_words.len() (if all words match with IDF=1.0).
+                    let seed_sim = (0.15 + 0.35 * (file_score / q_words.len() as f64)).min(0.50);
                     if let Some(candidates) = file_candidates.get_mut(file) {
                         candidates.sort_by(|a, b| {
                             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -156,7 +180,7 @@ impl QueryEngine {
                         });
                         for (id, _centrality) in candidates.iter().take(max_per_file) {
                             if added >= max_total { break; }
-                            seed_hits.push((id.clone(), 0.35));
+                            seed_hits.push((id.clone(), seed_sim));
                             added += 1;
                         }
                     }
@@ -818,6 +842,8 @@ impl QueryEngine {
 
     /// Keyword-based fallback when no vector store or embedding is available.
     /// Matches query words against node names, signatures, and file paths.
+    /// Uses IDF weighting so rare terms (e.g. "JWT") contribute more than
+    /// common terms (e.g. "user") that appear in hundreds of symbols.
     fn keyword_fallback(&self, query_text: &str, top_k: usize) -> Vec<(SymbolId, f64)> {
         let query_lower = query_text.to_lowercase();
         let cleaned: String = query_lower
@@ -833,9 +859,32 @@ impl QueryEngine {
             return Vec::new();
         }
 
+        // Compute IDF for each query word: how many symbols mention it?
+        // Words appearing in many symbols (low IDF) contribute less to scores.
+        let all_nodes = self.graph.all_nodes();
+        let total_nodes = all_nodes.len().max(1) as f64;
+        let word_idf: HashMap<&str, f64> = query_words.iter()
+            .map(|w| {
+                let df = all_nodes.iter()
+                    .filter(|n| {
+                        let nl = n.name.to_lowercase();
+                        nl.contains(*w) || n.signature.to_lowercase().contains(*w)
+                    })
+                    .count()
+                    .max(1);
+                (*w, (total_nodes / df as f64).ln().max(0.1))
+            })
+            .collect();
+        let max_idf = word_idf.values().cloned().fold(0.1f64, f64::max);
+
+        // Pre-compute total IDF (sum of all word IDFs) — constant across nodes
+        let total_idf: f64 = query_words.iter()
+            .map(|w| word_idf.get(*w).copied().unwrap_or(1.0))
+            .sum();
+
         let mut scored: Vec<(SymbolId, f64)> = Vec::new();
 
-        for node in self.graph.all_nodes() {
+        for node in &all_nodes {
             // Skip Lattice's own source code — never relevant to user queries
             if is_lattice_own_source(&node.file) {
                 continue;
@@ -846,14 +895,13 @@ impl QueryEngine {
             let file_lower = node.file.to_lowercase();
 
             // Fast path: exact symbol name in query → high score.
-            // For long queries (5+ words), discount simple variables/constants
-            // since generic names like "token" match many unrelated things.
+            // IDF-weighted: exact match on a rare term scores higher than on a common one.
             if query_words.iter().any(|w| *w == name_lower) {
+                let idf_factor = word_idf.get(name_lower.as_str()).copied().unwrap_or(max_idf) / max_idf;
                 let exact_score = if query_words.len() >= 5 {
                     match node.kind {
-                        crate::symbols::SymbolKind::Variable
-                        | crate::symbols::SymbolKind::Constant => 0.5,
-                        _ => 1.0,
+                        SymbolKind::Variable | SymbolKind::Constant => 0.5 * idf_factor,
+                        _ => idf_factor.max(0.5), // exact name match always strong
                     }
                 } else {
                     1.0
@@ -863,12 +911,19 @@ impl QueryEngine {
             }
 
             let name_parts = split_identifier(&name_lower);
+            // Pre-split file path into exact segments for matching
+            let file_segments: Vec<&str> = file_lower
+                .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                .filter(|p| p.len() >= 3)
+                .collect();
 
-            let mut best_word_score: f64 = 0.0;
+            let mut idf_weighted_score: f64 = 0.0;
             let mut words_matched = 0usize;
             let mut has_file_match = false;
 
             for word in &query_words {
+                let idf = word_idf.get(*word).copied().unwrap_or(1.0);
+                let idf_factor = idf / max_idf; // 0..1 range
                 let mut word_score: f64 = 0.0;
 
                 // Name starts with query word (e.g. word="login", name="loginUser")
@@ -903,70 +958,44 @@ impl QueryEngine {
                     word_score = 0.2;
                 }
 
-                // File path match — contributes to word_score directly so that
-                // files like agent_auth.py can compete as seed hits when the
-                // query mentions "auth". Also sets has_file_match for bonus.
-                if file_lower.contains(word) {
-                    // Exact word in path (e.g. "user" in "user_service.py")
+                // File path match — exact segment matching only.
+                // "user" matches "user" segment but NOT "users" or "users_linux".
+                if file_segments.iter().any(|seg| *seg == *word) {
                     has_file_match = true;
                     if word_score < 0.4 {
                         word_score = 0.4;
-                    }
-                } else {
-                    // Split file path into parts and check bidirectional matching
-                    let file_parts: Vec<&str> = file_lower
-                        .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
-                        .filter(|p| p.len() >= 3)
-                        .collect();
-                    // Full containment: query word contains path part or vice versa
-                    // e.g. "authentication" contains "auth" from agent_auth.py
-                    if file_parts.iter().any(|part| word.contains(part) || part.contains(word)) {
-                        has_file_match = true;
-                        if word_score < 0.35 {
-                            word_score = 0.35;
-                        }
-                    }
-                    // Prefix match only (weaker)
-                    else if file_parts.iter().any(|part| {
-                        word.starts_with(part) || part.starts_with(word)
-                    }) {
-                        has_file_match = true;
-                        if word_score < 0.25 {
-                            word_score = 0.25;
-                        }
                     }
                 }
 
                 if word_score > 0.0 {
                     words_matched += 1;
-                    if word_score > best_word_score {
-                        best_word_score = word_score;
-                    }
+                    // Weight this word's contribution by its IDF
+                    idf_weighted_score += word_score * idf_factor;
                 }
             }
 
-            if words_matched == 0 && !has_file_match {
+            if words_matched == 0 {
                 continue;
             }
 
-            // For long queries (5+ words), require at least 2 matched words.
-            // Single-word matches like SystemInfo→"system" or _build_candidate_products→"token"
-            // are almost always noise when the query has many terms.
-            if query_words.len() >= 5 && words_matched < 2 {
+            // For queries with 3+ words, require at least 2 matched words.
+            // Single-word matches on common terms are almost always noise.
+            if query_words.len() >= 3 && words_matched < 2 {
                 continue;
             }
 
-            // Score based on best single-word match, with coverage bonus + file bonus.
-            // For long queries, increase the coverage weight so that symbols matching
-            // more query words are strongly preferred over single-concept matches.
+            // Score: IDF-weighted sum normalized by word count, with coverage scaling.
+            // This naturally suppresses nodes matching only common terms while boosting
+            // those matching rare terms or multiple terms.
             let coverage = words_matched as f64 / query_words.len() as f64;
-            let file_bonus = if has_file_match { 0.15 } else { 0.0 };
-            let (base, cov_weight) = if query_words.len() >= 5 {
-                (0.4, 0.6) // long query: coverage matters more
+            let file_bonus = if has_file_match { 0.1 } else { 0.0 };
+            let max_possible_score = total_idf / max_idf; // max if all words matched at 1.0
+            let normalized = if max_possible_score > 0.0 {
+                let raw = idf_weighted_score / max_possible_score.min(query_words.len() as f64);
+                (raw * (0.5 + 0.5 * coverage) + file_bonus).min(1.0)
             } else {
-                (0.7, 0.3) // short query: best match dominates
+                0.0
             };
-            let normalized = (best_word_score * (base + cov_weight * coverage) + file_bonus).min(1.0);
 
             if normalized > 0.05 {
                 scored.push((node.id.clone(), normalized));
@@ -983,17 +1012,15 @@ impl QueryEngine {
         scored.truncate(top_k);
 
         // File diversity: ensure at least one representative from each file
-        // that scored well (>0.3) but got crowded out of top_k. This prevents
-        // a single dominant concept (e.g. "user") from monopolizing all seed slots
-        // and missing files like agent_auth.py whose symbols only match via path.
+        // that scored well but got crowded out of top_k. Uses same IDF weighting
+        // and exact segment matching as the main scoring loop.
         if scored.len() == top_k {
             let selected_files: std::collections::HashSet<&str> = scored.iter()
                 .map(|(id, _)| id.file.as_str())
                 .collect();
 
-            // Find best symbol per unrepresented file by scanning all nodes
             let mut unrepresented: Vec<(SymbolId, f64)> = Vec::new();
-            for node in self.graph.all_nodes() {
+            for node in &all_nodes {
                 if selected_files.contains(node.file.as_str())
                     || is_lattice_own_source(&node.file)
                 {
@@ -1001,39 +1028,41 @@ impl QueryEngine {
                 }
                 let name_lower = node.name.to_lowercase();
                 let file_lower = node.file.to_lowercase();
-                // Quick relevance check: does this file match any query word?
-                let file_parts: Vec<&str> = file_lower
+                // Exact segment matching for file relevance
+                let file_segs: Vec<&str> = file_lower
                     .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
                     .filter(|p| p.len() >= 3)
                     .collect();
                 let file_relevant = query_words.iter().any(|w| {
-                    file_lower.contains(w)
-                        || file_parts.iter().any(|part| w.contains(part) || part.contains(w))
+                    file_segs.iter().any(|seg| *seg == *w)
                 });
                 if !file_relevant {
                     continue;
                 }
-                // Compute score for this symbol
-                let mut best_ws: f64 = 0.0;
+                // IDF-weighted scoring (same logic as main loop)
+                let mut idf_ws: f64 = 0.0;
                 let mut wm = 0usize;
                 let name_parts = split_identifier(&name_lower);
                 for word in &query_words {
+                    let idf_f = word_idf.get(*word).copied().unwrap_or(1.0) / max_idf;
                     let mut ws: f64 = 0.0;
                     if name_lower.starts_with(word) { ws = 0.8; }
                     else if word.starts_with(&name_lower) && name_lower.len() >= 3 { ws = 0.6; }
                     else if name_lower.contains(word) { ws = 0.4; }
                     else if name_parts.iter().any(|p| p.len() >= 3 && (word.contains(p.as_str()) || p.starts_with(word))) { ws = 0.5; }
-                    // File path contributes to word score
-                    if file_lower.contains(word) { ws = ws.max(0.4); }
-                    else if file_parts.iter().any(|part| word.contains(part) || part.contains(word)) { ws = ws.max(0.35); }
-                    if ws > 0.0 { wm += 1; if ws > best_ws { best_ws = ws; } }
+                    // File path: exact segment match only
+                    if file_segs.iter().any(|seg| *seg == *word) { ws = ws.max(0.4); }
+                    if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
                 }
                 if wm == 0 { continue; }
-                if query_words.len() >= 5 && wm < 2 { continue; }
+                if query_words.len() >= 3 && wm < 2 { continue; }
                 let cov = wm as f64 / query_words.len() as f64;
-                let (div_base, div_cw) = if query_words.len() >= 5 { (0.4, 0.6) } else { (0.7, 0.3) };
-                let norm = (best_ws * (div_base + div_cw * cov) + 0.15).min(1.0);
-                if norm > 0.3 {
+                let max_possible = total_idf / max_idf;
+                let norm = if max_possible > 0.0 {
+                    let raw = idf_ws / max_possible.min(query_words.len() as f64);
+                    (raw * (0.5 + 0.5 * cov) + 0.1).min(1.0)
+                } else { 0.0 };
+                if norm > 0.2 {
                     unrepresented.push((node.id.clone(), norm));
                 }
             }
@@ -1050,7 +1079,6 @@ impl QueryEngine {
 
             // Swap in up to 5 unrepresented file representatives for the lowest seed hits
             let mut swaps: Vec<(SymbolId, f64)> = best_per_file.into_values().collect();
-            // Sort by score desc, then file name asc for deterministic ordering
             swaps.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -1060,13 +1088,10 @@ impl QueryEngine {
             for i in 0..max_swaps {
                 let swap_idx = scored.len() - 1 - i;
                 if swaps[i].1 > scored[swap_idx].1 * 0.6 {
-                    // Only swap if the unrepresented symbol is at least 60% of the
-                    // score it's replacing — don't evict high-quality hits
                     scored[swap_idx] = swaps[i].clone();
                 }
             }
 
-            // Re-sort after swaps
             scored.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
