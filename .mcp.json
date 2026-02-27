@@ -2,7 +2,7 @@
   "mcpServers": {
     "lattice": {
       "type": "stdio",
-      "command": "D:\\lattice\\lattice.exe",
+      "command": "D:/lattice/lattice.exe",
       "args": ["--stdio"]
     }
   }

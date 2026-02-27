@@ -5,3 +5,8 @@ src/**
 node_modules/**
 .gitignore
 tsconfig.json
+.lattice/**
+*.db
+*.db-wal
+*.db-shm
+package-lock.json

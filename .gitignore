@@ -28,3 +28,7 @@ daemon/models/
 .env
 *.pem
 *.key
+daemon/target2/
+daemon/target_new/
+daemon/target_msvc/
+extension/*.vsix

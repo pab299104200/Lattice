@@ -79,10 +79,18 @@ export class DaemonManager implements vscode.Disposable {
             // not found on PATH
         }
 
-        // 3. Check ../daemon/target/debug/
-        const debugBin = path.join(this.extensionPath, '..', 'daemon', 'target', 'debug', binaryName);
-        if (fs.existsSync(debugBin)) {
-            return debugBin;
+        // 3. Check ../daemon/target/debug/ and target_new/debug/
+        for (const targetDir of ['target', 'target_new']) {
+            const debugBin = path.join(this.extensionPath, '..', 'daemon', targetDir, 'debug', binaryName);
+            if (fs.existsSync(debugBin)) {
+                return debugBin;
+            }
+        }
+
+        // 4. Check D:\lattice\ (deployed location)
+        const deployedBin = path.join('D:', 'lattice', binaryName);
+        if (fs.existsSync(deployedBin)) {
+            return deployedBin;
         }
 
         return null;
@@ -276,38 +284,31 @@ export class DaemonManager implements vscode.Disposable {
 
     private parseBuffer(): void {
         while (true) {
-            // Look for Content-Length header
-            const headerEnd = this.buffer.indexOf('\r\n\r\n');
-            if (headerEnd === -1) {
-                return;
-            }
+            // Try newline-delimited JSON first (each line is a complete JSON message)
+            const newlineIdx = this.buffer.indexOf('\n');
+            if (newlineIdx !== -1) {
+                const line = this.buffer.substring(0, newlineIdx).trim();
+                this.buffer = this.buffer.substring(newlineIdx + 1);
 
-            const header = this.buffer.substring(0, headerEnd);
-            const match = header.match(/Content-Length:\s*(\d+)/i);
-            if (!match) {
-                // Malformed header, skip past it
-                this.buffer = this.buffer.substring(headerEnd + 4);
+                if (!line) { continue; } // skip empty lines
+
+                // Skip Content-Length headers (daemon may still send them)
+                if (line.match(/^Content-Length:/i)) { continue; }
+
+                if (line.startsWith('{')) {
+                    try {
+                        const message = JSON.parse(line) as JsonRpcResponse;
+                        this.handleMessage(message);
+                    } catch (err) {
+                        console.error(`[lattice-daemon] failed to parse JSON line: ${err}`);
+                    }
+                }
                 continue;
             }
 
-            const contentLength = parseInt(match[1], 10);
-            const bodyStart = headerEnd + 4;
-            const bodyEnd = bodyStart + contentLength;
-
-            if (this.buffer.length < bodyEnd) {
-                // Not enough data yet
-                return;
-            }
-
-            const body = this.buffer.substring(bodyStart, bodyEnd);
-            this.buffer = this.buffer.substring(bodyEnd);
-
-            try {
-                const message = JSON.parse(body) as JsonRpcResponse;
-                this.handleMessage(message);
-            } catch (err) {
-                console.error(`[lattice-daemon] failed to parse JSON-RPC message: ${err}`);
-            }
+            // No newline yet — check if we have a partial JSON object without newline
+            // (shouldn't happen with our daemon, but handle gracefully)
+            return;
         }
     }
 
@@ -353,7 +354,7 @@ export class DaemonManager implements vscode.Disposable {
             };
 
             const body = JSON.stringify(request);
-            const message = `Content-Length: ${Buffer.byteLength(body, 'utf-8')}\r\n\r\n${body}`;
+            const message = body + '\n';
 
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
