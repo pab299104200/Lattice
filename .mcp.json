@@ -2,8 +2,8 @@
   "mcpServers": {
     "lattice": {
       "type": "stdio",
-      "command": "D:/lattice/lattice.exe",
-      "args": ["--stdio"]
+      "command": "/home/pete/Lattice/daemon/target/release/lattice",
+      "args": ["--stdio", "--workspace", "/home/pete/Lattice"]
     }
   }
 }
