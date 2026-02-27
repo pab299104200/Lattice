@@ -19,7 +19,7 @@ fn test_normal_files_not_excluded() {
     let filter = SecurityFilter::new(&PathBuf::from("/nonexistent/workspace"));
 
     assert!(!filter.is_excluded("src/auth.ts"), "auth.ts should not be excluded");
-    assert!(!filter.is_excluded("lib/utils.py"), "utils.py should not be excluded");
+    assert!(!filter.is_excluded("helpers/utils.py"), "utils.py should not be excluded");
     assert!(!filter.is_excluded("README.md"), "README.md should not be excluded");
     assert!(!filter.is_excluded("src/index.js"), "index.js should not be excluded");
 }
@@ -71,7 +71,9 @@ fn test_is_excluded_dir() {
     assert!(filter.is_excluded_dir("target"));
     assert!(filter.is_excluded_dir("__pycache__"));
     assert!(!filter.is_excluded_dir("src"));
-    assert!(!filter.is_excluded_dir("lib"));
+    assert!(filter.is_excluded_dir("lib"));
+    assert!(filter.is_excluded_dir("vendor"));
+    assert!(!filter.is_excluded_dir("helpers"));
 }
 
 #[test]

@@ -59,15 +59,27 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         try {
             vscode.window.showInformationMessage('Lattice: Re-indexing workspace...');
-            await daemon.sendRequest('lattice/reindex');
-            // Refresh stats after re-index
-            const result = await daemon.sendRequest('lattice/status') as any;
-            if (result && typeof result === 'object') {
-                const nodes = result.nodes ?? result.node_count ?? 0;
-                const files = result.files ?? result.file_count ?? 0;
-                const edges = result.edges ?? result.edge_count ?? 0;
-                sidebarProvider.updateStats({ nodes, files, edges });
-                statusBar.updateNodeCount(nodes);
+            await daemon.sendRequest('lattice/reindex', undefined, 300_000);
+            // Poll status until indexing stabilizes
+            let lastNodes = -1;
+            let stableCount = 0;
+            for (let i = 0; i < 60; i++) {
+                await new Promise(r => setTimeout(r, 2000));
+                const result = await daemon.sendRequest('lattice/status') as any;
+                if (result && typeof result === 'object') {
+                    const nodes = result.nodes ?? result.node_count ?? 0;
+                    const files = result.files ?? result.file_count ?? 0;
+                    const edges = result.edges ?? result.edge_count ?? 0;
+                    sidebarProvider.updateStats({ nodes, files, edges });
+                    statusBar.updateNodeCount(nodes);
+                    if (nodes === lastNodes && nodes > 0) {
+                        stableCount++;
+                        if (stableCount >= 2) { break; }
+                    } else {
+                        stableCount = 0;
+                    }
+                    lastNodes = nodes;
+                }
             }
             vscode.window.showInformationMessage('Lattice: Re-index complete');
         } catch (err) {

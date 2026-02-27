@@ -38,6 +38,8 @@ impl SecurityFilter {
             "node_modules", ".git", "target", "dist", "build", "out",
             "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
             ".next", ".nuxt", ".svelte-kit", "coverage", ".lattice",
+            "lib", "lib64", ".eggs", "vendor", "third_party",
+            "site-packages", "bower_components", ".cargo", ".gradle",
         ].into_iter().map(String::from).collect();
 
         Self { gitignore, default_patterns, excluded_dirs }

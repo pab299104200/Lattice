@@ -346,7 +346,7 @@ export class DaemonManager implements vscode.Disposable {
      * Send a JSON-RPC request to the daemon.
      * Returns a Promise that resolves with the result.
      */
-    public sendRequest(method: string, params?: unknown): Promise<unknown> {
+    public sendRequest(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
         return new Promise((resolve, reject) => {
             if (!this.process || !this.process.stdin) {
                 reject(new Error('Daemon is not running'));
@@ -364,10 +364,11 @@ export class DaemonManager implements vscode.Disposable {
             const body = JSON.stringify(request);
             const message = body + '\n';
 
+            const effectiveTimeout = timeoutMs ?? this.requestTimeoutMs;
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
-                reject(new Error(`Request ${method} (id=${id}) timed out after ${this.requestTimeoutMs}ms`));
-            }, this.requestTimeoutMs);
+                reject(new Error(`Request ${method} (id=${id}) timed out after ${effectiveTimeout}ms`));
+            }, effectiveTimeout);
 
             this.pendingRequests.set(id, { resolve, reject, timer });
 

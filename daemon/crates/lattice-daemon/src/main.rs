@@ -88,12 +88,16 @@ async fn main() -> Result<()> {
     // OnceLock for EmbeddingEngine — populated in background once model loads
     let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
 
+    // Shared indexing state flag
+    let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
     // ── Spawn background indexing task ────────────────────────────────
     {
         let engine_bg = Arc::clone(&engine);
         let indexer_bg = Arc::clone(&indexer);
         let graph_store_bg = Arc::clone(&graph_store);
         let embedding_engine_bg = Arc::clone(&embedding_engine);
+        let indexing_bg = Arc::clone(&indexing);
         let ws_manager_bg = workspace_manager.clone();
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
@@ -199,6 +203,7 @@ async fn main() -> Result<()> {
                 }
             }
 
+            indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("Background indexing complete");
         });
     }
@@ -403,6 +408,7 @@ async fn main() -> Result<()> {
         session_id,
         workspace_manager,
         workspace_roots,
+        indexing,
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);

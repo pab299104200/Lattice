@@ -341,17 +341,16 @@ impl QueryEngine {
     }
 
     /// Keyword-based fallback when no vector store or embedding is available.
-    /// Matches query words against node names and signatures.
+    /// Matches query words against node names, signatures, and file paths.
     fn keyword_fallback(&self, query_text: &str, top_k: usize) -> Vec<(SymbolId, f64)> {
         let query_lower = query_text.to_lowercase();
-        // Strip punctuation and split into words
         let cleaned: String = query_lower
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
             .collect();
         let query_words: Vec<&str> = cleaned
             .split_whitespace()
-            .filter(|w| w.len() > 2) // skip very short words like "a", "is", etc.
+            .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
             .collect();
 
         if query_words.is_empty() {
@@ -363,21 +362,60 @@ impl QueryEngine {
         for node in self.graph.all_nodes() {
             let name_lower = node.name.to_lowercase();
             let sig_lower = node.signature.to_lowercase();
+            let file_lower = node.file.to_lowercase();
 
             let mut match_score: f64 = 0.0;
+            let mut words_matched = 0usize;
 
             for word in &query_words {
-                if name_lower.contains(word) {
-                    match_score += 0.6;
+                let mut word_score = 0.0;
+
+                // Exact name match (highest signal)
+                if name_lower == *word {
+                    word_score += 1.0;
                 }
-                if sig_lower.contains(word) {
-                    match_score += 0.4;
+                // Name starts with query word
+                else if name_lower.starts_with(word) {
+                    word_score += 0.8;
                 }
+                // Name contains query word as a word boundary (e.g. "auth" in "authenticate_user")
+                else if name_lower.contains(word) {
+                    // Check if it's at a word boundary (after _, or camelCase boundary)
+                    let is_boundary = name_lower.find(word).map(|pos| {
+                        pos == 0 || name_lower.as_bytes().get(pos - 1) == Some(&b'_')
+                    }).unwrap_or(false);
+                    word_score += if is_boundary { 0.7 } else { 0.4 };
+                }
+
+                // Signature match (lower weight)
+                if sig_lower.contains(word) && word_score < 0.3 {
+                    word_score += 0.2;
+                }
+
+                // File path match (boosts relevance — e.g. "auth" in "auth/login.py")
+                if file_lower.contains(word) {
+                    word_score += 0.3;
+                }
+
+                if word_score > 0.0 {
+                    words_matched += 1;
+                }
+                match_score += word_score;
             }
 
-            if match_score > 0.0 {
-                // Cap at 1.0
-                let normalized = match_score.min(1.0);
+            if words_matched == 0 {
+                continue;
+            }
+
+            // Bonus for matching multiple query words
+            let coverage = words_matched as f64 / query_words.len() as f64;
+            match_score *= 0.5 + 0.5 * coverage;
+
+            // Normalize to 0..1 range
+            let max_possible = query_words.len() as f64 * 1.3; // max per word ≈ 1.0 + 0.3
+            let normalized = (match_score / max_possible).min(1.0);
+
+            if normalized > 0.05 {
                 scored.push((node.id.clone(), normalized));
             }
         }
@@ -484,3 +522,15 @@ fn classify_relationship(semantic_sim: f64) -> String {
 }
 
 // classify_why was replaced by the detailed score/path-based why_included format in Fix 18.
+
+/// Common English stop words filtered from keyword queries to avoid noisy matches.
+const STOP_WORDS: &[&str] = &[
+    "how", "does", "what", "where", "when", "why", "which", "who",
+    "the", "this", "that", "these", "those", "with", "from", "into",
+    "for", "and", "but", "not", "are", "was", "were", "been", "being",
+    "have", "has", "had", "will", "would", "could", "should", "can",
+    "may", "might", "shall", "must", "need", "use", "used", "using",
+    "work", "works", "working", "make", "made", "get", "set", "all",
+    "any", "each", "every", "some", "about", "also", "then", "than",
+    "very", "just", "only", "more", "most", "other", "new", "old",
+];

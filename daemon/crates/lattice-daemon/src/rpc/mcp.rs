@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use serde_json::{json, Value};
 
@@ -9,6 +10,7 @@ use lattice_core::indexer::Indexer;
 use lattice_core::memory::{Memory, MemoryType, MemoryStore};
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::GraphStore;
+use lattice_core::security::SecurityFilter;
 use lattice_core::watcher::should_index_file;
 use lattice_core::workspace::WorkspaceManager;
 
@@ -27,6 +29,7 @@ pub struct McpHandler {
     #[allow(dead_code)]
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
     workspace_roots: Vec<PathBuf>,
+    indexing: Arc<AtomicBool>,
 }
 
 impl McpHandler {
@@ -41,6 +44,7 @@ impl McpHandler {
         session_id: String,
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
         workspace_roots: Vec<PathBuf>,
+        indexing: Arc<AtomicBool>,
     ) -> Self {
         Self {
             engine,
@@ -52,6 +56,7 @@ impl McpHandler {
             session_id,
             workspace_manager,
             workspace_roots,
+            indexing,
         }
     }
 
@@ -883,6 +888,8 @@ impl McpHandler {
     }
 
     async fn tool_index_status(&self, _args: &Value) -> Result<Value, (i32, String)> {
+        let is_indexing = self.indexing.load(Ordering::Relaxed);
+
         let engine = self.engine.lock().await;
         let stats = engine.graph().stats();
         let all_nodes = engine.graph().all_nodes();
@@ -893,7 +900,7 @@ impl McpHandler {
         }
 
         let mut result = json!({
-            "status": "running",
+            "status": if is_indexing { "indexing" } else { "ready" },
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.workspace_root.to_string_lossy(),
             "nodes": stats.node_count,
@@ -1125,69 +1132,64 @@ impl McpHandler {
         }))
     }
 
-    /// Handle `lattice/reindex` — re-scan all files and rebuild graph.
+    /// Handle `lattice/reindex` — spawn background re-scan, return immediately.
     async fn handle_reindex(&self) -> Result<Value, (i32, String)> {
         let workspace_root = self.workspace_root.clone();
+        let indexer = Arc::clone(&self.indexer);
+        let engine = Arc::clone(&self.engine);
+        let graph_store = Arc::clone(&self.graph_store);
+        let indexing = Arc::clone(&self.indexing);
 
-        // Re-scan the workspace
-        let mut files_indexed = 0usize;
-        let mut errors = Vec::new();
+        indexing.store(true, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let security_filter = SecurityFilter::new(&workspace_root);
+            let mut files_indexed = 0usize;
+            let mut errors = 0usize;
 
-        {
-            let mut indexer = self.indexer.lock().await;
-            // Walk the workspace directory
-            let entries = walk_directory(&workspace_root);
-            for entry_path in &entries {
-                let rel_path = entry_path
-                    .strip_prefix(&workspace_root)
-                    .unwrap_or(entry_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+            {
+                let mut idx = indexer.lock().await;
+                let entries = walk_directory_filtered(&workspace_root, &security_filter);
+                for entry_path in &entries {
+                    let rel_path = entry_path
+                        .strip_prefix(&workspace_root)
+                        .unwrap_or(entry_path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
 
-                if !should_index_file(&rel_path) {
-                    continue;
-                }
+                    if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
+                        continue;
+                    }
 
-                match std::fs::read_to_string(entry_path) {
-                    Ok(content) => {
-                        if let Err(e) = indexer.index_file_content(&rel_path, &content) {
-                            errors.push(format!("{}: {}", rel_path, e));
-                        } else {
-                            files_indexed += 1;
+                    match std::fs::read_to_string(entry_path) {
+                        Ok(content) => {
+                            if idx.index_file_content(&rel_path, &content).is_ok() {
+                                files_indexed += 1;
+                            } else {
+                                errors += 1;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        errors.push(format!("{}: {}", rel_path, e));
+                        Err(_) => { errors += 1; }
                     }
                 }
-            }
 
-            // Update the engine with the new graph
-            let new_graph = indexer.graph().clone();
-            let stats = new_graph.stats();
+                let new_graph = idx.graph().clone();
 
-            // Save to graph store
-            {
-                let gs = self.graph_store.lock().await;
-                if let Err(e) = gs.save_graph(&new_graph) {
-                    tracing::warn!("Failed to save graph to store: {}", e);
+                if let Ok(gs) = graph_store.try_lock() {
+                    let _ = gs.save_graph(&new_graph);
                 }
+
+                let mut eng = engine.lock().await;
+                eng.update_graph(new_graph);
             }
 
-            // Update the query engine
-            {
-                let mut engine = self.engine.lock().await;
-                engine.update_graph(new_graph);
-            }
+            indexing.store(false, Ordering::Relaxed);
+            tracing::info!("Reindex complete: {} files indexed, {} errors", files_indexed, errors);
+        });
 
-            Ok(json!({
-                "status": "ok",
-                "files_indexed": files_indexed,
-                "nodes": stats.node_count,
-                "edges": stats.edge_count,
-                "errors": errors.len()
-            }))
-        }
+        Ok(json!({
+            "status": "started",
+            "message": "Re-index started in background"
+        }))
     }
 }
 
@@ -1204,10 +1206,19 @@ impl RequestHandler for McpHandler {
             "tools/call" => self.handle_tools_call(&params).await,
             "ping" => Ok(json!({})),
             "lattice/status" => {
+                let is_indexing = self.indexing.load(Ordering::Relaxed);
                 let engine = self.engine.lock().await;
-                let stats = engine.graph().stats();
+                let stats = if engine.graph().stats().node_count == 0 && is_indexing {
+                    if let Ok(idx) = self.indexer.try_lock() {
+                        idx.graph().stats()
+                    } else {
+                        engine.graph().stats()
+                    }
+                } else {
+                    engine.graph().stats()
+                };
                 Ok(json!({
-                    "status": "running",
+                    "status": if is_indexing { "indexing" } else { "ready" },
                     "version": env!("CARGO_PKG_VERSION"),
                     "workspace": self.workspace_root.to_string_lossy(),
                     "nodes": stats.node_count,
@@ -1243,19 +1254,18 @@ fn wrap_tool_result(value: Value) -> Value {
 }
 
 /// Recursively walk a directory, collecting all file paths.
-fn walk_directory(root: &std::path::Path) -> Vec<PathBuf> {
+fn walk_directory_filtered(root: &std::path::Path, filter: &SecurityFilter) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Skip excluded directories
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if lattice_core::watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                    if filter.is_excluded_dir(dir_name) {
                         continue;
                     }
                 }
-                files.extend(walk_directory(&path));
+                files.extend(walk_directory_filtered(&path, filter));
             } else if path.is_file() {
                 files.push(path);
             }
