@@ -40,6 +40,12 @@ pub struct CapsuleStats {
     pub tokens_saved: usize,
     pub nodes_evaluated: usize,
     pub nodes_included: usize,
+    /// Engine version for diagnosing binary freshness.
+    pub engine_version: String,
+    /// Number of initial seed hits from keyword/semantic search.
+    pub seed_count: usize,
+    /// Top seed symbol names (for diagnosing candidate generation).
+    pub seed_symbols: Vec<String>,
 }
 
 /// A Context Capsule — the structured response from the query engine.

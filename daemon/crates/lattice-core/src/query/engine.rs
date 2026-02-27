@@ -14,6 +14,9 @@ use super::intent::{detect_intent, IntentParams};
 /// Token estimation: ~4 characters per token.
 const CHARS_PER_TOKEN: usize = 4;
 
+/// Engine version for diagnosing binary freshness.
+const ENGINE_VERSION: &str = "v18";
+
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
     node: &'a GraphNode,
@@ -106,20 +109,7 @@ impl QueryEngine {
 
                 // 2 hops from dependencies
                 if params.hop_depth >= 2 {
-                    let hop2_deps = self.graph.get_dependencies(&dep_node.id);
-                    // Cap Contains expansion at hop 2 to prevent class member flooding.
-                    // e.g., WorkflowEngine reached at hop 1 via "password" test →
-                    // without cap, all 25 methods get included at hop 2.
-                    // Non-Contains edges (Calls, Imports) are uncapped.
-                    let mut contains_count = 0usize;
-                    let max_contains_at_hop2 = 5usize;
-                    for (dep2_node, edge_kind2) in &hop2_deps {
-                        if matches!(edge_kind2, EdgeKind::Contains) {
-                            contains_count += 1;
-                            if contains_count > max_contains_at_hop2 {
-                                continue;
-                            }
-                        }
+                    for (dep2_node, edge_kind2) in self.graph.get_dependencies(&dep_node.id) {
                         candidate_ids.entry(dep2_node.id.clone())
                             .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
                             .or_insert(decay_2hop);
@@ -133,36 +123,33 @@ impl QueryEngine {
 
             // 1 hop: direct dependents (callers + containers)
             // Contains dependents at hop 1 discover the class/module a method belongs to.
-            for (caller_node, edge_kind) in self.graph.get_dependents(id) {
-                let edge_label = format_edge_kind_reverse(edge_kind);
+            // No 2-hop dependents: callers-of-callers are "things that use auth" not
+            // "how auth works" — always noise for understanding queries. The dependency
+            // direction (callees) already handles implementation chain discovery.
+            //
+            // Hub-node damping: functions with many callers (>5) are infrastructure
+            // utilities (e.g., get_current_idp_user_id called by 20+ routers). Expanding
+            // all callers floods results with unrelated domains. For hub nodes, only
+            // include Contains-direction dependents (module/class containers) which are
+            // always relevant, and skip Calls-direction dependents (consumer functions).
+            let dependents = self.graph.get_dependents(id);
+            let is_hub_node = dependents.iter()
+                .filter(|(_, ek)| matches!(ek, EdgeKind::Calls))
+                .count() > 5;
+
+            for (caller_node, edge_kind) in &dependents {
+                // For hub nodes, only follow Contains edges (module discovery),
+                // skip Calls edges (consumer expansion).
+                if is_hub_node && matches!(edge_kind, EdgeKind::Calls) {
+                    continue;
+                }
+                let edge_label = format_edge_kind_reverse(*edge_kind);
                 candidate_ids.entry(caller_node.id.clone())
                     .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
                     .or_insert(decay_1hop);
                 relationship_paths.entry(caller_node.id.clone()).or_insert_with(|| {
                     format!("{}: {}", edge_label, seed_name)
                 });
-
-                // 2 hops from dependents
-                if params.hop_depth >= 2 {
-                    let hop2_callers = self.graph.get_dependents(&caller_node.id);
-                    let mut contains_count = 0usize;
-                    let max_contains_at_hop2 = 5usize;
-                    for (caller2_node, edge_kind2) in &hop2_callers {
-                        if matches!(edge_kind2, EdgeKind::Contains) {
-                            contains_count += 1;
-                            if contains_count > max_contains_at_hop2 {
-                                continue;
-                            }
-                        }
-                        candidate_ids.entry(caller2_node.id.clone())
-                            .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
-                            .or_insert(decay_2hop);
-                        relationship_paths.entry(caller2_node.id.clone()).or_insert_with(|| {
-                            format!("{} -> {} -> {} (via {:?})",
-                                seed_name, caller_node.name, caller2_node.name, edge_kind2)
-                        });
-                    }
-                }
             }
         }
 
@@ -398,6 +385,24 @@ impl QueryEngine {
                     continue;
                 }
 
+                // Skip files whose path has no exact-word overlap with query words.
+                // Prevents irrelevant files from getting sibling expansion just
+                // because one symbol happened to match a generic keyword
+                // (e.g., getLastLogins matching "login" in hostinfo/users_linux.go).
+                // Uses exact segment matching: path "users_linux" splits to ["users", "linux"]
+                // and only matches query word "users", not "user" (no substring matching).
+                let file_lower = file.to_lowercase();
+                let file_segments: Vec<&str> = file_lower
+                    .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                    .filter(|p| p.len() >= 3)
+                    .collect();
+                let file_relevant = sib_words.iter().any(|w| {
+                    file_segments.iter().any(|seg| *seg == *w)
+                });
+                if !file_relevant {
+                    continue;
+                }
+
                 // Collect candidate siblings with relevance scores
                 let mut candidates: Vec<(&GraphNode, f64)> = Vec::new();
                 for node in self.graph.all_nodes() {
@@ -571,6 +576,12 @@ impl QueryEngine {
                 tokens_saved,
                 nodes_evaluated,
                 nodes_included,
+                engine_version: ENGINE_VERSION.to_string(),
+                seed_count: seed_hits.len(),
+                seed_symbols: seed_hits.iter()
+                    .take(15)
+                    .map(|(id, _)| format!("{}:{}", id.file.rsplit('/').next().unwrap_or(&id.file), id.name))
+                    .collect(),
             },
         }
     }
