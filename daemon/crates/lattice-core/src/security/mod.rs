@@ -4,41 +4,69 @@ mod tests;
 use std::path::Path;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-/// Manages file exclusions from .lattice_ignore and default patterns.
+/// Manages file exclusions from .gitignore, .lattice_ignore, and default patterns.
 pub struct SecurityFilter {
     gitignore: Option<Gitignore>,
     default_patterns: Vec<String>,
+    excluded_dirs: Vec<String>,
 }
 
 impl SecurityFilter {
     pub fn new(workspace_root: &Path) -> Self {
-        let ignore_path = workspace_root.join(".lattice_ignore");
-        let gitignore = if ignore_path.exists() {
-            let mut builder = GitignoreBuilder::new(workspace_root);
-            builder.add(&ignore_path);
-            builder.build().ok()
-        } else {
-            None
-        };
+        let mut builder = GitignoreBuilder::new(workspace_root);
+
+        // Load .gitignore if it exists
+        let gitignore_path = workspace_root.join(".gitignore");
+        if gitignore_path.exists() {
+            builder.add(&gitignore_path);
+        }
+
+        // Load .lattice_ignore if it exists (adds to .gitignore rules)
+        let lattice_ignore_path = workspace_root.join(".lattice_ignore");
+        if lattice_ignore_path.exists() {
+            builder.add(&lattice_ignore_path);
+        }
+
+        let gitignore = builder.build().ok();
 
         let default_patterns = vec![
             "*.env*", "*credentials*", "*.pem", "*.key", "*.pfx",
             "*id_rsa*", "*id_ed25519*", "*.p12", "*.jks",
         ].into_iter().map(String::from).collect();
 
-        Self { gitignore, default_patterns }
+        let excluded_dirs = vec![
+            "node_modules", ".git", "target", "dist", "build", "out",
+            "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
+            ".next", ".nuxt", ".svelte-kit", "coverage", ".lattice",
+        ].into_iter().map(String::from).collect();
+
+        Self { gitignore, default_patterns, excluded_dirs }
+    }
+
+    /// Check if a directory name should be skipped during traversal.
+    pub fn is_excluded_dir(&self, dir_name: &str) -> bool {
+        self.excluded_dirs.iter().any(|d| d == dir_name)
     }
 
     /// Check if a file should be excluded from indexing.
+    /// Combines .gitignore, .lattice_ignore, excluded dirs, and default security patterns.
     pub fn is_excluded(&self, rel_path: &str) -> bool {
-        // Check .lattice_ignore
+        // Check .gitignore + .lattice_ignore
         if let Some(gi) = &self.gitignore {
             if gi.matched(rel_path, false).is_ignore() {
                 return true;
             }
         }
 
-        // Check default patterns
+        // Check excluded directory components
+        let normalized = rel_path.replace('\\', "/");
+        for component in normalized.split('/') {
+            if self.excluded_dirs.iter().any(|d| d == component) {
+                return true;
+            }
+        }
+
+        // Check default security patterns
         let filename = Path::new(rel_path).file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("")

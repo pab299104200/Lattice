@@ -51,3 +51,42 @@ region = "us-east-1"
     assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "AWS key should not appear");
     assert!(redacted.contains("region"), "non-sensitive lines should remain");
 }
+
+#[test]
+fn test_excluded_dirs() {
+    let filter = SecurityFilter::new(&PathBuf::from("/nonexistent/workspace"));
+
+    assert!(filter.is_excluded("node_modules/express/index.js"), "node_modules should be excluded");
+    assert!(filter.is_excluded(".git/config"), ".git should be excluded");
+    assert!(filter.is_excluded("src/target/release/binary"), "target should be excluded");
+    assert!(!filter.is_excluded("src/main.ts"), "normal path should not be excluded");
+}
+
+#[test]
+fn test_is_excluded_dir() {
+    let filter = SecurityFilter::new(&PathBuf::from("/nonexistent/workspace"));
+
+    assert!(filter.is_excluded_dir("node_modules"));
+    assert!(filter.is_excluded_dir(".git"));
+    assert!(filter.is_excluded_dir("target"));
+    assert!(filter.is_excluded_dir("__pycache__"));
+    assert!(!filter.is_excluded_dir("src"));
+    assert!(!filter.is_excluded_dir("lib"));
+}
+
+#[test]
+fn test_gitignore_integration() {
+    // Create a temp dir with a .gitignore
+    let tmp = std::env::temp_dir().join("lattice_test_gitignore");
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(tmp.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+
+    let filter = SecurityFilter::new(&tmp);
+
+    assert!(filter.is_excluded("app.log"), "*.log should be excluded via .gitignore");
+    assert!(filter.is_excluded("build/output.js"), "build/ should be excluded via .gitignore");
+    assert!(!filter.is_excluded("src/main.ts"), "normal file should not be excluded");
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&tmp);
+}

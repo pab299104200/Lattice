@@ -79,6 +79,25 @@ impl Language {
     }
 }
 
+impl SymbolKind {
+    /// Compact string code for token-efficient output.
+    pub fn short_code(&self) -> &'static str {
+        match self {
+            SymbolKind::Function => "fn",
+            SymbolKind::Class => "cls",
+            SymbolKind::Interface => "ifc",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Module => "mod",
+            SymbolKind::Variable => "var",
+            SymbolKind::Constant => "const",
+            SymbolKind::Method => "meth",
+            SymbolKind::Trait => "trait",
+            SymbolKind::Struct => "struct",
+        }
+    }
+}
+
 /// An import statement extracted from a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportInfo {

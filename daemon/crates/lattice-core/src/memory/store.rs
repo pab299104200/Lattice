@@ -39,6 +39,7 @@ impl MemoryStore {
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS memories (
                     id              TEXT PRIMARY KEY,
+                    session_id      TEXT NOT NULL DEFAULT '',
                     content         TEXT NOT NULL,
                     memory_type     TEXT NOT NULL,
                     confidence      REAL NOT NULL DEFAULT 1.0,
@@ -55,9 +56,18 @@ impl MemoryStore {
                 CREATE INDEX IF NOT EXISTS idx_memories_created
                     ON memories(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memories_type
-                    ON memories(memory_type);",
+                    ON memories(memory_type);
+                CREATE INDEX IF NOT EXISTS idx_memories_session
+                    ON memories(session_id);",
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to initialize memory schema: {}", e)))?;
+
+        // Migration: add session_id column if upgrading from older schema
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         Ok(())
     }
 
@@ -83,11 +93,12 @@ impl MemoryStore {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO memories
-                    (id, content, memory_type, confidence, linked_symbols, source_query,
+                    (id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                      created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
                 params![
                     memory.id,
+                    memory.session_id,
                     memory.content,
                     memory.memory_type.as_str(),
                     memory.confidence,
@@ -110,7 +121,7 @@ impl MemoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, content, memory_type, confidence, linked_symbols, source_query,
+                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason
                  FROM memories
                  WHERE is_invalidated = 0
@@ -120,49 +131,27 @@ impl MemoryStore {
 
         let rows = stmt
             .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let memory_type_str: String = row.get(2)?;
-                let confidence: f64 = row.get(3)?;
-                let linked_json: String = row.get(4)?;
-                let source_query: Option<String> = row.get(5)?;
-                let created_at: i64 = row.get(6)?;
-                let last_accessed: i64 = row.get(7)?;
-                let access_count: i64 = row.get(8)?;
-                let is_stale: i32 = row.get(9)?;
-                let stale_reason: Option<String> = row.get(10)?;
-
-                Ok((
-                    id, content, memory_type_str, confidence, linked_json,
-                    source_query, created_at, last_accessed, access_count,
-                    is_stale, stale_reason,
-                ))
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type_str: row.get(3)?,
+                    confidence: row.get(4)?,
+                    linked_json: row.get(5)?,
+                    source_query: row.get(6)?,
+                    created_at: row.get(7)?,
+                    last_accessed: row.get(8)?,
+                    access_count: row.get(9)?,
+                    is_stale: row.get(10)?,
+                    stale_reason: row.get(11)?,
+                })
             })
             .map_err(|e| LatticeError::Storage(format!("Failed to query memories: {}", e)))?;
 
         let mut memories = Vec::new();
         for row in rows {
-            let (id, content, memory_type_str, confidence, linked_json,
-                 source_query, created_at, last_accessed, access_count,
-                 is_stale_int, stale_reason) =
-                row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
-
-            let linked_symbols: Vec<String> = serde_json::from_str(&linked_json)
-                .unwrap_or_default();
-
-            memories.push(Memory {
-                id,
-                content,
-                memory_type: MemoryType::from_str(&memory_type_str),
-                confidence,
-                linked_symbols,
-                source_query,
-                created_at: created_at as u64,
-                last_accessed: last_accessed as u64,
-                access_count: access_count as u32,
-                is_stale: is_stale_int != 0,
-                stale_reason,
-            });
+            let r = row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
+            memories.push(r.into_memory());
         }
 
         Ok(memories)
@@ -175,7 +164,7 @@ impl MemoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, content, memory_type, confidence, linked_symbols, source_query,
+                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason
                  FROM memories
                  WHERE is_invalidated = 0 AND content LIKE ?1
@@ -185,49 +174,27 @@ impl MemoryStore {
 
         let rows = stmt
             .query_map(params![pattern], |row| {
-                let id: String = row.get(0)?;
-                let content: String = row.get(1)?;
-                let memory_type_str: String = row.get(2)?;
-                let confidence: f64 = row.get(3)?;
-                let linked_json: String = row.get(4)?;
-                let source_query: Option<String> = row.get(5)?;
-                let created_at: i64 = row.get(6)?;
-                let last_accessed: i64 = row.get(7)?;
-                let access_count: i64 = row.get(8)?;
-                let is_stale: i32 = row.get(9)?;
-                let stale_reason: Option<String> = row.get(10)?;
-
-                Ok((
-                    id, content, memory_type_str, confidence, linked_json,
-                    source_query, created_at, last_accessed, access_count,
-                    is_stale, stale_reason,
-                ))
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type_str: row.get(3)?,
+                    confidence: row.get(4)?,
+                    linked_json: row.get(5)?,
+                    source_query: row.get(6)?,
+                    created_at: row.get(7)?,
+                    last_accessed: row.get(8)?,
+                    access_count: row.get(9)?,
+                    is_stale: row.get(10)?,
+                    stale_reason: row.get(11)?,
+                })
             })
             .map_err(|e| LatticeError::Storage(format!("Failed to search memories: {}", e)))?;
 
         let mut memories = Vec::new();
         for row in rows {
-            let (id, content, memory_type_str, confidence, linked_json,
-                 source_query, created_at, last_accessed, access_count,
-                 is_stale_int, stale_reason) =
-                row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
-
-            let linked_symbols: Vec<String> = serde_json::from_str(&linked_json)
-                .unwrap_or_default();
-
-            memories.push(Memory {
-                id,
-                content,
-                memory_type: MemoryType::from_str(&memory_type_str),
-                confidence,
-                linked_symbols,
-                source_query,
-                created_at: created_at as u64,
-                last_accessed: last_accessed as u64,
-                access_count: access_count as u32,
-                is_stale: is_stale_int != 0,
-                stale_reason,
-            });
+            let r = row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
+            memories.push(r.into_memory());
         }
 
         // Touch each returned memory to update last_accessed
@@ -315,6 +282,155 @@ impl MemoryStore {
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to touch memory: {}", e)))?;
         Ok(())
+    }
+
+    /// Get memories for a specific session, ordered by most recent first.
+    pub fn get_session_memories(&self, session_id: &str, limit: usize) -> Result<Vec<Memory>, LatticeError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0 AND session_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to prepare session query: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![session_id, limit as i64], |row| {
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type_str: row.get(3)?,
+                    confidence: row.get(4)?,
+                    linked_json: row.get(5)?,
+                    source_query: row.get(6)?,
+                    created_at: row.get(7)?,
+                    last_accessed: row.get(8)?,
+                    access_count: row.get(9)?,
+                    is_stale: row.get(10)?,
+                    stale_reason: row.get(11)?,
+                })
+            })
+            .map_err(|e| LatticeError::Storage(format!("Failed to query session memories: {}", e)))?;
+
+        let mut memories = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
+            memories.push(r.into_memory());
+        }
+        Ok(memories)
+    }
+
+    /// Search memories across all sessions by keyword, optionally excluding a session.
+    pub fn search_across_sessions(
+        &self,
+        keyword: &str,
+        exclude_session: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        let pattern = format!("%{}%", keyword);
+
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(excl) = exclude_session {
+            (
+                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0 AND content LIKE ?1 AND session_id != ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3",
+                vec![Box::new(pattern), Box::new(excl.to_string()), Box::new(limit as i64)],
+            )
+        } else {
+            (
+                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0 AND content LIKE ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                vec![Box::new(pattern), Box::new(limit as i64)],
+            )
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| LatticeError::Storage(format!("Failed to prepare cross-session query: {}", e)))?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type_str: row.get(3)?,
+                    confidence: row.get(4)?,
+                    linked_json: row.get(5)?,
+                    source_query: row.get(6)?,
+                    created_at: row.get(7)?,
+                    last_accessed: row.get(8)?,
+                    access_count: row.get(9)?,
+                    is_stale: row.get(10)?,
+                    stale_reason: row.get(11)?,
+                })
+            })
+            .map_err(|e| LatticeError::Storage(format!("Failed to search across sessions: {}", e)))?;
+
+        let mut memories = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| LatticeError::Storage(format!("Failed to read memory row: {}", e)))?;
+            memories.push(r.into_memory());
+        }
+
+        // Touch returned memories
+        for mem in &memories {
+            let _ = self.touch_memory(&mem.id);
+        }
+
+        Ok(memories)
+    }
+}
+
+/// Internal helper to reduce row-mapping boilerplate.
+struct MemoryRow {
+    id: String,
+    session_id: String,
+    content: String,
+    memory_type_str: String,
+    confidence: f64,
+    linked_json: String,
+    source_query: Option<String>,
+    created_at: i64,
+    last_accessed: i64,
+    access_count: i64,
+    is_stale: i32,
+    stale_reason: Option<String>,
+}
+
+impl MemoryRow {
+    fn into_memory(self) -> Memory {
+        let linked_symbols: Vec<String> = serde_json::from_str(&self.linked_json)
+            .unwrap_or_default();
+        Memory {
+            id: self.id,
+            session_id: self.session_id,
+            content: self.content,
+            memory_type: MemoryType::from_str(&self.memory_type_str),
+            confidence: self.confidence,
+            linked_symbols,
+            source_query: self.source_query,
+            created_at: self.created_at as u64,
+            last_accessed: self.last_accessed as u64,
+            access_count: self.access_count as u32,
+            is_stale: self.is_stale != 0,
+            stale_reason: self.stale_reason,
+        }
     }
 }
 

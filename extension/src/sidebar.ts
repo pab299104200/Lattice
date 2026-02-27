@@ -5,6 +5,7 @@ interface IndexStats {
     nodes: number;
     files: number;
     edges: number;
+    repos?: Array<{ name: string; files: number; nodes: number; edges: number }>;
 }
 
 export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
@@ -76,6 +77,7 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
                         nodes: result.nodes ?? result.node_count ?? 0,
                         files: result.files ?? result.file_count ?? 0,
                         edges: result.edges ?? result.edge_count ?? 0,
+                        repos: result.repos,
                     };
                 }
             } catch {
@@ -258,6 +260,11 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
         </div>
     </div>
 
+    <div id="reposSection" class="section" style="display:none">
+        <div class="section-title">Repositories</div>
+        <div id="reposList"></div>
+    </div>
+
     <div class="section">
         <div class="section-title">Actions</div>
         <div class="actions">
@@ -294,6 +301,21 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
                     nodeCount.textContent = message.stats.nodes.toLocaleString();
                     fileCount.textContent = message.stats.files.toLocaleString();
                     edgeCount.textContent = message.stats.edges.toLocaleString();
+
+                    // Update per-repo cards if available
+                    const reposSection = document.getElementById('reposSection');
+                    const reposList = document.getElementById('reposList');
+                    if (message.stats.repos && message.stats.repos.length > 0) {
+                        reposSection.style.display = 'block';
+                        reposList.innerHTML = message.stats.repos.map(r =>
+                            '<div class="stat-card" style="margin-bottom:6px;text-align:left;padding:6px 8px">' +
+                            '<strong>' + r.name + '</strong><br>' +
+                            '<span style="font-size:11px;color:var(--vscode-descriptionForeground)">' +
+                            r.nodes + ' nodes · ' + r.files + ' files · ' + r.edges + ' edges</span></div>'
+                        ).join('');
+                    } else {
+                        reposSection.style.display = 'none';
+                    }
                 }
             }
         });

@@ -18,7 +18,6 @@ pub struct PivotNode {
     pub file: String,
     pub line: usize,
     pub source: String,
-    pub why: String,
     pub score: f64,
 }
 

@@ -183,6 +183,7 @@ fn test_stale_memory_on_file_change() {
     // Store a memory linked to "loginUser"
     store.store(Memory {
         id: String::new(),
+        session_id: String::new(),
         content: "loginUser uses bcrypt".to_string(),
         memory_type: MemoryType::Observation,
         confidence: 0.9,

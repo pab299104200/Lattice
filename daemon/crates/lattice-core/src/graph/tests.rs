@@ -1,6 +1,36 @@
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 
+// ─── Short code tests ────────────────────────────────────────────────
+
+#[test]
+fn test_symbol_kind_short_codes() {
+    assert_eq!(SymbolKind::Function.short_code(), "fn");
+    assert_eq!(SymbolKind::Class.short_code(), "cls");
+    assert_eq!(SymbolKind::Interface.short_code(), "ifc");
+    assert_eq!(SymbolKind::TypeAlias.short_code(), "type");
+    assert_eq!(SymbolKind::Enum.short_code(), "enum");
+    assert_eq!(SymbolKind::Module.short_code(), "mod");
+    assert_eq!(SymbolKind::Variable.short_code(), "var");
+    assert_eq!(SymbolKind::Constant.short_code(), "const");
+    assert_eq!(SymbolKind::Method.short_code(), "meth");
+    assert_eq!(SymbolKind::Trait.short_code(), "trait");
+    assert_eq!(SymbolKind::Struct.short_code(), "struct");
+}
+
+#[test]
+fn test_edge_kind_short_codes() {
+    assert_eq!(EdgeKind::Calls.short_code(), "C");
+    assert_eq!(EdgeKind::Imports.short_code(), "I");
+    assert_eq!(EdgeKind::Implements.short_code(), "M");
+    assert_eq!(EdgeKind::Extends.short_code(), "E");
+    assert_eq!(EdgeKind::TypeRef.short_code(), "T");
+    assert_eq!(EdgeKind::Contains.short_code(), "N");
+    assert_eq!(EdgeKind::CoChanges.short_code(), "X");
+}
+
+// ─── Graph tests ─────────────────────────────────────────────────────
+
 fn make_id(file: &str, name: &str) -> SymbolId {
     SymbolId {
         file: file.to_string(),
@@ -242,4 +272,134 @@ export function hashPassword(plain: string): string {
 
     assert!(graph.node_count() >= 2);
     assert!(graph.stats().edge_count > 0);
+}
+
+#[test]
+fn test_intra_file_call_edges() {
+    use crate::parser::parse_file;
+    use crate::graph::builder::GraphBuilder;
+
+    // Two functions in the same file where helper() is called by main_func()
+    let source = r#"
+function helper(): string {
+    return "hello";
+}
+
+function main_func(): string {
+    return helper();
+}
+"#;
+
+    let parsed = parse_file("src/utils.ts", source).unwrap();
+    let mut builder = GraphBuilder::new();
+    builder.add_file(parsed);
+    let graph = builder.build();
+
+    // Find the IDs
+    let main_id = graph.all_nodes().iter()
+        .find(|n| n.name == "main_func")
+        .map(|n| n.id.clone());
+    let helper_id = graph.all_nodes().iter()
+        .find(|n| n.name == "helper")
+        .map(|n| n.id.clone());
+
+    assert!(main_id.is_some(), "main_func should exist in graph");
+    assert!(helper_id.is_some(), "helper should exist in graph");
+
+    // main_func should have a Calls edge to helper
+    let deps = graph.get_dependencies(&main_id.unwrap());
+    let calls_helper = deps.iter().any(|(n, edge)| n.name == "helper" && *edge == EdgeKind::Calls);
+    assert!(calls_helper, "main_func should have a Calls edge to helper, deps: {:?}",
+        deps.iter().map(|(n, e)| (&n.name, e)).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_no_self_loop_edges() {
+    use crate::parser::parse_file;
+    use crate::graph::builder::GraphBuilder;
+
+    // Recursive function — should NOT create a self-loop edge
+    let source = r#"
+function recursive(n: number): number {
+    if (n <= 0) return 0;
+    return recursive(n - 1);
+}
+"#;
+
+    let parsed = parse_file("src/rec.ts", source).unwrap();
+    let mut builder = GraphBuilder::new();
+    builder.add_file(parsed);
+    let graph = builder.build();
+
+    let rec_id = graph.all_nodes().iter()
+        .find(|n| n.name == "recursive")
+        .map(|n| n.id.clone())
+        .expect("recursive should exist");
+
+    let deps = graph.get_dependencies(&rec_id);
+    let self_loop = deps.iter().any(|(n, _)| n.name == "recursive");
+    assert!(!self_loop, "recursive should NOT have a self-loop Calls edge");
+}
+
+#[test]
+fn test_find_call_paths() {
+    let mut graph = CodeGraph::new();
+    let id_a = make_id("src/a.ts", "a");
+    let id_b = make_id("src/b.ts", "b");
+    let id_c = make_id("src/c.ts", "c");
+    let id_d = make_id("src/d.ts", "d");
+
+    for (id, name) in [
+        (&id_a, "a"),
+        (&id_b, "b"),
+        (&id_c, "c"),
+        (&id_d, "d"),
+    ] {
+        graph.add_node(
+            id.clone(), SymbolKind::Function, name.to_string(),
+            String::new(), String::new(), format!("src/{}.ts", name),
+            1, 1, false, Language::TypeScript,
+        );
+    }
+
+    // Chain: a -> b -> c -> d
+    graph.add_edge(&id_a, &id_b, EdgeKind::Calls);
+    graph.add_edge(&id_b, &id_c, EdgeKind::Calls);
+    graph.add_edge(&id_c, &id_d, EdgeKind::Calls);
+
+    // Should find path a -> b -> c -> d
+    let paths = graph.find_call_paths(&id_a, &id_d, 5, 10);
+    assert_eq!(paths.len(), 1);
+    let names: Vec<&str> = paths[0].iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b", "c", "d"]);
+
+    // No path from d to a (directed)
+    let no_paths = graph.find_call_paths(&id_d, &id_a, 5, 10);
+    assert!(no_paths.is_empty(), "Should be no path from d to a");
+
+    // max_depth limits results
+    let short = graph.find_call_paths(&id_a, &id_d, 2, 10);
+    assert!(short.is_empty(), "max_depth=2 should not reach d from a (needs 3 hops)");
+}
+
+#[test]
+fn test_find_call_paths_disconnected() {
+    let mut graph = CodeGraph::new();
+    let id_a = make_id("src/a.ts", "a");
+    let id_b = make_id("src/b.ts", "b");
+
+    graph.add_node(
+        id_a.clone(), SymbolKind::Function, "a".to_string(),
+        String::new(), String::new(), "src/a.ts".to_string(),
+        1, 1, false, Language::TypeScript,
+    );
+    graph.add_node(
+        id_b.clone(), SymbolKind::Function, "b".to_string(),
+        String::new(), String::new(), "src/b.ts".to_string(),
+        1, 1, false, Language::TypeScript,
+    );
+
+    // No edges — should find no paths
+    let paths = graph.find_call_paths(&id_a, &id_b, 5, 10);
+    assert!(paths.is_empty());
 }

@@ -2,8 +2,13 @@ use super::model::{Memory, MemoryType};
 use super::store::MemoryStore;
 
 fn make_memory(content: &str, memory_type: MemoryType, linked_symbols: Vec<&str>) -> Memory {
+    make_memory_with_session(content, memory_type, linked_symbols, "")
+}
+
+fn make_memory_with_session(content: &str, memory_type: MemoryType, linked_symbols: Vec<&str>, session_id: &str) -> Memory {
     Memory {
         id: String::new(),
+        session_id: session_id.to_string(),
         content: content.to_string(),
         memory_type,
         confidence: 1.0,
@@ -117,6 +122,7 @@ fn test_memory_decay_and_pruning() {
     store
         .store(Memory {
             id: "old-mem".to_string(),
+            session_id: String::new(),
             content: "old observation".to_string(),
             memory_type: MemoryType::Observation,
             confidence: 0.5,
@@ -151,4 +157,68 @@ fn test_memory_decay_and_pruning() {
         remaining.is_empty(),
         "Low confidence memory should be pruned"
     );
+}
+
+#[test]
+fn test_session_id_stored_and_retrieved() {
+    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
+
+    let mem = make_memory_with_session(
+        "Auth uses JWT tokens",
+        MemoryType::Observation,
+        vec!["auth"],
+        "s-abc123",
+    );
+
+    store.store(mem).expect("Failed to store memory");
+
+    let all = store.list_all().expect("Failed to list memories");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].session_id, "s-abc123");
+}
+
+#[test]
+fn test_get_session_memories() {
+    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
+
+    // Session A memories
+    store.store(make_memory_with_session("mem A1", MemoryType::Observation, vec![], "session-a")).unwrap();
+    store.store(make_memory_with_session("mem A2", MemoryType::Decision, vec![], "session-a")).unwrap();
+
+    // Session B memories
+    store.store(make_memory_with_session("mem B1", MemoryType::Observation, vec![], "session-b")).unwrap();
+
+    let session_a = store.get_session_memories("session-a", 10).expect("Failed to get session memories");
+    assert_eq!(session_a.len(), 2);
+    assert!(session_a.iter().all(|m| m.session_id == "session-a"));
+
+    let session_b = store.get_session_memories("session-b", 10).expect("Failed to get session memories");
+    assert_eq!(session_b.len(), 1);
+    assert_eq!(session_b[0].session_id, "session-b");
+
+    let session_c = store.get_session_memories("session-c", 10).expect("Failed to get session memories");
+    assert_eq!(session_c.len(), 0);
+}
+
+#[test]
+fn test_search_across_sessions() {
+    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
+
+    store.store(make_memory_with_session("JWT auth pattern", MemoryType::Pattern, vec![], "s1")).unwrap();
+    store.store(make_memory_with_session("JWT validation bug", MemoryType::Observation, vec![], "s2")).unwrap();
+    store.store(make_memory_with_session("Database pool config", MemoryType::Decision, vec![], "s1")).unwrap();
+
+    // Search across all sessions
+    let results = store.search_across_sessions("JWT", None, 10).expect("search failed");
+    assert_eq!(results.len(), 2);
+
+    // Search excluding s1
+    let results = store.search_across_sessions("JWT", Some("s1"), 10).expect("search failed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session_id, "s2");
+
+    // Search excluding s2
+    let results = store.search_across_sessions("JWT", Some("s2"), 10).expect("search failed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].session_id, "s1");
 }

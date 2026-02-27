@@ -38,6 +38,7 @@ impl MemoryType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
+    pub session_id: String,
     pub content: String,
     pub memory_type: MemoryType,
     pub confidence: f64,

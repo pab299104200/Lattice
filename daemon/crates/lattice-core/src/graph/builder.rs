@@ -116,6 +116,43 @@ impl GraphBuilder {
                     }
                 }
             }
+
+            // 2c: Reference-based Calls edges — resolve Symbol.references to graph edges
+            // Parsers extract function calls from bodies into references.
+            // Priority: same-file match first, then any global match.
+            for symbol in &file.symbols {
+                for ref_name in &symbol.references {
+                    // Skip self-references
+                    let simple_name = ref_name.rsplit('.').next().unwrap_or(ref_name);
+                    if simple_name == symbol.name.rsplit('.').next().unwrap_or(&symbol.name) {
+                        continue;
+                    }
+
+                    // Try same-file first
+                    let target = if let Some(file_ids) = file_lookup.get(&file.file) {
+                        if let Some(ref_ids) = name_lookup.get(simple_name) {
+                            ref_ids.iter().find(|id| file_ids.contains(id)).cloned()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Fall back to any global match
+                    let target = target.or_else(|| {
+                        name_lookup.get(simple_name)
+                            .and_then(|ids| ids.first().cloned())
+                    });
+
+                    if let Some(target_id) = target {
+                        // Don't create self-loops
+                        if target_id != symbol.id {
+                            graph.add_edge(&symbol.id, &target_id, EdgeKind::Calls);
+                        }
+                    }
+                }
+            }
         }
 
         graph

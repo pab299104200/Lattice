@@ -1,7 +1,7 @@
 mod rpc;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -18,6 +18,7 @@ use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, VectorStore};
 use lattice_core::watcher::{self, FileEventKind};
+use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
 
@@ -30,8 +31,16 @@ async fn main() -> Result<()> {
 
     tracing::info!("Lattice daemon starting...");
 
-    // ── Parse workspace root ─────────────────────────────────────────
-    let workspace_root = parse_workspace_root();
+    // ── Parse workspace roots ────────────────────────────────────────
+    let workspace_roots = parse_workspace_roots();
+    let workspace_root = workspace_roots[0].clone();
+    let is_multi_repo = workspace_roots.len() > 1;
+    if is_multi_repo {
+        tracing::info!("Multi-repo mode: {} workspaces", workspace_roots.len());
+        for r in &workspace_roots {
+            tracing::info!("  - {}", r.display());
+        }
+    }
 
     // ── Create EMPTY engine + stores — start server IMMEDIATELY ──────
     // Everything else happens in background so MCP handshake isn't delayed.
@@ -39,45 +48,107 @@ async fn main() -> Result<()> {
     let ms = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
     let memory_store = Arc::new(Mutex::new(ms));
     let ms_for_engine = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
-    let engine = QueryEngine::new(graph, None, Some(Arc::new(std::sync::Mutex::new(ms_for_engine))));
+
+    // Create .lattice dir and disk-backed VectorStore for semantic search
+    let lattice_dir = workspace_root.join(".lattice");
+    let _ = std::fs::create_dir_all(&lattice_dir);
+    let vector_store = {
+        let vs_path = lattice_dir.join("vectors.db");
+        match VectorStore::open(&vs_path.to_string_lossy()) {
+            Ok(vs) => {
+                if let Err(e) = vs.initialize(384) {
+                    tracing::warn!("Failed to initialize vector store: {}", e);
+                    None
+                } else {
+                    let _ = vs.load_cache(); // Warm start from previous run
+                    Some(vs)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open vector store, semantic search disabled: {}", e);
+                None
+            }
+        }
+    };
+
+    let engine = QueryEngine::new(graph, vector_store, Some(Arc::new(std::sync::Mutex::new(ms_for_engine))));
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(
         GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
     ));
 
+    // Multi-repo workspace manager (only used when multiple workspaces)
+    let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = if is_multi_repo {
+        Some(Arc::new(Mutex::new(WorkspaceManager::new())))
+    } else {
+        None
+    };
+
+    // OnceLock for EmbeddingEngine — populated in background once model loads
+    let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
+
     // ── Spawn background indexing task ────────────────────────────────
     {
         let engine_bg = Arc::clone(&engine);
         let indexer_bg = Arc::clone(&indexer);
         let graph_store_bg = Arc::clone(&graph_store);
+        let embedding_engine_bg = Arc::clone(&embedding_engine);
+        let ws_manager_bg = workspace_manager.clone();
+        let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
         let lattice_dir_bg = ws_root.join(".lattice");
 
         tokio::spawn(async move {
             tracing::info!("Background indexing starting...");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
-            let security_filter = SecurityFilter::new(&ws_root);
 
-            let files_indexed = {
-                // CRITICAL: Run file scanning in spawn_blocking so it doesn't
-                // block the tokio runtime (which also handles MCP requests)
+            let files_indexed = if let Some(wm) = &ws_manager_bg {
+                // Multi-repo: index each workspace through WorkspaceManager
+                let wm_clone = Arc::clone(wm);
+                let roots = ws_roots_bg.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut wm = wm_clone.blocking_lock();
+                    let mut total = 0usize;
+                    for root in &roots {
+                        let repo_name = root.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("default")
+                            .to_string();
+                        if let Err(e) = wm.add_repo(repo_name.clone(), root.clone()) {
+                            tracing::warn!("Failed to add repo {}: {}", repo_name, e);
+                            continue;
+                        }
+                        let sf = SecurityFilter::new(root);
+                        let count = index_workspace_via_manager(root, &repo_name, &mut wm, &sf);
+                        tracing::info!("Indexed {} files from repo '{}'", count, repo_name);
+                        total += count;
+                    }
+                    wm.detect_cross_repo_edges();
+                    tracing::info!("Detected {} cross-repo edges", wm.cross_repo_edges().len());
+                    total
+                }).await.unwrap_or(0)
+            } else {
+                // Single repo: use existing Indexer
                 let idx_clone = Arc::clone(&indexer_bg);
                 let ws = ws_root.clone();
-                let sf = security_filter;
-                let count = tokio::task::spawn_blocking(move || {
+                let sf = SecurityFilter::new(&ws);
+                tokio::task::spawn_blocking(move || {
                     let mut idx = idx_clone.blocking_lock();
                     index_workspace_inner(&ws, &mut idx, &sf)
-                }).await.unwrap_or(0);
-                tracing::info!("Indexed {} files", count);
-                count
+                }).await.unwrap_or(0)
             };
+            tracing::info!("Indexed {} files total", files_indexed);
 
             if files_indexed > 0 {
-                let new_graph = {
+                let new_graph = if let Some(wm) = &ws_manager_bg {
+                    let wm = wm.lock().await;
+                    wm.unified_graph()
+                } else {
                     let idx = indexer_bg.lock().await;
                     idx.graph().clone()
                 };
+
                 let stats = new_graph.stats();
                 tracing::info!(
                     "Graph ready: {} nodes, {} edges, {} files",
@@ -105,12 +176,18 @@ async fn main() -> Result<()> {
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
+                        let emb = Arc::new(emb_engine);
+                        let _ = embedding_engine_bg.set(Arc::clone(&emb));
+
                         let eng = engine_bg.lock().await;
                         let nodes = eng.graph().all_nodes();
                         let mut embedded = 0usize;
                         for node in &nodes {
                             let text = format!("{} {}", node.name, node.signature);
-                            if let Ok(_vec) = emb_engine.embed(&text) {
+                            if let Ok(vec) = emb.embed(&text) {
+                                if let Some(vs) = eng.vector_store() {
+                                    let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
+                                }
                                 embedded += 1;
                             }
                         }
@@ -126,34 +203,49 @@ async fn main() -> Result<()> {
         });
     }
 
-    let embedding_engine_for_watcher: Option<Arc<EmbeddingEngine>> = None;
-
-    // ── Start file watcher entirely in background ───────────────────
+    // ── Start file watcher(s) entirely in background ────────────────
+    // For multi-repo, we merge all watcher events into a single channel.
     {
         let engine_clone = Arc::clone(&engine);
         let indexer_clone = Arc::clone(&indexer);
         let graph_store_clone = Arc::clone(&graph_store);
-        let emb_engine_clone = embedding_engine_for_watcher;
-        let ws_root = workspace_root.clone();
+        let emb_engine_clone = Arc::clone(&embedding_engine);
+        let ws_manager_clone = workspace_manager.clone();
+        let ws_roots_watch = workspace_roots.clone();
 
         tokio::spawn(async move {
-            // start_watcher can be slow on large dirs — run in spawn_blocking
-            let watcher_result = tokio::task::spawn_blocking({
-                let ws = ws_root.clone();
-                move || watcher::start_watcher(ws)
-            }).await;
+            // Merge watchers from all workspace roots into a single channel
+            let (merged_tx, mut merged_rx) = tokio::sync::mpsc::unbounded_channel::<(watcher::FileEvent, PathBuf)>();
 
-            let Ok(Ok((_watcher, mut rx))) = watcher_result else {
-                tracing::warn!("Failed to start file watcher");
-                return;
-            };
-            tracing::info!("File watcher started");
+            let mut _watcher_handles = Vec::new();
+            for root in &ws_roots_watch {
+                let watcher_result = tokio::task::spawn_blocking({
+                    let ws = root.clone();
+                    move || watcher::start_watcher(ws)
+                }).await;
 
-            // Keep the _watcher alive so it keeps watching
-            let _watcher_handle = _watcher;
+                match watcher_result {
+                    Ok(Ok((w, mut rx))) => {
+                        _watcher_handles.push(w);
+                        let tx = merged_tx.clone();
+                        let root_for_task = root.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = rx.recv().await {
+                                let _ = tx.send((event, root_for_task.clone()));
+                            }
+                        });
+                        tracing::info!("File watcher started for {}", root.display());
+                    }
+                    _ => {
+                        tracing::warn!("Failed to start file watcher for {}", root.display());
+                    }
+                }
+            }
+            drop(merged_tx); // Drop original sender so merged_rx ends when all watchers close
+
             let mut change_tracker = ChangeTracker::new();
 
-            while let Some(event) = rx.recv().await {
+            while let Some((event, ws_root)) = merged_rx.recv().await {
                 let rel_path = event
                     .path
                     .strip_prefix(&ws_root)
@@ -161,68 +253,99 @@ async fn main() -> Result<()> {
                     .to_string_lossy()
                     .replace('\\', "/");
 
-                tracing::debug!("File event: {:?} {}", event.kind, rel_path);
+                tracing::debug!("File event: {:?} {} (root: {})", event.kind, rel_path, ws_root.display());
 
-                let mut idx = indexer_clone.lock().await;
+                // Determine repo name for multi-repo
+                let repo_name = ws_root.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("default")
+                    .to_string();
 
-                // Capture old symbols before re-indexing (for diff)
-                let old_symbols: Vec<lattice_core::symbols::Symbol> = idx.graph().all_nodes().iter()
-                    .filter(|n| n.file == rel_path)
-                    .map(|n| lattice_core::symbols::Symbol {
-                        id: n.id.clone(),
-                        kind: n.kind,
-                        name: n.name.clone(),
-                        signature: n.signature.clone(),
-                        body: n.body.clone(),
-                        file: n.file.clone(),
-                        line: n.line,
-                        end_line: n.end_line,
-                        is_exported: n.is_exported,
-                        language: n.language,
-                        references: vec![],
-                        imports: vec![],
-                    })
-                    .collect();
+                // Get old symbols for diff (from engine's current graph)
+                let old_symbols: Vec<lattice_core::symbols::Symbol> = {
+                    let eng = engine_clone.lock().await;
+                    eng.graph().all_nodes().iter()
+                        .filter(|n| n.file == rel_path)
+                        .map(|n| lattice_core::symbols::Symbol {
+                            id: n.id.clone(),
+                            kind: n.kind,
+                            name: n.name.clone(),
+                            signature: n.signature.clone(),
+                            body: n.body.clone(),
+                            file: n.file.clone(),
+                            line: n.line,
+                            end_line: n.end_line,
+                            is_exported: n.is_exported,
+                            language: n.language,
+                            references: vec![],
+                            imports: vec![],
+                        })
+                        .collect()
+                };
 
-                match event.kind {
-                    FileEventKind::Created | FileEventKind::Modified => {
-                        if let Ok(content) = std::fs::read_to_string(&event.path) {
-                            if let Err(e) = idx.index_file_content(&rel_path, &content) {
-                                tracing::warn!("Failed to re-index {}: {}", rel_path, e);
-                                continue;
-                            }
-
-                            // Diff symbols and record co-changes
-                            if let Ok(new_parsed) = parser::parse_file(&rel_path, &content) {
-                                let changes = diff::diff_symbols(&old_symbols, &new_parsed.symbols);
-                                if !changes.is_empty() {
-                                    let changed_names: Vec<String> = changes.iter()
-                                        .map(|c| c.name.clone())
-                                        .collect();
-
-                                    // Record changes individually
-                                    for change in &changes {
-                                        change_tracker.record_change(change);
-                                    }
-
-                                    // Record as a batch for co-change detection
-                                    change_tracker.record_batch(changed_names);
+                // Index the file change
+                if let Some(wm) = &ws_manager_clone {
+                    let mut wm = wm.lock().await;
+                    match event.kind {
+                        FileEventKind::Created | FileEventKind::Modified => {
+                            if let Ok(content) = std::fs::read_to_string(&event.path) {
+                                if let Err(e) = wm.index_file(&repo_name, &rel_path, &content) {
+                                    tracing::warn!("Failed to re-index {}: {}", rel_path, e);
+                                    continue;
                                 }
                             }
                         }
+                        FileEventKind::Deleted => {
+                            wm.remove_file(&repo_name, &rel_path);
+                        }
                     }
-                    FileEventKind::Deleted => {
-                        idx.remove_file(&rel_path);
+                } else {
+                    let mut idx = indexer_clone.lock().await;
+                    match event.kind {
+                        FileEventKind::Created | FileEventKind::Modified => {
+                            if let Ok(content) = std::fs::read_to_string(&event.path) {
+                                if let Err(e) = idx.index_file_content(&rel_path, &content) {
+                                    tracing::warn!("Failed to re-index {}: {}", rel_path, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        FileEventKind::Deleted => {
+                            idx.remove_file(&rel_path);
+                        }
                     }
                 }
 
-                // Update engine with new graph
-                let mut new_graph = idx.graph().clone();
+                // Diff symbols and record co-changes
+                if matches!(event.kind, FileEventKind::Created | FileEventKind::Modified) {
+                    if let Ok(content) = std::fs::read_to_string(&event.path) {
+                        if let Ok(new_parsed) = parser::parse_file(&rel_path, &content) {
+                            let changes = diff::diff_symbols(&old_symbols, &new_parsed.symbols);
+                            if !changes.is_empty() {
+                                let changed_names: Vec<String> = changes.iter()
+                                    .map(|c| c.name.clone())
+                                    .collect();
+                                for change in &changes {
+                                    change_tracker.record_change(change);
+                                }
+                                change_tracker.record_batch(changed_names);
+                            }
+                        }
+                    }
+                }
+
+                // Build updated graph
+                let mut new_graph = if let Some(wm) = &ws_manager_clone {
+                    let wm = wm.lock().await;
+                    wm.unified_graph()
+                } else {
+                    let idx = indexer_clone.lock().await;
+                    idx.graph().clone()
+                };
 
                 // Add CoChanges edges for any pairs that reach threshold
                 let co_pairs = change_tracker.get_co_change_pairs(3);
                 for (sym_a, sym_b, _count) in &co_pairs {
-                    // Find the SymbolIds for these symbols
                     let id_a = new_graph.all_node_ids().iter()
                         .find(|id| id.name == *sym_a)
                         .cloned()
@@ -236,24 +359,24 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Re-embed changed nodes if embedding engine is available
-                if let Some(ref emb_engine) = emb_engine_clone {
-                    let file_nodes: Vec<_> = new_graph.all_nodes().into_iter()
-                        .filter(|n| n.file == rel_path)
-                        .collect();
+                // Update engine with new graph and re-embed changed nodes if possible
+                {
                     let mut eng = engine_clone.lock().await;
-                    for node in &file_nodes {
-                        let text = format!("{} {}", node.name, node.signature);
-                        if let Ok(vec) = emb_engine.embed(&text) {
-                            if let Some(vs) = eng.vector_store() {
-                                let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
+                    eng.update_graph(new_graph.clone());
+
+                    if let Some(emb_engine) = emb_engine_clone.get() {
+                        let file_nodes: Vec<_> = new_graph.all_nodes().into_iter()
+                            .filter(|n| n.file == rel_path)
+                            .collect();
+                        for node in &file_nodes {
+                            let text = format!("{} {}", node.name, node.signature);
+                            if let Ok(vec) = emb_engine.embed(&text) {
+                                if let Some(vs) = eng.vector_store() {
+                                    let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
+                                }
                             }
                         }
                     }
-                    eng.update_graph(new_graph.clone());
-                } else {
-                    let mut eng = engine_clone.lock().await;
-                    eng.update_graph(new_graph.clone());
                 }
 
                 // Persist to graph store (best effort)
@@ -268,13 +391,18 @@ async fn main() -> Result<()> {
     }
 
     // ── Create McpHandler and start StdioServer ──────────────────────
-    tracing::info!("Creating MCP handler");
+    let session_id = generate_session_id();
+    tracing::info!("Creating MCP handler (session: {})", session_id);
     let handler = Arc::new(McpHandler::new(
         engine,
         indexer,
         memory_store,
         graph_store,
+        embedding_engine,
         workspace_root,
+        session_id,
+        workspace_manager,
+        workspace_roots,
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
@@ -284,25 +412,74 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse workspace root from command-line args.
-/// Supports `--workspace <path>` or defaults to current directory.
-fn parse_workspace_root() -> PathBuf {
+/// Parse workspace roots from command-line args.
+/// Supports multiple `--workspace <path>` flags. Defaults to current directory.
+/// Applies anti-double-indexing: if root A is a parent of root B, B is dropped.
+fn parse_workspace_roots() -> Vec<PathBuf> {
     let args: Vec<String> = std::env::args().collect();
+    let mut roots = Vec::new();
 
-    for i in 0..args.len() {
+    let mut i = 0;
+    while i < args.len() {
         if args[i] == "--workspace" || args[i] == "-w" {
             if let Some(path) = args.get(i + 1) {
                 let p = PathBuf::from(path);
                 if p.is_dir() {
-                    return p.canonicalize().unwrap_or(p);
+                    roots.push(p.canonicalize().unwrap_or(p));
                 } else {
-                    eprintln!("Warning: --workspace path '{}' is not a directory, using cwd", path);
+                    eprintln!("Warning: --workspace path '{}' is not a directory, skipping", path);
                 }
+                i += 2;
+                continue;
             }
         }
+        i += 1;
     }
 
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    if roots.is_empty() {
+        roots.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    }
+
+    // Anti-double-indexing: remove any root that is a subdirectory of another
+    deduplicate_roots(roots)
+}
+
+/// Remove roots that are subdirectories of other roots.
+fn deduplicate_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort_by(|a, b| a.as_os_str().len().cmp(&b.as_os_str().len()));
+    let mut result = Vec::new();
+    for root in &roots {
+        let is_child = result.iter().any(|parent: &PathBuf| root.starts_with(parent));
+        if !is_child {
+            result.push(root.clone());
+        }
+    }
+    if result.is_empty() && !roots.is_empty() {
+        result.push(roots[0].clone());
+    }
+    result
+}
+
+/// Generate a unique session identifier using timestamp + hash.
+fn generate_session_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let mut hasher = DefaultHasher::new();
+    now.as_nanos().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let h = hasher.finish();
+
+    format!(
+        "s-{:08x}{:08x}",
+        (h >> 32) as u32,
+        now.subsec_nanos()
+    )
 }
 
 /// Walk the workspace directory and index all supported files.
@@ -313,17 +490,34 @@ fn index_workspace_inner(
     security_filter: &SecurityFilter,
 ) -> usize {
     let mut count = 0;
-    walk_and_index(root, root, indexer, security_filter, &mut count);
+    walk_and_index(root, root, security_filter, &mut count, &mut |rel_path, content| {
+        indexer.index_file_content(rel_path, content).is_ok()
+    });
     count
 }
 
-/// Recursively walk a directory and index files.
+/// Walk the workspace directory and index via WorkspaceManager.
+fn index_workspace_via_manager(
+    root: &PathBuf,
+    repo_name: &str,
+    manager: &mut WorkspaceManager,
+    security_filter: &SecurityFilter,
+) -> usize {
+    let mut count = 0;
+    let rn = repo_name.to_string();
+    walk_and_index(root, root, security_filter, &mut count, &mut |rel_path, content| {
+        manager.index_file(&rn, rel_path, content).is_ok()
+    });
+    count
+}
+
+/// Recursively walk a directory and index files via a callback.
 fn walk_and_index(
     dir: &PathBuf,
     root: &PathBuf,
-    indexer: &mut Indexer,
     security_filter: &SecurityFilter,
     count: &mut usize,
+    index_fn: &mut dyn FnMut(&str, &str) -> bool,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -334,13 +528,13 @@ fn walk_and_index(
         let path = entry.path();
 
         if path.is_dir() {
-            // Skip excluded directories
+            // Use SecurityFilter for directory exclusions (includes .gitignore patterns)
             if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                if security_filter.is_excluded_dir(dir_name) {
                     continue;
                 }
             }
-            walk_and_index(&path, root, indexer, security_filter, count);
+            walk_and_index(&path, root, security_filter, count, index_fn);
         } else if path.is_file() {
             let rel_path = path
                 .strip_prefix(root)
@@ -348,23 +542,20 @@ fn walk_and_index(
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            // Check watcher filter (extension + excluded dirs/patterns)
-            if !watcher::should_index_file(&rel_path) {
+            // Check security filter (.gitignore + .lattice_ignore + default patterns + excluded dirs)
+            if security_filter.is_excluded(&rel_path) {
                 continue;
             }
 
-            // Check security filter (.lattice_ignore + default secret patterns)
-            if security_filter.is_excluded(&rel_path) {
+            // Check for supported language extension
+            if !watcher::should_index_file(&rel_path) {
                 continue;
             }
 
             // Read and index
             if let Ok(content) = std::fs::read_to_string(&path) {
-                match indexer.index_file_content(&rel_path, &content) {
-                    Ok(()) => *count += 1,
-                    Err(e) => {
-                        tracing::debug!("Failed to index {}: {}", rel_path, e);
-                    }
+                if index_fn(&rel_path, &content) {
+                    *count += 1;
                 }
             }
         }

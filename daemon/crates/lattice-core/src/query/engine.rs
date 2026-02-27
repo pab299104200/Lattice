@@ -198,7 +198,7 @@ impl QueryEngine {
                     if tokens_used + sig_tokens <= budget {
                         context.push(ContextNode {
                             symbol: candidate.node.name.clone(),
-                            kind: format!("{:?}", candidate.node.kind),
+                            kind: candidate.node.kind.short_code().to_string(),
                             file: candidate.node.file.clone(),
                             line: candidate.node.line,
                             skeleton: candidate.node.signature.clone(),
@@ -210,19 +210,12 @@ impl QueryEngine {
                     continue;
                 }
 
-                let centrality = self.graph.centrality(&candidate.node.id);
                 pivots.push(PivotNode {
                     symbol: candidate.node.name.clone(),
-                    kind: format!("{:?}", candidate.node.kind),
+                    kind: candidate.node.kind.short_code().to_string(),
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
                     source: candidate.node.body.clone(),
-                    why: format!(
-                        "score: {:.2}, {}, centrality: {:.2}",
-                        candidate.score,
-                        candidate.relationship_detail,
-                        centrality,
-                    ),
                     score: candidate.score,
                 });
                 tokens_used += source_tokens;
@@ -235,7 +228,7 @@ impl QueryEngine {
 
                 context.push(ContextNode {
                     symbol: candidate.node.name.clone(),
-                    kind: format!("{:?}", candidate.node.kind),
+                    kind: candidate.node.kind.short_code().to_string(),
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
                     skeleton: candidate.node.signature.clone(),
@@ -263,9 +256,6 @@ impl QueryEngine {
                 serde_json::json!({
                     "content": m.content,
                     "type": m.memory_type.as_str(),
-                    "stale": m.is_stale,
-                    "stale_reason": m.stale_reason,
-                    "confidence": m.confidence,
                 })
             }).collect()
         } else {

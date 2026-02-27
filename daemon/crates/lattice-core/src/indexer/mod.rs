@@ -38,6 +38,11 @@ impl Indexer {
         &self.graph
     }
 
+    /// Access the code graph mutably (e.g., for adding LSP edges).
+    pub fn graph_mut(&mut self) -> &mut CodeGraph {
+        &mut self.graph
+    }
+
     /// Parse and index a single file by its relative path and content.
     ///
     /// If the file was previously indexed, its old symbols are replaced.

@@ -239,7 +239,7 @@ fn test_query_no_filters() {
 // ─── Detailed why_included tests ────────────────────────────────────
 
 #[test]
-fn test_why_included_has_detail() {
+fn test_pivot_has_positive_score() {
     let graph = build_test_graph();
     let mut engine = QueryEngine::new(graph, None, None);
 
@@ -247,9 +247,9 @@ fn test_why_included_has_detail() {
 
     for pivot in &capsule.pivots {
         assert!(
-            pivot.why.contains("score:"),
-            "Pivot why should contain 'score:' — got '{}'",
-            pivot.why
+            pivot.score > 0.0,
+            "Pivot score should be positive — got {}",
+            pivot.score
         );
     }
 }

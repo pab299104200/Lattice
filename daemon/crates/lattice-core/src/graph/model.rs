@@ -16,6 +16,21 @@ pub enum EdgeKind {
     CoChanges,
 }
 
+impl EdgeKind {
+    /// Compact single-char code for token-efficient output.
+    pub fn short_code(&self) -> &'static str {
+        match self {
+            EdgeKind::Calls => "C",
+            EdgeKind::Imports => "I",
+            EdgeKind::Implements => "M",
+            EdgeKind::Extends => "E",
+            EdgeKind::TypeRef => "T",
+            EdgeKind::Contains => "N",
+            EdgeKind::CoChanges => "X",
+        }
+    }
+}
+
 /// A node in the code dependency graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
@@ -332,6 +347,72 @@ impl CodeGraph {
             .count();
 
         (in_degree + out_degree) as f64 / (total - 1) as f64
+    }
+
+    /// Find all simple paths from one node to another, following only Calls edges.
+    /// Returns up to `max_results` paths, each path is a Vec of &GraphNode.
+    pub fn find_call_paths(
+        &self,
+        from: &SymbolId,
+        to: &SymbolId,
+        max_depth: usize,
+        max_results: usize,
+    ) -> Vec<Vec<&GraphNode>> {
+        let from_idx = match self.index.get(from) {
+            Some(&idx) => idx,
+            None => return Vec::new(),
+        };
+        let to_idx = match self.index.get(to) {
+            Some(&idx) => idx,
+            None => return Vec::new(),
+        };
+
+        // Build a subgraph containing only Calls edges
+        let calls_only: petgraph::graph::DiGraph<NodeIndex, ()> = {
+            let mut sub = petgraph::graph::DiGraph::new();
+            let mut idx_map: HashMap<NodeIndex, petgraph::graph::NodeIndex> = HashMap::new();
+            for idx in self.graph.node_indices() {
+                let new_idx = sub.add_node(idx);
+                idx_map.insert(idx, new_idx);
+            }
+            for edge_idx in self.graph.edge_indices() {
+                if let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) {
+                    if let Some(weight) = self.graph.edge_weight(edge_idx) {
+                        if *weight == EdgeKind::Calls {
+                            if let (Some(&s), Some(&t)) = (idx_map.get(&src), idx_map.get(&tgt)) {
+                                sub.add_edge(s, t, ());
+                            }
+                        }
+                    }
+                }
+            }
+            sub
+        };
+
+        // Map our from/to indices through the subgraph
+        let sub_from = calls_only.node_indices()
+            .find(|&idx| calls_only[idx] == from_idx);
+        let sub_to = calls_only.node_indices()
+            .find(|&idx| calls_only[idx] == to_idx);
+
+        let (sub_from, sub_to) = match (sub_from, sub_to) {
+            (Some(f), Some(t)) => (f, t),
+            _ => return Vec::new(),
+        };
+
+        // max_depth is number of edges/hops; intermediate_nodes = edges - 1
+        let max_intermediates = max_depth.saturating_sub(1);
+        let paths: Vec<Vec<petgraph::graph::NodeIndex>> =
+            petgraph::algo::all_simple_paths(&calls_only, sub_from, sub_to, 0, Some(max_intermediates))
+                .take(max_results)
+                .collect();
+
+        paths.iter().map(|path| {
+            path.iter().map(|&sub_idx| {
+                let original_idx = calls_only[sub_idx];
+                &self.graph[original_idx]
+            }).collect()
+        }).collect()
     }
 }
 

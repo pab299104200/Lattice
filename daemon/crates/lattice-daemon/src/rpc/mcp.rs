@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use serde_json::{json, Value};
 
+use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::{Memory, MemoryType, MemoryStore};
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::GraphStore;
 use lattice_core::watcher::should_index_file;
+use lattice_core::workspace::WorkspaceManager;
 
 use super::server::RequestHandler;
 
@@ -19,7 +21,12 @@ pub struct McpHandler {
     indexer: Arc<Mutex<Indexer>>,
     memory_store: Arc<Mutex<MemoryStore>>,
     graph_store: Arc<Mutex<GraphStore>>,
+    embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
     workspace_root: PathBuf,
+    session_id: String,
+    #[allow(dead_code)]
+    workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
+    workspace_roots: Vec<PathBuf>,
 }
 
 impl McpHandler {
@@ -29,14 +36,22 @@ impl McpHandler {
         indexer: Arc<Mutex<Indexer>>,
         memory_store: Arc<Mutex<MemoryStore>>,
         graph_store: Arc<Mutex<GraphStore>>,
+        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
         workspace_root: PathBuf,
+        session_id: String,
+        workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
+        workspace_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
             engine,
             indexer,
             memory_store,
             graph_store,
+            embedding_engine,
             workspace_root,
+            session_id,
+            workspace_manager,
+            workspace_roots,
         }
     }
 
@@ -61,8 +76,8 @@ impl McpHandler {
         json!({
             "tools": [
                 {
-                    "name": "query_context",
-                    "description": "Query the code graph for relevant context. Returns a Context Capsule with pivots (full source) and context nodes (signatures).",
+                    "name": "get_context_capsule",
+                    "description": "Most relevant code for your task — always call first. Returns pivots (full source) and context nodes (signatures).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -87,6 +102,12 @@ impl McpHandler {
                             "file": {
                                 "type": "string",
                                 "description": "File path containing the symbol"
+                            },
+                            "detail": {
+                                "type": "string",
+                                "description": "Detail level: 'summary' (default) or 'full' (includes source, end_line, is_exported, dep lists)",
+                                "enum": ["summary", "full"],
+                                "default": "summary"
                             }
                         },
                         "required": ["name", "file"]
@@ -129,8 +150,8 @@ impl McpHandler {
                     }
                 },
                 {
-                    "name": "blast_radius",
-                    "description": "Compute the blast radius of changing a symbol — all transitive dependents up to N hops.",
+                    "name": "get_impact_graph",
+                    "description": "What breaks if a symbol changes — all transitive dependents up to N hops.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -165,14 +186,20 @@ impl McpHandler {
                                 "type": "integer",
                                 "description": "Maximum number of results (default: 20)",
                                 "default": 20
+                            },
+                            "detail": {
+                                "type": "string",
+                                "description": "Detail level: 'summary' (default) or 'full' (adds kind, exported, signature)",
+                                "enum": ["summary", "full"],
+                                "default": "summary"
                             }
                         },
                         "required": ["pattern"]
                     }
                 },
                 {
-                    "name": "get_file_context",
-                    "description": "Get all symbols defined in a given file.",
+                    "name": "get_skeleton",
+                    "description": "Token-efficient file structure view — symbols, kinds, and dependent counts.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -185,8 +212,8 @@ impl McpHandler {
                     }
                 },
                 {
-                    "name": "store_memory",
-                    "description": "Store a memory (insight, decision, or pattern) for later recall.",
+                    "name": "save_observation",
+                    "description": "Store an observation, decision, or pattern for later recall.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -209,8 +236,27 @@ impl McpHandler {
                     }
                 },
                 {
-                    "name": "recall_memories",
-                    "description": "Recall stored memories relevant to a query.",
+                    "name": "get_session_context",
+                    "description": "Get memories from the current session plus relevant memories from previous sessions.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Optional query to filter memories"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of memories to return (default: 20)",
+                                "default": 20
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "search_memory",
+                    "description": "Search all sessions for memories matching a query.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -225,6 +271,87 @@ impl McpHandler {
                             }
                         },
                         "required": ["query"]
+                    }
+                },
+                {
+                    "name": "search_logic_flow",
+                    "description": "Execution paths between functions — finds call chains from one symbol to another.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "from": {
+                                "type": "string",
+                                "description": "Source symbol name"
+                            },
+                            "to": {
+                                "type": "string",
+                                "description": "Target symbol name"
+                            },
+                            "from_file": {
+                                "type": "string",
+                                "description": "Optional file path to disambiguate source symbol"
+                            },
+                            "to_file": {
+                                "type": "string",
+                                "description": "Optional file path to disambiguate target symbol"
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum path depth (default: 5)",
+                                "default": 5
+                            }
+                        },
+                        "required": ["from", "to"]
+                    }
+                },
+                {
+                    "name": "submit_lsp_edges",
+                    "description": "Submit high-confidence edges from LSP call hierarchy to enrich the graph.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "edges": {
+                                "type": "array",
+                                "description": "Array of edges to add",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "from_name": { "type": "string" },
+                                        "from_file": { "type": "string" },
+                                        "to_name": { "type": "string" },
+                                        "to_file": { "type": "string" },
+                                        "kind": { "type": "string", "default": "Calls" }
+                                    },
+                                    "required": ["from_name", "from_file", "to_name", "to_file"]
+                                }
+                            }
+                        },
+                        "required": ["edges"]
+                    }
+                },
+                {
+                    "name": "workspace_setup",
+                    "description": "Get workspace conventions, language breakdown, and recommended configuration.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "format": {
+                                "type": "string",
+                                "description": "Output format: 'json' or 'markdown' (default: 'markdown')",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "index_status",
+                    "description": "Get current indexing status, graph stats, and language breakdown.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
                     }
                 },
                 {
@@ -247,15 +374,20 @@ impl McpHandler {
         let arguments = &params["arguments"];
 
         match tool_name {
-            "query_context" => self.tool_query_context(arguments).await,
+            "get_context_capsule" | "query_context" => self.tool_query_context(arguments).await,
             "get_symbol" => self.tool_get_symbol(arguments).await,
             "get_dependents" => self.tool_get_dependents(arguments).await,
             "get_dependencies" => self.tool_get_dependencies(arguments).await,
-            "blast_radius" => self.tool_blast_radius(arguments).await,
+            "get_impact_graph" | "blast_radius" => self.tool_blast_radius(arguments).await,
             "search_symbols" => self.tool_search_symbols(arguments).await,
-            "get_file_context" => self.tool_get_file_context(arguments).await,
-            "store_memory" => self.tool_store_memory(arguments).await,
-            "recall_memories" => self.tool_recall_memories(arguments).await,
+            "get_skeleton" | "get_file_context" => self.tool_get_file_context(arguments).await,
+            "save_observation" | "store_memory" => self.tool_store_memory(arguments).await,
+            "get_session_context" => self.tool_get_session_context(arguments).await,
+            "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
+            "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
+            "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
+            "workspace_setup" => self.tool_workspace_setup(arguments).await,
+            "index_status" => self.tool_index_status(arguments).await,
             "get_project_rules" => self.tool_get_project_rules(arguments).await,
             _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
         }
@@ -268,8 +400,12 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
 
+        // Embed query text if embedding engine is available (graceful fallback to keyword)
+        let embedding = self.embedding_engine.get()
+            .and_then(|eng| eng.embed(query).ok());
+
         let mut engine = self.engine.lock().await;
-        let capsule = engine.query(query, None);
+        let capsule = engine.query(query, embedding.as_deref());
         serde_json::to_value(&capsule)
             .map(|v| wrap_tool_result(v))
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))
@@ -282,10 +418,10 @@ impl McpHandler {
         let file = args["file"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
+        let detail = args["detail"].as_str().unwrap_or("summary");
 
         let engine = self.engine.lock().await;
 
-        // Direct graph lookup: find node matching name and file
         let node = engine.graph().all_nodes().into_iter()
             .find(|n| n.name == name && n.file == file);
 
@@ -293,26 +429,35 @@ impl McpHandler {
             Some(n) => {
                 let dependents = engine.graph().get_dependents(&n.id);
                 let dependencies = engine.graph().get_dependencies(&n.id);
-                Ok(wrap_tool_result(json!({
+
+                let mut result = json!({
                     "symbol": n.name,
-                    "kind": format!("{:?}", n.kind),
+                    "kind": n.kind.short_code(),
                     "file": n.file,
                     "line": n.line,
-                    "end_line": n.end_line,
-                    "source": n.body,
                     "signature": n.signature,
-                    "is_exported": n.is_exported,
-                    "dependents": dependents.iter().map(|(dep, edge)| json!({
-                        "symbol": dep.name,
-                        "file": dep.file,
-                        "edge": format!("{:?}", edge)
-                    })).collect::<Vec<_>>(),
-                    "dependencies": dependencies.iter().map(|(dep, edge)| json!({
-                        "symbol": dep.name,
-                        "file": dep.file,
-                        "edge": format!("{:?}", edge)
-                    })).collect::<Vec<_>>()
-                })))
+                    "dependents": dependents.len(),
+                    "dependencies": dependencies.len()
+                });
+
+                if detail == "full" {
+                    let obj = result.as_object_mut().unwrap();
+                    obj.insert("source".to_string(), json!(n.body));
+                    obj.insert("end_line".to_string(), json!(n.end_line));
+                    obj.insert("is_exported".to_string(), json!(n.is_exported));
+                    obj.insert("dep_list".to_string(), json!(
+                        dependents.iter().map(|(dep, edge)| json!({
+                            "s": dep.name, "f": dep.file, "e": edge.short_code()
+                        })).collect::<Vec<_>>()
+                    ));
+                    obj.insert("deps_list".to_string(), json!(
+                        dependencies.iter().map(|(dep, edge)| json!({
+                            "s": dep.name, "f": dep.file, "e": edge.short_code()
+                        })).collect::<Vec<_>>()
+                    ));
+                }
+
+                Ok(wrap_tool_result(result))
             }
             None => Ok(wrap_tool_result(json!({
                 "error": format!("Symbol '{}' not found in '{}'", name, file)
@@ -330,7 +475,6 @@ impl McpHandler {
 
         let engine = self.engine.lock().await;
 
-        // Find the actual node by name and file
         let node = engine.graph().all_nodes().into_iter()
             .find(|n| n.name == name && n.file == file);
 
@@ -339,11 +483,11 @@ impl McpHandler {
                 let dependents = engine.graph().get_dependents(&n.id);
                 let dep_values: Vec<Value> = dependents.iter().map(|(dep, edge)| {
                     json!({
-                        "symbol": dep.name,
-                        "kind": format!("{:?}", dep.kind),
-                        "file": dep.file,
-                        "line": dep.line,
-                        "edge": format!("{:?}", edge)
+                        "s": dep.name,
+                        "k": dep.kind.short_code(),
+                        "f": dep.file,
+                        "l": dep.line,
+                        "e": edge.short_code()
                     })
                 }).collect();
 
@@ -378,11 +522,11 @@ impl McpHandler {
                 let dependencies = engine.graph().get_dependencies(&n.id);
                 let dep_values: Vec<Value> = dependencies.iter().map(|(dep, edge)| {
                     json!({
-                        "symbol": dep.name,
-                        "kind": format!("{:?}", dep.kind),
-                        "file": dep.file,
-                        "line": dep.line,
-                        "edge": format!("{:?}", edge)
+                        "s": dep.name,
+                        "k": dep.kind.short_code(),
+                        "f": dep.file,
+                        "l": dep.line,
+                        "e": edge.short_code()
                     })
                 }).collect();
 
@@ -415,16 +559,15 @@ impl McpHandler {
 
         match node {
             Some(n) => {
-                // Use transitive dependents (incoming edges only)
                 let affected = engine.graph().get_transitive_dependents(&n.id, hops);
                 let affected_files: HashSet<&str> = affected.iter().map(|a| a.file.as_str()).collect();
 
                 let affected_values: Vec<Value> = affected.iter().map(|a| {
                     json!({
-                        "symbol": a.name,
-                        "kind": format!("{:?}", a.kind),
-                        "file": a.file,
-                        "line": a.line
+                        "s": a.name,
+                        "k": a.kind.short_code(),
+                        "f": a.file,
+                        "l": a.line
                     })
                 }).collect();
 
@@ -432,8 +575,8 @@ impl McpHandler {
                     "symbol": name,
                     "file": file,
                     "hops": hops,
-                    "affected_symbols": affected_values,
-                    "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
+                    "affected": affected_values,
+                    "files": affected_files.into_iter().collect::<Vec<_>>(),
                     "count": affected_values.len()
                 })))
             }
@@ -448,22 +591,26 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: pattern".to_string()))?;
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let detail = args["detail"].as_str().unwrap_or("summary");
 
         let engine = self.engine.lock().await;
         let pattern_lower = pattern.to_lowercase();
 
-        // Direct graph search: case-insensitive substring match on name
         let mut results: Vec<Value> = engine.graph().all_nodes().into_iter()
             .filter(|n| n.name.to_lowercase().contains(&pattern_lower))
             .map(|n| {
-                json!({
+                let mut obj = json!({
                     "symbol": n.name,
-                    "kind": format!("{:?}", n.kind),
                     "file": n.file,
-                    "line": n.line,
-                    "is_exported": n.is_exported,
-                    "signature": n.signature
-                })
+                    "line": n.line
+                });
+                if detail == "full" {
+                    let m = obj.as_object_mut().unwrap();
+                    m.insert("kind".to_string(), json!(n.kind.short_code()));
+                    m.insert("exported".to_string(), json!(n.is_exported));
+                    m.insert("signature".to_string(), json!(n.signature));
+                }
+                obj
             })
             .collect();
 
@@ -486,21 +633,13 @@ impl McpHandler {
         // Direct graph lookup: all symbols in the file
         let file_nodes = engine.file_symbols(file);
         let symbols: Vec<Value> = file_nodes.iter().map(|n| {
-            let dependents = engine.graph().get_dependents(&n.id);
-            let dependent_files: HashSet<&str> = dependents.iter()
-                .map(|(d, _)| d.file.as_str())
-                .collect();
-
+            let dep_count = engine.graph().get_dependents(&n.id).len();
             json!({
                 "symbol": n.name,
-                "kind": format!("{:?}", n.kind),
-                "file": n.file,
+                "kind": n.kind.short_code(),
                 "line": n.line,
-                "end_line": n.end_line,
-                "is_exported": n.is_exported,
-                "signature": n.signature,
-                "dependent_count": dependents.len(),
-                "dependent_files": dependent_files.len()
+                "exported": n.is_exported,
+                "dependents": dep_count
             })
         }).collect();
 
@@ -530,6 +669,7 @@ impl McpHandler {
 
         let memory = Memory {
             id: String::new(),
+            session_id: self.session_id.clone(),
             content: content.to_string(),
             memory_type: memory_type.clone(),
             confidence: 1.0,
@@ -554,17 +694,68 @@ impl McpHandler {
         })))
     }
 
-    async fn tool_recall_memories(&self, args: &Value) -> Result<Value, (i32, String)> {
+    async fn tool_get_session_context(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let query = args["query"].as_str();
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+
+        let store = self.memory_store.lock().await;
+
+        // Current session memories (always included)
+        let current = store.get_session_memories(&self.session_id, limit)
+            .map_err(|e| (-32603, format!("Failed to get session memories: {}", e)))?;
+
+        // Previous session memories: if query provided, search; otherwise get recent across sessions
+        let remaining = limit.saturating_sub(current.len());
+        let previous = if remaining > 0 {
+            let keyword = query.unwrap_or("");
+            if keyword.is_empty() {
+                // Get recent memories from other sessions
+                store.search_across_sessions("", Some(&self.session_id), remaining)
+                    .unwrap_or_default()
+            } else {
+                store.search_across_sessions(keyword, Some(&self.session_id), remaining)
+                    .unwrap_or_default()
+            }
+        } else {
+            vec![]
+        };
+
+        let format_memory = |m: &Memory, is_current: bool| {
+            let mut obj = json!({
+                "id": m.id,
+                "content": m.content,
+                "type": m.memory_type.as_str(),
+                "linked_symbols": m.linked_symbols
+            });
+            if !is_current {
+                let o = obj.as_object_mut().unwrap();
+                o.insert("session".to_string(), json!(m.session_id));
+                if m.is_stale {
+                    o.insert("stale".to_string(), json!(true));
+                }
+            }
+            obj
+        };
+
+        let current_values: Vec<Value> = current.iter().map(|m| format_memory(m, true)).collect();
+        let previous_values: Vec<Value> = previous.iter().map(|m| format_memory(m, false)).collect();
+
+        Ok(wrap_tool_result(json!({
+            "session_id": self.session_id,
+            "current": current_values,
+            "previous": previous_values
+        })))
+    }
+
+    async fn tool_search_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
         let query = args["query"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
         let store = self.memory_store.lock().await;
-        let mut memories = store.search_by_keyword(query)
-            .map_err(|e| (-32603, format!("Failed to recall memories: {}", e)))?;
-
-        memories.truncate(limit);
+        let memories = store.search_across_sessions(query, None, limit)
+            .map_err(|e| (-32603, format!("Failed to search memories: {}", e)))?;
 
         let memory_values: Vec<Value> = memories
             .iter()
@@ -572,13 +763,9 @@ impl McpHandler {
                 json!({
                     "id": m.id,
                     "content": m.content,
-                    "memory_type": m.memory_type.as_str(),
-                    "confidence": m.confidence,
+                    "type": m.memory_type.as_str(),
                     "linked_symbols": m.linked_symbols,
-                    "is_stale": m.is_stale,
-                    "stale_reason": m.stale_reason,
-                    "created_at": m.created_at,
-                    "access_count": m.access_count
+                    "session": m.session_id
                 })
             })
             .collect();
@@ -588,6 +775,155 @@ impl McpHandler {
             "memories": memory_values,
             "count": memory_values.len()
         })))
+    }
+
+    async fn tool_submit_lsp_edges(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let edges = args["edges"]
+            .as_array()
+            .ok_or((-32602, "Missing required parameter: edges (array)".to_string()))?;
+
+        let mut indexer = self.indexer.lock().await;
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+
+        for edge in edges {
+            let from_name = edge["from_name"].as_str().unwrap_or("");
+            let from_file = edge["from_file"].as_str().unwrap_or("");
+            let to_name = edge["to_name"].as_str().unwrap_or("");
+            let to_file = edge["to_file"].as_str().unwrap_or("");
+            let kind_str = edge["kind"].as_str().unwrap_or("Calls");
+
+            let edge_kind = match kind_str {
+                "Calls" | "C" => lattice_core::graph::model::EdgeKind::Calls,
+                "Imports" | "I" => lattice_core::graph::model::EdgeKind::Imports,
+                "TypeRef" | "T" => lattice_core::graph::model::EdgeKind::TypeRef,
+                "Implements" | "M" => lattice_core::graph::model::EdgeKind::Implements,
+                "Extends" | "E" => lattice_core::graph::model::EdgeKind::Extends,
+                _ => lattice_core::graph::model::EdgeKind::Calls,
+            };
+
+            // Find the nodes in the graph
+            let graph = indexer.graph();
+            let from_id = graph.all_nodes().iter()
+                .find(|n| n.name == from_name && n.file == from_file)
+                .map(|n| n.id.clone());
+            let to_id = graph.all_nodes().iter()
+                .find(|n| n.name == to_name && n.file == to_file)
+                .map(|n| n.id.clone());
+
+            if let (Some(fid), Some(tid)) = (from_id, to_id) {
+                indexer.graph_mut().add_edge(&fid, &tid, edge_kind);
+                added += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+
+        // Propagate updated graph to engine
+        let new_graph = indexer.graph().clone();
+        {
+            let mut engine = self.engine.lock().await;
+            engine.update_graph(new_graph);
+        }
+
+        Ok(wrap_tool_result(json!({
+            "added": added,
+            "skipped": skipped
+        })))
+    }
+
+    async fn tool_workspace_setup(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let format = args["format"].as_str().unwrap_or("markdown");
+
+        let engine = self.engine.lock().await;
+        let all_nodes = engine.graph().all_nodes();
+        let stats = engine.graph().stats();
+
+        // Collect unique files and language breakdown
+        let mut file_set = HashSet::new();
+        let mut lang_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for node in &all_nodes {
+            file_set.insert(node.file.clone());
+            *lang_counts.entry(format!("{:?}", node.language)).or_insert(0) += 1;
+        }
+        let files: Vec<String> = file_set.into_iter().collect();
+
+        // Detect project rules
+        let detector = lattice_core::intelligence::RulesDetector::new();
+        let rules = detector.detect_rules(&files);
+
+        if format == "markdown" {
+            let mut md = String::new();
+            md.push_str(&format!("# Workspace Setup\n\n"));
+            md.push_str(&format!("**Files:** {} | **Symbols:** {} | **Edges:** {}\n\n", stats.file_count, stats.node_count, stats.edge_count));
+            md.push_str("## Languages\n\n");
+            for (lang, count) in &lang_counts {
+                md.push_str(&format!("- {}: {} symbols\n", lang, count));
+            }
+            md.push_str("\n## Detected Conventions\n\n");
+            for rule in &rules {
+                md.push_str(&format!("- {} (confidence: {:.0}%, {} occurrences)\n", rule.description, rule.confidence * 100.0, rule.occurrences));
+            }
+            Ok(wrap_tool_result(json!({ "markdown": md })))
+        } else {
+            let rule_values: Vec<Value> = rules.iter().map(|r| json!({
+                "description": r.description,
+                "confidence": r.confidence,
+                "occurrences": r.occurrences,
+            })).collect();
+
+            Ok(wrap_tool_result(json!({
+                "files": stats.file_count,
+                "symbols": stats.node_count,
+                "edges": stats.edge_count,
+                "languages": lang_counts,
+                "rules": rule_values
+            })))
+        }
+    }
+
+    async fn tool_index_status(&self, _args: &Value) -> Result<Value, (i32, String)> {
+        let engine = self.engine.lock().await;
+        let stats = engine.graph().stats();
+        let all_nodes = engine.graph().all_nodes();
+
+        let mut lang_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for node in &all_nodes {
+            *lang_counts.entry(format!("{:?}", node.language)).or_insert(0) += 1;
+        }
+
+        let mut result = json!({
+            "status": "running",
+            "version": env!("CARGO_PKG_VERSION"),
+            "workspace": self.workspace_root.to_string_lossy(),
+            "nodes": stats.node_count,
+            "edges": stats.edge_count,
+            "files": stats.file_count,
+            "languages": lang_counts
+        });
+
+        // Add multi-repo info if applicable
+        if self.workspace_roots.len() > 1 {
+            let obj = result.as_object_mut().unwrap();
+            let roots: Vec<String> = self.workspace_roots.iter()
+                .map(|r| r.to_string_lossy().to_string())
+                .collect();
+            obj.insert("workspaces".to_string(), json!(roots));
+            obj.insert("multi_repo".to_string(), json!(true));
+
+            if let Some(wm) = &self.workspace_manager {
+                let wm = wm.lock().await;
+                let repo_stats: Vec<Value> = wm.repo_stats().iter().map(|s| json!({
+                    "name": s.name,
+                    "files": s.file_count,
+                    "nodes": s.node_count,
+                    "edges": s.edge_count
+                })).collect();
+                obj.insert("repos".to_string(), json!(repo_stats));
+            }
+        }
+
+        Ok(wrap_tool_result(result))
     }
 
     async fn tool_get_project_rules(&self, _args: &Value) -> Result<Value, (i32, String)> {
@@ -622,6 +958,58 @@ impl McpHandler {
             "status": "ok",
             "rules": rule_values,
             "count": rule_values.len()
+        })))
+    }
+
+    async fn tool_search_logic_flow(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let from_name = args["from"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: from".to_string()))?;
+        let to_name = args["to"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: to".to_string()))?;
+        let from_file = args["from_file"].as_str();
+        let to_file = args["to_file"].as_str();
+        let max_depth = args["max_depth"].as_u64().unwrap_or(5) as usize;
+
+        let engine = self.engine.lock().await;
+        let all_nodes = engine.graph().all_nodes();
+
+        // Find source symbol
+        let from_node = all_nodes.iter().find(|n| {
+            n.name == from_name && from_file.map_or(true, |f| n.file == f)
+        });
+        // Find target symbol
+        let to_node = all_nodes.iter().find(|n| {
+            n.name == to_name && to_file.map_or(true, |f| n.file == f)
+        });
+
+        let (from_node, to_node) = match (from_node, to_node) {
+            (Some(f), Some(t)) => (f, t),
+            (None, _) => return Ok(wrap_tool_result(json!({
+                "error": format!("Source symbol '{}' not found", from_name)
+            }))),
+            (_, None) => return Ok(wrap_tool_result(json!({
+                "error": format!("Target symbol '{}' not found", to_name)
+            }))),
+        };
+
+        let paths = engine.graph().find_call_paths(&from_node.id, &to_node.id, max_depth, 10);
+
+        let path_values: Vec<Value> = paths.iter().map(|path| {
+            json!(path.iter().map(|n| json!({
+                "s": n.name,
+                "f": n.file,
+                "l": n.line,
+                "k": n.kind.short_code()
+            })).collect::<Vec<_>>())
+        }).collect();
+
+        Ok(wrap_tool_result(json!({
+            "from": from_name,
+            "to": to_name,
+            "paths": path_values,
+            "count": path_values.len()
         })))
     }
 
@@ -849,7 +1237,7 @@ fn wrap_tool_result(value: Value) -> Value {
     json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+            "text": serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
         }]
     })
 }
