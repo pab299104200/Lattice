@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v20";
+const ENGINE_VERSION: &str = "v21";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -117,7 +117,7 @@ impl QueryEngine {
 
                     let match_count: usize = q_words.iter()
                         .filter(|w| {
-                            file_segments.iter().any(|seg| *seg == **w || seg.contains(**w) || w.contains(seg))
+                            file_segments.iter().any(|seg| *seg == **w)
                         })
                         .count();
 

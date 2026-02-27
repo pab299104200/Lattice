@@ -11,6 +11,9 @@ extension/*.vsix
 .vscode/settings.json
 .idea/
 
+# GitHub config
+.github/
+
 # OS
 .DS_Store
 Thumbs.db
