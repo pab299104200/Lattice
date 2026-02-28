@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v26";
+const ENGINE_VERSION: &str = "v27";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -158,6 +158,16 @@ impl QueryEngine {
 
                     if match_count == 0 { continue; }
 
+                    // For long queries (5+ content words), require 2+ file segment
+                    // matches. A single "system" match on an 11-word auth query seeded
+                    // Go system_collector.go, pulling Logger.Errorf via graph traversal.
+                    // With many query words, a single file-path match is almost certainly
+                    // coincidental. Shorter queries (2-4 words) keep the 1-match threshold
+                    // since each word carries more signal.
+                    if q_words.len() >= 5 && match_count < 2 {
+                        continue;
+                    }
+
                     let centrality = self.graph.centrality(&node.id);
                     file_candidates.entry(node.file.clone())
                         .or_default()
@@ -246,16 +256,28 @@ impl QueryEngine {
             // Build path-aware traversal from this seed hit.
             // Propagate decayed similarity so graph-traversed nodes get
             // meaningful scores instead of 0.0.
-            let seed_name = self.graph.get_node(id)
+            let seed_node_info = self.graph.get_node(id);
+            let seed_name = seed_node_info
                 .map(|n| n.name.clone())
                 .unwrap_or_else(|| id.name.clone());
-            let decay_1hop = sim * 0.6;
-            let decay_2hop = sim * 0.3;
+            let seed_dir = seed_node_info
+                .map(|n| file_directory(&n.file))
+                .unwrap_or_default();
+            let base_decay_1hop = sim * 0.6;
+            let base_decay_2hop = sim * 0.3;
 
             // 1 hop: direct dependencies (callees + contained members)
             // Contains edges at hop 1 are fine — they discover the module/class
             // that a seed function belongs to, which is key for finding siblings.
             for (dep_node, edge_kind) in self.graph.get_dependencies(id) {
+                // Cross-directory penalty: hops from snmp_engine.py to tunnel.go
+                // cross a domain boundary. Penalize these so they can't reach pivot
+                // scores. Same-directory hops (snmp_engine.py → snmp_models.py)
+                // are domain-coherent and get full decay.
+                let dep_dir = file_directory(&dep_node.file);
+                let same_dir = dep_dir == seed_dir;
+                let decay_1hop = if same_dir { base_decay_1hop } else { base_decay_1hop * 0.4 };
+
                 let edge_label = format_edge_kind(edge_kind);
                 candidate_ids.entry(dep_node.id.clone())
                     .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
@@ -267,6 +289,10 @@ impl QueryEngine {
                 // 2 hops from dependencies
                 if params.hop_depth >= 2 {
                     for (dep2_node, edge_kind2) in self.graph.get_dependencies(&dep_node.id) {
+                        let dep2_dir = file_directory(&dep2_node.file);
+                        let same_dir_2 = dep2_dir == seed_dir;
+                        let decay_2hop = if same_dir_2 { base_decay_2hop } else { base_decay_2hop * 0.3 };
+
                         candidate_ids.entry(dep2_node.id.clone())
                             .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
                             .or_insert(decay_2hop);
@@ -300,10 +326,14 @@ impl QueryEngine {
                 if is_hub_node && matches!(edge_kind, EdgeKind::Calls) {
                     continue;
                 }
+                let caller_dir = file_directory(&caller_node.file);
+                let same_dir_caller = caller_dir == seed_dir;
+                let caller_decay = if same_dir_caller { base_decay_1hop } else { base_decay_1hop * 0.4 };
+
                 let edge_label = format_edge_kind_reverse(*edge_kind);
                 candidate_ids.entry(caller_node.id.clone())
-                    .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
-                    .or_insert(decay_1hop);
+                    .and_modify(|s| { if caller_decay > *s { *s = caller_decay; } })
+                    .or_insert(caller_decay);
                 relationship_paths.entry(caller_node.id.clone()).or_insert_with(|| {
                     format!("{}: {}", edge_label, seed_name)
                 });
@@ -431,8 +461,10 @@ impl QueryEngine {
                 // Cap score for nodes with no direct keyword/semantic match.
                 // These were pulled in only through graph traversal and shouldn't
                 // outrank direct matches just because they have high centrality.
+                // Cap at 0.08 — low enough to stay out of pivot range but high
+                // enough to appear as context when relevant.
                 if *semantic_sim < 0.01 {
-                    score = score.min(0.15);
+                    score = score.min(0.08);
                 }
 
                 // Demote test files — useful as context but shouldn't dominate pivots.
@@ -1396,6 +1428,16 @@ fn classify_relationship(semantic_sim: f64) -> String {
 }
 
 // classify_why was replaced by the detailed score/path-based why_included format in Fix 18.
+
+/// Extract the directory portion of a file path for co-directory checks.
+/// e.g., "src/auth/helpers.py" → "src/auth", "agent/tunnels/tunnel.go" → "agent/tunnels"
+fn file_directory(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+        .to_string()
+}
 
 /// Detect if a file path belongs to the Lattice daemon's own source code.
 /// These should be excluded from query results when the user is querying
