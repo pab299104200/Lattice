@@ -373,6 +373,17 @@ fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>) {
                 _ => {}
             }
         }
+        // Collect bare identifier arguments — function references passed as
+        // callbacks. Depends(get_current_user) has get_current_user as a direct
+        // identifier child of argument_list, not as a call expression.
+        if let Some(args_node) = node.child_by_field_name("arguments") {
+            let mut args_cursor = args_node.walk();
+            for arg in args_node.children(&mut args_cursor) {
+                if arg.kind() == "identifier" {
+                    refs.push(node_text(arg, source));
+                }
+            }
+        }
     }
 
     let mut cursor = node.walk();
