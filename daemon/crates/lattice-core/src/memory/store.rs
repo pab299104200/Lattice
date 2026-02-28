@@ -246,6 +246,21 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Update the content of a memory in-place. Clears stale flags since the content is now fresh.
+    pub fn update_content(&self, id: &str, new_content: &str) -> Result<(), LatticeError> {
+        let updated = self.conn
+            .execute(
+                "UPDATE memories SET content = ?1, is_stale = 0, stale_reason = NULL
+                 WHERE id = ?2 AND is_invalidated = 0",
+                params![new_content, id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to update memory: {}", e)))?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!("Memory '{}' not found or invalidated", id)));
+        }
+        Ok(())
+    }
+
     /// Decay confidence of memories that haven't been accessed recently.
     /// Reduces confidence by `decay_rate` for each memory not accessed in `stale_days` days.
     pub fn decay_old_memories(&self, stale_days: u64, decay_rate: f64) -> Result<usize, LatticeError> {

@@ -13,6 +13,7 @@ Use these tools when they're the best fit:
 - `save_observation` / `get_session_context` / `search_memory` — persist and recall insights across sessions
 - `list_observations` — to review stored memories and clean up stale ones
 - `delete_observation` — to remove obsolete or incorrect memories
+- `update_observation` — to edit an existing observation's content in-place
 
 For targeted edits to known files, Read/Grep/Edit are fine.
 Lattice adds the most value when you don't already know where to look.

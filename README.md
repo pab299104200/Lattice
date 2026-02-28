@@ -167,6 +167,7 @@ Use these tools when they're the best fit:
 - `search_logic_flow` — to trace call chains between functions
 - `save_observation` / `get_session_context` / `search_memory` — persist and recall insights across sessions
 - `list_observations` — to review stored memories and clean up stale ones
+- `update_observation` — to edit an existing observation's content in-place
 - `delete_observation` — to remove obsolete or incorrect memories
 
 For targeted edits to known files, Read/Grep/Edit are fine.

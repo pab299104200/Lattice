@@ -406,6 +406,24 @@ impl McpHandler {
                         },
                         "required": ["id"]
                     }
+                },
+                {
+                    "name": "update_observation",
+                    "description": "Update the content of an existing observation in-place. Clears stale flags.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "The memory ID to update"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The new content for this observation"
+                            }
+                        },
+                        "required": ["id", "content"]
+                    }
                 }
             ]
         })
@@ -430,6 +448,7 @@ impl McpHandler {
             "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
             "list_observations" => self.tool_list_observations(arguments).await,
             "delete_observation" => self.tool_delete_observation(arguments).await,
+            "update_observation" => self.tool_update_observation(arguments).await,
             "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
             "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
             "workspace_setup" => self.tool_workspace_setup(arguments).await,
@@ -877,6 +896,24 @@ impl McpHandler {
         })))
     }
 
+    async fn tool_update_observation(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let id = args["id"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: content".to_string()))?;
+
+        let store = self.memory_store.lock().await;
+        store.update_content(id, content)
+            .map_err(|e| (-32603, format!("Failed to update observation: {}", e)))?;
+
+        Ok(wrap_tool_result(json!({
+            "status": "updated",
+            "id": id
+        })))
+    }
+
     async fn tool_submit_lsp_edges(&self, args: &Value) -> Result<Value, (i32, String)> {
         let edges = args["edges"]
             .as_array()
@@ -885,6 +922,7 @@ impl McpHandler {
         let mut indexer = self.indexer.lock().await;
         let mut added = 0usize;
         let mut skipped = 0usize;
+        let mut skip_reasons: Vec<Value> = Vec::new();
 
         for edge in edges {
             let from_name = edge["from_name"].as_str().unwrap_or("");
@@ -911,11 +949,32 @@ impl McpHandler {
                 .find(|n| n.name == to_name && n.file == to_file)
                 .map(|n| n.id.clone());
 
-            if let (Some(fid), Some(tid)) = (from_id, to_id) {
-                indexer.graph_mut().add_edge(&fid, &tid, edge_kind);
-                added += 1;
-            } else {
-                skipped += 1;
+            match (from_id, to_id) {
+                (Some(fid), Some(tid)) => {
+                    indexer.graph_mut().add_edge(&fid, &tid, edge_kind);
+                    added += 1;
+                }
+                (None, None) => {
+                    skip_reasons.push(json!({
+                        "from": from_name, "to": to_name,
+                        "reason": format!("both '{}::{}' and '{}::{}' not found in graph", from_file, from_name, to_file, to_name)
+                    }));
+                    skipped += 1;
+                }
+                (None, Some(_)) => {
+                    skip_reasons.push(json!({
+                        "from": from_name, "to": to_name,
+                        "reason": format!("source '{}::{}' not found in graph", from_file, from_name)
+                    }));
+                    skipped += 1;
+                }
+                (Some(_), None) => {
+                    skip_reasons.push(json!({
+                        "from": from_name, "to": to_name,
+                        "reason": format!("target '{}::{}' not found in graph", to_file, to_name)
+                    }));
+                    skipped += 1;
+                }
             }
         }
 
@@ -928,7 +987,8 @@ impl McpHandler {
 
         Ok(wrap_tool_result(json!({
             "added": added,
-            "skipped": skipped
+            "skipped": skipped,
+            "skip_reasons": skip_reasons
         })))
     }
 

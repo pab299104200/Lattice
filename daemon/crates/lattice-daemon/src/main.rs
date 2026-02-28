@@ -45,13 +45,16 @@ async fn main() -> Result<()> {
     // ── Create EMPTY engine + stores — start server IMMEDIATELY ──────
     // Everything else happens in background so MCP handshake isn't delayed.
     let graph = CodeGraph::new();
-    let ms = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
-    let memory_store = Arc::new(Mutex::new(ms));
-    let ms_for_engine = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
 
-    // Create .lattice dir and disk-backed VectorStore for semantic search
+    // Create .lattice dir for persistent storage
     let lattice_dir = workspace_root.join(".lattice");
     let _ = std::fs::create_dir_all(&lattice_dir);
+
+    // File-backed memory store — observations persist across daemon restarts
+    let memories_path = lattice_dir.join("memories.db");
+    let ms = MemoryStore::open(&memories_path).expect("Failed to open memory store");
+    let memory_store = Arc::new(Mutex::new(ms));
+    let ms_for_engine = MemoryStore::open(&memories_path).expect("Failed to open memory store for engine");
     let vector_store = {
         let vs_path = lattice_dir.join("vectors.db");
         match VectorStore::open(&vs_path.to_string_lossy()) {
@@ -235,6 +238,7 @@ async fn main() -> Result<()> {
         let emb_engine_clone = Arc::clone(&embedding_engine);
         let ws_manager_clone = workspace_manager.clone();
         let ws_roots_watch = workspace_roots.clone();
+        let memory_store_clone = Arc::clone(&memory_store);
 
         tokio::spawn(async move {
             // Merge watchers from all workspace roots into a single channel
@@ -352,6 +356,32 @@ async fn main() -> Result<()> {
                                     change_tracker.record_change(change);
                                 }
                                 change_tracker.record_batch(changed_names);
+
+                                // Mark stale memories for modified/removed symbols
+                                {
+                                    let ms = memory_store_clone.lock().await;
+                                    for change in &changes {
+                                        if change.kind == diff::ChangeKind::Modified
+                                            || change.kind == diff::ChangeKind::Removed
+                                        {
+                                            let reason = format!(
+                                                "{}() was {:?} in {}",
+                                                change.name, change.kind, change.file
+                                            );
+                                            let _ = ms.mark_stale_by_symbol(&change.name, &reason);
+                                        }
+                                    }
+                                }
+
+                                // Surface thrashing / dead-end detection
+                                let thrashing = change_tracker.detect_thrashing();
+                                if !thrashing.is_empty() {
+                                    tracing::info!("Thrashing detected: {:?}", thrashing);
+                                }
+                                let dead_ends = change_tracker.detect_dead_ends();
+                                if !dead_ends.is_empty() {
+                                    tracing::info!("Dead-end symbols: {:?}", dead_ends);
+                                }
                             }
                         }
                     }
@@ -408,6 +438,23 @@ async fn main() -> Result<()> {
                     if let Err(e) = gs.save_graph(&new_graph) {
                         tracing::warn!("Failed to persist graph: {}", e);
                     }
+                }
+            }
+        });
+    }
+
+    // ── Periodic memory decay / prune ─────────────────────────────────
+    {
+        let memory_store_decay = Arc::clone(&memory_store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let ms = memory_store_decay.lock().await;
+                let decayed = ms.decay_old_memories(7, 0.1).unwrap_or(0);
+                let pruned = ms.prune_old_memories(0.2, 30).unwrap_or(0);
+                if decayed > 0 || pruned > 0 {
+                    tracing::info!("Memory maintenance: decayed {}, pruned {}", decayed, pruned);
                 }
             }
         });
