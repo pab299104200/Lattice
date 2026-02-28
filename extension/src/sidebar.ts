@@ -180,6 +180,7 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body {
@@ -326,6 +327,12 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
             error: 'Error'
         };
 
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
         window.addEventListener('message', (event) => {
             const message = event.data;
             if (message.type === 'update') {
@@ -346,9 +353,9 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
                         reposSection.style.display = 'block';
                         reposList.innerHTML = message.stats.repos.map(r =>
                             '<div class="stat-card" style="margin-bottom:6px;text-align:left;padding:6px 8px">' +
-                            '<strong>' + r.name + '</strong><br>' +
+                            '<strong>' + escapeHtml(r.name) + '</strong><br>' +
                             '<span style="font-size:11px;color:var(--vscode-descriptionForeground)">' +
-                            r.nodes + ' nodes · ' + r.files + ' files · ' + r.edges + ' edges</span></div>'
+                            escapeHtml(String(r.nodes)) + ' nodes · ' + escapeHtml(String(r.files)) + ' files · ' + escapeHtml(String(r.edges)) + ' edges</span></div>'
                         ).join('');
                     } else {
                         reposSection.style.display = 'none';

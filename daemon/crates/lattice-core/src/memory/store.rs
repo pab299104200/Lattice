@@ -159,7 +159,8 @@ impl MemoryStore {
 
     /// Search memories by keyword (LIKE match on content). Excludes invalidated.
     pub fn search_by_keyword(&self, keyword: &str) -> Result<Vec<Memory>, LatticeError> {
-        let pattern = format!("%{}%", keyword);
+        let escaped = keyword.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
 
         let mut stmt = self
             .conn
@@ -167,7 +168,7 @@ impl MemoryStore {
                 "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason
                  FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1
+                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\'
                  ORDER BY created_at DESC",
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare search query: {}", e)))?;
@@ -210,13 +211,14 @@ impl MemoryStore {
     pub fn mark_stale_by_symbol(&self, symbol_name: &str, reason: &str) -> Result<u64, LatticeError> {
         // The linked_symbols column stores JSON arrays like ["foo","bar"].
         // We match symbol names contained inside the JSON string.
-        let pattern = format!("%\"{}\"%" , symbol_name);
+        let escaped = symbol_name.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%\"{}\"%" , escaped);
 
         let updated = self
             .conn
             .execute(
                 "UPDATE memories SET is_stale = 1, stale_reason = ?1
-                 WHERE is_invalidated = 0 AND linked_symbols LIKE ?2",
+                 WHERE is_invalidated = 0 AND linked_symbols LIKE ?2 ESCAPE '\\'",
                 params![reason, pattern],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to mark stale: {}", e)))?;
@@ -332,14 +334,15 @@ impl MemoryStore {
         exclude_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Memory>, LatticeError> {
-        let pattern = format!("%{}%", keyword);
+        let escaped = keyword.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
 
         let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(excl) = exclude_session {
             (
                 "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason
                  FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1 AND session_id != ?2
+                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\' AND session_id != ?2
                  ORDER BY created_at DESC
                  LIMIT ?3",
                 vec![Box::new(pattern), Box::new(excl.to_string()), Box::new(limit as i64)],
@@ -349,7 +352,7 @@ impl MemoryStore {
                 "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason
                  FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1
+                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\'
                  ORDER BY created_at DESC
                  LIMIT ?2",
                 vec![Box::new(pattern), Box::new(limit as i64)],
@@ -434,17 +437,24 @@ impl MemoryRow {
     }
 }
 
-/// Generate a simple UUID-like identifier (without external crate dependency).
+/// Generate a unique identifier using timestamp, thread ID, and an atomic counter
+/// to avoid collisions even when called rapidly from the same or different threads.
 fn generate_id() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     let mut hasher = DefaultHasher::new();
     now.as_nanos().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    seq.hash(&mut hasher);
     let h = hasher.finish();
 
     format!(

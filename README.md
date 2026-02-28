@@ -155,33 +155,22 @@ cd daemon && cargo test --workspace
 Add the following to your LLM assistant's project memory (`CLAUDE.md`, `AGENTS.md`, Codex instructions, or equivalent) when working on codebases with Lattice enabled:
 
 ```markdown
-## Lattice MCP Server
+### Lattice Context Engine — Available Tools
 
-This project has a Lattice MCP server providing dependency graph tools.
-Always use Lattice tools for code exploration before file-based tools.
+Lattice provides a dependency graph and context engine for this codebase.
+Use these tools when they're the best fit:
 
-### Tool Usage
-1. **`get_context_capsule`** — Start here for any question about the codebase.
-   Returns ranked pivots (full source) and context (signatures) within a token budget.
-2. **`get_impact_graph`** — Run before making changes. Shows all transitive
-   dependents up to N hops.
-3. **`get_dependents` / `get_dependencies`** — Who calls what, who imports what.
-4. **`search_symbols`** — Find symbols by name pattern (faster than grep for symbols).
-5. **`get_skeleton`** — File overview: all symbols with their dependent counts.
-6. **`get_symbol`** — Full details on a specific symbol including source code.
-7. **`save_observation`** — Persist insights, decisions, and patterns across sessions.
-   Use `get_session_context` to retrieve them, `search_memory` to search.
-8. **`search_logic_flow`** — Find call chains between two symbols.
-9. **`submit_lsp_edges`** — Enrich the graph with LSP call hierarchy edges.
-10. **`workspace_setup`** — Project conventions, language breakdown.
-11. **`index_status`** — Indexing progress and graph stats.
-12. **`get_project_rules`** — Auto-detected project conventions and patterns.
+- `get_context_capsule` — when exploring unfamiliar code or broad questions (use `mode: "focused"` for targeted lookups)
+- `get_impact_graph` — before refactoring to understand blast radius
+- `search_symbols` — when looking for a symbol by name across the project
+- `get_skeleton` — for a quick overview of a large file's structure
+- `search_logic_flow` — to trace call chains between functions
+- `save_observation` / `get_session_context` / `search_memory` — persist and recall insights across sessions
+- `list_observations` — to review stored memories and clean up stale ones
+- `delete_observation` — to remove obsolete or incorrect memories
 
-### Workflow
-1. Before reading files manually, check if Lattice has the context via
-   `get_context_capsule` or `search_symbols`
-2. Before editing code, run `get_impact_graph` on symbols you plan to change
-3. After making architectural decisions, store them with `save_observation`
+For targeted edits to known files, Read/Grep/Edit are fine.
+Lattice adds the most value when you don't already know where to look.
 ```
 
 ## License

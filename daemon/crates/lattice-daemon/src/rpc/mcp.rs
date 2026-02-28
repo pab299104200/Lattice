@@ -82,13 +82,19 @@ impl McpHandler {
             "tools": [
                 {
                     "name": "get_context_capsule",
-                    "description": "Most relevant code for your task — always call first. Returns pivots (full source) and context nodes (signatures).",
+                    "description": "Most relevant code for your task — returns pivots (full source) and context nodes (signatures).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
                                 "description": "Natural language query describing what you need context for"
+                            },
+                            "mode": {
+                                "type": "string",
+                                "description": "Result mode: 'full' (default, multiple pivots + context) or 'focused' (max 1 pivot, max 5 context, minimal budget)",
+                                "enum": ["full", "focused"],
+                                "default": "full"
                             }
                         },
                         "required": ["query"]
@@ -367,6 +373,39 @@ impl McpHandler {
                         "properties": {},
                         "required": []
                     }
+                },
+                {
+                    "name": "list_observations",
+                    "description": "List stored observations and memories. Returns all non-invalidated memories, newest first.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "description": "Optional: filter to memories from this session only"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return (default: 50, max: 200)",
+                                "default": 50
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "delete_observation",
+                    "description": "Delete a stored observation by ID. The memory will no longer appear in listings or search results.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "The memory ID to delete (from list_observations or save_observation response)"
+                            }
+                        },
+                        "required": ["id"]
+                    }
                 }
             ]
         })
@@ -389,6 +428,8 @@ impl McpHandler {
             "save_observation" | "store_memory" => self.tool_store_memory(arguments).await,
             "get_session_context" => self.tool_get_session_context(arguments).await,
             "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
+            "list_observations" => self.tool_list_observations(arguments).await,
+            "delete_observation" => self.tool_delete_observation(arguments).await,
             "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
             "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
             "workspace_setup" => self.tool_workspace_setup(arguments).await,
@@ -404,13 +445,14 @@ impl McpHandler {
         let query = args["query"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
+        let focused = args["mode"].as_str().unwrap_or("full") == "focused";
 
         // Embed query text if embedding engine is available (graceful fallback to keyword)
         let embedding = self.embedding_engine.get()
             .and_then(|eng| eng.embed(query).ok());
 
         let mut engine = self.engine.lock().await;
-        let capsule = engine.query(query, embedding.as_deref());
+        let capsule = engine.query(query, embedding.as_deref(), focused);
         serde_json::to_value(&capsule)
             .map(|v| wrap_tool_result(v))
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))
@@ -446,20 +488,21 @@ impl McpHandler {
                 });
 
                 if detail == "full" {
-                    let obj = result.as_object_mut().unwrap();
-                    obj.insert("source".to_string(), json!(n.body));
-                    obj.insert("end_line".to_string(), json!(n.end_line));
-                    obj.insert("is_exported".to_string(), json!(n.is_exported));
-                    obj.insert("dep_list".to_string(), json!(
-                        dependents.iter().map(|(dep, edge)| json!({
-                            "s": dep.name, "f": dep.file, "e": edge.short_code()
-                        })).collect::<Vec<_>>()
-                    ));
-                    obj.insert("deps_list".to_string(), json!(
-                        dependencies.iter().map(|(dep, edge)| json!({
-                            "s": dep.name, "f": dep.file, "e": edge.short_code()
-                        })).collect::<Vec<_>>()
-                    ));
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("source".to_string(), json!(n.body));
+                        obj.insert("end_line".to_string(), json!(n.end_line));
+                        obj.insert("is_exported".to_string(), json!(n.is_exported));
+                        obj.insert("dep_list".to_string(), json!(
+                            dependents.iter().map(|(dep, edge)| json!({
+                                "s": dep.name, "f": dep.file, "e": edge.short_code()
+                            })).collect::<Vec<_>>()
+                        ));
+                        obj.insert("deps_list".to_string(), json!(
+                            dependencies.iter().map(|(dep, edge)| json!({
+                                "s": dep.name, "f": dep.file, "e": edge.short_code()
+                            })).collect::<Vec<_>>()
+                        ));
+                    }
                 }
 
                 Ok(wrap_tool_result(result))
@@ -555,7 +598,7 @@ impl McpHandler {
         let file = args["file"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
-        let hops = args["hops"].as_u64().unwrap_or(3) as usize;
+        let hops = (args["hops"].as_u64().unwrap_or(3) as usize).min(10);
 
         let engine = self.engine.lock().await;
 
@@ -595,7 +638,7 @@ impl McpHandler {
         let pattern = args["pattern"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: pattern".to_string()))?;
-        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let limit = (args["limit"].as_u64().unwrap_or(20) as usize).min(200);
         let detail = args["detail"].as_str().unwrap_or("summary");
 
         let engine = self.engine.lock().await;
@@ -610,10 +653,11 @@ impl McpHandler {
                     "line": n.line
                 });
                 if detail == "full" {
-                    let m = obj.as_object_mut().unwrap();
-                    m.insert("kind".to_string(), json!(n.kind.short_code()));
-                    m.insert("exported".to_string(), json!(n.is_exported));
-                    m.insert("signature".to_string(), json!(n.signature));
+                    if let Some(m) = obj.as_object_mut() {
+                        m.insert("kind".to_string(), json!(n.kind.short_code()));
+                        m.insert("exported".to_string(), json!(n.is_exported));
+                        m.insert("signature".to_string(), json!(n.signature));
+                    }
                 }
                 obj
             })
@@ -701,7 +745,7 @@ impl McpHandler {
 
     async fn tool_get_session_context(&self, args: &Value) -> Result<Value, (i32, String)> {
         let query = args["query"].as_str();
-        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        let limit = (args["limit"].as_u64().unwrap_or(20) as usize).min(100);
 
         let store = self.memory_store.lock().await;
 
@@ -733,10 +777,11 @@ impl McpHandler {
                 "linked_symbols": m.linked_symbols
             });
             if !is_current {
-                let o = obj.as_object_mut().unwrap();
-                o.insert("session".to_string(), json!(m.session_id));
-                if m.is_stale {
-                    o.insert("stale".to_string(), json!(true));
+                if let Some(o) = obj.as_object_mut() {
+                    o.insert("session".to_string(), json!(m.session_id));
+                    if m.is_stale {
+                        o.insert("stale".to_string(), json!(true));
+                    }
                 }
             }
             obj
@@ -756,7 +801,7 @@ impl McpHandler {
         let query = args["query"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
-        let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+        let limit = (args["limit"].as_u64().unwrap_or(10) as usize).min(100);
 
         let store = self.memory_store.lock().await;
         let memories = store.search_across_sessions(query, None, limit)
@@ -779,6 +824,56 @@ impl McpHandler {
             "query": query,
             "memories": memory_values,
             "count": memory_values.len()
+        })))
+    }
+
+    async fn tool_list_observations(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let session_id = args["session_id"].as_str();
+        let limit = (args["limit"].as_u64().unwrap_or(50) as usize).min(200);
+
+        let store = self.memory_store.lock().await;
+
+        let memories = if let Some(sid) = session_id {
+            store.get_session_memories(sid, limit)
+                .map_err(|e| (-32603, format!("Failed to list observations: {}", e)))?
+        } else {
+            let all = store.list_all()
+                .map_err(|e| (-32603, format!("Failed to list observations: {}", e)))?;
+            all.into_iter().take(limit).collect()
+        };
+
+        let entries: Vec<Value> = memories.iter().map(|m| {
+            json!({
+                "id": m.id,
+                "session_id": m.session_id,
+                "content": m.content,
+                "type": m.memory_type.as_str(),
+                "confidence": m.confidence,
+                "linked_symbols": m.linked_symbols,
+                "created_at": m.created_at,
+                "is_stale": m.is_stale,
+                "stale_reason": m.stale_reason,
+            })
+        }).collect();
+
+        Ok(wrap_tool_result(json!({
+            "count": entries.len(),
+            "memories": entries
+        })))
+    }
+
+    async fn tool_delete_observation(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let id = args["id"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
+
+        let store = self.memory_store.lock().await;
+        store.invalidate(id)
+            .map_err(|e| (-32603, format!("Failed to delete observation: {}", e)))?;
+
+        Ok(wrap_tool_result(json!({
+            "status": "deleted",
+            "id": id
         })))
     }
 
@@ -911,7 +1006,10 @@ impl McpHandler {
 
         // Add multi-repo info if applicable
         if self.workspace_roots.len() > 1 {
-            let obj = result.as_object_mut().unwrap();
+            let obj = match result.as_object_mut() {
+                Some(o) => o,
+                None => return Ok(result),
+            };
             let roots: Vec<String> = self.workspace_roots.iter()
                 .map(|r| r.to_string_lossy().to_string())
                 .collect();
@@ -977,7 +1075,7 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: to".to_string()))?;
         let from_file = args["from_file"].as_str();
         let to_file = args["to_file"].as_str();
-        let max_depth = args["max_depth"].as_u64().unwrap_or(5) as usize;
+        let max_depth = (args["max_depth"].as_u64().unwrap_or(5) as usize).min(15);
 
         let engine = self.engine.lock().await;
         let all_nodes = engine.graph().all_nodes();

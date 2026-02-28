@@ -81,6 +81,9 @@ impl StdioServer {
     }
 }
 
+/// Maximum payload size (10 MB). Reject anything larger to prevent OOM.
+const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
+
 /// Read a single message from stdin.
 /// Supports both Content-Length framing (for clients that send it) and raw JSON lines.
 fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String>> {
@@ -96,6 +99,12 @@ fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String
             let length: usize = trimmed.split(':').nth(1)
                 .ok_or_else(|| anyhow::anyhow!("bad header"))?
                 .trim().parse()?;
+            if length > MAX_PAYLOAD_SIZE {
+                return Err(anyhow::anyhow!(
+                    "Content-Length {} exceeds maximum allowed size of {} bytes",
+                    length, MAX_PAYLOAD_SIZE
+                ));
+            }
             // Skip remaining headers until blank line
             loop {
                 let mut hdr = String::new();

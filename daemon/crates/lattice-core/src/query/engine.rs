@@ -85,7 +85,7 @@ impl QueryEngine {
     ///
     /// If `embedding` is provided and a vector store is available, semantic search
     /// is used. Otherwise, falls back to keyword matching on node names/signatures.
-    pub fn query(&mut self, query_text: &str, embedding: Option<&[f32]>) -> ContextCapsule {
+    pub fn query(&mut self, query_text: &str, embedding: Option<&[f32]>, focused: bool) -> ContextCapsule {
         // Record the query for frequency tracking (adaptive budget)
         self.record_query(query_text);
 
@@ -607,11 +607,12 @@ impl QueryEngine {
         let mut pivots = Vec::new();
         let mut context = Vec::new();
         let mut tokens_used: usize = 0;
-        let budget = params.base_token_budget + (repeat_count * 500);
+        let budget = if focused { 1500 } else { params.base_token_budget + (repeat_count * 500) };
         // Cap context nodes to prevent 3rd-degree noise from flooding results.
         // Pivots (full source) are uncapped since they're budget-limited by token cost.
         // Context (signatures) are cheap, so without a count cap they can explode to 100+.
-        let max_context_nodes: usize = 30;
+        let max_context_nodes: usize = if focused { 5 } else { 30 };
+        let max_pivots: usize = if focused { 1 } else { usize::MAX };
 
         // Relative pivot threshold: if the best candidate scores 0.15, absolute
         // thresholds (0.20/0.35) would produce zero pivots. Use max_score * 0.55
@@ -631,7 +632,7 @@ impl QueryEngine {
             let absolute_threshold: f64 = if candidate.is_seed_hit { 0.20 } else { 0.35 };
             let pivot_threshold = absolute_threshold.min(relative_pivot);
 
-            if candidate.score > pivot_threshold {
+            if candidate.score > pivot_threshold && pivots.len() < max_pivots {
                 // Pivot: include full source for strong matches
                 let source_tokens = candidate.node.body.len() / CHARS_PER_TOKEN;
                 if tokens_used + source_tokens > budget {
@@ -684,6 +685,12 @@ impl QueryEngine {
                     continue;
                 }
 
+                let reason = if candidate.is_seed_hit {
+                    format!("seed match (score: {:.2})", candidate.score)
+                } else {
+                    format!("graph traversal: {} (score: {:.2})", candidate.relationship_detail, candidate.score)
+                };
+
                 pivots.push(PivotNode {
                     symbol: candidate.node.name.clone(),
                     kind: candidate.node.kind.short_code().to_string(),
@@ -691,6 +698,7 @@ impl QueryEngine {
                     line: candidate.node.line,
                     source: candidate.node.body.clone(),
                     score: candidate.score,
+                    reason,
                 });
                 tokens_used += source_tokens;
             } else if candidate.score > 0.05 && context.len() < max_context_nodes {
@@ -714,14 +722,14 @@ impl QueryEngine {
             // Scores <= 0.05 or context cap reached → excluded
         }
 
-        // Step 5b: Same-file sibling completion.
+        // Step 5b: Same-file sibling completion (skipped in focused mode).
         // If we already included 2+ symbols from the same file, include a few
         // more siblings ranked by query relevance. Guards:
         //  - Skip files with 10+ total symbols (grab-bag files like conftest.py)
         //  - Cap at 5 siblings per file
         //  - Rank candidate siblings by keyword overlap with query
         //  - Separate 500-token mini-budget so siblings aren't blocked by main budget
-        {
+        if !focused {
             let sibling_budget = 500usize;
             let mut sibling_tokens_used = 0usize;
             let max_siblings_per_file = 5usize;
@@ -854,12 +862,12 @@ impl QueryEngine {
             tokens_used += sibling_tokens_used;
         }
 
-        // Step 5c: Dependency completion from PIVOT nodes only.
+        // Step 5c: Dependency completion from PIVOT nodes only (skipped in focused mode).
         // Pivots are high-confidence matches (score > 0.20). Their direct Calls
         // dependencies are likely relevant helpers. Context nodes are weaker
         // matches and their deps would amplify noise (e.g. vuln_matcher deps).
         // Uses a separate 300-token mini-budget, capped at 5 total additions.
-        {
+        if !focused {
             let dep_budget = 300usize;
             let mut dep_tokens_used = 0usize;
             let max_dep_additions = 5usize;
@@ -943,14 +951,18 @@ impl QueryEngine {
 
         // Step 6: Retrieve relevant memories
         let memories = if let Some(ref ms) = self.memory_store {
-            let store = ms.lock().unwrap();
-            let results = store.search_by_keyword(query_text).unwrap_or_default();
-            results.into_iter().take(5).map(|m| {
-                serde_json::json!({
-                    "content": m.content,
-                    "type": m.memory_type.as_str(),
-                })
-            }).collect()
+            match ms.lock() {
+                Ok(store) => {
+                    store.search_by_keyword(query_text).unwrap_or_default()
+                        .into_iter().take(5).map(|m| {
+                            serde_json::json!({
+                                "content": m.content,
+                                "type": m.memory_type.as_str(),
+                            })
+                        }).collect()
+                }
+                Err(_) => vec![], // Mutex poisoned — skip memories gracefully
+            }
         } else {
             vec![]
         };
@@ -1007,6 +1019,10 @@ impl QueryEngine {
 
     /// Record a query for frequency tracking.
     pub fn record_query(&mut self, query: &str) {
+        // Cap history size to prevent unbounded memory growth
+        if self.query_history.len() >= 1000 {
+            self.query_history.clear();
+        }
         *self.query_history.entry(query.to_string()).or_insert(0) += 1;
     }
 

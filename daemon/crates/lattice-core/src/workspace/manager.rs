@@ -64,7 +64,7 @@ impl WorkspaceManager {
     pub fn query(&self, query_text: &str) -> ContextCapsule {
         let graph = self.build_merged_graph();
         let mut engine = QueryEngine::new(graph, None, None);
-        engine.query(query_text, None)
+        engine.query(query_text, None, false)
     }
 
     fn build_merged_graph(&self) -> CodeGraph {

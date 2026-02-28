@@ -19,6 +19,7 @@ pub struct PivotNode {
     pub line: usize,
     pub source: String,
     pub score: f64,
+    pub reason: String,
 }
 
 /// A supporting node included with a skeleton (signature only).
