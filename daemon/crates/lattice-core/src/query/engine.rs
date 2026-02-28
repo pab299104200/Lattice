@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v23";
+const ENGINE_VERSION: &str = "v24";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -118,6 +118,7 @@ impl QueryEngine {
                 // Track per-file IDF-weighted match score for prioritization.
                 let mut file_candidates: HashMap<String, Vec<(SymbolId, f64)>> = HashMap::new();
                 let mut file_idf_scores: HashMap<String, f64> = HashMap::new();
+                let mut file_match_counts: HashMap<String, usize> = HashMap::new();
 
                 for node in &all_fp_nodes {
                     if seed_ids.contains(&node.id)
@@ -136,11 +137,19 @@ impl QueryEngine {
                         .filter(|p| p.len() >= 3)
                         .collect();
 
-                    // Compute IDF-weighted match score for this file
+                    // Compute IDF-weighted match score for this file.
+                    // Use prefix matching: a file segment like "auth" matches query word
+                    // "authentication" (the file abbreviates the concept). Require the
+                    // prefix to be >= 4 chars to prevent short matches like "user"→"users".
+                    // Do NOT match segment.starts_with(word) — that's the v20 bug
+                    // where "users" matched query word "user".
                     let mut file_score: f64 = 0.0;
                     let mut match_count: usize = 0;
                     for w in &q_words {
-                        if file_segments.iter().any(|seg| seg == w) {
+                        let matched = file_segments.iter().any(|seg| {
+                            seg == w || (seg.len() >= 4 && w.starts_with(seg))
+                        });
+                        if matched {
                             let idf_f = fp_word_idf_floored.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
                             file_score += idf_f;
                             match_count += 1;
@@ -156,12 +165,14 @@ impl QueryEngine {
                     file_idf_scores.entry(node.file.clone())
                         .and_modify(|s| { if file_score > *s { *s = file_score; } })
                         .or_insert(file_score);
+                    file_match_counts.entry(node.file.clone())
+                        .and_modify(|c| { if match_count > *c { *c = match_count; } })
+                        .or_insert(match_count);
                 }
 
                 // Sort files by IDF-weighted score DESC. Files matching rare words
                 // or multiple words rank higher than files matching one common word.
-                let max_per_file = 2;
-                let max_total = 15;
+                let max_total = 20;
                 let mut added = 0;
 
                 let mut files: Vec<String> = file_candidates.keys().cloned().collect();
@@ -175,6 +186,11 @@ impl QueryEngine {
                 for file in &files {
                     if added >= max_total { break; }
                     let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
+                    // Dynamic max_per_file: files matching 2+ query words are highly
+                    // relevant and deserve more seed slots. auth_mgmt/helpers.py matching
+                    // "auth" + "user" gets 5 slots; a file matching only 1 word gets 3.
+                    let file_matches = file_match_counts.get(file).copied().unwrap_or(1);
+                    let max_per_file = if file_matches >= 2 { 5 } else { 3 };
                     // Convert file IDF score to seed similarity: scale to 0.15..0.50 range.
                     // Max file_score is q_words.len() (if all words match with IDF=1.0).
                     let seed_sim = (0.15 + 0.35 * (file_score / q_words.len() as f64)).min(0.50);
@@ -464,7 +480,7 @@ impl QueryEngine {
         // as a floor — the top ~45% of candidates become pivot-eligible regardless
         // of absolute score, ensuring every query gets some full source.
         let max_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0.0);
-        let relative_pivot = max_candidate_score * 0.55;
+        let relative_pivot = (max_candidate_score * 0.55).max(0.12);
 
         for candidate in &candidates {
             if tokens_used >= budget {
@@ -1056,6 +1072,79 @@ impl QueryEngine {
                 .then_with(|| a.0.name.cmp(&b.0.name))
         });
         scored.truncate(top_k);
+
+        // Cap test file seeds at 3 total. Test functions match query keywords
+        // (test_authenticate_user matches "authenticate" + "user") but provide
+        // test logic, not implementation. Without a cap, 11 of 15 seeds can be
+        // tests from one file, starving real implementation files of seed slots.
+        {
+            let max_test_seeds = 3;
+            let test_count = scored.iter().filter(|(id, _)| is_test_file(&id.file)).count();
+            if test_count > max_test_seeds {
+                // Collect non-test overflow candidates from the full scored list
+                let mut overflow_candidates: Vec<(SymbolId, f64)> = Vec::new();
+                for node in &all_nodes {
+                    if is_test_file(&node.file) || is_lattice_own_source(&node.file) {
+                        continue;
+                    }
+                    // Check if already in scored
+                    if scored.iter().any(|(id, _)| *id == node.id) {
+                        continue;
+                    }
+                    let name_lower = node.name.to_lowercase();
+                    let name_parts = split_identifier(&name_lower);
+                    let mut idf_ws: f64 = 0.0;
+                    let mut wm = 0usize;
+                    for word in &query_words {
+                        let idf_f = word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
+                        let mut ws: f64 = 0.0;
+                        if name_lower.starts_with(word) { ws = 0.8; }
+                        else if name_lower.contains(word) { ws = 0.4; }
+                        else if name_parts.iter().any(|p| p.len() >= 3 && word.contains(p.as_str())) { ws = 0.5; }
+                        if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
+                    }
+                    if wm == 0 { continue; }
+                    let cov = wm as f64 / query_words.len() as f64;
+                    let max_possible = total_idf / max_idf_floored;
+                    let norm = if max_possible > 0.0 {
+                        (idf_ws / max_possible.min(query_words.len() as f64) * (0.5 + 0.5 * cov)).min(1.0)
+                    } else { 0.0 };
+                    if norm > 0.05 {
+                        overflow_candidates.push((node.id.clone(), norm));
+                    }
+                }
+                overflow_candidates.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                // Remove excess test seeds (keep highest-scoring 3), replace with overflow
+                let mut test_kept = 0;
+                let mut to_remove = Vec::new();
+                for (i, (id, _)) in scored.iter().enumerate() {
+                    if is_test_file(&id.file) {
+                        test_kept += 1;
+                        if test_kept > max_test_seeds {
+                            to_remove.push(i);
+                        }
+                    }
+                }
+                // Replace excess test seeds with overflow candidates
+                let mut oc_idx = 0;
+                for &idx in &to_remove {
+                    if oc_idx < overflow_candidates.len() {
+                        scored[idx] = overflow_candidates[oc_idx].clone();
+                        oc_idx += 1;
+                    }
+                }
+                // Re-sort after replacements
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.name.cmp(&b.0.name))
+                });
+                scored.truncate(top_k);
+            }
+        }
 
         // File diversity: ensure at least one representative from each file
         // that scored well but got crowded out of top_k. Uses same IDF weighting
