@@ -1,6 +1,5 @@
 # Rust
 daemon/target/
-**/*.rs.bk
 
 # Node
 extension/node_modules/
@@ -11,7 +10,7 @@ extension/*.vsix
 .vscode/settings.json
 .idea/
 
-# GitHub config
+# GitHub config (user-specific workflows and skills)
 .github/
 
 # OS
@@ -31,7 +30,3 @@ daemon/models/
 .env
 *.pem
 *.key
-daemon/target2/
-daemon/target_new/
-daemon/target_msvc/
-extension/*.vsix
