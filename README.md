@@ -158,16 +158,24 @@ Add the following to your LLM assistant's project memory (`CLAUDE.md`, `AGENTS.m
 ## Lattice MCP Server
 
 This project has a Lattice MCP server providing dependency graph tools.
+Always use Lattice tools for code exploration before file-based tools.
 
-### Tool Priority
-- **Start with `get_context_capsule`** for any question about the codebase.
-  It returns ranked symbols with full source for pivots and signatures for context.
-- **Use `get_impact_graph` before editing** to see what depends on the symbols
-  you plan to change.
-- **Use `search_symbols`** instead of grep for finding functions/classes by name.
-- **Use `get_skeleton`** to understand a file's role before reading it.
-- **Use `save_observation`** to persist architectural decisions and patterns
-  across sessions.
+### Tool Usage
+1. **`get_context_capsule`** — Start here for any question about the codebase.
+   Returns ranked pivots (full source) and context (signatures) within a token budget.
+2. **`get_impact_graph`** — Run before making changes. Shows all transitive
+   dependents up to N hops.
+3. **`get_dependents` / `get_dependencies`** — Who calls what, who imports what.
+4. **`search_symbols`** — Find symbols by name pattern (faster than grep for symbols).
+5. **`get_skeleton`** — File overview: all symbols with their dependent counts.
+6. **`get_symbol`** — Full details on a specific symbol including source code.
+7. **`save_observation`** — Persist insights, decisions, and patterns across sessions.
+   Use `get_session_context` to retrieve them, `search_memory` to search.
+8. **`search_logic_flow`** — Find call chains between two symbols.
+9. **`submit_lsp_edges`** — Enrich the graph with LSP call hierarchy edges.
+10. **`workspace_setup`** — Project conventions, language breakdown.
+11. **`index_status`** — Indexing progress and graph stats.
+12. **`get_project_rules`** — Auto-detected project conventions and patterns.
 
 ### Workflow
 1. Before reading files manually, check if Lattice has the context via
