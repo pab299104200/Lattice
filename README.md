@@ -141,7 +141,7 @@ The query engine (v31) combines keyword matching with graph-based scoring to fin
 - **Word-boundary matching** — `split_identifier` prevents "dispatch" from matching "patch"
 - **Intent detection** — adjusts budget and scoring weights for Explore/FixBug/Refactor/AddFeature queries
 
-Benchmarked at 96.5% average precision across 4 test queries (auth, patch management, host discovery, SNMP polling).
+Benchmarked at 96.5% average precision.
 
 ## Running Tests
 
