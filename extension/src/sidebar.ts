@@ -15,12 +15,19 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
     private currentStatus: DaemonStatus = 'stopped';
     private stats: IndexStats = { nodes: 0, files: 0, edges: 0 };
     private disposables: vscode.Disposable[] = [];
+    private pollTimer: ReturnType<typeof setInterval> | undefined;
 
     constructor(private readonly daemon: DaemonManager) {
         this.currentStatus = daemon.getStatus();
 
         const sub = daemon.onStatusChange((status) => {
             this.currentStatus = status;
+            if (status === 'running') {
+                this.refreshFromDaemon();
+                this.startPolling();
+            } else {
+                this.stopPolling();
+            }
             this.postUpdate();
         });
         this.disposables.push(sub);
@@ -60,8 +67,11 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
         });
 
         this.renderHtml();
-        // Also fetch fresh data on first render
+        // Fetch fresh data on first render and start polling if indexing
         this.refreshFromDaemon();
+        if (this.currentStatus === 'running') {
+            this.startPolling();
+        }
     }
 
     /**
@@ -79,12 +89,39 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
                         edges: result.edges ?? result.edge_count ?? 0,
                         repos: result.repos,
                     };
+                    // Stop polling once indexing is complete
+                    if (result.status !== 'indexing') {
+                        this.stopPolling();
+                    }
                 }
             } catch {
                 // ignore — just use cached stats
             }
         }
         this.postUpdate();
+    }
+
+    /**
+     * Start polling the daemon for stats updates every 3 seconds.
+     * Used during indexing to keep the sidebar current.
+     */
+    private startPolling(): void {
+        if (this.pollTimer) {
+            return; // Already polling
+        }
+        this.pollTimer = setInterval(() => {
+            this.refreshFromDaemon();
+        }, 3000);
+    }
+
+    /**
+     * Stop polling when indexing is complete or daemon stops.
+     */
+    private stopPolling(): void {
+        if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = undefined;
+        }
     }
 
     /**
@@ -333,6 +370,7 @@ export class LatticeSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     public dispose(): void {
+        this.stopPolling();
         for (const d of this.disposables) {
             d.dispose();
         }
