@@ -1043,9 +1043,11 @@ impl QueryEngine {
                     }).unwrap_or(false);
                     word_score = if is_boundary { 0.7 } else { 0.4 };
                 }
-                // Name part exactly matches query word or query word contains name part
+                // Name part exactly matches query word or query word starts with name part.
+                // Prefix match is valid: "auth" → "authentication". Substring match is not:
+                // "info" ⊂ "verification" is coincidental, not semantic.
                 else if name_parts.iter().any(|part| {
-                    part.len() >= 3 && (*word == part.as_str() || word.contains(part.as_str()))
+                    part.len() >= 3 && (*word == part.as_str() || word.starts_with(part.as_str()))
                 }) {
                     word_score = 0.5;
                 }
@@ -1431,10 +1433,11 @@ fn is_migration_file(file_path: &str) -> bool {
 /// Split an identifier into constituent words (handles snake_case and camelCase).
 /// e.g., "authenticate_user" → ["authenticate", "user"]
 ///       "getUserAuth" → ["get", "user", "auth"]
+///       "SystemCollector.GetSystemInfo" → ["system", "collector", "get", "system", "info"]
 fn split_identifier(name: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    // First split on underscores
-    for segment in name.split('_') {
+    // Split on underscores and dots (Go methods use Class.Method notation)
+    for segment in name.split(|c: char| c == '_' || c == '.') {
         if segment.is_empty() {
             continue;
         }

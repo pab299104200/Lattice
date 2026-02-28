@@ -334,11 +334,19 @@ fn extract_import_from(node: Node, source: &[u8]) -> Option<ImportInfo> {
 }
 
 /// Extract references from a function/method body (call expression identifiers).
+/// Also walks the parameters node to capture dependency-injected calls like
+/// FastAPI's `Depends(get_current_user)` which appear as default values in
+/// function parameters, not in the body.
 fn extract_references_from_body(node: Node, source: &[u8]) -> Vec<String> {
     let mut refs = Vec::new();
 
     if let Some(body_node) = node.child_by_field_name("body") {
         collect_call_identifiers(body_node, source, &mut refs);
+    }
+
+    // Walk parameters to capture calls in default values (e.g., Depends(get_current_user)).
+    if let Some(params_node) = node.child_by_field_name("parameters") {
+        collect_call_identifiers(params_node, source, &mut refs);
     }
 
     refs.sort();
