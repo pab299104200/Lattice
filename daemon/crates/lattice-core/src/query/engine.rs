@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v27";
+const ENGINE_VERSION: &str = "v28";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -400,6 +400,15 @@ impl QueryEngine {
         let all_node_ids: Vec<&SymbolId> = self.graph.all_node_ids();
         let nodes_evaluated = candidate_ids.len();
 
+        // Pre-compute query words for keyword coherence check on graph-traversed nodes.
+        let scoring_q_lower = clean_query.to_lowercase();
+        let scoring_q_cleaned: String = scoring_q_lower.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+            .collect();
+        let scoring_q_words: Vec<&str> = scoring_q_cleaned.split_whitespace()
+            .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
+            .collect();
+
         for (id, semantic_sim) in &candidate_ids {
             if let Some(node) = self.graph.get_node(id) {
                 // Skip Lattice's own source and apply query filters
@@ -458,13 +467,32 @@ impl QueryEngine {
                     + recency * params.w_recency
                     + effective_caller * params.w_caller;
 
-                // Cap score for nodes with no direct keyword/semantic match.
-                // These were pulled in only through graph traversal and shouldn't
-                // outrank direct matches just because they have high centrality.
-                // Cap at 0.08 — low enough to stay out of pivot range but high
-                // enough to appear as context when relevant.
-                if *semantic_sim < 0.01 {
-                    score = score.min(0.08);
+                // Keyword coherence gate for graph-traversed nodes.
+                // Nodes reached only through graph edges (not direct keyword matches)
+                // must share at least one query word in their name, signature, or file
+                // path. Without this, _get_lock (score 0.159) becomes an SNMP pivot
+                // because snmp_poll_loop calls it — structurally true but semantically
+                // irrelevant. _get_lock has zero keyword affinity with "SNMP polling
+                // credential encryption".
+                //
+                // Seed hits (is_seed_hit) skip this check — they already matched keywords.
+                // Graph-traversed nodes with zero keyword overlap get capped at 0.06,
+                // low enough to stay out of pivot range but available as last-resort context.
+                if !seed_hit_ids.contains(id) {
+                    let name_lower = node.name.to_lowercase();
+                    let sig_lower = node.signature.to_lowercase();
+                    let file_lower = node.file.to_lowercase();
+                    let name_parts = split_identifier(&node.name);
+                    let has_keyword_overlap = scoring_q_words.iter().any(|w| {
+                        name_lower.contains(w)
+                            || sig_lower.contains(w)
+                            || file_lower.split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                                .any(|seg| seg == *w || (seg.len() >= 4 && w.starts_with(seg)))
+                            || name_parts.iter().any(|p| p.len() >= 3 && (p == w || w.starts_with(p.as_str())))
+                    });
+                    if !has_keyword_overlap {
+                        score = score.min(0.06);
+                    }
                 }
 
                 // Demote test files — useful as context but shouldn't dominate pivots.
