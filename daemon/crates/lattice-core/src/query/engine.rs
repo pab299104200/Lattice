@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v25";
+const ENGINE_VERSION: &str = "v26";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -210,26 +210,11 @@ impl QueryEngine {
                     }
                 }
 
-                // High-centrality promotion: functions with >20 dependents are
-                // architectural hubs (e.g., get_current_user called by every endpoint).
-                // If they live in a file that matched the query but didn't make
-                // max_per_file, promote them as seeds. These are too important to miss.
-                for file in &files {
-                    if added >= max_total + 5 { break; } // allow up to 5 extra hub promotions
-                    let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
-                    let seed_sim = (0.15 + 0.35 * (file_score / q_words.len() as f64)).min(0.50);
-                    if let Some(candidates) = file_candidates.get(file) {
-                        for (id, _centrality) in candidates {
-                            if seeded_ids.contains(id) { continue; }
-                            let dep_count = self.graph.get_dependents(id).len();
-                            if dep_count >= 20 {
-                                seed_hits.push((id.clone(), seed_sim));
-                                seeded_ids.insert(id.clone());
-                                added += 1;
-                            }
-                        }
-                    }
-                }
+                // High-centrality promotion removed: with the parser now capturing
+                // Depends() edges correctly, hub functions like get_current_user are
+                // found through normal graph traversal from domain-specific seeds.
+                // Blind centrality promotion caused get_db/get_current_user to leak
+                // into every query regardless of relevance.
             }
         }
 
@@ -404,7 +389,13 @@ impl QueryEngine {
                     .max(1);
                 let recency = node.last_modified as f64 / max_modified as f64;
 
-                // Caller count: number of incoming edges (dependents)
+                // Caller count: number of incoming edges (dependents).
+                // Use log compression so infrastructure hubs (get_db: 500+ deps,
+                // get_current_user: 531 deps) don't dominate scoring. Without this,
+                // caller_norm=1.0 × w_caller=0.2 = 0.2 free score for being popular,
+                // enough to push generic functions into every query's pivots.
+                // log(1+n)/log(1+max) compresses the range: 5 deps → ~0.5, 500 → ~0.9
+                // instead of the linear 5→0.01, 500→1.0.
                 let caller_count = self.graph.get_dependents(id).len() as f64;
                 let max_callers = all_node_ids
                     .iter()
@@ -412,12 +403,30 @@ impl QueryEngine {
                     .max()
                     .unwrap_or(1)
                     .max(1);
-                let caller_norm = caller_count / max_callers as f64;
+                let caller_norm = (1.0 + caller_count).ln() / (1.0 + max_callers as f64).ln();
+
+                // Hub dampening: symbols with extreme centrality (top 1% by dependents)
+                // are infrastructure utilities (get_db, get_current_user, require_permission).
+                // They're called by everything but carry no topical signal. Dampen their
+                // centrality and caller contributions so they can't become pivots purely
+                // on graph position.
+                let hub_threshold = max_callers as f64 * 0.10; // top 10% by caller count
+                let is_infra_hub = caller_count > hub_threshold && caller_count > 20.0;
+                let effective_centrality = if is_infra_hub {
+                    centrality * 0.3
+                } else {
+                    centrality
+                };
+                let effective_caller = if is_infra_hub {
+                    caller_norm * 0.3
+                } else {
+                    caller_norm
+                };
 
                 let mut score = semantic_sim * params.w_semantic
-                    + centrality * params.w_centrality
+                    + effective_centrality * params.w_centrality
                     + recency * params.w_recency
-                    + caller_norm * params.w_caller;
+                    + effective_caller * params.w_caller;
 
                 // Cap score for nodes with no direct keyword/semantic match.
                 // These were pulled in only through graph traversal and shouldn't
@@ -1102,11 +1111,14 @@ impl QueryEngine {
             };
 
             // Penalty for single-match in multi-word queries.
-            // "user" matching inside "GetSystemUsers" gives score ~0.17, which
-            // survives thresholds. With the penalty: 0.17 * 0.35 ≈ 0.06 → excluded.
-            // Valid matches like AuthenticationMiddleware (0.40 * 0.35 = 0.14) still survive.
+            // Scale by query length: longer queries are more specific, so a single
+            // word match is increasingly likely to be noise.
+            // 2 words: × 0.35 (AuthenticationMiddleware survives)
+            // 5 words: × 0.15 (very unlikely to be relevant)
+            // 8+ words: × 0.05 (essentially excluded)
             if query_words.len() >= 2 && words_matched == 1 {
-                normalized *= 0.35;
+                let penalty = (0.50 / query_words.len() as f64).max(0.05);
+                normalized *= penalty;
             }
 
             if normalized > 0.05 {
