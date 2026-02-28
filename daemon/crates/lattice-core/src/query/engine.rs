@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v28";
+const ENGINE_VERSION: &str = "v29";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -479,20 +479,17 @@ impl QueryEngine {
                 // Graph-traversed nodes with zero keyword overlap get capped at 0.06,
                 // low enough to stay out of pivot range but available as last-resort context.
                 if !seed_hit_ids.contains(id) {
-                    let name_lower = node.name.to_lowercase();
-                    let sig_lower = node.signature.to_lowercase();
-                    let file_lower = node.file.to_lowercase();
-                    let name_parts = split_identifier(&node.name);
-                    let has_keyword_overlap = scoring_q_words.iter().any(|w| {
-                        name_lower.contains(w)
-                            || sig_lower.contains(w)
-                            || file_lower.split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
-                                .any(|seg| seg == *w || (seg.len() >= 4 && w.starts_with(seg)))
-                            || name_parts.iter().any(|p| p.len() >= 3 && (p == w || w.starts_with(p.as_str())))
-                    });
-                    if !has_keyword_overlap {
-                        score = score.min(0.06);
+                    if !has_keyword_coherence(&node.name, &node.signature, &node.file, &scoring_q_words) {
+                        score = score.min(0.04);
                     }
+                }
+
+                // Deprioritize variable/constant declarations for pivot selection.
+                // Variables like RemoteDesktop.tsx:token (a one-line localStorage.getItem())
+                // keyword-match "token" but waste pivot slots with assignments instead
+                // of implementation logic. Functions and methods are better pivots.
+                if matches!(node.kind, SymbolKind::Variable | SymbolKind::Constant) {
+                    score *= 0.25;
                 }
 
                 // Demote test files — useful as context but shouldn't dominate pivots.
@@ -770,12 +767,9 @@ impl QueryEngine {
                             name_lower.contains(*w)
                             // Part matches: word contains part OR part contains word
                             || name_parts.iter().any(|p| {
-                                p.len() >= 3 && (
-                                    w.contains(p.as_str())
-                                    || p.contains(*w)
-                                    || w.starts_with(p.as_str())
-                                    || p.starts_with(*w)
-                                )
+                                (p.len() >= 3 && p.as_str() == **w)
+                                || (p.len() >= 4 && w.starts_with(p.as_str()))
+                                || (p.len() >= 3 && p.starts_with(**w))
                             })
                             // Signature match
                             || sig_lower.contains(*w)
@@ -795,6 +789,12 @@ impl QueryEngine {
                 for (node, rel) in &candidates {
                     if added >= max_siblings_per_file {
                         break;
+                    }
+                    // Skip siblings with zero keyword relevance — they matched no query
+                    // words and are only here because their file has 2+ included symbols.
+                    // Without this, Host and Organization interfaces waste context slots.
+                    if *rel <= 0.0 {
+                        continue;
                     }
                     let sig_tokens = node.signature.len() / CHARS_PER_TOKEN;
                     if sibling_tokens_used + sig_tokens > sibling_budget {
@@ -864,6 +864,12 @@ impl QueryEngine {
                         continue;
                     }
                     if is_lattice_own_source(&dep_node.file) || is_test_file(&dep_node.file) {
+                        continue;
+                    }
+                    // Keyword coherence: only include dependencies that share query keywords.
+                    // Without this, login → get_db and login → dispatch_webhook_event
+                    // waste context slots despite zero topical relevance to the auth query.
+                    if !has_keyword_coherence(&dep_node.name, &dep_node.signature, &dep_node.file, &scoring_q_words) {
                         continue;
                     }
                     let sig_tokens = dep_node.signature.len() / CHARS_PER_TOKEN;
@@ -1115,14 +1121,17 @@ impl QueryEngine {
                 // Name part exactly matches query word or query word starts with name part.
                 // Prefix match is valid: "auth" → "authentication". Substring match is not:
                 // "info" ⊂ "verification" is coincidental, not semantic.
+                // Require part.len() >= 4 for prefix matching to prevent "log"→"login"
+                // (3 chars is too short — "log" ≠ "login" semantically). Exact matches
+                // keep the >= 3 threshold since they're unambiguous.
                 else if name_parts.iter().any(|part| {
-                    part.len() >= 3 && (*word == part.as_str() || word.starts_with(part.as_str()))
+                    (part.len() >= 3 && *word == part.as_str()) || (part.len() >= 4 && word.starts_with(part.as_str()))
                 }) {
                     word_score = 0.5;
                 }
                 // Prefix match between name parts and query words
                 else if name_parts.iter().any(|part| {
-                    part.len() >= 3 && (word.starts_with(part.as_str()) || part.starts_with(word))
+                    (part.len() >= 4 && word.starts_with(part.as_str())) || (part.len() >= 3 && part.starts_with(word))
                 }) {
                     word_score = 0.4;
                 }
@@ -1222,7 +1231,7 @@ impl QueryEngine {
                         let mut ws: f64 = 0.0;
                         if name_lower.starts_with(word) { ws = 0.8; }
                         else if name_lower.contains(word) { ws = 0.4; }
-                        else if name_parts.iter().any(|p| p.len() >= 3 && word.contains(p.as_str())) { ws = 0.5; }
+                        else if name_parts.iter().any(|p| (p.len() >= 3 && *word == p.as_str()) || (p.len() >= 4 && word.starts_with(p.as_str()))) { ws = 0.5; }
                         if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
                     }
                     if wm == 0 { continue; }
@@ -1306,7 +1315,7 @@ impl QueryEngine {
                     if name_lower.starts_with(word) { ws = 0.8; }
                     else if word.starts_with(&name_lower) && name_lower.len() >= 3 { ws = 0.6; }
                     else if name_lower.contains(word) { ws = 0.4; }
-                    else if name_parts.iter().any(|p| p.len() >= 3 && (word.contains(p.as_str()) || p.starts_with(word))) { ws = 0.5; }
+                    else if name_parts.iter().any(|p| (p.len() >= 3 && *word == p.as_str()) || (p.len() >= 4 && word.starts_with(p.as_str())) || (p.len() >= 3 && p.starts_with(word))) { ws = 0.5; }
                     // File path: exact segment match only
                     if file_segs.iter().any(|seg| *seg == *word) { ws = ws.max(0.4); }
                     if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
@@ -1412,6 +1421,40 @@ pub fn parse_query_filters(query: &str) -> (QueryFilter, String) {
     }
 
     (filter, clean_parts.join(" "))
+}
+
+/// Check if a symbol has keyword overlap with query words.
+///
+/// Uses word-boundary matching (split_identifier parts) instead of substring
+/// matching to prevent false positives like "dispatch" containing "patch".
+/// Also checks signature (substring OK there — it's structured) and file path
+/// segments.
+///
+/// Rules for name part matching:
+/// - Exact match: part.len() >= 3 (e.g., "auth" == "auth")
+/// - Query word starts with part: part.len() >= 4 (e.g., "authentication".starts_with("auth"))
+/// - Part starts with query word: part.len() >= 3 (e.g., "authenticate".starts_with("auth"))
+fn has_keyword_coherence(
+    name: &str,
+    signature: &str,
+    file: &str,
+    query_words: &[&str],
+) -> bool {
+    let name_parts = split_identifier(name);
+    let sig_lower = signature.to_lowercase();
+    let file_lower = file.to_lowercase();
+
+    query_words.iter().any(|w| {
+        sig_lower.contains(w)
+            || file_lower
+                .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+                .any(|seg| seg == *w || (seg.len() >= 4 && w.starts_with(seg)))
+            || name_parts.iter().any(|p| {
+                (p.len() >= 3 && p.as_str() == *w)
+                    || (p.len() >= 4 && w.starts_with(p.as_str()))
+                    || (p.len() >= 3 && p.starts_with(w))
+            })
+    })
 }
 
 /// Format an edge kind for display in dependency direction (outgoing).
