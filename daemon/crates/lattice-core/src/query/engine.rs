@@ -15,22 +15,33 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v30";
+const ENGINE_VERSION: &str = "v31";
 
 /// Stop words excluded from the negative keyword signal.
 /// These are too generic to carry semantic meaning in symbol names
 /// (e.g., "get_user" — "get" shouldn't penalize a match on "user").
+/// Includes common verbs, prepositions, programming primitives, and
+/// generic qualifiers that don't indicate domain subsystems.
 const NAME_STOP_WORDS: &[&str] = &[
+    // Common verbs / actions
     "get", "set", "new", "run", "do", "is", "has", "can", "to", "from",
-    "by", "in", "on", "of", "for", "the", "and", "or", "at", "as",
     "add", "del", "put", "all", "try", "with", "into", "init", "make",
     "create", "update", "delete", "remove", "handle", "process",
     "check", "test", "build", "parse", "load", "save", "read", "write",
     "find", "list", "show", "send", "call", "start", "stop", "open",
-    "close", "done", "data", "info", "item", "self", "this", "that",
-    "type", "name", "id", "key", "val", "value", "result", "error",
-    "async", "await", "impl", "func", "def", "class", "pub", "fn",
-    "mut", "ref", "var", "let", "const", "return", "export", "default",
+    "close", "done", "apply", "emit", "register", "ensure",
+    // Prepositions / articles / conjunctions
+    "by", "in", "on", "of", "for", "the", "and", "or", "at", "as",
+    // Generic qualifiers / modifiers
+    "current", "info", "item", "self", "this", "that", "level",
+    "data", "name", "id", "ids", "key", "val", "value", "result",
+    "error", "endpoint", "params", "args", "options", "config",
+    "state", "status", "count", "index", "size", "total", "raw",
+    "base", "node", "entry", "record", "row", "col", "field",
+    // Programming language keywords / primitives
+    "type", "async", "await", "impl", "func", "def", "class", "pub",
+    "fn", "mut", "ref", "var", "let", "const", "return", "export",
+    "default", "int", "str", "bool", "num", "obj", "err", "ctx",
 ];
 
 /// A candidate node with its computed score for ranking.
@@ -500,11 +511,15 @@ impl QueryEngine {
                     }
                 }
 
-                // Negative keyword signal: penalize symbols whose names contain
-                // strong words absent from the query. "verify_agent_flexible" matching
-                // on "verify" gets penalized for "agent" and "flexible" — words the
-                // user didn't ask about. Each unmatched strong part applies 0.85×.
-                score *= negative_keyword_penalty(&node.name, &scoring_q_words);
+                // Negative keyword signal: symbols whose names contain 2+ strong
+                // words absent from the query get capped at the coherence floor.
+                // "verify_agent_flexible" has 2 unmatched strong parts ("agent",
+                // "flexible") → capped. But "get_password_hash" has only 1 unmatched
+                // ("hash") → no penalty. The 2+ threshold prevents collateral damage
+                // to descriptive names while catching wrong-subsystem matches.
+                if unmatched_strong_parts(&node.name, &scoring_q_words) >= 2 {
+                    score = score.min(0.04);
+                }
 
                 // Deprioritize variable/constant declarations for pivot selection.
                 // Variables like RemoteDesktop.tsx:token (a one-line localStorage.getItem())
@@ -1479,23 +1494,20 @@ fn has_keyword_coherence(
     })
 }
 
-/// Compute a penalty multiplier for symbols whose names contain strong words
-/// not present in the query. For example, "verify_agent_signature" queried with
-/// "authentication JWT login token verification" — "agent" and "signature" are
-/// strong name parts with no query match, so the symbol gets penalized.
-///
-/// Returns a multiplier in (0.0, 1.0] — 1.0 means no penalty.
-/// Each unmatched strong name part applies a 0.85× factor.
-fn negative_keyword_penalty(name: &str, query_words: &[&str]) -> f64 {
+/// Count the number of strong (non-stop-word, >= 3 chars) name parts that
+/// don't match any query word. Used to detect wrong-subsystem symbols:
+/// "verify_agent_flexible" has 2 unmatched ("agent", "flexible") while
+/// "get_password_hash" has only 1 ("hash").
+fn unmatched_strong_parts(name: &str, query_words: &[&str]) -> usize {
     let name_parts = split_identifier(name);
-    let mut unmatched_strong = 0u32;
+    let mut count = 0usize;
 
     for part in &name_parts {
         if part.len() < 3 {
             continue; // Too short to carry meaning
         }
         if NAME_STOP_WORDS.contains(&part.as_str()) {
-            continue; // Generic verb/preposition
+            continue; // Generic verb/preposition/qualifier
         }
         // Check if this name part matches any query word
         let matches_query = query_words.iter().any(|w| {
@@ -1504,11 +1516,11 @@ fn negative_keyword_penalty(name: &str, query_words: &[&str]) -> f64 {
                 || (part.len() >= 3 && part.starts_with(w))
         });
         if !matches_query {
-            unmatched_strong += 1;
+            count += 1;
         }
     }
 
-    0.85_f64.powi(unmatched_strong as i32)
+    count
 }
 
 /// Format an edge kind for display in dependency direction (outgoing).
