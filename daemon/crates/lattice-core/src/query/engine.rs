@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v24";
+const ENGINE_VERSION: &str = "v25";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
