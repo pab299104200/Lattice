@@ -15,7 +15,23 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v29";
+const ENGINE_VERSION: &str = "v30";
+
+/// Stop words excluded from the negative keyword signal.
+/// These are too generic to carry semantic meaning in symbol names
+/// (e.g., "get_user" — "get" shouldn't penalize a match on "user").
+const NAME_STOP_WORDS: &[&str] = &[
+    "get", "set", "new", "run", "do", "is", "has", "can", "to", "from",
+    "by", "in", "on", "of", "for", "the", "and", "or", "at", "as",
+    "add", "del", "put", "all", "try", "with", "into", "init", "make",
+    "create", "update", "delete", "remove", "handle", "process",
+    "check", "test", "build", "parse", "load", "save", "read", "write",
+    "find", "list", "show", "send", "call", "start", "stop", "open",
+    "close", "done", "data", "info", "item", "self", "this", "that",
+    "type", "name", "id", "key", "val", "value", "result", "error",
+    "async", "await", "impl", "func", "def", "class", "pub", "fn",
+    "mut", "ref", "var", "let", "const", "return", "export", "default",
+];
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -483,6 +499,12 @@ impl QueryEngine {
                         score = score.min(0.04);
                     }
                 }
+
+                // Negative keyword signal: penalize symbols whose names contain
+                // strong words absent from the query. "verify_agent_flexible" matching
+                // on "verify" gets penalized for "agent" and "flexible" — words the
+                // user didn't ask about. Each unmatched strong part applies 0.85×.
+                score *= negative_keyword_penalty(&node.name, &scoring_q_words);
 
                 // Deprioritize variable/constant declarations for pivot selection.
                 // Variables like RemoteDesktop.tsx:token (a one-line localStorage.getItem())
@@ -1455,6 +1477,38 @@ fn has_keyword_coherence(
                     || (p.len() >= 3 && p.starts_with(w))
             })
     })
+}
+
+/// Compute a penalty multiplier for symbols whose names contain strong words
+/// not present in the query. For example, "verify_agent_signature" queried with
+/// "authentication JWT login token verification" — "agent" and "signature" are
+/// strong name parts with no query match, so the symbol gets penalized.
+///
+/// Returns a multiplier in (0.0, 1.0] — 1.0 means no penalty.
+/// Each unmatched strong name part applies a 0.85× factor.
+fn negative_keyword_penalty(name: &str, query_words: &[&str]) -> f64 {
+    let name_parts = split_identifier(name);
+    let mut unmatched_strong = 0u32;
+
+    for part in &name_parts {
+        if part.len() < 3 {
+            continue; // Too short to carry meaning
+        }
+        if NAME_STOP_WORDS.contains(&part.as_str()) {
+            continue; // Generic verb/preposition
+        }
+        // Check if this name part matches any query word
+        let matches_query = query_words.iter().any(|w| {
+            (part.len() >= 3 && part.as_str() == *w)
+                || (part.len() >= 4 && w.starts_with(part.as_str()))
+                || (part.len() >= 3 && part.starts_with(w))
+        });
+        if !matches_query {
+            unmatched_strong += 1;
+        }
+    }
+
+    0.85_f64.powi(unmatched_strong as i32)
 }
 
 /// Format an edge kind for display in dependency direction (outgoing).
