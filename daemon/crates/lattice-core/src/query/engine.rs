@@ -15,7 +15,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v22";
+const ENGINE_VERSION: &str = "v23";
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -107,7 +107,12 @@ impl QueryEngine {
                         (*w, (fp_total / df as f64).ln().max(0.1))
                     })
                     .collect();
-                let fp_max_idf = fp_word_idf.values().cloned().fold(0.1f64, f64::max);
+                let fp_max_idf_raw = fp_word_idf.values().cloned().fold(0.1f64, f64::max);
+                let fp_idf_floor = fp_max_idf_raw * 0.3;
+                let fp_word_idf_floored: HashMap<&str, f64> = fp_word_idf.iter()
+                    .map(|(w, idf)| (*w, idf.max(fp_idf_floor)))
+                    .collect();
+                let fp_max_idf = fp_word_idf_floored.values().cloned().fold(0.1f64, f64::max);
 
                 // Group functions by matching file, scored by centrality.
                 // Track per-file IDF-weighted match score for prioritization.
@@ -136,7 +141,7 @@ impl QueryEngine {
                     let mut match_count: usize = 0;
                     for w in &q_words {
                         if file_segments.iter().any(|seg| seg == w) {
-                            let idf_f = fp_word_idf.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
+                            let idf_f = fp_word_idf_floored.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
                             file_score += idf_f;
                             match_count += 1;
                         }
@@ -377,6 +382,13 @@ impl QueryEngine {
                     score *= 0.3;
                 }
 
+                // Demote migration files (Alembic, Django, etc.). upgrade()/downgrade()
+                // are generic function names that keyword-match any domain term appearing
+                // in the migration filename (e.g. 042_fingerprint_system.py matching "system").
+                if is_migration_file(&node.file) {
+                    score *= 0.2;
+                }
+
                 // Schema deprioritization for Explore intent.
                 // "How does X work" queries need implementation logic, not type defs.
                 // Schemas/interfaces keyword-match well (DeploymentSchema matches
@@ -419,6 +431,23 @@ impl QueryEngine {
                 .then_with(|| a.node.name.cmp(&b.node.name))
         });
 
+        // Deduplicate: when multiple candidates share the same name and >80% body
+        // overlap (e.g. 5 identical `interface Host` in different .tsx files), keep
+        // only the highest-scoring one. This collapses re-exported type aliases and
+        // copy-pasted interfaces that waste slots without adding information.
+        {
+            let mut seen_bodies: Vec<(String, String)> = Vec::new(); // (name, body)
+            candidates.retain(|c| {
+                let dominated = seen_bodies.iter().any(|(name, body)| {
+                    c.node.name == *name && line_overlap_ratio(body, &c.node.body) > 0.80
+                });
+                if !dominated {
+                    seen_bodies.push((c.node.name.clone(), c.node.body.clone()));
+                }
+                !dominated
+            });
+        }
+
         // Step 5: Budget allocation (adaptive: repeated queries expand context)
         let repeat_count = self.query_history.get(query_text).copied().unwrap_or(0);
         let mut pivots = Vec::new();
@@ -430,16 +459,23 @@ impl QueryEngine {
         // Context (signatures) are cheap, so without a count cap they can explode to 100+.
         let max_context_nodes: usize = 30;
 
+        // Relative pivot threshold: if the best candidate scores 0.15, absolute
+        // thresholds (0.20/0.35) would produce zero pivots. Use max_score * 0.55
+        // as a floor — the top ~45% of candidates become pivot-eligible regardless
+        // of absolute score, ensuring every query gets some full source.
+        let max_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0.0);
+        let relative_pivot = max_candidate_score * 0.55;
+
         for candidate in &candidates {
             if tokens_used >= budget {
                 break;
             }
 
-            // Seed hits (direct keyword/semantic matches) need 0.20 to be pivots.
-            // Graph-traversed nodes need 0.35 — they're included because they
-            // call/are-called-by relevant symbols, but their full source may be
-            // off-topic (e.g., create_user calling get_password_hash).
-            let pivot_threshold = if candidate.is_seed_hit { 0.20 } else { 0.35 };
+            // Pivot threshold: relative to max score OR absolute floor, whichever is lower.
+            // This ensures pivots even when all scores are low (SNMP/credential queries),
+            // while maintaining the absolute gate when scores are healthy.
+            let absolute_threshold: f64 = if candidate.is_seed_hit { 0.20 } else { 0.35 };
+            let pivot_threshold = absolute_threshold.min(relative_pivot);
 
             if candidate.score > pivot_threshold {
                 // Pivot: include full source for strong matches
@@ -877,9 +913,19 @@ impl QueryEngine {
             .collect();
         let max_idf = word_idf.values().cloned().fold(0.1f64, f64::max);
 
-        // Pre-compute total IDF (sum of all word IDFs) — constant across nodes
+        // Floor IDF at 30% of max. If a word is in the query, it's relevant by
+        // definition — IDF should compress the range, not eliminate terms. Without
+        // this, auth queries fail because "token"/"password"/"user" have near-zero
+        // IDF in codebases where those words are ubiquitous.
+        let idf_floor = max_idf * 0.3;
+        let word_idf_floored: HashMap<&str, f64> = word_idf.iter()
+            .map(|(w, idf)| (*w, idf.max(idf_floor)))
+            .collect();
+        let max_idf_floored = word_idf_floored.values().cloned().fold(0.1f64, f64::max);
+
+        // Pre-compute total IDF (sum of all floored word IDFs) — constant across nodes
         let total_idf: f64 = query_words.iter()
-            .map(|w| word_idf.get(*w).copied().unwrap_or(1.0))
+            .map(|w| word_idf_floored.get(*w).copied().unwrap_or(1.0))
             .sum();
 
         let mut scored: Vec<(SymbolId, f64)> = Vec::new();
@@ -897,7 +943,7 @@ impl QueryEngine {
             // Fast path: exact symbol name in query → high score.
             // IDF-weighted: exact match on a rare term scores higher than on a common one.
             if query_words.iter().any(|w| *w == name_lower) {
-                let idf_factor = word_idf.get(name_lower.as_str()).copied().unwrap_or(max_idf) / max_idf;
+                let idf_factor = word_idf_floored.get(name_lower.as_str()).copied().unwrap_or(max_idf_floored) / max_idf_floored;
                 let exact_score = if query_words.len() >= 5 {
                     match node.kind {
                         SymbolKind::Variable | SymbolKind::Constant => 0.5 * idf_factor,
@@ -922,8 +968,8 @@ impl QueryEngine {
             let mut has_file_match = false;
 
             for word in &query_words {
-                let idf = word_idf.get(*word).copied().unwrap_or(1.0);
-                let idf_factor = idf / max_idf; // 0..1 range
+                let idf = word_idf_floored.get(*word).copied().unwrap_or(1.0);
+                let idf_factor = idf / max_idf_floored; // 0..1 range, floored at 0.3
                 let mut word_score: f64 = 0.0;
 
                 // Name starts with query word (e.g. word="login", name="loginUser")
@@ -989,7 +1035,7 @@ impl QueryEngine {
             // those matching rare terms or multiple terms.
             let coverage = words_matched as f64 / query_words.len() as f64;
             let file_bonus = if has_file_match { 0.1 } else { 0.0 };
-            let max_possible_score = total_idf / max_idf; // max if all words matched at 1.0
+            let max_possible_score = total_idf / max_idf_floored; // max if all words matched at 1.0
             let normalized = if max_possible_score > 0.0 {
                 let raw = idf_weighted_score / max_possible_score.min(query_words.len() as f64);
                 (raw * (0.5 + 0.5 * coverage) + file_bonus).min(1.0)
@@ -1044,7 +1090,7 @@ impl QueryEngine {
                 let mut wm = 0usize;
                 let name_parts = split_identifier(&name_lower);
                 for word in &query_words {
-                    let idf_f = word_idf.get(*word).copied().unwrap_or(1.0) / max_idf;
+                    let idf_f = word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
                     let mut ws: f64 = 0.0;
                     if name_lower.starts_with(word) { ws = 0.8; }
                     else if word.starts_with(&name_lower) && name_lower.len() >= 3 { ws = 0.6; }
@@ -1057,7 +1103,7 @@ impl QueryEngine {
                 if wm == 0 { continue; }
                 if query_words.len() >= 3 && wm < 2 { continue; }
                 let cov = wm as f64 / query_words.len() as f64;
-                let max_possible = total_idf / max_idf;
+                let max_possible = total_idf / max_idf_floored;
                 let norm = if max_possible > 0.0 {
                     let raw = idf_ws / max_possible.min(query_words.len() as f64);
                     (raw * (0.5 + 0.5 * cov) + 0.1).min(1.0)
@@ -1229,6 +1275,20 @@ fn is_test_file(file_path: &str) -> bool {
         || filename == "conftest.py"
         || lower.contains("/tests/")
         || lower.contains("/__tests__/")
+}
+
+/// Detect if a file path is a database migration file (Alembic, Django, Sequelize, etc.).
+/// Migration files contain generic upgrade()/downgrade() functions whose names match
+/// any query but whose content is DDL, not application logic.
+fn is_migration_file(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    // Alembic: versions/042_some_name.py (digits followed by underscore)
+    // Django: migrations/0001_initial.py
+    // Common migration directories
+    lower.contains("/versions/")
+        || lower.contains("/migrations/")
+        || lower.contains("/alembic/")
+        || lower.contains("/migrate/")
 }
 
 /// Split an identifier into constituent words (handles snake_case and camelCase).
