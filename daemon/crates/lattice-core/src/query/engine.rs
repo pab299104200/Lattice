@@ -183,6 +183,8 @@ impl QueryEngine {
                         .then_with(|| a.cmp(b))
                 });
 
+                let mut seeded_ids: std::collections::HashSet<SymbolId> = seed_ids.clone();
+
                 for file in &files {
                     if added >= max_total { break; }
                     let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
@@ -202,7 +204,29 @@ impl QueryEngine {
                         for (id, _centrality) in candidates.iter().take(max_per_file) {
                             if added >= max_total { break; }
                             seed_hits.push((id.clone(), seed_sim));
+                            seeded_ids.insert(id.clone());
                             added += 1;
+                        }
+                    }
+                }
+
+                // High-centrality promotion: functions with >20 dependents are
+                // architectural hubs (e.g., get_current_user called by every endpoint).
+                // If they live in a file that matched the query but didn't make
+                // max_per_file, promote them as seeds. These are too important to miss.
+                for file in &files {
+                    if added >= max_total + 5 { break; } // allow up to 5 extra hub promotions
+                    let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
+                    let seed_sim = (0.15 + 0.35 * (file_score / q_words.len() as f64)).min(0.50);
+                    if let Some(candidates) = file_candidates.get(file) {
+                        for (id, _centrality) in candidates {
+                            if seeded_ids.contains(id) { continue; }
+                            let dep_count = self.graph.get_dependents(id).len();
+                            if dep_count >= 20 {
+                                seed_hits.push((id.clone(), seed_sim));
+                                seeded_ids.insert(id.clone());
+                                added += 1;
+                            }
                         }
                     }
                 }
@@ -222,6 +246,17 @@ impl QueryEngine {
                 id.clone(),
                 format!("semantic_match: {:.2}", sim),
             );
+
+            // Skip graph expansion from Variable/Constant nodes.
+            // Variables are data declarations (e.g., `const token = localStorage.get(...)`)
+            // whose graph edges are often coincidental name matches or import artifacts.
+            // Expanding from them produces cross-domain noise (e.g., RemoteDesktop's
+            // "token" variable connecting to vuln_matcher's _build_candidate_products).
+            if let Some(seed_node) = self.graph.get_node(id) {
+                if matches!(seed_node.kind, SymbolKind::Variable | SymbolKind::Constant) {
+                    continue;
+                }
+            }
 
             // Build path-aware traversal from this seed hit.
             // Propagate decayed similarity so graph-traversed nodes get
@@ -972,7 +1007,12 @@ impl QueryEngine {
                 continue;
             }
 
-            let name_parts = split_identifier(&name_lower);
+            // Split on original name (preserving camelCase boundaries).
+            // split_identifier("GetSystemUsers") → ["get", "system", "users"]
+            // Previously we passed name_lower which destroyed camelCase info,
+            // producing ["getsystemusers"] — a single blob that matched "user"
+            // via substring but missed that "users" ≠ "user".
+            let name_parts = split_identifier(&node.name);
             // Pre-split file path into exact segments for matching
             let file_segments: Vec<&str> = file_lower
                 .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
@@ -1052,12 +1092,20 @@ impl QueryEngine {
             let coverage = words_matched as f64 / query_words.len() as f64;
             let file_bonus = if has_file_match { 0.1 } else { 0.0 };
             let max_possible_score = total_idf / max_idf_floored; // max if all words matched at 1.0
-            let normalized = if max_possible_score > 0.0 {
+            let mut normalized = if max_possible_score > 0.0 {
                 let raw = idf_weighted_score / max_possible_score.min(query_words.len() as f64);
                 (raw * (0.5 + 0.5 * coverage) + file_bonus).min(1.0)
             } else {
                 0.0
             };
+
+            // Penalty for single-match in multi-word queries.
+            // "user" matching inside "GetSystemUsers" gives score ~0.17, which
+            // survives thresholds. With the penalty: 0.17 * 0.35 ≈ 0.06 → excluded.
+            // Valid matches like AuthenticationMiddleware (0.40 * 0.35 = 0.14) still survive.
+            if query_words.len() >= 2 && words_matched == 1 {
+                normalized *= 0.35;
+            }
 
             if normalized > 0.05 {
                 scored.push((node.id.clone(), normalized));
