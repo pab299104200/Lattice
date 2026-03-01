@@ -221,4 +221,16 @@ fn test_search_across_sessions() {
     let results = store.search_across_sessions("JWT", Some("s2"), 10).expect("search failed");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session_id, "s1");
+
+    // Multi-word search: words matched independently (AND logic)
+    let results = store.search_across_sessions("auth pattern", None, 10).expect("search failed");
+    assert_eq!(results.len(), 1, "Should match 'JWT auth pattern' with words 'auth' AND 'pattern'");
+
+    // Multi-word: no single entry contains both words
+    let results = store.search_across_sessions("JWT pool", None, 10).expect("search failed");
+    assert_eq!(results.len(), 0, "No single memory contains both 'JWT' and 'pool'");
+
+    // Empty keyword returns all
+    let results = store.search_across_sessions("", None, 10).expect("search failed");
+    assert_eq!(results.len(), 3, "Empty search should return all memories");
 }

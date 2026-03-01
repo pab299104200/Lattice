@@ -561,3 +561,59 @@ public enum Status {
     // Imports
     assert!(result.imports.len() >= 2, "Should find at least 2 imports, found {}", result.imports.len());
 }
+
+#[test]
+fn test_parse_python_sqlalchemy_model() {
+    let source = r#"
+from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy.orm import relationship
+
+class Host(Base):
+    __tablename__ = "hosts"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255))
+    org_id = Column(Integer, ForeignKey("organizations.id"))
+
+class HypervisorDiscovery(Base):
+    __tablename__ = "hypervisor_discoveries"
+    id = Column(Integer, primary_key=True)
+    hypervisor_host_id = Column(Integer, ForeignKey("hosts.id"), nullable=False)
+    hypervisor = relationship("Host", foreign_keys=[hypervisor_host_id])
+    cloud_meta = relationship("CloudMetadata")
+"#;
+
+    let result = parse_file("models/discovery.py", source).expect("Failed to parse");
+
+    // HypervisorDiscovery should have references to Host and CloudMetadata via relationship()
+    let hyp = result.symbols.iter()
+        .find(|s| s.name == "HypervisorDiscovery" && s.kind == SymbolKind::Class)
+        .expect("Should find HypervisorDiscovery class");
+
+    assert!(
+        hyp.references.contains(&"Host".to_string()),
+        "Should have Host reference from relationship(), got: {:?}",
+        hyp.references
+    );
+    assert!(
+        hyp.references.contains(&"CloudMetadata".to_string()),
+        "Should have CloudMetadata reference from relationship(), got: {:?}",
+        hyp.references
+    );
+
+    // Should also capture ForeignKey table refs
+    assert!(
+        hyp.references.contains(&"hosts".to_string()),
+        "Should have hosts reference from ForeignKey(), got: {:?}",
+        hyp.references
+    );
+
+    // Host class should have organizations ref from ForeignKey
+    let host = result.symbols.iter()
+        .find(|s| s.name == "Host" && s.kind == SymbolKind::Class)
+        .expect("Should find Host class");
+    assert!(
+        host.references.contains(&"organizations".to_string()),
+        "Should have organizations reference from ForeignKey(), got: {:?}",
+        host.references
+    );
+}

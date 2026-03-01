@@ -157,24 +157,49 @@ impl MemoryStore {
         Ok(memories)
     }
 
-    /// Search memories by keyword (LIKE match on content). Excludes invalidated.
+    /// Search memories by keyword (per-word AND match on content + linked_symbols). Excludes invalidated.
     pub fn search_by_keyword(&self, keyword: &str) -> Result<Vec<Memory>, LatticeError> {
-        let escaped = keyword.replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{}%", escaped);
+        // Split into individual words — each must match content or linked_symbols
+        let words: Vec<String> = keyword
+            .split_whitespace()
+            .filter(|w| w.len() >= 2)
+            .map(|w| {
+                let escaped = w.replace('%', "\\%").replace('_', "\\_");
+                format!("%{}%", escaped)
+            })
+            .collect();
+
+        let mut where_clauses = vec!["is_invalidated = 0".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1usize;
+
+        for pattern in &words {
+            where_clauses.push(format!(
+                "(content LIKE ?{p} ESCAPE '\\' OR linked_symbols LIKE ?{p} ESCAPE '\\')",
+                p = param_idx
+            ));
+            params_vec.push(Box::new(pattern.clone()));
+            param_idx += 1;
+        }
+
+        let sql = format!(
+            "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason
+             FROM memories
+             WHERE {}
+             ORDER BY created_at DESC",
+            where_clauses.join(" AND ")
+        );
 
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
-                 FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\'
-                 ORDER BY created_at DESC",
-            )
+            .prepare(&sql)
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare search query: {}", e)))?;
 
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
         let rows = stmt
-            .query_map(params![pattern], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok(MemoryRow {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -349,34 +374,53 @@ impl MemoryStore {
         exclude_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Memory>, LatticeError> {
-        let escaped = keyword.replace('%', "\\%").replace('_', "\\_");
-        let pattern = format!("%{}%", escaped);
+        // Split query into individual words and AND them together.
+        // "project architecture patterns" → content LIKE '%project%' AND content LIKE '%architecture%' AND content LIKE '%patterns%'
+        // Also search linked_symbols JSON column for each word.
+        let words: Vec<String> = keyword
+            .split_whitespace()
+            .filter(|w| w.len() >= 2) // skip single-char noise
+            .map(|w| {
+                let escaped = w.replace('%', "\\%").replace('_', "\\_");
+                format!("%{}%", escaped)
+            })
+            .collect();
 
-        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(excl) = exclude_session {
-            (
-                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
-                 FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\' AND session_id != ?2
-                 ORDER BY created_at DESC
-                 LIMIT ?3",
-                vec![Box::new(pattern), Box::new(excl.to_string()), Box::new(limit as i64)],
-            )
-        } else {
-            (
-                "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
-                 FROM memories
-                 WHERE is_invalidated = 0 AND content LIKE ?1 ESCAPE '\\'
-                 ORDER BY created_at DESC
-                 LIMIT ?2",
-                vec![Box::new(pattern), Box::new(limit as i64)],
-            )
-        };
+        let mut where_clauses = vec!["is_invalidated = 0".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1usize;
+
+        // Per-word: match content OR linked_symbols
+        for pattern in &words {
+            where_clauses.push(format!(
+                "(content LIKE ?{p} ESCAPE '\\' OR linked_symbols LIKE ?{p} ESCAPE '\\')",
+                p = param_idx
+            ));
+            params_vec.push(Box::new(pattern.clone()));
+            param_idx += 1;
+        }
+
+        if let Some(excl) = exclude_session {
+            where_clauses.push(format!("session_id != ?{}", param_idx));
+            params_vec.push(Box::new(excl.to_string()));
+            param_idx += 1;
+        }
+
+        let sql = format!(
+            "SELECT id, session_id, content, memory_type, confidence, linked_symbols, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason
+             FROM memories
+             WHERE {}
+             ORDER BY created_at DESC
+             LIMIT ?{}",
+            where_clauses.join(" AND "),
+            param_idx
+        );
+        params_vec.push(Box::new(limit as i64));
 
         let mut stmt = self
             .conn
-            .prepare(sql)
+            .prepare(&sql)
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare cross-session query: {}", e)))?;
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();

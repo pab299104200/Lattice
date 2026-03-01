@@ -172,6 +172,18 @@ fn extract_class(
         .trim()
         .to_string();
 
+    // Extract references from class body (Column, relationship, ForeignKey calls, etc.)
+    let class_refs = if let Some(body_node) = node.child_by_field_name("body") {
+        let mut refs = Vec::new();
+        collect_call_identifiers(body_node, source, &mut refs);
+        collect_string_model_refs(body_node, source, &mut refs);
+        refs.sort();
+        refs.dedup();
+        refs
+    } else {
+        vec![]
+    };
+
     symbols.push(Symbol {
         id: SymbolId {
             file: file_path.to_string(),
@@ -187,7 +199,7 @@ fn extract_class(
         end_line: node.end_position().row + 1,
         is_exported,
         language: Language::Python,
-        references: vec![],
+        references: class_refs,
         imports: vec![],
     });
 
@@ -389,6 +401,56 @@ fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_call_identifiers(child, source, refs);
+    }
+}
+
+/// Extract string literal arguments from framework calls like `relationship("Host")`
+/// and `ForeignKey("hosts.id")`. These create model-to-model edges that static
+/// analysis would otherwise miss.
+fn collect_string_model_refs(node: Node, source: &[u8], refs: &mut Vec<String>) {
+    if node.kind() == "call" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            let func_name = match func_node.kind() {
+                "identifier" => node_text(func_node, source),
+                "attribute" => {
+                    // e.g., orm.relationship — use the attribute name
+                    func_node.child_by_field_name("attribute")
+                        .map(|a| node_text(a, source))
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+
+            if func_name == "relationship" || func_name == "ForeignKey" {
+                // Extract the first string argument
+                if let Some(args_node) = node.child_by_field_name("arguments") {
+                    let mut args_cursor = args_node.walk();
+                    for arg in args_node.children(&mut args_cursor) {
+                        if arg.kind() == "string" {
+                            let raw = node_text(arg, source);
+                            // Strip quotes and extract model/table name
+                            let cleaned = raw.trim_matches(|c| c == '"' || c == '\'');
+                            if !cleaned.is_empty() {
+                                // For ForeignKey("hosts.id"), extract "hosts"
+                                // For relationship("Host"), use "Host" directly
+                                let model_ref = if func_name == "ForeignKey" {
+                                    cleaned.split('.').next().unwrap_or(cleaned).to_string()
+                                } else {
+                                    cleaned.to_string()
+                                };
+                                refs.push(model_ref);
+                            }
+                            break; // Only first string arg matters
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_string_model_refs(child, source, refs);
     }
 }
 

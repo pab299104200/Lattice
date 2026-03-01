@@ -12,7 +12,7 @@ use lattice_core::graph::CodeGraph;
 use lattice_core::graph::model::EdgeKind;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::ChangeTracker;
-use lattice_core::memory::MemoryStore;
+use lattice_core::memory::{Memory, MemoryType, MemoryStore};
 use lattice_core::parser;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
@@ -357,30 +357,67 @@ async fn main() -> Result<()> {
                                 }
                                 change_tracker.record_batch(changed_names);
 
-                                // Mark stale memories for modified/removed symbols
-                                {
-                                    let ms = memory_store_clone.lock().await;
-                                    for change in &changes {
-                                        if change.kind == diff::ChangeKind::Modified
-                                            || change.kind == diff::ChangeKind::Removed
-                                        {
-                                            let reason = format!(
-                                                "{}() was {:?} in {}",
-                                                change.name, change.kind, change.file
-                                            );
-                                            let _ = ms.mark_stale_by_symbol(&change.name, &reason);
-                                        }
+                                // Mark stale memories + surface thrashing/dead-ends as observations
+                                let ms = memory_store_clone.lock().await;
+                                for change in &changes {
+                                    if change.kind == diff::ChangeKind::Modified
+                                        || change.kind == diff::ChangeKind::Removed
+                                    {
+                                        let reason = format!(
+                                            "{}() was {:?} in {}",
+                                            change.name, change.kind, change.file
+                                        );
+                                        let _ = ms.mark_stale_by_symbol(&change.name, &reason);
                                     }
                                 }
 
-                                // Surface thrashing / dead-end detection
+                                // Surface thrashing / dead-end detection as observations
                                 let thrashing = change_tracker.detect_thrashing();
-                                if !thrashing.is_empty() {
-                                    tracing::info!("Thrashing detected: {:?}", thrashing);
+                                for sym in &thrashing {
+                                    let score = change_tracker.get_hotspot_score(sym);
+                                    let content = format!(
+                                        "Thrashing detected: {}() has been edited {} times this session — may indicate instability or unclear requirements",
+                                        sym, score
+                                    );
+                                    tracing::info!("{}", content);
+                                    let mem = Memory {
+                                        id: String::new(),
+                                        session_id: String::new(),
+                                        content,
+                                        memory_type: MemoryType::AntiPattern,
+                                        confidence: 0.8,
+                                        linked_symbols: vec![sym.clone()],
+                                        source_query: None,
+                                        created_at: 0,
+                                        last_accessed: 0,
+                                        access_count: 0,
+                                        is_stale: false,
+                                        stale_reason: None,
+                                    };
+                                    let _ = ms.store(mem);
                                 }
                                 let dead_ends = change_tracker.detect_dead_ends();
-                                if !dead_ends.is_empty() {
-                                    tracing::info!("Dead-end symbols: {:?}", dead_ends);
+                                for sym in &dead_ends {
+                                    let content = format!(
+                                        "Dead-end detected: {}() was added then removed this session — abandoned approach",
+                                        sym
+                                    );
+                                    tracing::info!("{}", content);
+                                    let mem = Memory {
+                                        id: String::new(),
+                                        session_id: String::new(),
+                                        content,
+                                        memory_type: MemoryType::AntiPattern,
+                                        confidence: 0.7,
+                                        linked_symbols: vec![sym.clone()],
+                                        source_query: None,
+                                        created_at: 0,
+                                        last_accessed: 0,
+                                        access_count: 0,
+                                        is_stale: false,
+                                        stale_reason: None,
+                                    };
+                                    let _ = ms.store(mem);
                                 }
                             }
                         }
