@@ -2,6 +2,7 @@
 daemon/target/
 
 # Node
+/node_modules/
 extension/node_modules/
 extension/out/
 extension/*.vsix
