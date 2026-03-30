@@ -41,6 +41,7 @@ pub fn parse(file_path: &str, source: &str, language: Language) -> Result<Parsed
         language,
         symbols,
         imports,
+        links: vec![],
     })
 }
 

@@ -217,6 +217,38 @@ fn test_adaptive_budget_expands_on_repeat() {
     // query_history should now have count 3 for this query
 }
 
+#[test]
+fn test_query_engine_can_return_markdown_sections() {
+    use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
+
+    let guide_source = r#"
+# Guide
+
+## Setup
+
+Run `prepare_change` before editing.
+"#;
+    let mut builder = GraphBuilder::new();
+    builder.add_file(parse_file("docs/guide.md", guide_source).unwrap());
+    let graph = builder.build();
+    let mut engine = QueryEngine::new(graph, None, None);
+
+    let capsule = engine.query("setup guide", None, false);
+    let all_symbols: Vec<&str> = capsule
+        .pivots
+        .iter()
+        .map(|pivot| pivot.symbol.as_str())
+        .chain(capsule.context.iter().map(|node| node.symbol.as_str()))
+        .collect();
+
+    assert!(
+        all_symbols.contains(&"Setup") || all_symbols.contains(&"Guide"),
+        "expected markdown doc symbols in results, got: {:?}",
+        all_symbols
+    );
+}
+
 // ─── Query filter parsing tests ─────────────────────────────────────
 
 #[test]

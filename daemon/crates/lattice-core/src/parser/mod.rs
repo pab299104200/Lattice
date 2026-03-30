@@ -1,5 +1,6 @@
 pub mod go_lang;
 pub mod java;
+pub mod markdown;
 pub mod python;
 pub mod rust_lang;
 pub mod typescript;
@@ -23,6 +24,7 @@ pub fn parse_file(file_path: &str, source: &str) -> Result<ParsedFile, LatticeEr
         Language::Rust => rust_lang::parse(file_path, source),
         Language::Go => go_lang::parse(file_path, source),
         Language::Java => java::parse(file_path, source),
+        Language::Markdown => markdown::parse(file_path, source),
         _ => Err(LatticeError::Parse {
             file: file_path.to_string(),
             message: format!("Unsupported language: {:?}", language),

@@ -33,6 +33,32 @@ impl MemoryType {
     }
 }
 
+/// The durability scope of a memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryScope {
+    Session,
+    Branch,
+    Repo,
+}
+
+impl MemoryScope {
+    pub fn as_str(&self) -> &str {
+        match self {
+            MemoryScope::Session => "session",
+            MemoryScope::Branch => "branch",
+            MemoryScope::Repo => "repo",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "branch" => MemoryScope::Branch,
+            "repo" => MemoryScope::Repo,
+            _ => MemoryScope::Session,
+        }
+    }
+}
+
 /// A session memory — an insight, decision, pattern, or observation recorded
 /// during an AI coding session for later recall.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +67,13 @@ pub struct Memory {
     pub session_id: String,
     pub content: String,
     pub memory_type: MemoryType,
+    pub scope: MemoryScope,
     pub confidence: f64,
     pub linked_symbols: Vec<String>,
+    pub linked_files: Vec<String>,
+    pub workspace_id: Option<String>,
+    pub branch: Option<String>,
+    pub refresh_key: Option<String>,
     pub source_query: Option<String>,
     pub created_at: u64,
     pub last_accessed: u64,

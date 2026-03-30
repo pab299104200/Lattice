@@ -1,23 +1,22 @@
-mod rpc;
+#![recursion_limit = "256"]
 
+mod rpc;
+mod watcher;
+
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
-use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use lattice_core::diff;
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::graph::CodeGraph;
-use lattice_core::graph::model::EdgeKind;
 use lattice_core::indexer::Indexer;
-use lattice_core::intelligence::ChangeTracker;
-use lattice_core::memory::{Memory, MemoryType, MemoryStore};
-use lattice_core::parser;
+use lattice_core::memory::MemoryStore;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, VectorStore};
-use lattice_core::watcher::{self, FileEventKind};
+use lattice_core::watcher as core_watcher;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
@@ -54,7 +53,8 @@ async fn main() -> Result<()> {
     let memories_path = lattice_dir.join("memories.db");
     let ms = MemoryStore::open(&memories_path).expect("Failed to open memory store");
     let memory_store = Arc::new(Mutex::new(ms));
-    let ms_for_engine = MemoryStore::open(&memories_path).expect("Failed to open memory store for engine");
+    let ms_for_engine =
+        MemoryStore::open(&memories_path).expect("Failed to open memory store for engine");
     let vector_store = {
         let vs_path = lattice_dir.join("vectors.db");
         match VectorStore::open(&vs_path.to_string_lossy()) {
@@ -68,17 +68,24 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to open vector store, semantic search disabled: {}", e);
+                tracing::warn!(
+                    "Failed to open vector store, semantic search disabled: {}",
+                    e
+                );
                 None
             }
         }
     };
 
-    let engine = QueryEngine::new(graph, vector_store, Some(Arc::new(std::sync::Mutex::new(ms_for_engine))));
+    let engine = QueryEngine::new(
+        graph,
+        vector_store,
+        Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
+    );
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(
-        GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
+        GraphStore::open_in_memory().expect("Failed to create in-memory graph store"),
     ));
 
     // Multi-repo workspace manager (only used when multiple workspaces)
@@ -118,7 +125,8 @@ async fn main() -> Result<()> {
                     let mut wm = wm_clone.blocking_lock();
                     let mut total = 0usize;
                     for root in &roots {
-                        let repo_name = root.file_name()
+                        let repo_name = root
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("default")
                             .to_string();
@@ -134,7 +142,9 @@ async fn main() -> Result<()> {
                     wm.detect_cross_repo_edges();
                     tracing::info!("Detected {} cross-repo edges", wm.cross_repo_edges().len());
                     total
-                }).await.unwrap_or(0)
+                })
+                .await
+                .unwrap_or(0)
             } else {
                 // Single repo: collect files, then index in batches with engine updates
                 let ws = ws_root.clone();
@@ -184,7 +194,9 @@ async fn main() -> Result<()> {
                 let stats = new_graph.stats();
                 tracing::info!(
                     "Graph ready: {} nodes, {} edges, {} files",
-                    stats.node_count, stats.edge_count, stats.file_count
+                    stats.node_count,
+                    stats.edge_count,
+                    stats.file_count
                 );
 
                 {
@@ -211,7 +223,12 @@ async fn main() -> Result<()> {
                             let text = format!("{} {}", node.name, node.signature);
                             if let Ok(vec) = emb.embed(&text) {
                                 if let Some(vs) = eng.vector_store() {
-                                    let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
+                                    let _ = vs.upsert_vector(
+                                        &node.file,
+                                        &node.name,
+                                        node.id.byte_offset,
+                                        &vec,
+                                    );
                                 }
                                 embedded += 1;
                             }
@@ -232,250 +249,23 @@ async fn main() -> Result<()> {
     // ── Start file watcher(s) entirely in background ────────────────
     // For multi-repo, we merge all watcher events into a single channel.
     {
-        let engine_clone = Arc::clone(&engine);
-        let indexer_clone = Arc::clone(&indexer);
-        let graph_store_clone = Arc::clone(&graph_store);
-        let emb_engine_clone = Arc::clone(&embedding_engine);
-        let ws_manager_clone = workspace_manager.clone();
-        let ws_roots_watch = workspace_roots.clone();
-        let memory_store_clone = Arc::clone(&memory_store);
+        let engine = Arc::clone(&engine);
+        let indexer = Arc::clone(&indexer);
+        let workspace_roots = workspace_roots.clone();
 
         tokio::spawn(async move {
-            // Merge watchers from all workspace roots into a single channel
-            let (merged_tx, mut merged_rx) = tokio::sync::mpsc::unbounded_channel::<(watcher::FileEvent, PathBuf)>();
+            for root in workspace_roots {
+                let watcher = crate::watcher::FileWatcher::new(
+                    root.clone(),
+                    Arc::clone(&indexer),
+                    Arc::clone(&engine),
+                );
 
-            let mut _watcher_handles = Vec::new();
-            for root in &ws_roots_watch {
-                let watcher_result = tokio::task::spawn_blocking({
-                    let ws = root.clone();
-                    move || watcher::start_watcher(ws)
-                }).await;
-
-                match watcher_result {
-                    Ok(Ok((w, mut rx))) => {
-                        _watcher_handles.push(w);
-                        let tx = merged_tx.clone();
-                        let root_for_task = root.clone();
-                        tokio::spawn(async move {
-                            while let Some(event) = rx.recv().await {
-                                let _ = tx.send((event, root_for_task.clone()));
-                            }
-                        });
-                        tracing::info!("File watcher started for {}", root.display());
+                tokio::spawn(async move {
+                    if let Err(e) = watcher.run().await {
+                        tracing::error!("File watcher failed for {:?}: {}", root, e);
                     }
-                    _ => {
-                        tracing::warn!("Failed to start file watcher for {}", root.display());
-                    }
-                }
-            }
-            drop(merged_tx); // Drop original sender so merged_rx ends when all watchers close
-
-            let mut change_tracker = ChangeTracker::new();
-
-            while let Some((event, ws_root)) = merged_rx.recv().await {
-                let rel_path = event
-                    .path
-                    .strip_prefix(&ws_root)
-                    .unwrap_or(&event.path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-
-                tracing::debug!("File event: {:?} {} (root: {})", event.kind, rel_path, ws_root.display());
-
-                // Determine repo name for multi-repo
-                let repo_name = ws_root.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("default")
-                    .to_string();
-
-                // Get old symbols for diff (from engine's current graph)
-                let old_symbols: Vec<lattice_core::symbols::Symbol> = {
-                    let eng = engine_clone.lock().await;
-                    eng.graph().all_nodes().iter()
-                        .filter(|n| n.file == rel_path)
-                        .map(|n| lattice_core::symbols::Symbol {
-                            id: n.id.clone(),
-                            kind: n.kind,
-                            name: n.name.clone(),
-                            signature: n.signature.clone(),
-                            body: n.body.clone(),
-                            file: n.file.clone(),
-                            line: n.line,
-                            end_line: n.end_line,
-                            is_exported: n.is_exported,
-                            language: n.language,
-                            references: vec![],
-                            imports: vec![],
-                        })
-                        .collect()
-                };
-
-                // Index the file change
-                if let Some(wm) = &ws_manager_clone {
-                    let mut wm = wm.lock().await;
-                    match event.kind {
-                        FileEventKind::Created | FileEventKind::Modified => {
-                            if let Ok(content) = std::fs::read_to_string(&event.path) {
-                                if let Err(e) = wm.index_file(&repo_name, &rel_path, &content) {
-                                    tracing::warn!("Failed to re-index {}: {}", rel_path, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        FileEventKind::Deleted => {
-                            wm.remove_file(&repo_name, &rel_path);
-                        }
-                    }
-                } else {
-                    let mut idx = indexer_clone.lock().await;
-                    match event.kind {
-                        FileEventKind::Created | FileEventKind::Modified => {
-                            if let Ok(content) = std::fs::read_to_string(&event.path) {
-                                if let Err(e) = idx.index_file_content(&rel_path, &content) {
-                                    tracing::warn!("Failed to re-index {}: {}", rel_path, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        FileEventKind::Deleted => {
-                            idx.remove_file(&rel_path);
-                        }
-                    }
-                }
-
-                // Diff symbols and record co-changes
-                if matches!(event.kind, FileEventKind::Created | FileEventKind::Modified) {
-                    if let Ok(content) = std::fs::read_to_string(&event.path) {
-                        if let Ok(new_parsed) = parser::parse_file(&rel_path, &content) {
-                            let changes = diff::diff_symbols(&old_symbols, &new_parsed.symbols);
-                            if !changes.is_empty() {
-                                let changed_names: Vec<String> = changes.iter()
-                                    .map(|c| c.name.clone())
-                                    .collect();
-                                for change in &changes {
-                                    change_tracker.record_change(change);
-                                }
-                                change_tracker.record_batch(changed_names);
-
-                                // Mark stale memories + surface thrashing/dead-ends as observations
-                                let ms = memory_store_clone.lock().await;
-                                for change in &changes {
-                                    if change.kind == diff::ChangeKind::Modified
-                                        || change.kind == diff::ChangeKind::Removed
-                                    {
-                                        let reason = format!(
-                                            "{}() was {:?} in {}",
-                                            change.name, change.kind, change.file
-                                        );
-                                        let _ = ms.mark_stale_by_symbol(&change.name, &reason);
-                                    }
-                                }
-
-                                // Surface thrashing / dead-end detection as observations
-                                let thrashing = change_tracker.detect_thrashing();
-                                for sym in &thrashing {
-                                    let score = change_tracker.get_hotspot_score(sym);
-                                    let content = format!(
-                                        "Thrashing detected: {}() has been edited {} times this session — may indicate instability or unclear requirements",
-                                        sym, score
-                                    );
-                                    tracing::info!("{}", content);
-                                    let mem = Memory {
-                                        id: String::new(),
-                                        session_id: String::new(),
-                                        content,
-                                        memory_type: MemoryType::AntiPattern,
-                                        confidence: 0.8,
-                                        linked_symbols: vec![sym.clone()],
-                                        source_query: None,
-                                        created_at: 0,
-                                        last_accessed: 0,
-                                        access_count: 0,
-                                        is_stale: false,
-                                        stale_reason: None,
-                                    };
-                                    let _ = ms.store(mem);
-                                }
-                                let dead_ends = change_tracker.detect_dead_ends();
-                                for sym in &dead_ends {
-                                    let content = format!(
-                                        "Dead-end detected: {}() was added then removed this session — abandoned approach",
-                                        sym
-                                    );
-                                    tracing::info!("{}", content);
-                                    let mem = Memory {
-                                        id: String::new(),
-                                        session_id: String::new(),
-                                        content,
-                                        memory_type: MemoryType::AntiPattern,
-                                        confidence: 0.7,
-                                        linked_symbols: vec![sym.clone()],
-                                        source_query: None,
-                                        created_at: 0,
-                                        last_accessed: 0,
-                                        access_count: 0,
-                                        is_stale: false,
-                                        stale_reason: None,
-                                    };
-                                    let _ = ms.store(mem);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Build updated graph
-                let mut new_graph = if let Some(wm) = &ws_manager_clone {
-                    let wm = wm.lock().await;
-                    wm.unified_graph()
-                } else {
-                    let idx = indexer_clone.lock().await;
-                    idx.graph().clone()
-                };
-
-                // Add CoChanges edges for any pairs that reach threshold
-                let co_pairs = change_tracker.get_co_change_pairs(3);
-                for (sym_a, sym_b, _count) in &co_pairs {
-                    let id_a = new_graph.all_node_ids().iter()
-                        .find(|id| id.name == *sym_a)
-                        .cloned()
-                        .cloned();
-                    let id_b = new_graph.all_node_ids().iter()
-                        .find(|id| id.name == *sym_b)
-                        .cloned()
-                        .cloned();
-                    if let (Some(a), Some(b)) = (id_a, id_b) {
-                        new_graph.add_edge(&a, &b, EdgeKind::CoChanges);
-                    }
-                }
-
-                // Update engine with new graph and re-embed changed nodes if possible
-                {
-                    let mut eng = engine_clone.lock().await;
-                    eng.update_graph(new_graph.clone());
-
-                    if let Some(emb_engine) = emb_engine_clone.get() {
-                        let file_nodes: Vec<_> = new_graph.all_nodes().into_iter()
-                            .filter(|n| n.file == rel_path)
-                            .collect();
-                        for node in &file_nodes {
-                            let text = format!("{} {}", node.name, node.signature);
-                            if let Ok(vec) = emb_engine.embed(&text) {
-                                if let Some(vs) = eng.vector_store() {
-                                    let _ = vs.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vec);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Persist to graph store (best effort)
-                {
-                    let gs = graph_store_clone.lock().await;
-                    if let Err(e) = gs.save_graph(&new_graph) {
-                        tracing::warn!("Failed to persist graph: {}", e);
-                    }
-                }
+                });
             }
         });
     }
@@ -499,6 +289,7 @@ async fn main() -> Result<()> {
 
     // ── Create McpHandler and start StdioServer ──────────────────────
     let session_id = generate_session_id();
+    let context_cache_path = lattice_dir.join("context_handles.json");
     tracing::info!("Creating MCP handler (session: {})", session_id);
     let handler = Arc::new(McpHandler::new(
         engine,
@@ -507,6 +298,7 @@ async fn main() -> Result<()> {
         graph_store,
         embedding_engine,
         workspace_root,
+        context_cache_path,
         session_id,
         workspace_manager,
         workspace_roots,
@@ -535,7 +327,10 @@ fn parse_workspace_roots() -> Vec<PathBuf> {
                 if p.is_dir() {
                     roots.push(p.canonicalize().unwrap_or(p));
                 } else {
-                    eprintln!("Warning: --workspace path '{}' is not a directory, skipping", path);
+                    eprintln!(
+                        "Warning: --workspace path '{}' is not a directory, skipping",
+                        path
+                    );
                 }
                 i += 2;
                 continue;
@@ -557,7 +352,9 @@ fn deduplicate_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     roots.sort_by(|a, b| a.as_os_str().len().cmp(&b.as_os_str().len()));
     let mut result = Vec::new();
     for root in &roots {
-        let is_child = result.iter().any(|parent: &PathBuf| root.starts_with(parent));
+        let is_child = result
+            .iter()
+            .any(|parent: &PathBuf| root.starts_with(parent));
         if !is_child {
             result.push(root.clone());
         }
@@ -583,11 +380,7 @@ fn generate_session_id() -> String {
     std::process::id().hash(&mut hasher);
     let h = hasher.finish();
 
-    format!(
-        "s-{:08x}{:08x}",
-        (h >> 32) as u32,
-        now.subsec_nanos()
-    )
+    format!("s-{:08x}{:08x}", (h >> 32) as u32, now.subsec_nanos())
 }
 
 /// Walk the workspace directory and index via WorkspaceManager.
@@ -599,9 +392,13 @@ fn index_workspace_via_manager(
 ) -> usize {
     let mut count = 0;
     let rn = repo_name.to_string();
-    walk_and_index(root, root, security_filter, &mut count, &mut |rel_path, content| {
-        manager.index_file(&rn, rel_path, content).is_ok()
-    });
+    walk_and_index(
+        root,
+        root,
+        security_filter,
+        &mut count,
+        &mut |rel_path, content| manager.index_file(&rn, rel_path, content).is_ok(),
+    );
     count
 }
 
@@ -646,7 +443,7 @@ fn collect_files_recursive(
                 continue;
             }
 
-            if !watcher::should_index_file(&rel_path) {
+            if !core_watcher::should_index_file(&rel_path) {
                 continue;
             }
 
@@ -692,7 +489,7 @@ fn walk_and_index(
             }
 
             // Check for supported language extension
-            if !watcher::should_index_file(&rel_path) {
+            if !core_watcher::should_index_file(&rel_path) {
                 continue;
             }
 

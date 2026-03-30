@@ -15,7 +15,8 @@ fn test_should_index_python() {
 
 #[test]
 fn test_should_not_index_non_code() {
-    assert!(!should_index_file("README.md"));
+    assert!(should_index_file("README.md"));
+    assert!(should_index_file("docs/runbook.md"));
     assert!(!should_index_file("package.json"));
     assert!(!should_index_file("logo.png"));
     assert!(!should_index_file(".env"));
@@ -26,6 +27,8 @@ fn test_should_not_index_excluded_dirs() {
     assert!(!should_index_file("node_modules/express/index.js"));
     assert!(!should_index_file(".git/hooks/pre-commit"));
     assert!(!should_index_file("target/debug/main.rs"));
+    assert!(!should_index_file(".claude/worktrees/agent-123/src/app.py"));
+    assert!(!should_index_file(".codex/worktrees/task-123/src/app.py"));
 }
 
 #[test]

@@ -10,6 +10,7 @@
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
+  "icon": "resources/lattice-icon.svg",
   "contributes": {
     "commands": [
       {
@@ -27,6 +28,46 @@
       {
         "command": "lattice.clearMemory",
         "title": "Lattice: Clear Memory"
+      },
+      {
+        "command": "lattice.prepareChange",
+        "title": "Lattice: Prepare Change"
+      },
+      {
+        "command": "lattice.impactFromDiff",
+        "title": "Lattice: Analyze Diff Impact"
+      },
+      {
+        "command": "lattice.getWorkingSetContext",
+        "title": "Lattice: Get Working Set Context"
+      },
+      {
+        "command": "lattice.diagnoseFailure",
+        "title": "Lattice: Diagnose Failure"
+      },
+      {
+        "command": "lattice.expandContext",
+        "title": "Lattice: Expand Context"
+      },
+      {
+        "command": "lattice.getDocsCapsule",
+        "title": "Lattice: Get Docs Capsule"
+      },
+      {
+        "command": "lattice.showBacklinks",
+        "title": "Lattice: Show Backlinks"
+      },
+      {
+        "command": "lattice.showOutgoingLinks",
+        "title": "Lattice: Show Outgoing Links"
+      },
+      {
+        "command": "lattice.findStaleDocs",
+        "title": "Lattice: Find Stale Docs"
+      },
+      {
+        "command": "lattice.openDocsWorkbench",
+        "title": "Lattice: Open Docs Graph"
       }
     ],
     "viewsContainers": {

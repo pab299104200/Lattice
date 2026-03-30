@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
 
-use super::protocol::{parse_request, format_response, JsonRpcResponse};
+use super::protocol::{format_response, parse_request, JsonRpcResponse};
 
 /// Trait for handling JSON-RPC requests.
 #[async_trait::async_trait]
@@ -29,7 +29,9 @@ impl StdioServer {
         // Set stdout/stdin to binary mode on Windows to prevent \n -> \r\n translation.
         #[cfg(windows)]
         unsafe {
-            extern "C" { fn _setmode(fd: i32, mode: i32) -> i32; }
+            extern "C" {
+                fn _setmode(fd: i32, mode: i32) -> i32;
+            }
             _setmode(0, 0x8000); // stdin  -> _O_BINARY
             _setmode(1, 0x8000); // stdout -> _O_BINARY
         }
@@ -43,7 +45,9 @@ impl StdioServer {
             loop {
                 match read_message_sync(&mut reader) {
                     Ok(Some(msg)) => {
-                        if tx.send(msg).is_err() { break; }
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
                     }
                     Ok(None) => break, // EOF
                     Err(_) => continue,
@@ -52,28 +56,37 @@ impl StdioServer {
         });
 
         // Process messages from the channel.
-        while let Some(message) = rx.recv().await {
-            let request = match parse_request(&message) {
-                Ok(req) => req,
-                Err(e) => {
-                    let err_resp = JsonRpcResponse::error(
-                        serde_json::Value::Null, -32700,
-                        format!("Parse error: {}", e),
-                    );
-                    write_response_sync(&err_resp);
-                    continue;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(message) = msg else { break };
+                    let request = match parse_request(&message) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            let err_resp = JsonRpcResponse::error(
+                                serde_json::Value::Null,
+                                -32700,
+                                format!("Parse error: {}", e),
+                            );
+                            write_response_sync(&err_resp);
+                            continue;
+                        }
+                    };
+
+                    let is_notification = request.id.is_null();
+                    let response = match self.handler.handle(&request.method, request.params).await {
+                        Ok(result) => JsonRpcResponse::success(request.id, result),
+                        Err((code, message)) => JsonRpcResponse::error(request.id, code, message),
+                    };
+
+                    if !is_notification {
+                        write_response_sync(&response);
+                    }
                 }
-            };
-
-            let is_notification = request.id.is_null();
-
-            let response = match self.handler.handle(&request.method, request.params).await {
-                Ok(result) => JsonRpcResponse::success(request.id, result),
-                Err((code, message)) => JsonRpcResponse::error(request.id, code, message),
-            };
-
-            if !is_notification {
-                write_response_sync(&response);
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received Ctrl+C, shutting down");
+                    break;
+                }
             }
         }
 
@@ -90,26 +103,36 @@ fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
-        if n == 0 { return Ok(None); }
+        if n == 0 {
+            return Ok(None);
+        }
 
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         if trimmed.to_lowercase().starts_with("content-length:") {
-            let length: usize = trimmed.split(':').nth(1)
+            let length: usize = trimmed
+                .split(':')
+                .nth(1)
                 .ok_or_else(|| anyhow::anyhow!("bad header"))?
-                .trim().parse()?;
+                .trim()
+                .parse()?;
             if length > MAX_PAYLOAD_SIZE {
                 return Err(anyhow::anyhow!(
                     "Content-Length {} exceeds maximum allowed size of {} bytes",
-                    length, MAX_PAYLOAD_SIZE
+                    length,
+                    MAX_PAYLOAD_SIZE
                 ));
             }
             // Skip remaining headers until blank line
             loop {
                 let mut hdr = String::new();
                 reader.read_line(&mut hdr)?;
-                if hdr.trim().is_empty() { break; }
+                if hdr.trim().is_empty() {
+                    break;
+                }
             }
             let mut body = vec![0u8; length];
             std::io::Read::read_exact(reader, &mut body)?;

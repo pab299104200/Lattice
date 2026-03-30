@@ -58,6 +58,14 @@ fn test_excluded_dirs() {
 
     assert!(filter.is_excluded("node_modules/express/index.js"), "node_modules should be excluded");
     assert!(filter.is_excluded(".git/config"), ".git should be excluded");
+    assert!(
+        filter.is_excluded(".claude/worktrees/agent-123/src/app.py"),
+        ".claude assistant worktrees should be excluded"
+    );
+    assert!(
+        filter.is_excluded(".codex/worktrees/task-123/src/app.py"),
+        ".codex assistant worktrees should be excluded"
+    );
     assert!(filter.is_excluded("src/target/release/binary"), "target should be excluded");
     assert!(!filter.is_excluded("src/main.ts"), "normal path should not be excluded");
 }
@@ -68,6 +76,8 @@ fn test_is_excluded_dir() {
 
     assert!(filter.is_excluded_dir("node_modules"));
     assert!(filter.is_excluded_dir(".git"));
+    assert!(filter.is_excluded_dir(".claude"));
+    assert!(filter.is_excluded_dir(".codex"));
     assert!(filter.is_excluded_dir("target"));
     assert!(filter.is_excluded_dir("__pycache__"));
     assert!(!filter.is_excluded_dir("src"));

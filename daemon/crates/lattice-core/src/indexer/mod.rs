@@ -3,13 +3,13 @@ pub mod lazy;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use crate::error::LatticeError;
-use crate::graph::CodeGraph;
 use crate::graph::builder::GraphBuilder;
+use crate::graph::CodeGraph;
 use crate::parser;
 use crate::symbols::ParsedFile;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Incremental indexer that maintains a code graph from parsed files.
 ///
@@ -86,7 +86,10 @@ impl Indexer {
 
     /// Index a directory using parallel file parsing.
     /// Files are parsed concurrently, then the graph is rebuilt once.
-    pub async fn index_directory_parallel(&mut self, dir: &std::path::Path) -> anyhow::Result<usize> {
+    pub async fn index_directory_parallel(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<usize> {
         let files = self.collect_indexable_files(dir)?;
         let mut handles = Vec::new();
 
@@ -112,13 +115,21 @@ impl Indexer {
         Ok(count)
     }
 
-    fn collect_indexable_files(&self, dir: &std::path::Path) -> anyhow::Result<Vec<(String, String)>> {
+    fn collect_indexable_files(
+        &self,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut files = Vec::new();
         self.scan_files(dir, dir, &mut files)?;
         Ok(files)
     }
 
-    fn scan_files(&self, base: &std::path::Path, dir: &std::path::Path, files: &mut Vec<(String, String)>) -> anyhow::Result<()> {
+    fn scan_files(
+        &self,
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut Vec<(String, String)>,
+    ) -> anyhow::Result<()> {
         let entries = std::fs::read_dir(dir)?;
         for entry in entries {
             let entry = entry?;
@@ -129,7 +140,8 @@ impl Indexer {
                     self.scan_files(base, &path, files)?;
                 }
             } else if path.is_file() {
-                let rel_path = path.strip_prefix(base)
+                let rel_path = path
+                    .strip_prefix(base)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
@@ -152,9 +164,12 @@ impl Indexer {
         memory_store: Option<&crate::memory::MemoryStore>,
     ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
         let new_parsed = crate::parser::parse_file(rel_path, content)?;
+        let had_existing_file = self.parsed_files.contains_key(rel_path);
 
         // Get old symbols for this file
-        let old_symbols = self.parsed_files.get(rel_path)
+        let old_symbols = self
+            .parsed_files
+            .get(rel_path)
             .map(|f| f.symbols.clone())
             .unwrap_or_default();
 
@@ -163,14 +178,16 @@ impl Indexer {
 
         // Mark stale memories for modified/removed symbols
         if let Some(store) = memory_store {
+            if had_existing_file {
+                let reason = format!("{} changed", rel_path);
+                let _ = store.mark_stale_by_file(rel_path, &reason);
+            }
             for change in &changes {
                 if change.kind == crate::diff::ChangeKind::Modified
                     || change.kind == crate::diff::ChangeKind::Removed
                 {
-                    let reason = format!(
-                        "{}() was {:?} in {}",
-                        change.name, change.kind, change.file
-                    );
+                    let reason =
+                        format!("{}() was {:?} in {}", change.name, change.kind, change.file);
                     let _ = store.mark_stale_by_symbol(&change.name, &reason);
                 }
             }

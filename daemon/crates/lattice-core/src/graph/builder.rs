@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::graph::model::{CodeGraph, EdgeKind};
-use crate::symbols::{ParsedFile, SymbolId, SymbolKind};
+use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
 
 /// Builds a CodeGraph from parsed source files using a two-pass approach:
 /// 1. Add all symbols as nodes and build a name→SymbolId lookup.
@@ -29,6 +29,7 @@ impl GraphBuilder {
 
         // file_lookup: resolved file path → list of SymbolIds in that file
         let mut file_lookup: HashMap<String, Vec<SymbolId>> = HashMap::new();
+        let mut kind_lookup: HashMap<SymbolId, SymbolKind> = HashMap::new();
 
         // ---- Pass 1: Add all symbols as nodes ----
         for file in &self.files {
@@ -45,6 +46,7 @@ impl GraphBuilder {
                     symbol.is_exported,
                     symbol.language,
                 );
+                kind_lookup.insert(symbol.id.clone(), symbol.kind);
 
                 // Index by simple name (last component for qualified names like "Class.method")
                 let simple_name = symbol.name.rsplit('.').next().unwrap_or(&symbol.name);
@@ -95,7 +97,7 @@ impl GraphBuilder {
                 }
             }
 
-            // 2b: Contains edges — class contains methods (by line range)
+            // 2b: Contains edges — classes contain methods and documents contain sections
             let classes: Vec<_> = file
                 .symbols
                 .iter()
@@ -117,7 +119,46 @@ impl GraphBuilder {
                 }
             }
 
-            // 2c: Reference-based Calls edges — resolve Symbol.references to graph edges
+            let documents: Vec<_> = file
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Document)
+                .collect();
+            let sections: Vec<_> = file
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Section)
+                .collect();
+
+            for document in &documents {
+                for section in &sections {
+                    if section.id != document.id
+                        && section.line >= document.line
+                        && section.end_line <= document.end_line
+                    {
+                        graph.add_edge(&document.id, &section.id, EdgeKind::Contains);
+                    }
+                }
+            }
+
+            // 2c: Markdown links — resolve document and section links
+            for link in &file.links {
+                let Some(target_id) = resolve_document_link_target(
+                    &file.file,
+                    &link.target,
+                    link.heading.as_deref(),
+                    &file_lookup,
+                    &kind_lookup,
+                ) else {
+                    continue;
+                };
+
+                if target_id != link.from {
+                    graph.add_edge(&link.from, &target_id, EdgeKind::LinksTo);
+                }
+            }
+
+            // 2d: Reference-based edges — resolve Symbol.references to graph edges
             // Parsers extract function calls from bodies into references.
             // Priority: same-file match first, then any global match.
             for symbol in &file.symbols {
@@ -148,7 +189,12 @@ impl GraphBuilder {
                     if let Some(target_id) = target {
                         // Don't create self-loops
                         if target_id != symbol.id {
-                            graph.add_edge(&symbol.id, &target_id, EdgeKind::Calls);
+                            let edge_kind = if file.language == Language::Markdown {
+                                EdgeKind::Mentions
+                            } else {
+                                EdgeKind::Calls
+                            };
+                            graph.add_edge(&symbol.id, &target_id, edge_kind);
                         }
                     }
                 }
@@ -156,6 +202,164 @@ impl GraphBuilder {
         }
 
         graph
+    }
+}
+
+fn resolve_document_link_target(
+    from_file: &str,
+    target: &str,
+    heading: Option<&str>,
+    file_lookup: &HashMap<String, Vec<SymbolId>>,
+    kind_lookup: &HashMap<SymbolId, SymbolKind>,
+) -> Option<SymbolId> {
+    let target_file = resolve_markdown_target_path(from_file, target, file_lookup)?;
+
+    if let Some(heading) = heading {
+        if let Some(section_id) =
+            find_section_in_file(heading, &target_file, file_lookup, kind_lookup)
+        {
+            return Some(section_id);
+        }
+    }
+
+    find_symbol_in_file_by_kind(SymbolKind::Document, &target_file, file_lookup, kind_lookup)
+        .or_else(|| {
+            find_symbol_in_file_by_kind(SymbolKind::Section, &target_file, file_lookup, kind_lookup)
+        })
+}
+
+fn resolve_markdown_target_path(
+    from_file: &str,
+    target: &str,
+    file_lookup: &HashMap<String, Vec<SymbolId>>,
+) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Some(from_file.to_string());
+    }
+
+    if trimmed == from_file || file_lookup.contains_key(trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    if trimmed.starts_with('#') {
+        return Some(from_file.to_string());
+    }
+
+    if trimmed.starts_with('.') {
+        let resolved = resolve_relative_path(from_file, trimmed, "md");
+        if file_lookup.contains_key(&resolved) {
+            return Some(resolved);
+        }
+    }
+
+    let with_extension = if trimmed.contains('.') {
+        trimmed.to_string()
+    } else {
+        format!("{}.md", trimmed)
+    };
+    if file_lookup.contains_key(&with_extension) {
+        return Some(with_extension);
+    }
+
+    let target_name = trimmed
+        .trim_end_matches(".md")
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed);
+    let target_name_lower = target_name.to_lowercase();
+
+    file_lookup.keys().find_map(|candidate| {
+        let stem = candidate
+            .rsplit('/')
+            .next()
+            .unwrap_or(candidate)
+            .trim_end_matches(".md")
+            .to_lowercase();
+        if stem == target_name_lower {
+            Some(candidate.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_symbol_in_file_by_kind(
+    kind: SymbolKind,
+    target_file: &str,
+    file_lookup: &HashMap<String, Vec<SymbolId>>,
+    kind_lookup: &HashMap<SymbolId, SymbolKind>,
+) -> Option<SymbolId> {
+    file_lookup
+        .get(target_file)
+        .and_then(|ids| ids.iter().find(|id| kind_lookup.get(*id).copied() == Some(kind)).cloned())
+}
+
+fn find_section_in_file(
+    heading: &str,
+    target_file: &str,
+    file_lookup: &HashMap<String, Vec<SymbolId>>,
+    kind_lookup: &HashMap<SymbolId, SymbolKind>,
+) -> Option<SymbolId> {
+    let target_anchor = normalize_anchor(heading);
+    let file_symbols = file_lookup.get(target_file)?;
+
+    file_symbols.iter().find_map(|id| {
+        if kind_lookup.get(id).copied() != Some(SymbolKind::Section) {
+            return None;
+        }
+
+        if normalize_anchor(&id.name) == target_anchor {
+            Some(id.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_anchor(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+
+    for ch in value.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_dash = false;
+        } else if ch.is_ascii_whitespace() || ch == '-' || ch == '_' {
+            if !last_was_dash && !normalized.is_empty() {
+                normalized.push('-');
+                last_was_dash = true;
+            }
+        }
+    }
+
+    normalized.trim_matches('-').to_string()
+}
+
+fn resolve_relative_path(from_file: &str, target: &str, default_ext: &str) -> String {
+    let dir = if let Some(pos) = from_file.rfind('/') {
+        &from_file[..pos]
+    } else {
+        "."
+    };
+
+    let mut parts: Vec<&str> = dir.split('/').collect();
+    for segment in target.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+
+    let resolved = parts.join("/");
+    if resolved.contains('.') && resolved.rsplit('/').next().map_or(false, |item| item.contains('.')) {
+        resolved
+    } else {
+        format!("{}.{}", resolved, default_ext)
     }
 }
 

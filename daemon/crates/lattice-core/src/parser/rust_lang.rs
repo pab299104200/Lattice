@@ -32,6 +32,7 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
         language: Language::Rust,
         symbols,
         imports,
+        links: vec![],
     })
 }
 

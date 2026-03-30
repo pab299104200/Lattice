@@ -23,6 +23,7 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     "node_modules", ".git", "target", "dist", "build", "out",
     "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
     ".next", ".nuxt", ".svelte-kit", "coverage", ".lattice",
+    ".claude", ".codex",
 ];
 
 const EXCLUDED_PATTERNS: &[&str] = &[

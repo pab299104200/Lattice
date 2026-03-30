@@ -16,6 +16,8 @@ fn test_symbol_kind_short_codes() {
     assert_eq!(SymbolKind::Method.short_code(), "meth");
     assert_eq!(SymbolKind::Trait.short_code(), "trait");
     assert_eq!(SymbolKind::Struct.short_code(), "struct");
+    assert_eq!(SymbolKind::Document.short_code(), "doc");
+    assert_eq!(SymbolKind::Section.short_code(), "sec");
 }
 
 #[test]
@@ -26,6 +28,8 @@ fn test_edge_kind_short_codes() {
     assert_eq!(EdgeKind::Extends.short_code(), "E");
     assert_eq!(EdgeKind::TypeRef.short_code(), "T");
     assert_eq!(EdgeKind::Contains.short_code(), "N");
+    assert_eq!(EdgeKind::LinksTo.short_code(), "L");
+    assert_eq!(EdgeKind::Mentions.short_code(), "R");
     assert_eq!(EdgeKind::CoChanges.short_code(), "X");
 }
 
@@ -272,6 +276,86 @@ export function hashPassword(plain: string): string {
 
     assert!(graph.node_count() >= 2);
     assert!(graph.stats().edge_count > 0);
+}
+
+#[test]
+fn test_build_graph_from_markdown_links() {
+    use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
+
+    let overview_source = r#"
+# Overview
+
+See [[guide#Setup]] for the workflow.
+"#;
+    let guide_source = r#"
+# Guide
+
+## Setup
+
+Run `prepare_change` first.
+"#;
+
+    let overview = parse_file("docs/overview.md", overview_source).unwrap();
+    let guide = parse_file("docs/guide.md", guide_source).unwrap();
+
+    let mut builder = GraphBuilder::new();
+    builder.add_file(overview);
+    builder.add_file(guide);
+    let graph = builder.build();
+
+    let overview_section_id = graph
+        .all_nodes()
+        .iter()
+        .find(|node| node.file == "docs/overview.md" && node.kind == SymbolKind::Section)
+        .map(|node| node.id.clone())
+        .expect("overview section should exist");
+
+    let deps = graph.get_dependencies(&overview_section_id);
+    assert!(
+        deps.iter()
+            .any(|(node, edge)| node.name == "Setup" && *edge == EdgeKind::LinksTo),
+        "overview section should link to the Setup section"
+    );
+}
+
+#[test]
+fn test_markdown_sections_mention_code_symbols() {
+    use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
+
+    let doc_source = r#"
+# Workflow
+
+Use `prepare_change` before editing code.
+"#;
+    let code_source = r#"
+export function prepare_change(): string {
+    return "ready";
+}
+"#;
+
+    let doc = parse_file("docs/workflow.md", doc_source).unwrap();
+    let code = parse_file("src/workflow.ts", code_source).unwrap();
+
+    let mut builder = GraphBuilder::new();
+    builder.add_file(doc);
+    builder.add_file(code);
+    let graph = builder.build();
+
+    let workflow_section_id = graph
+        .all_nodes()
+        .iter()
+        .find(|node| node.file == "docs/workflow.md" && node.kind == SymbolKind::Section)
+        .map(|node| node.id.clone())
+        .expect("workflow section should exist");
+
+    let deps = graph.get_dependencies(&workflow_section_id);
+    assert!(
+        deps.iter()
+            .any(|(node, edge)| node.name == "prepare_change" && *edge == EdgeKind::Mentions),
+        "workflow section should mention prepare_change"
+    );
 }
 
 #[test]

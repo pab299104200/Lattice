@@ -35,6 +35,10 @@ export class LatticeCodeLensProvider implements vscode.CodeLensProvider {
             return [];
         }
 
+        if (isMarkdownDocument(document)) {
+            return provideMarkdownCodeLenses(document);
+        }
+
         try {
             const relPath = vscode.workspace.asRelativePath(document.uri).replace(/\\/g, '/');
             const result = await this.daemon.sendRequest('lattice/file_symbols', {
@@ -83,4 +87,84 @@ export class LatticeCodeLensProvider implements vscode.CodeLensProvider {
     public dispose(): void {
         this._onDidChangeCodeLenses.dispose();
     }
+}
+
+function isMarkdownDocument(document: vscode.TextDocument): boolean {
+    const relPath = vscode.workspace.asRelativePath(document.uri).replace(/\\/g, '/');
+    return document.languageId === 'markdown' || relPath.endsWith('.md');
+}
+
+function provideMarkdownCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+    const relPath = vscode.workspace.asRelativePath(document.uri).replace(/\\/g, '/');
+    const headings = collectMarkdownHeadings(document);
+    const lenses: vscode.CodeLens[] = [];
+    const fileRange = new vscode.Range(0, 0, 0, 0);
+
+    addMarkdownActionLenses(lenses, fileRange, {
+        target: relPath,
+        kind: 'file',
+        label: relPath,
+        file: relPath,
+        line: 1,
+    });
+
+    if (headings.length === 0) {
+        return lenses;
+    }
+
+    for (const heading of headings) {
+        const range = new vscode.Range(heading.line, 0, heading.line, 0);
+        addMarkdownActionLenses(lenses, range, {
+            target: `${relPath}#${heading.title}`,
+            kind: 'section',
+            label: `${relPath}#${heading.title}`,
+            file: relPath,
+            line: heading.line + 1,
+        });
+    }
+
+    return lenses;
+}
+
+function addMarkdownActionLenses(
+    lenses: vscode.CodeLens[],
+    range: vscode.Range,
+    target: { target: string; kind: string; label: string; file: string; line: number }
+): void {
+    lenses.push(
+        new vscode.CodeLens(range, {
+            title: 'Lattice: Open Docs Graph',
+            command: 'lattice.openDocsWorkbench',
+            arguments: [target],
+            tooltip: `Open the local docs graph for ${target.label}`,
+        }),
+        new vscode.CodeLens(range, {
+            title: 'Backlinks',
+            command: 'lattice.showBacklinks',
+            arguments: [target],
+            tooltip: `Show Markdown backlinks for ${target.label}`,
+        }),
+        new vscode.CodeLens(range, {
+            title: 'Outgoing',
+            command: 'lattice.showOutgoingLinks',
+            arguments: [target],
+            tooltip: `Show outgoing links and mentions for ${target.label}`,
+        })
+    );
+}
+
+function collectMarkdownHeadings(document: vscode.TextDocument): Array<{ line: number; title: string }> {
+    const headings: Array<{ line: number; title: string }> = [];
+    for (let line = 0; line < document.lineCount; line++) {
+        const text = document.lineAt(line).text.trim();
+        const match = text.match(/^#{1,6}\s+(.+?)\s*#*$/);
+        if (!match?.[1]) {
+            continue;
+        }
+        headings.push({
+            line,
+            title: match[1].trim(),
+        });
+    }
+    return headings;
 }

@@ -25,6 +25,8 @@ pub enum SymbolKind {
     Method,
     Trait,
     Struct,
+    Document,
+    Section,
 }
 
 /// A symbol extracted from a source file.
@@ -62,6 +64,7 @@ pub enum Language {
     Rust,
     Go,
     Java,
+    Markdown,
     Unknown,
 }
 
@@ -74,6 +77,7 @@ impl Language {
             "rs" => Language::Rust,
             "go" => Language::Go,
             "java" => Language::Java,
+            "md" => Language::Markdown,
             _ => Language::Unknown,
         }
     }
@@ -94,6 +98,8 @@ impl SymbolKind {
             SymbolKind::Method => "meth",
             SymbolKind::Trait => "trait",
             SymbolKind::Struct => "struct",
+            SymbolKind::Document => "doc",
+            SymbolKind::Section => "sec",
         }
     }
 }
@@ -111,6 +117,21 @@ pub struct ImportInfo {
     pub is_wildcard: bool,
 }
 
+/// A document-style link extracted from a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkInfo {
+    /// Symbol that owns the link.
+    pub from: SymbolId,
+    /// Raw target path or wiki-link target.
+    pub target: String,
+    /// Optional section or anchor target within the target document.
+    pub heading: Option<String>,
+    /// Visible text or alias, when available.
+    pub text: Option<String>,
+    /// Whether the original syntax was a wiki-link.
+    pub is_wiki: bool,
+}
+
 /// Result of parsing a single file.
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -118,4 +139,5 @@ pub struct ParsedFile {
     pub language: Language,
     pub symbols: Vec<Symbol>,
     pub imports: Vec<ImportInfo>,
+    pub links: Vec<LinkInfo>,
 }

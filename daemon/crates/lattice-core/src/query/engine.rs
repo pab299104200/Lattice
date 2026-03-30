@@ -596,7 +596,7 @@ impl QueryEngine {
                     c.node.name == *name && line_overlap_ratio(body, &c.node.body) > 0.80
                 });
                 if !dominated {
-                    seen_bodies.push((c.node.name.clone(), c.node.body.clone()));
+                    seen_bodies.push((c.node.name.clone(), c.node.body.to_string()));
                 }
                 !dominated
             });
@@ -645,7 +645,7 @@ impl QueryEngine {
                                 kind: candidate.node.kind.short_code().to_string(),
                                 file: candidate.node.file.clone(),
                                 line: candidate.node.line,
-                                skeleton: candidate.node.signature.clone(),
+                                skeleton: candidate.node.signature.to_string(),
                                 relationship: candidate.relationship_detail.clone(),
                                 score: candidate.score,
                             });
@@ -675,7 +675,7 @@ impl QueryEngine {
                                 kind: candidate.node.kind.short_code().to_string(),
                                 file: candidate.node.file.clone(),
                                 line: candidate.node.line,
-                                skeleton: candidate.node.signature.clone(),
+                                skeleton: candidate.node.signature.to_string(),
                                 relationship: format!("near_duplicate_of: {}", dup_of),
                                 score: candidate.score,
                             });
@@ -696,7 +696,7 @@ impl QueryEngine {
                     kind: candidate.node.kind.short_code().to_string(),
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
-                    source: candidate.node.body.clone(),
+                    source: candidate.node.body.to_string(),
                     score: candidate.score,
                     reason,
                 });
@@ -713,7 +713,7 @@ impl QueryEngine {
                     kind: candidate.node.kind.short_code().to_string(),
                     file: candidate.node.file.clone(),
                     line: candidate.node.line,
-                    skeleton: candidate.node.signature.clone(),
+                    skeleton: candidate.node.signature.to_string(),
                     relationship: candidate.relationship_detail.clone(),
                     score: candidate.score,
                 });
@@ -850,7 +850,7 @@ impl QueryEngine {
                         kind: node.kind.short_code().to_string(),
                         file: node.file.clone(),
                         line: node.line,
-                        skeleton: node.signature.clone(),
+                        skeleton: node.signature.to_string(),
                         relationship: format!("same_file_sibling (relevance: {:.0})", rel),
                         score: 0.06 + rel * 0.02, // slightly above context threshold
                     });
@@ -929,7 +929,7 @@ impl QueryEngine {
                         kind: dep_node.kind.short_code().to_string(),
                         file: dep_node.file.clone(),
                         line: dep_node.line,
-                        skeleton: dep_node.signature.clone(),
+                        skeleton: dep_node.signature.to_string(),
                         relationship: format!("called_by: {}", caller_name),
                         score: 0.08,
                     });
@@ -1549,6 +1549,8 @@ fn format_edge_kind(kind: EdgeKind) -> String {
         EdgeKind::Extends => "extends".to_string(),
         EdgeKind::TypeRef => "type_ref_of".to_string(),
         EdgeKind::Contains => "contains".to_string(),
+        EdgeKind::LinksTo => "links_to".to_string(),
+        EdgeKind::Mentions => "mentions".to_string(),
         EdgeKind::CoChanges => "co_changes_with".to_string(),
     }
 }
@@ -1563,6 +1565,8 @@ fn format_edge_kind_reverse(kind: EdgeKind) -> String {
         EdgeKind::Extends => "extended_by".to_string(),
         EdgeKind::TypeRef => "type_referenced_by".to_string(),
         EdgeKind::Contains => "contained_in".to_string(),
+        EdgeKind::LinksTo => "linked_from".to_string(),
+        EdgeKind::Mentions => "mentioned_by".to_string(),
         EdgeKind::CoChanges => "co_changes_with".to_string(),
     }
 }

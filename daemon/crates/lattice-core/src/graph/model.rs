@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,8 @@ pub enum EdgeKind {
     Extends,
     TypeRef,
     Contains,
+    LinksTo,
+    Mentions,
     CoChanges,
 }
 
@@ -26,6 +29,8 @@ impl EdgeKind {
             EdgeKind::Extends => "E",
             EdgeKind::TypeRef => "T",
             EdgeKind::Contains => "N",
+            EdgeKind::LinksTo => "L",
+            EdgeKind::Mentions => "R",
             EdgeKind::CoChanges => "X",
         }
     }
@@ -37,8 +42,8 @@ pub struct GraphNode {
     pub id: SymbolId,
     pub kind: SymbolKind,
     pub name: String,
-    pub signature: String,
-    pub body: String,
+    pub signature: Arc<str>,
+    pub body: Arc<str>,
     pub file: String,
     pub line: usize,
     pub end_line: usize,
@@ -78,8 +83,8 @@ impl CodeGraph {
         id: SymbolId,
         kind: SymbolKind,
         name: String,
-        signature: String,
-        body: String,
+        signature: impl Into<Arc<str>>,
+        body: impl Into<Arc<str>>,
         file: String,
         line: usize,
         end_line: usize,
@@ -91,8 +96,8 @@ impl CodeGraph {
             let node = &mut self.graph[idx];
             node.kind = kind;
             node.name = name;
-            node.signature = signature;
-            node.body = body;
+            node.signature = signature.into();
+            node.body = body.into();
             node.file = file;
             node.line = line;
             node.end_line = end_line;
@@ -105,8 +110,8 @@ impl CodeGraph {
                 id: id.clone(),
                 kind,
                 name,
-                signature,
-                body,
+                signature: signature.into(),
+                body: body.into(),
                 file,
                 line,
                 end_line,

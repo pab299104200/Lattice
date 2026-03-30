@@ -1,5 +1,35 @@
-use std::collections::HashMap;
+pub mod agent;
+pub mod docs;
+
+#[cfg(test)]
+mod agent_tests;
+
+#[cfg(test)]
+mod benchmark_tests;
+
+#[cfg(test)]
+mod docs_tests;
+
 use crate::diff::{ChangeKind, SymbolChange};
+use std::collections::HashMap;
+
+pub use agent::{
+    diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
+    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem,
+    AffectedSymbolImpact, BundleMode, ChangedFileImpact, ChangedSymbolImpact,
+    CompactFileSummary, CompactSymbolSummary, DiffImpactReport, DiffImpactStats,
+    ExpandContextSeed, ExpandedContext, ExpandedContextStats, ExpandedFileContext,
+    ExpandedFileSymbolContext, ExpandedRelationshipContext, ExpandedSymbolContext,
+    ExpandedTestContext, FailureDiagnosis, FailureDiagnosisStats, FileRecommendation,
+    MemoryHighlight, RepoPlaybook, RepoPlaybookStats, ReviewChecklistItem, RiskRecommendation,
+    SubsystemSummary, SubsystemSummaryStats, SymbolRecommendation, TaskBundle, TaskBundleStats,
+    TestRecommendation, TestSelectionReport, WorkingSetContext, WorkingSetStats,
+};
+pub use docs::{
+    find_stale_docs, get_backlinks, get_docs_capsule, get_outgoing_links, BacklinksReport,
+    DocHit, DocsCapsule, DocsCapsuleStats, DocsTargetKind, LinkReference,
+    OutgoingLinksReport, RelatedDocSymbol, StaleDocHit, StaleDocsReport, StaleDocsStats,
+};
 
 /// Tracks symbol-level changes during a coding session to detect patterns
 /// such as hotspots (frequently edited symbols), anti-patterns
@@ -42,11 +72,8 @@ impl ChangeTracker {
             .unwrap_or_default()
             .as_secs();
 
-        self.session_changes.push((
-            change.name.clone(),
-            kind_str.to_string(),
-            timestamp,
-        ));
+        self.session_changes
+            .push((change.name.clone(), kind_str.to_string(), timestamp));
     }
 
     /// Return the hotspot score (edit count) for a symbol.
@@ -373,14 +400,20 @@ mod tests {
 
         // Simulate 3 batches where funcA and funcB always change together
         tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string()]);
-        tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string(), "funcC".to_string()]);
+        tracker.record_batch(vec![
+            "funcA".to_string(),
+            "funcB".to_string(),
+            "funcC".to_string(),
+        ]);
         tracker.record_batch(vec!["funcA".to_string(), "funcB".to_string()]);
 
         // funcA-funcB should have count 3 (appeared together in all 3 batches)
         let pairs = tracker.get_co_change_pairs(3);
         assert!(
-            pairs.iter().any(|(a, b, c)| (*a == "funcA" && *b == "funcB" && *c >= 3)
-                || (*a == "funcB" && *b == "funcA" && *c >= 3)),
+            pairs
+                .iter()
+                .any(|(a, b, c)| (*a == "funcA" && *b == "funcB" && *c >= 3)
+                    || (*a == "funcB" && *b == "funcA" && *c >= 3)),
             "Expected funcA-funcB co-change pair with count >= 3, got: {:?}",
             pairs
         );
@@ -388,8 +421,10 @@ mod tests {
         // funcA-funcC should have count 1 (only appeared together in batch 2)
         let pairs_low = tracker.get_co_change_pairs(1);
         assert!(
-            pairs_low.iter().any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
-                || (*a == "funcC" && *b == "funcA")),
+            pairs_low
+                .iter()
+                .any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
+                    || (*a == "funcC" && *b == "funcA")),
             "Expected funcA-funcC co-change pair at threshold 1, got: {:?}",
             pairs_low
         );
@@ -397,8 +432,10 @@ mod tests {
         // funcA-funcC should NOT appear at threshold 2 (only count 1)
         let pairs_high = tracker.get_co_change_pairs(2);
         assert!(
-            !pairs_high.iter().any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
-                || (*a == "funcC" && *b == "funcA")),
+            !pairs_high
+                .iter()
+                .any(|(a, b, _)| (*a == "funcA" && *b == "funcC")
+                    || (*a == "funcC" && *b == "funcA")),
             "funcA-funcC should not appear at threshold 2"
         );
     }

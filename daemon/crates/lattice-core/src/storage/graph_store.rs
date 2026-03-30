@@ -66,12 +66,12 @@ impl GraphStore {
             for node in graph.all_nodes() {
                 insert_node
                     .execute(params![
-                        node.file,
-                        node.name,
+                        &node.file,
+                        &node.name,
                         node.id.byte_offset as i64,
                         format!("{:?}", node.kind),
-                        node.signature,
-                        node.body,
+                        &*node.signature,
+                        &*node.body,
                         node.line as i64,
                         node.end_line as i64,
                         node.is_exported as i32,
@@ -95,11 +95,11 @@ impl GraphStore {
             for (from_node, to_node, edge_kind) in graph.all_edges() {
                 insert_edge
                     .execute(params![
-                        from_node.id.file,
-                        from_node.id.name,
+                        &from_node.id.file,
+                        &from_node.id.name,
                         from_node.id.byte_offset as i64,
-                        to_node.id.file,
-                        to_node.id.name,
+                        &to_node.id.file,
+                        &to_node.id.name,
                         to_node.id.byte_offset as i64,
                         format!("{:?}", edge_kind),
                     ])
@@ -253,6 +253,8 @@ fn parse_symbol_kind(s: &str) -> Option<SymbolKind> {
         "Method" => Some(SymbolKind::Method),
         "Trait" => Some(SymbolKind::Trait),
         "Struct" => Some(SymbolKind::Struct),
+        "Document" => Some(SymbolKind::Document),
+        "Section" => Some(SymbolKind::Section),
         _ => None,
     }
 }
@@ -266,6 +268,7 @@ fn parse_language(s: &str) -> Option<Language> {
         "Rust" => Some(Language::Rust),
         "Go" => Some(Language::Go),
         "Java" => Some(Language::Java),
+        "Markdown" => Some(Language::Markdown),
         "Unknown" => Some(Language::Unknown),
         _ => None,
     }
@@ -280,6 +283,8 @@ fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "Extends" => Some(EdgeKind::Extends),
         "TypeRef" => Some(EdgeKind::TypeRef),
         "Contains" => Some(EdgeKind::Contains),
+        "LinksTo" => Some(EdgeKind::LinksTo),
+        "Mentions" => Some(EdgeKind::Mentions),
         "CoChanges" => Some(EdgeKind::CoChanges),
         _ => None,
     }

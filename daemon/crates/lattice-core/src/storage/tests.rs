@@ -63,7 +63,7 @@ fn test_save_and_load_graph() {
     let id_a = make_id("src/auth.ts", "loginUser", 0);
     let node = loaded.get_node(&id_a).expect("loginUser node should exist");
     assert_eq!(
-        node.signature,
+        node.signature.as_ref(),
         "function loginUser(creds: Credentials): Promise<Session>"
     );
 }

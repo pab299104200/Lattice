@@ -190,6 +190,52 @@ export const MAX_RETRIES = 3;
     assert!(const_sym.is_exported);
 }
 
+#[test]
+fn test_parse_markdown_document_and_sections() {
+    let source = r#"
+# Guide
+
+Intro paragraph with `prepare_change`.
+
+## Setup
+
+See [[runbook#Checklist]] and [Overview](./overview.md).
+"#;
+
+    let result = parse_file("docs/guide.md", source).expect("Failed to parse");
+    assert_eq!(result.language, Language::Markdown);
+
+    let document = result
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Document)
+        .expect("Should find a document symbol");
+    assert_eq!(document.name, "Guide");
+
+    let sections: Vec<_> = result
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Section)
+        .collect();
+    assert_eq!(sections.len(), 2, "Should create one section per heading");
+    assert!(
+        sections
+            .iter()
+            .any(|section| section.references.contains(&"prepare_change".to_string())),
+        "Markdown sections should capture inline code references"
+    );
+
+    assert_eq!(result.links.len(), 2, "Should extract both Markdown and wiki links");
+    assert!(
+        result.links.iter().any(|link| link.target == "runbook" && link.heading.as_deref() == Some("Checklist") && link.is_wiki),
+        "Should extract wiki-links with section targets"
+    );
+    assert!(
+        result.links.iter().any(|link| link.target == "./overview.md" && !link.is_wiki),
+        "Should extract Markdown links"
+    );
+}
+
 // ==================== Python Tests ====================
 
 #[test]
