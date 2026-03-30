@@ -4,7 +4,7 @@ mod rpc;
 mod watcher;
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -125,11 +125,7 @@ async fn main() -> Result<()> {
                     let mut wm = wm_clone.blocking_lock();
                     let mut total = 0usize;
                     for root in &roots {
-                        let repo_name = root
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("default")
-                            .to_string();
+                        let repo_name = repo_name_for_root(root);
                         if let Err(e) = wm.add_repo(repo_name.clone(), root.clone()) {
                             tracing::warn!("Failed to add repo {}: {}", repo_name, e);
                             continue;
@@ -205,6 +201,9 @@ async fn main() -> Result<()> {
                         tracing::warn!("Failed to save graph: {}", e);
                     }
                 }
+
+                let mut eng = engine_bg.lock().await;
+                eng.update_graph(new_graph);
             }
 
             // Try to load ONNX embedding model
@@ -251,13 +250,17 @@ async fn main() -> Result<()> {
     {
         let engine = Arc::clone(&engine);
         let indexer = Arc::clone(&indexer);
+        let graph_store = Arc::clone(&graph_store);
+        let workspace_manager = workspace_manager.clone();
         let workspace_roots = workspace_roots.clone();
 
         tokio::spawn(async move {
             for root in workspace_roots {
                 let watcher = crate::watcher::FileWatcher::new(
                     root.clone(),
-                    Arc::clone(&indexer),
+                    Some(Arc::clone(&indexer)),
+                    workspace_manager.clone(),
+                    Arc::clone(&graph_store),
                     Arc::clone(&engine),
                 );
 
@@ -345,6 +348,13 @@ fn parse_workspace_roots() -> Vec<PathBuf> {
 
     // Anti-double-indexing: remove any root that is a subdirectory of another
     deduplicate_roots(roots)
+}
+
+pub(crate) fn repo_name_for_root(root: &Path) -> String {
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default")
+        .to_string()
 }
 
 /// Remove roots that are subdirectories of other roots.

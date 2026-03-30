@@ -8,12 +8,11 @@ use tokio::sync::Mutex;
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::{
-    diagnose_failure, expand_context, find_relevant_tests, find_stale_docs,
-    get_backlinks, get_docs_capsule, get_outgoing_links, get_repo_playbook,
-    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem,
-    BundleMode, DiffImpactReport, DocsTargetKind, ExpandContextSeed, FailureDiagnosis,
-    MemoryHighlight, RepoPlaybook, RulesDetector, SubsystemSummary, TaskBundle,
-    WorkingSetContext,
+    diagnose_failure, expand_context, find_relevant_tests, find_stale_docs, get_backlinks,
+    get_docs_capsule, get_outgoing_links, get_repo_playbook, get_working_set_context,
+    impact_from_diff, prepare_change, summarize_subsystem, BundleMode, DiffImpactReport,
+    DocsTargetKind, ExpandContextSeed, FailureDiagnosis, MemoryHighlight, RepoPlaybook,
+    RulesDetector, SubsystemSummary, TaskBundle, WorkingSetContext,
 };
 use lattice_core::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
 use lattice_core::query::{ContextCapsule, QueryEngine};
@@ -23,8 +22,8 @@ use lattice_core::watcher::should_index_file;
 use lattice_core::workspace::WorkspaceManager;
 
 use super::context_cache::ContextHandleCache;
-use super::session_metrics::{SessionMetrics, SessionMetricsReport, ToolCallMetadata};
 use super::server::RequestHandler;
+use super::session_metrics::{SessionMetrics, SessionMetricsReport, ToolCallMetadata};
 
 /// MCP (Model Context Protocol) handler that routes JSON-RPC methods
 /// to the appropriate tool implementations.
@@ -1186,13 +1185,15 @@ impl McpHandler {
             ) {
                 if let Some(ref embedding) = embedding {
                     let semantic_capsule = engine.query(query, Some(embedding.as_slice()), false);
-                    if prepare_change_capsule_quality(&semantic_capsule, &entry_files, &entry_symbols)
-                        > prepare_change_capsule_quality(
-                            &keyword_capsule,
-                            &entry_files,
-                            &entry_symbols,
-                        )
-                    {
+                    if prepare_change_capsule_quality(
+                        &semantic_capsule,
+                        &entry_files,
+                        &entry_symbols,
+                    ) > prepare_change_capsule_quality(
+                        &keyword_capsule,
+                        &entry_files,
+                        &entry_symbols,
+                    ) {
                         keyword_capsule = semantic_capsule;
                         semantic_fallback_used = true;
                     }
@@ -1564,10 +1565,7 @@ impl McpHandler {
             )
         };
         let handle = self
-            .store_context_handle(
-                "summarize_subsystem",
-                seed_from_subsystem_summary(&report),
-            )
+            .store_context_handle("summarize_subsystem", seed_from_subsystem_summary(&report))
             .await;
 
         let playbook_memory = self
@@ -1613,8 +1611,12 @@ impl McpHandler {
         let (report, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            let compact_report =
-                get_repo_playbook(engine.graph(), &memories, &project_rules, BundleMode::Compact);
+            let compact_report = get_repo_playbook(
+                engine.graph(),
+                &memories,
+                &project_rules,
+                BundleMode::Compact,
+            );
             let (delivery_mode, mode_reason) =
                 select_repo_playbook_mode(requested_mode, &compact_report);
             let report = if matches!(delivery_mode, BundleMode::Full) {
@@ -1738,12 +1740,23 @@ impl McpHandler {
         let (mut report, metadata_mode_reason) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            let compact_report =
-                diagnose_failure(engine.graph(), input, kind, &project_rules, BundleMode::Compact);
+            let compact_report = diagnose_failure(
+                engine.graph(),
+                input,
+                kind,
+                &project_rules,
+                BundleMode::Compact,
+            );
             let (delivery_mode, mode_reason) =
                 select_failure_diagnosis_mode(requested_mode, &compact_report);
             let report = if matches!(delivery_mode, BundleMode::Full) {
-                diagnose_failure(engine.graph(), input, kind, &project_rules, BundleMode::Full)
+                diagnose_failure(
+                    engine.graph(),
+                    input,
+                    kind,
+                    &project_rules,
+                    BundleMode::Full,
+                )
             } else {
                 compact_report
             };
@@ -1767,10 +1780,8 @@ impl McpHandler {
             .await?;
         let outcome_memory_reuse_count = count_outcome_memory_reuse(&memories);
         report.memory_highlights = report_memory_highlights(&memories, 1);
-        report.overview = build_failure_overview_value(
-            &report.overview,
-            report.memory_highlights.first(),
-        );
+        report.overview =
+            build_failure_overview_value(&report.overview, report.memory_highlights.first());
         let metadata = WorkflowRunMetadata {
             delivery_mode: metadata_mode_reason.0.as_str().to_string(),
             wire_format: "standard".to_string(),
@@ -1799,7 +1810,10 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: task".to_string()))?;
         let status = args["status"].as_str().unwrap_or("success");
-        let summary = args["summary"].as_str().map(|value| value.trim()).filter(|value| !value.is_empty());
+        let summary = args["summary"]
+            .as_str()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
         let mut files = parse_string_array(args, "files");
         let mut symbols = parse_string_array(args, "symbols");
         let mut tests = parse_string_array(args, "tests");
@@ -1827,12 +1841,16 @@ impl McpHandler {
         dedupe_string_values(&mut symbols);
         dedupe_string_values(&mut tests);
 
-        let refresh_key = format!("workflow_outcome::{}", stable_refresh_key(task, &files, &symbols));
+        let refresh_key = format!(
+            "workflow_outcome::{}",
+            stable_refresh_key(task, &files, &symbols)
+        );
         let source_query = summary
             .map(|value| value.to_string())
             .or(inherited_query)
             .or_else(|| Some(task.to_string()));
-        let content = summarize_workflow_outcome_content(task, status, summary, &files, &symbols, &tests);
+        let content =
+            summarize_workflow_outcome_content(task, status, summary, &files, &symbols, &tests);
         let workspace_id = self.workspace_root.to_string_lossy().to_string();
         let branch = current_git_branch(&self.workspace_root);
         let scope = if branch.is_some() {
@@ -1844,7 +1862,12 @@ impl McpHandler {
         let store = self.memory_store.lock().await;
         let existing = store
             .find_by_refresh_key(&refresh_key, Some(&workspace_id), branch.as_deref())
-            .map_err(|e| (-32603, format!("Failed to find workflow outcome memory: {}", e)))?;
+            .map_err(|e| {
+                (
+                    -32603,
+                    format!("Failed to find workflow outcome memory: {}", e),
+                )
+            })?;
 
         let value = if let Some(existing) = existing {
             let refreshed = store
@@ -1861,7 +1884,12 @@ impl McpHandler {
                     source_query.as_deref(),
                     Some(if status == "success" { 0.96 } else { 0.72 }),
                 )
-                .map_err(|e| (-32603, format!("Failed to refresh workflow outcome memory: {}", e)))?;
+                .map_err(|e| {
+                    (
+                        -32603,
+                        format!("Failed to refresh workflow outcome memory: {}", e),
+                    )
+                })?;
             json!({
                 "status": "refreshed",
                 "id": refreshed.id,
@@ -1892,7 +1920,12 @@ impl McpHandler {
                     is_stale: false,
                     stale_reason: None,
                 })
-                .map_err(|e| (-32603, format!("Failed to store workflow outcome memory: {}", e)))?;
+                .map_err(|e| {
+                    (
+                        -32603,
+                        format!("Failed to store workflow outcome memory: {}", e),
+                    )
+                })?;
             json!({
                 "status": "stored",
                 "id": id,
@@ -1973,7 +2006,13 @@ impl McpHandler {
             response_options,
             pruning_profile,
         );
-        apply_workflow_budget(tool_name, &mut value, budget, pruning_profile, &mut metadata);
+        apply_workflow_budget(
+            tool_name,
+            &mut value,
+            budget,
+            pruning_profile,
+            &mut metadata,
+        );
 
         if let Some(max_tokens) = response_options.max_tokens {
             if approx_value_tokens(&value) > max_tokens {
@@ -2116,14 +2155,24 @@ impl McpHandler {
 
         if let Some(memory) = store
             .find_by_refresh_key("repo_playbook", Some(&workspace_id), None)
-            .map_err(|e| (-32603, format!("Failed to load repo playbook memory: {}", e)))?
+            .map_err(|e| {
+                (
+                    -32603,
+                    format!("Failed to load repo playbook memory: {}", e),
+                )
+            })?
         {
             values.push(memory_to_value(&memory, true));
         }
 
         if let Some(memory) = store
             .find_by_refresh_key(&subsystem_key, Some(&workspace_id), branch.as_deref())
-            .map_err(|e| (-32603, format!("Failed to load subsystem playbook memory: {}", e)))?
+            .map_err(|e| {
+                (
+                    -32603,
+                    format!("Failed to load subsystem playbook memory: {}", e),
+                )
+            })?
         {
             values.push(memory_to_value(&memory, true));
         }
@@ -2139,14 +2188,22 @@ impl McpHandler {
     ) -> Result<Vec<Value>, (i32, String)> {
         let workspace_id = self.workspace_root.to_string_lossy().to_string();
         let branch = current_git_branch(&self.workspace_root);
-        let refresh_key = format!("workflow_outcome::{}", stable_refresh_key(query, files, symbols));
+        let refresh_key = format!(
+            "workflow_outcome::{}",
+            stable_refresh_key(query, files, symbols)
+        );
 
         let store = self.memory_store.lock().await;
         let mut values = Vec::new();
 
         if let Some(memory) = store
             .find_by_refresh_key(&refresh_key, Some(&workspace_id), branch.as_deref())
-            .map_err(|e| (-32603, format!("Failed to load workflow outcome memory: {}", e)))?
+            .map_err(|e| {
+                (
+                    -32603,
+                    format!("Failed to load workflow outcome memory: {}", e),
+                )
+            })?
         {
             values.push(memory_to_value(&memory, true));
         }
@@ -2206,11 +2263,7 @@ impl McpHandler {
 
         let store = self.memory_store.lock().await;
         let existing = store
-            .find_by_refresh_key(
-                &refresh_key,
-                Some(&workspace_id),
-                scoped_branch.as_deref(),
-            )
+            .find_by_refresh_key(&refresh_key, Some(&workspace_id), scoped_branch.as_deref())
             .map_err(|e| (-32603, format!("Failed to find playbook memory: {}", e)))?;
 
         let result = if let Some(existing) = existing {
@@ -2883,72 +2936,47 @@ impl McpHandler {
             "Missing required parameter: edges (array)".to_string(),
         ))?;
 
-        let mut indexer = self.indexer.lock().await;
         let mut added = 0usize;
         let mut skipped = 0usize;
         let mut skip_reasons: Vec<Value> = Vec::new();
 
-        for edge in edges {
-            let from_name = edge["from_name"].as_str().unwrap_or("");
-            let from_file = edge["from_file"].as_str().unwrap_or("");
-            let to_name = edge["to_name"].as_str().unwrap_or("");
-            let to_file = edge["to_file"].as_str().unwrap_or("");
-            let kind_str = edge["kind"].as_str().unwrap_or("Calls");
-
-            let edge_kind = match kind_str {
-                "Calls" | "C" => lattice_core::graph::model::EdgeKind::Calls,
-                "Imports" | "I" => lattice_core::graph::model::EdgeKind::Imports,
-                "TypeRef" | "T" => lattice_core::graph::model::EdgeKind::TypeRef,
-                "Implements" | "M" => lattice_core::graph::model::EdgeKind::Implements,
-                "Extends" | "E" => lattice_core::graph::model::EdgeKind::Extends,
-                _ => lattice_core::graph::model::EdgeKind::Calls,
+        if self.workspace_manager.is_some() {
+            let new_graph = {
+                let mut engine = self.engine.lock().await;
+                for edge in edges {
+                    apply_lsp_edge_to_graph(
+                        engine.graph_mut(),
+                        edge,
+                        &mut added,
+                        &mut skipped,
+                        &mut skip_reasons,
+                    );
+                }
+                engine.graph().clone()
             };
 
-            // Find the nodes in the graph
-            let graph = indexer.graph();
-            let from_id = graph
-                .all_nodes()
-                .iter()
-                .find(|n| n.name == from_name && n.file == from_file)
-                .map(|n| n.id.clone());
-            let to_id = graph
-                .all_nodes()
-                .iter()
-                .find(|n| n.name == to_name && n.file == to_file)
-                .map(|n| n.id.clone());
+            let graph_store = self.graph_store.lock().await;
+            let _ = graph_store.save_graph(&new_graph);
+        } else {
+            let new_graph = {
+                let mut indexer = self.indexer.lock().await;
+                for edge in edges {
+                    apply_lsp_edge_to_graph(
+                        indexer.graph_mut(),
+                        edge,
+                        &mut added,
+                        &mut skipped,
+                        &mut skip_reasons,
+                    );
+                }
+                indexer.graph().clone()
+            };
 
-            match (from_id, to_id) {
-                (Some(fid), Some(tid)) => {
-                    indexer.graph_mut().add_edge(&fid, &tid, edge_kind);
-                    added += 1;
-                }
-                (None, None) => {
-                    skip_reasons.push(json!({
-                        "from": from_name, "to": to_name,
-                        "reason": format!("both '{}::{}' and '{}::{}' not found in graph", from_file, from_name, to_file, to_name)
-                    }));
-                    skipped += 1;
-                }
-                (None, Some(_)) => {
-                    skip_reasons.push(json!({
-                        "from": from_name, "to": to_name,
-                        "reason": format!("source '{}::{}' not found in graph", from_file, from_name)
-                    }));
-                    skipped += 1;
-                }
-                (Some(_), None) => {
-                    skip_reasons.push(json!({
-                        "from": from_name, "to": to_name,
-                        "reason": format!("target '{}::{}' not found in graph", to_file, to_name)
-                    }));
-                    skipped += 1;
-                }
+            {
+                let graph_store = self.graph_store.lock().await;
+                let _ = graph_store.save_graph(&new_graph);
             }
-        }
 
-        // Propagate updated graph to engine
-        let new_graph = indexer.graph().clone();
-        {
             let mut engine = self.engine.lock().await;
             engine.update_graph(new_graph);
         }
@@ -3317,18 +3345,59 @@ impl McpHandler {
     /// Handle `lattice/reindex` — spawn background re-scan, return immediately.
     async fn handle_reindex(&self) -> Result<Value, (i32, String)> {
         let workspace_root = self.workspace_root.clone();
+        let workspace_roots = self.workspace_roots.clone();
         let indexer = Arc::clone(&self.indexer);
         let engine = Arc::clone(&self.engine);
         let graph_store = Arc::clone(&self.graph_store);
         let indexing = Arc::clone(&self.indexing);
+        let workspace_manager = self.workspace_manager.clone();
 
         indexing.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
-            let security_filter = SecurityFilter::new(&workspace_root);
             let mut files_indexed = 0usize;
             let mut errors = 0usize;
 
-            {
+            let new_graph = if let Some(workspace_manager) = workspace_manager {
+                let mut manager = workspace_manager.lock().await;
+                for root in &workspace_roots {
+                    let repo_name = crate::repo_name_for_root(root);
+                    if let Err(e) = manager.add_repo(repo_name.clone(), root.clone()) {
+                        tracing::warn!("Failed to reset repo {} for reindex: {}", repo_name, e);
+                        errors += 1;
+                        continue;
+                    }
+
+                    let security_filter = SecurityFilter::new(root);
+                    let entries = walk_directory_filtered(root, &security_filter);
+                    for entry_path in &entries {
+                        let rel_path = entry_path
+                            .strip_prefix(root)
+                            .unwrap_or(entry_path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+
+                        if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
+                            continue;
+                        }
+
+                        match std::fs::read_to_string(entry_path) {
+                            Ok(content) => {
+                                if manager.index_file(&repo_name, &rel_path, &content).is_ok() {
+                                    files_indexed += 1;
+                                } else {
+                                    errors += 1;
+                                }
+                            }
+                            Err(_) => {
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+                manager.detect_cross_repo_edges();
+                manager.unified_graph()
+            } else {
+                let security_filter = SecurityFilter::new(&workspace_root);
                 let mut idx = indexer.lock().await;
                 let entries = walk_directory_filtered(&workspace_root, &security_filter);
                 for entry_path in &entries {
@@ -3356,15 +3425,16 @@ impl McpHandler {
                     }
                 }
 
-                let new_graph = idx.graph().clone();
+                idx.graph().clone()
+            };
 
-                if let Ok(gs) = graph_store.try_lock() {
-                    let _ = gs.save_graph(&new_graph);
-                }
-
-                let mut eng = engine.lock().await;
-                eng.update_graph(new_graph);
+            {
+                let gs = graph_store.lock().await;
+                let _ = gs.save_graph(&new_graph);
             }
+
+            let mut eng = engine.lock().await;
+            eng.update_graph(new_graph);
 
             indexing.store(false, Ordering::Relaxed);
             tracing::info!(
@@ -3378,6 +3448,68 @@ impl McpHandler {
             "status": "started",
             "message": "Re-index started in background"
         }))
+    }
+}
+
+fn apply_lsp_edge_to_graph(
+    graph: &mut lattice_core::graph::CodeGraph,
+    edge: &Value,
+    added: &mut usize,
+    skipped: &mut usize,
+    skip_reasons: &mut Vec<Value>,
+) {
+    let from_name = edge["from_name"].as_str().unwrap_or("");
+    let from_file = edge["from_file"].as_str().unwrap_or("");
+    let to_name = edge["to_name"].as_str().unwrap_or("");
+    let to_file = edge["to_file"].as_str().unwrap_or("");
+    let kind_str = edge["kind"].as_str().unwrap_or("Calls");
+
+    let edge_kind = match kind_str {
+        "Calls" | "C" => lattice_core::graph::model::EdgeKind::Calls,
+        "Imports" | "I" => lattice_core::graph::model::EdgeKind::Imports,
+        "TypeRef" | "T" => lattice_core::graph::model::EdgeKind::TypeRef,
+        "Implements" | "M" => lattice_core::graph::model::EdgeKind::Implements,
+        "Extends" | "E" => lattice_core::graph::model::EdgeKind::Extends,
+        _ => lattice_core::graph::model::EdgeKind::Calls,
+    };
+
+    let from_id = graph
+        .all_nodes()
+        .iter()
+        .find(|n| n.name == from_name && n.file == from_file)
+        .map(|n| n.id.clone());
+    let to_id = graph
+        .all_nodes()
+        .iter()
+        .find(|n| n.name == to_name && n.file == to_file)
+        .map(|n| n.id.clone());
+
+    match (from_id, to_id) {
+        (Some(fid), Some(tid)) => {
+            graph.add_edge(&fid, &tid, edge_kind);
+            *added += 1;
+        }
+        (None, None) => {
+            skip_reasons.push(json!({
+                "from": from_name, "to": to_name,
+                "reason": format!("both '{}::{}' and '{}::{}' not found in graph", from_file, from_name, to_file, to_name)
+            }));
+            *skipped += 1;
+        }
+        (None, Some(_)) => {
+            skip_reasons.push(json!({
+                "from": from_name, "to": to_name,
+                "reason": format!("source '{}::{}' not found in graph", from_file, from_name)
+            }));
+            *skipped += 1;
+        }
+        (Some(_), None) => {
+            skip_reasons.push(json!({
+                "from": from_name, "to": to_name,
+                "reason": format!("target '{}::{}' not found in graph", to_file, to_name)
+            }));
+            *skipped += 1;
+        }
     }
 }
 
@@ -3397,7 +3529,20 @@ impl RequestHandler for McpHandler {
                 let is_indexing = self.indexing.load(Ordering::Relaxed);
                 let engine = self.engine.lock().await;
                 let stats = if engine.graph().stats().node_count == 0 && is_indexing {
-                    if let Ok(idx) = self.indexer.try_lock() {
+                    if let Some(wm) = &self.workspace_manager {
+                        if let Ok(wm) = wm.try_lock() {
+                            let repo_stats = wm.repo_stats();
+                            lattice_core::graph::GraphStats {
+                                node_count: repo_stats.iter().map(|s| s.node_count).sum(),
+                                edge_count: repo_stats.iter().map(|s| s.edge_count).sum(),
+                                file_count: repo_stats.iter().map(|s| s.file_count).sum(),
+                            }
+                        } else if let Ok(idx) = self.indexer.try_lock() {
+                            idx.graph().stats()
+                        } else {
+                            engine.graph().stats()
+                        }
+                    } else if let Ok(idx) = self.indexer.try_lock() {
                         idx.graph().stats()
                     } else {
                         engine.graph().stats()
@@ -3698,7 +3843,8 @@ fn task_bundle_widen_reason(bundle: &TaskBundle) -> Option<&'static str> {
         Some("no primary edit files were identified")
     } else if high_primary == 0 && high_symbols == 0 {
         Some("the likely edit area is still low-confidence")
-    } else if bundle.tests.is_empty() && bundle.primary_files.len() <= 1 && bundle.symbols.len() < 2 {
+    } else if bundle.tests.is_empty() && bundle.primary_files.len() <= 1 && bundle.symbols.len() < 2
+    {
         Some("supporting symbols and tests were still sparse")
     } else {
         None
@@ -3708,7 +3854,8 @@ fn task_bundle_widen_reason(bundle: &TaskBundle) -> Option<&'static str> {
 fn diff_impact_widen_reason(report: &DiffImpactReport) -> Option<&'static str> {
     if report.changed_symbols.is_empty() && report.affected_symbols.len() < 2 {
         Some("the compact diff view did not resolve enough changed or affected symbols")
-    } else if report.tests.is_empty() && report.risks.is_empty() && report.changed_files.len() <= 1 {
+    } else if report.tests.is_empty() && report.risks.is_empty() && report.changed_files.len() <= 1
+    {
         Some("the compact diff view lacked downstream risk or test context")
     } else {
         None
@@ -3731,7 +3878,8 @@ fn working_set_widen_reason(report: &WorkingSetContext) -> Option<&'static str> 
 fn subsystem_summary_widen_reason(report: &SubsystemSummary) -> Option<&'static str> {
     if report.key_files.len() < 2 {
         Some("the compact summary surfaced too few key files")
-    } else if report.key_symbols.is_empty() && report.tests.is_empty() && report.memories.is_empty() {
+    } else if report.key_symbols.is_empty() && report.tests.is_empty() && report.memories.is_empty()
+    {
         Some("the compact summary lacked symbol, test, and memory coverage")
     } else {
         None
@@ -3793,10 +3941,11 @@ fn should_try_prepare_change_semantic_fallback(
     }
 
     !entry_symbols.is_empty()
-        && !capsule
-            .pivots
-            .iter()
-            .any(|pivot| entry_symbols.iter().any(|symbol| symbol_matches_hint(&pivot.symbol, symbol)))
+        && !capsule.pivots.iter().any(|pivot| {
+            entry_symbols
+                .iter()
+                .any(|symbol| symbol_matches_hint(&pivot.symbol, symbol))
+        })
 }
 
 fn prepare_change_capsule_quality(
@@ -3894,7 +4043,8 @@ fn count_outcome_memory_reuse(values: &[Value]) -> usize {
     values
         .iter()
         .filter(|value| {
-            value.get("refresh_key")
+            value
+                .get("refresh_key")
                 .and_then(|item| item.as_str())
                 .map(|item| item.starts_with("workflow_outcome::"))
                 .unwrap_or(false)
@@ -4043,7 +4193,15 @@ fn apply_tiny_workflow_pruning(
     };
 
     truncate_string_field(object, "overview", 88);
-    truncate_array_field(object, "memory_highlights", if pruning_profile.prune_memory_highlights { 0 } else { 1 });
+    truncate_array_field(
+        object,
+        "memory_highlights",
+        if pruning_profile.prune_memory_highlights {
+            0
+        } else {
+            1
+        },
+    );
     shorten_memory_entries(object, "memory_highlights", 44);
     object.remove("playbook_memory");
 
@@ -4285,7 +4443,9 @@ fn trim_value_for_token_budget(value: &mut Value, max_tokens: usize) {
 
 fn densify_workflow_value(value: Value) -> Value {
     match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(densify_workflow_value).collect()),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(densify_workflow_value).collect())
+        }
         Value::Object(object) => Value::Object(
             object
                 .into_iter()
@@ -4370,11 +4530,7 @@ fn dense_key(key: &str) -> &str {
     }
 }
 
-fn truncate_array_field(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    limit: usize,
-) {
+fn truncate_array_field(object: &mut serde_json::Map<String, Value>, key: &str, limit: usize) {
     let remove = match object.get_mut(key) {
         Some(Value::Array(items)) => {
             if limit == 0 {
@@ -4392,11 +4548,7 @@ fn truncate_array_field(
     }
 }
 
-fn truncate_string_field(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    limit: usize,
-) {
+fn truncate_string_field(object: &mut serde_json::Map<String, Value>, key: &str, limit: usize) {
     if let Some(Value::String(text)) = object.get_mut(key) {
         *text = truncate_text_value(text, limit);
     }
@@ -4464,7 +4616,8 @@ fn truncate_text_value(value: &str, limit: usize) -> String {
 }
 
 fn first_confidence_band<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key)?
+    value
+        .get(key)?
         .as_array()?
         .first()?
         .get("confidence_band")?
@@ -4472,7 +4625,8 @@ fn first_confidence_band<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn array_len(value: &Value, key: &str) -> usize {
-    value.get(key)
+    value
+        .get(key)
         .and_then(|item| item.as_array())
         .map(|items| items.len())
         .unwrap_or(0)
@@ -4480,9 +4634,15 @@ fn array_len(value: &Value, key: &str) -> usize {
 
 fn attach_workflow_metadata(value: &mut Value, metadata: &WorkflowRunMetadata) {
     if let Some(object) = value.as_object_mut() {
-        object.insert("delivery_mode".to_string(), json!(metadata.delivery_mode.as_str()));
+        object.insert(
+            "delivery_mode".to_string(),
+            json!(metadata.delivery_mode.as_str()),
+        );
         if metadata.wire_format != "standard" {
-            object.insert("wire_format".to_string(), json!(metadata.wire_format.as_str()));
+            object.insert(
+                "wire_format".to_string(),
+                json!(metadata.wire_format.as_str()),
+            );
         }
         if metadata.single_anchor_used {
             object.insert("single_anchor_used".to_string(), json!(true));
@@ -4737,7 +4897,11 @@ fn seed_from_failure_diagnosis(report: &FailureDiagnosis) -> ExpandContextSeed {
 fn seed_from_subsystem_summary(report: &SubsystemSummary) -> ExpandContextSeed {
     ExpandContextSeed {
         query: Some(report.query.clone()),
-        files: report.key_files.iter().map(|item| item.file.clone()).collect(),
+        files: report
+            .key_files
+            .iter()
+            .map(|item| item.file.clone())
+            .collect(),
         symbols: report
             .key_symbols
             .iter()
@@ -4762,7 +4926,11 @@ fn seed_from_subsystem_summary(report: &SubsystemSummary) -> ExpandContextSeed {
 fn seed_from_repo_playbook(report: &RepoPlaybook) -> ExpandContextSeed {
     ExpandContextSeed {
         query: Some(report.overview.clone()),
-        files: report.key_files.iter().map(|item| item.file.clone()).collect(),
+        files: report
+            .key_files
+            .iter()
+            .map(|item| item.file.clone())
+            .collect(),
         symbols: report
             .notable_symbols
             .iter()
@@ -4799,7 +4967,13 @@ fn attach_playbook_memory(value: &mut Value, playbook_memory: Value) {
 
 fn extract_wrapped_tool_metrics(
     value: &Value,
-) -> (usize, usize, Option<String>, Option<String>, ToolCallMetadata) {
+) -> (
+    usize,
+    usize,
+    Option<String>,
+    Option<String>,
+    ToolCallMetadata,
+) {
     let text = value["content"]
         .as_array()
         .and_then(|items| items.first())
@@ -4833,11 +5007,7 @@ fn extract_wrapped_tool_metrics(
             .map(|item| item.to_string()),
         single_anchor_used: parsed
             .as_ref()
-            .and_then(|inner| {
-                inner
-                    .get("single_anchor_used")
-                    .or_else(|| inner.get("sa"))
-            })
+            .and_then(|inner| inner.get("single_anchor_used").or_else(|| inner.get("sa")))
             .and_then(|item| item.as_bool())
             .unwrap_or(false),
         suggested_expand_focus: parsed
@@ -5015,12 +5185,15 @@ mod tests {
     #[test]
     fn test_report_memory_highlights_truncates_content() {
         let long_content = "repo-playbook ".repeat(40);
-        let highlights = report_memory_highlights(&[json!({
-            "content": long_content,
-            "type": "pattern",
-            "scope": "repo",
-            "is_stale": false
-        })], 3);
+        let highlights = report_memory_highlights(
+            &[json!({
+                "content": long_content,
+                "type": "pattern",
+                "scope": "repo",
+                "is_stale": false
+            })],
+            3,
+        );
 
         assert_eq!(highlights.len(), 1);
         assert!(highlights[0].content.len() <= 123);
@@ -5029,12 +5202,15 @@ mod tests {
 
     #[test]
     fn test_build_failure_overview_value_uses_short_memory_reference() {
-        let highlights = report_memory_highlights(&[json!({
-            "content": "durable-note ".repeat(30),
-            "type": "pattern",
-            "scope": "repo",
-            "is_stale": false
-        })], 1);
+        let highlights = report_memory_highlights(
+            &[json!({
+                "content": "durable-note ".repeat(30),
+                "type": "pattern",
+                "scope": "repo",
+                "is_stale": false
+            })],
+            1,
+        );
 
         let overview = build_failure_overview_value("test diagnosis.", highlights.first());
         assert!(overview.contains("Consider prior repo pattern."));

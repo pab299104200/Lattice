@@ -1,10 +1,10 @@
+use crate::graph::CodeGraph;
+use crate::indexer::Indexer;
+use crate::query::capsule::ContextCapsule;
+use crate::query::QueryEngine;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use anyhow::Result;
-use crate::indexer::Indexer;
-use crate::graph::CodeGraph;
-use crate::query::QueryEngine;
-use crate::query::capsule::ContextCapsule;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CrossRepoEdge {
@@ -45,14 +45,16 @@ impl WorkspaceManager {
 
     pub fn index_file(&mut self, repo_name: &str, rel_path: &str, content: &str) -> Result<()> {
         if let Some(repo) = self.repos.get_mut(repo_name) {
-            repo.indexer.index_file_content(rel_path, content)?;
+            let namespaced = repo_rel_path(repo_name, rel_path);
+            repo.indexer.index_file_content(&namespaced, content)?;
         }
         Ok(())
     }
 
     pub fn remove_file(&mut self, repo_name: &str, rel_path: &str) {
         if let Some(repo) = self.repos.get_mut(repo_name) {
-            repo.indexer.remove_file(rel_path);
+            let namespaced = repo_rel_path(repo_name, rel_path);
+            repo.indexer.remove_file(&namespaced);
         }
     }
 
@@ -75,10 +77,16 @@ impl WorkspaceManager {
             let source = repo.indexer.graph();
             for node in source.all_nodes() {
                 merged.add_node(
-                    node.id.clone(), node.kind, node.name.clone(),
-                    node.signature.clone(), node.body.clone(),
-                    node.file.clone(), node.line, node.end_line,
-                    node.is_exported, node.language,
+                    node.id.clone(),
+                    node.kind,
+                    node.name.clone(),
+                    node.signature.clone(),
+                    node.body.clone(),
+                    node.file.clone(),
+                    node.line,
+                    node.end_line,
+                    node.is_exported,
+                    node.language,
                 );
             }
             for (from, to, kind) in source.all_edges() {
@@ -88,22 +96,27 @@ impl WorkspaceManager {
         merged
     }
 
-    pub fn repo_count(&self) -> usize { self.repos.len() }
+    pub fn repo_count(&self) -> usize {
+        self.repos.len()
+    }
 
     pub fn repo_names(&self) -> Vec<&str> {
         self.repos.keys().map(|s| s.as_str()).collect()
     }
 
     pub fn repo_stats(&self) -> Vec<RepoStats> {
-        self.repos.iter().map(|(name, state)| {
-            let graph = state.indexer.graph();
-            RepoStats {
-                name: name.clone(),
-                file_count: state.indexer.file_count(),
-                node_count: graph.node_count(),
-                edge_count: graph.edge_count(),
-            }
-        }).collect()
+        self.repos
+            .iter()
+            .map(|(name, state)| {
+                let graph = state.indexer.graph();
+                RepoStats {
+                    name: name.clone(),
+                    file_count: state.indexer.file_count(),
+                    node_count: graph.node_count(),
+                    edge_count: graph.edge_count(),
+                }
+            })
+            .collect()
     }
 
     /// Detect cross-repo edges by comparing imports in one repo against
@@ -132,11 +145,8 @@ impl WorkspaceManager {
                 // Check references within symbol bodies
                 let graph = state.indexer.graph();
                 let deps = graph.get_dependencies(&node.id);
-                let local_names: std::collections::HashSet<String> = graph
-                    .all_nodes()
-                    .iter()
-                    .map(|n| n.name.clone())
-                    .collect();
+                let local_names: std::collections::HashSet<String> =
+                    graph.all_nodes().iter().map(|n| n.name.clone()).collect();
 
                 // Also scan import names from the parsed files' import info
                 // by looking at the node's body for identifiers that match
@@ -153,15 +163,16 @@ impl WorkspaceManager {
                         for owner_repo in owner_repos {
                             if owner_repo != repo_name {
                                 // Determine edge type from file extension
-                                let edge_type = if node.file.ends_with(".ts") || node.file.ends_with(".js") {
-                                    "npm"
-                                } else if node.file.ends_with(".rs") {
-                                    "cargo"
-                                } else if node.file.ends_with(".py") {
-                                    "pip"
-                                } else {
-                                    "unknown"
-                                };
+                                let edge_type =
+                                    if node.file.ends_with(".ts") || node.file.ends_with(".js") {
+                                        "npm"
+                                    } else if node.file.ends_with(".rs") {
+                                        "cargo"
+                                    } else if node.file.ends_with(".py") {
+                                        "pip"
+                                    } else {
+                                        "unknown"
+                                    };
 
                                 self.cross_repo_edges.push(CrossRepoEdge {
                                     from_repo: repo_name.clone(),
@@ -181,8 +192,11 @@ impl WorkspaceManager {
 
         // Deduplicate edges
         self.cross_repo_edges.sort_by(|a, b| {
-            (&a.from_repo, &a.to_repo, &a.dependency_name)
-                .cmp(&(&b.from_repo, &b.to_repo, &b.dependency_name))
+            (&a.from_repo, &a.to_repo, &a.dependency_name).cmp(&(
+                &b.from_repo,
+                &b.to_repo,
+                &b.dependency_name,
+            ))
         });
         self.cross_repo_edges.dedup_by(|a, b| {
             a.from_repo == b.from_repo
@@ -194,6 +208,16 @@ impl WorkspaceManager {
     /// Get the detected cross-repo edges.
     pub fn cross_repo_edges(&self) -> &[CrossRepoEdge] {
         &self.cross_repo_edges
+    }
+}
+
+fn repo_rel_path(repo_name: &str, rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
+    if trimmed.is_empty() {
+        repo_name.to_string()
+    } else {
+        format!("{}/{}", repo_name, trimmed)
     }
 }
 

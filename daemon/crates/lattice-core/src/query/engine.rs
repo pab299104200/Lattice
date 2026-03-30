@@ -6,9 +6,7 @@ use crate::memory::MemoryStore;
 use crate::storage::VectorStore;
 use crate::symbols::{SymbolId, SymbolKind};
 
-use super::capsule::{
-    CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent,
-};
+use super::capsule::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
 use super::intent::{detect_intent, IntentParams};
 
 /// Token estimation: ~4 characters per token.
@@ -24,24 +22,20 @@ const ENGINE_VERSION: &str = "v31";
 /// generic qualifiers that don't indicate domain subsystems.
 const NAME_STOP_WORDS: &[&str] = &[
     // Common verbs / actions
-    "get", "set", "new", "run", "do", "is", "has", "can", "to", "from",
-    "add", "del", "put", "all", "try", "with", "into", "init", "make",
-    "create", "update", "delete", "remove", "handle", "process",
-    "check", "test", "build", "parse", "load", "save", "read", "write",
-    "find", "list", "show", "send", "call", "start", "stop", "open",
-    "close", "done", "apply", "emit", "register", "ensure",
-    // Prepositions / articles / conjunctions
+    "get", "set", "new", "run", "do", "is", "has", "can", "to", "from", "add", "del", "put", "all",
+    "try", "with", "into", "init", "make", "create", "update", "delete", "remove", "handle",
+    "process", "check", "test", "build", "parse", "load", "save", "read", "write", "find", "list",
+    "show", "send", "call", "start", "stop", "open", "close", "done", "apply", "emit", "register",
+    "ensure", // Prepositions / articles / conjunctions
     "by", "in", "on", "of", "for", "the", "and", "or", "at", "as",
     // Generic qualifiers / modifiers
-    "current", "info", "item", "self", "this", "that", "level",
-    "data", "name", "id", "ids", "key", "val", "value", "result",
-    "error", "endpoint", "params", "args", "options", "config",
-    "state", "status", "count", "index", "size", "total", "raw",
-    "base", "node", "entry", "record", "row", "col", "field",
-    // Programming language keywords / primitives
-    "type", "async", "await", "impl", "func", "def", "class", "pub",
-    "fn", "mut", "ref", "var", "let", "const", "return", "export",
-    "default", "int", "str", "bool", "num", "obj", "err", "ctx",
+    "current", "info", "item", "self", "this", "that", "level", "data", "name", "id", "ids", "key",
+    "val", "value", "result", "error", "endpoint", "params", "args", "options", "config", "state",
+    "status", "count", "index", "size", "total", "raw", "base", "node", "entry", "record", "row",
+    "col", "field", // Programming language keywords / primitives
+    "type", "async", "await", "impl", "func", "def", "class", "pub", "fn", "mut", "ref", "var",
+    "let", "const", "return", "export", "default", "int", "str", "bool", "num", "obj", "err",
+    "ctx",
 ];
 
 /// A candidate node with its computed score for ranking.
@@ -85,7 +79,12 @@ impl QueryEngine {
     ///
     /// If `embedding` is provided and a vector store is available, semantic search
     /// is used. Otherwise, falls back to keyword matching on node names/signatures.
-    pub fn query(&mut self, query_text: &str, embedding: Option<&[f32]>, focused: bool) -> ContextCapsule {
+    pub fn query(
+        &mut self,
+        query_text: &str,
+        embedding: Option<&[f32]>,
+        focused: bool,
+    ) -> ContextCapsule {
         // Record the query for frequency tracking (adaptive budget)
         self.record_query(query_text);
 
@@ -107,24 +106,33 @@ impl QueryEngine {
         // Seed scores are IDF-weighted: files matching rare query words score higher.
         if intent == QueryIntent::Explore {
             let q_lower = clean_query.to_lowercase();
-            let q_cleaned: String = q_lower.chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+            let q_cleaned: String = q_lower
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
                 .collect();
-            let q_words: Vec<&str> = q_cleaned.split_whitespace()
+            let q_words: Vec<&str> = q_cleaned
+                .split_whitespace()
                 .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
                 .collect();
 
             if !q_words.is_empty() {
-                let seed_ids: std::collections::HashSet<SymbolId> = seed_hits.iter()
-                    .map(|(id, _)| id.clone())
-                    .collect();
+                let seed_ids: std::collections::HashSet<SymbolId> =
+                    seed_hits.iter().map(|(id, _)| id.clone()).collect();
 
                 // Compute IDF for file-path seed scoring
                 let all_fp_nodes = self.graph.all_nodes();
                 let fp_total = all_fp_nodes.len().max(1) as f64;
-                let fp_word_idf: HashMap<&str, f64> = q_words.iter()
+                let fp_word_idf: HashMap<&str, f64> = q_words
+                    .iter()
                     .map(|w| {
-                        let df = all_fp_nodes.iter()
+                        let df = all_fp_nodes
+                            .iter()
                             .filter(|n| {
                                 let nl = n.name.to_lowercase();
                                 nl.contains(*w) || n.signature.to_lowercase().contains(*w)
@@ -136,7 +144,8 @@ impl QueryEngine {
                     .collect();
                 let fp_max_idf_raw = fp_word_idf.values().cloned().fold(0.1f64, f64::max);
                 let fp_idf_floor = fp_max_idf_raw * 0.3;
-                let fp_word_idf_floored: HashMap<&str, f64> = fp_word_idf.iter()
+                let fp_word_idf_floored: HashMap<&str, f64> = fp_word_idf
+                    .iter()
                     .map(|(w, idf)| (*w, idf.max(fp_idf_floor)))
                     .collect();
                 let fp_max_idf = fp_word_idf_floored.values().cloned().fold(0.1f64, f64::max);
@@ -173,17 +182,20 @@ impl QueryEngine {
                     let mut file_score: f64 = 0.0;
                     let mut match_count: usize = 0;
                     for w in &q_words {
-                        let matched = file_segments.iter().any(|seg| {
-                            seg == w || (seg.len() >= 4 && w.starts_with(seg))
-                        });
+                        let matched = file_segments
+                            .iter()
+                            .any(|seg| seg == w || (seg.len() >= 4 && w.starts_with(seg)));
                         if matched {
-                            let idf_f = fp_word_idf_floored.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
+                            let idf_f =
+                                fp_word_idf_floored.get(*w).copied().unwrap_or(1.0) / fp_max_idf;
                             file_score += idf_f;
                             match_count += 1;
                         }
                     }
 
-                    if match_count == 0 { continue; }
+                    if match_count == 0 {
+                        continue;
+                    }
 
                     // For long queries (5+ content words), require 2+ file segment
                     // matches. A single "system" match on an 11-word auth query seeded
@@ -196,14 +208,25 @@ impl QueryEngine {
                     }
 
                     let centrality = self.graph.centrality(&node.id);
-                    file_candidates.entry(node.file.clone())
+                    file_candidates
+                        .entry(node.file.clone())
                         .or_default()
                         .push((node.id.clone(), centrality));
-                    file_idf_scores.entry(node.file.clone())
-                        .and_modify(|s| { if file_score > *s { *s = file_score; } })
+                    file_idf_scores
+                        .entry(node.file.clone())
+                        .and_modify(|s| {
+                            if file_score > *s {
+                                *s = file_score;
+                            }
+                        })
                         .or_insert(file_score);
-                    file_match_counts.entry(node.file.clone())
-                        .and_modify(|c| { if match_count > *c { *c = match_count; } })
+                    file_match_counts
+                        .entry(node.file.clone())
+                        .and_modify(|c| {
+                            if match_count > *c {
+                                *c = match_count;
+                            }
+                        })
                         .or_insert(match_count);
                 }
 
@@ -216,14 +239,17 @@ impl QueryEngine {
                 files.sort_by(|a, b| {
                     let sa = file_idf_scores.get(a).copied().unwrap_or(0.0);
                     let sb = file_idf_scores.get(b).copied().unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    sb.partial_cmp(&sa)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.cmp(b))
                 });
 
                 let mut seeded_ids: std::collections::HashSet<SymbolId> = seed_ids.clone();
 
                 for file in &files {
-                    if added >= max_total { break; }
+                    if added >= max_total {
+                        break;
+                    }
                     let file_score = file_idf_scores.get(file).copied().unwrap_or(0.0);
                     // Dynamic max_per_file: files matching 2+ query words are highly
                     // relevant and deserve more seed slots. auth_mgmt/helpers.py matching
@@ -235,11 +261,14 @@ impl QueryEngine {
                     let seed_sim = (0.15 + 0.35 * (file_score / q_words.len() as f64)).min(0.50);
                     if let Some(candidates) = file_candidates.get_mut(file) {
                         candidates.sort_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            b.1.partial_cmp(&a.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
                                 .then_with(|| a.0.name.cmp(&b.0.name))
                         });
                         for (id, _centrality) in candidates.iter().take(max_per_file) {
-                            if added >= max_total { break; }
+                            if added >= max_total {
+                                break;
+                            }
                             seed_hits.push((id.clone(), seed_sim));
                             seeded_ids.insert(id.clone());
                             added += 1;
@@ -258,16 +287,12 @@ impl QueryEngine {
         // Step 3: Graph traversal — N hops from semantic hits, tracking relationship paths
         let mut candidate_ids: HashMap<SymbolId, f64> = HashMap::new();
         let mut relationship_paths: HashMap<SymbolId, String> = HashMap::new();
-        let seed_hit_ids: std::collections::HashSet<SymbolId> = seed_hits.iter()
-            .map(|(id, _)| id.clone())
-            .collect();
+        let seed_hit_ids: std::collections::HashSet<SymbolId> =
+            seed_hits.iter().map(|(id, _)| id.clone()).collect();
 
         for (id, sim) in &seed_hits {
             candidate_ids.insert(id.clone(), *sim);
-            relationship_paths.insert(
-                id.clone(),
-                format!("semantic_match: {:.2}", sim),
-            );
+            relationship_paths.insert(id.clone(), format!("semantic_match: {:.2}", sim));
 
             // Skip graph expansion from Variable/Constant nodes.
             // Variables are data declarations (e.g., `const token = localStorage.get(...)`)
@@ -303,30 +328,54 @@ impl QueryEngine {
                 // are domain-coherent and get full decay.
                 let dep_dir = file_directory(&dep_node.file);
                 let same_dir = dep_dir == seed_dir;
-                let decay_1hop = if same_dir { base_decay_1hop } else { base_decay_1hop * 0.4 };
+                let decay_1hop = if same_dir {
+                    base_decay_1hop
+                } else {
+                    base_decay_1hop * 0.4
+                };
 
                 let edge_label = format_edge_kind(edge_kind);
-                candidate_ids.entry(dep_node.id.clone())
-                    .and_modify(|s| { if decay_1hop > *s { *s = decay_1hop; } })
+                candidate_ids
+                    .entry(dep_node.id.clone())
+                    .and_modify(|s| {
+                        if decay_1hop > *s {
+                            *s = decay_1hop;
+                        }
+                    })
                     .or_insert(decay_1hop);
-                relationship_paths.entry(dep_node.id.clone()).or_insert_with(|| {
-                    format!("{}: {} (via {})", edge_label, seed_name, dep_node.name)
-                });
+                relationship_paths
+                    .entry(dep_node.id.clone())
+                    .or_insert_with(|| {
+                        format!("{}: {} (via {})", edge_label, seed_name, dep_node.name)
+                    });
 
                 // 2 hops from dependencies
                 if params.hop_depth >= 2 {
                     for (dep2_node, edge_kind2) in self.graph.get_dependencies(&dep_node.id) {
                         let dep2_dir = file_directory(&dep2_node.file);
                         let same_dir_2 = dep2_dir == seed_dir;
-                        let decay_2hop = if same_dir_2 { base_decay_2hop } else { base_decay_2hop * 0.3 };
+                        let decay_2hop = if same_dir_2 {
+                            base_decay_2hop
+                        } else {
+                            base_decay_2hop * 0.3
+                        };
 
-                        candidate_ids.entry(dep2_node.id.clone())
-                            .and_modify(|s| { if decay_2hop > *s { *s = decay_2hop; } })
+                        candidate_ids
+                            .entry(dep2_node.id.clone())
+                            .and_modify(|s| {
+                                if decay_2hop > *s {
+                                    *s = decay_2hop;
+                                }
+                            })
                             .or_insert(decay_2hop);
-                        relationship_paths.entry(dep2_node.id.clone()).or_insert_with(|| {
-                            format!("{} -> {} -> {} (via {:?})",
-                                seed_name, dep_node.name, dep2_node.name, edge_kind2)
-                        });
+                        relationship_paths
+                            .entry(dep2_node.id.clone())
+                            .or_insert_with(|| {
+                                format!(
+                                    "{} -> {} -> {} (via {:?})",
+                                    seed_name, dep_node.name, dep2_node.name, edge_kind2
+                                )
+                            });
                     }
                 }
             }
@@ -343,9 +392,11 @@ impl QueryEngine {
             // include Contains-direction dependents (module/class containers) which are
             // always relevant, and skip Calls-direction dependents (consumer functions).
             let dependents = self.graph.get_dependents(id);
-            let is_hub_node = dependents.iter()
+            let is_hub_node = dependents
+                .iter()
                 .filter(|(_, ek)| matches!(ek, EdgeKind::Calls))
-                .count() > 5;
+                .count()
+                > 5;
 
             for (caller_node, edge_kind) in &dependents {
                 // For hub nodes, only follow Contains edges (module discovery),
@@ -355,15 +406,24 @@ impl QueryEngine {
                 }
                 let caller_dir = file_directory(&caller_node.file);
                 let same_dir_caller = caller_dir == seed_dir;
-                let caller_decay = if same_dir_caller { base_decay_1hop } else { base_decay_1hop * 0.4 };
+                let caller_decay = if same_dir_caller {
+                    base_decay_1hop
+                } else {
+                    base_decay_1hop * 0.4
+                };
 
                 let edge_label = format_edge_kind_reverse(*edge_kind);
-                candidate_ids.entry(caller_node.id.clone())
-                    .and_modify(|s| { if caller_decay > *s { *s = caller_decay; } })
+                candidate_ids
+                    .entry(caller_node.id.clone())
+                    .and_modify(|s| {
+                        if caller_decay > *s {
+                            *s = caller_decay;
+                        }
+                    })
                     .or_insert(caller_decay);
-                relationship_paths.entry(caller_node.id.clone()).or_insert_with(|| {
-                    format!("{}: {}", edge_label, seed_name)
-                });
+                relationship_paths
+                    .entry(caller_node.id.clone())
+                    .or_insert_with(|| format!("{}: {}", edge_label, seed_name));
             }
         }
 
@@ -382,7 +442,9 @@ impl QueryEngine {
                     .parent()
                     .and_then(|p| p.to_str())
                     .unwrap_or("");
-                if seed_dir.is_empty() { continue; }
+                if seed_dir.is_empty() {
+                    continue;
+                }
                 let seed_name = seed_node.name.clone();
 
                 // BFS: follow Calls edges within same directory, up to 4 hops
@@ -395,13 +457,19 @@ impl QueryEngine {
                     let mut next_layer: Vec<SymbolId> = Vec::new();
                     for id in &current_layer {
                         for (dep, ek) in self.graph.get_dependencies(id) {
-                            if !matches!(ek, EdgeKind::Calls) { continue; }
-                            if visited.contains(&dep.id) { continue; }
+                            if !matches!(ek, EdgeKind::Calls) {
+                                continue;
+                            }
+                            if visited.contains(&dep.id) {
+                                continue;
+                            }
                             let dep_dir = std::path::Path::new(&dep.file)
                                 .parent()
                                 .and_then(|p| p.to_str())
                                 .unwrap_or("");
-                            if dep_dir != seed_dir { continue; }
+                            if dep_dir != seed_dir {
+                                continue;
+                            }
 
                             visited.insert(dep.id.clone());
                             next_layer.push(dep.id.clone());
@@ -417,7 +485,9 @@ impl QueryEngine {
                         }
                     }
                     current_layer = next_layer;
-                    if current_layer.is_empty() { break; }
+                    if current_layer.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -429,10 +499,18 @@ impl QueryEngine {
 
         // Pre-compute query words for keyword coherence check on graph-traversed nodes.
         let scoring_q_lower = clean_query.to_lowercase();
-        let scoring_q_cleaned: String = scoring_q_lower.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+        let scoring_q_cleaned: String = scoring_q_lower
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    ' '
+                }
+            })
             .collect();
-        let scoring_q_words: Vec<&str> = scoring_q_cleaned.split_whitespace()
+        let scoring_q_words: Vec<&str> = scoring_q_cleaned
+            .split_whitespace()
             .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
             .collect();
 
@@ -506,7 +584,12 @@ impl QueryEngine {
                 // Graph-traversed nodes with zero keyword overlap get capped at 0.06,
                 // low enough to stay out of pivot range but available as last-resort context.
                 if !seed_hit_ids.contains(id) {
-                    if !has_keyword_coherence(&node.name, &node.signature, &node.file, &scoring_q_words) {
+                    if !has_keyword_coherence(
+                        &node.name,
+                        &node.signature,
+                        &node.file,
+                        &scoring_q_words,
+                    ) {
                         score = score.min(0.04);
                     }
                 }
@@ -551,20 +634,21 @@ impl QueryEngine {
                     match node.kind {
                         SymbolKind::Interface | SymbolKind::TypeAlias => {
                             score *= 0.3;
-                        },
+                        }
                         SymbolKind::Enum => {
                             score *= 0.5;
-                        },
+                        }
                         SymbolKind::Class | SymbolKind::Struct => {
                             if is_schema_heavy(&node.body) {
                                 score *= 0.4;
                             }
-                        },
+                        }
                         _ => {}
                     }
                 }
 
-                let rel_detail = relationship_paths.get(id)
+                let rel_detail = relationship_paths
+                    .get(id)
                     .cloned()
                     .unwrap_or_else(|| classify_relationship(*semantic_sim));
 
@@ -580,7 +664,8 @@ impl QueryEngine {
 
         // Sort by descending score, tiebreak by name for deterministic results
         candidates.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.node.name.cmp(&b.node.name))
         });
@@ -607,7 +692,11 @@ impl QueryEngine {
         let mut pivots = Vec::new();
         let mut context = Vec::new();
         let mut tokens_used: usize = 0;
-        let budget = if focused { 1500 } else { params.base_token_budget + (repeat_count * 500) };
+        let budget = if focused {
+            1500
+        } else {
+            params.base_token_budget + (repeat_count * 500)
+        };
         // Cap context nodes to prevent 3rd-degree noise from flooding results.
         // Pivots (full source) are uncapped since they're budget-limited by token cost.
         // Context (signatures) are cheap, so without a count cap they can explode to 100+.
@@ -666,8 +755,11 @@ impl QueryEngine {
                     if context.len() < max_context_nodes {
                         let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
                         if tokens_used + sig_tokens <= budget {
-                            let dup_of = pivots.iter()
-                                .find(|p: &&PivotNode| line_overlap_ratio(&p.source, &candidate.node.body) > 0.80)
+                            let dup_of = pivots
+                                .iter()
+                                .find(|p: &&PivotNode| {
+                                    line_overlap_ratio(&p.source, &candidate.node.body) > 0.80
+                                })
                                 .map(|p| p.symbol.clone())
                                 .unwrap_or_default();
                             context.push(ContextNode {
@@ -688,7 +780,10 @@ impl QueryEngine {
                 let reason = if candidate.is_seed_hit {
                     format!("seed match (score: {:.2})", candidate.score)
                 } else {
-                    format!("graph traversal: {} (score: {:.2})", candidate.relationship_detail, candidate.score)
+                    format!(
+                        "graph traversal: {} (score: {:.2})",
+                        candidate.relationship_detail, candidate.score
+                    )
                 };
 
                 pivots.push(PivotNode {
@@ -742,12 +837,14 @@ impl QueryEngine {
             for c in &context {
                 *file_counts.entry(c.file.clone()).or_insert(0) += 1;
             }
-            let included_symbols: std::collections::HashSet<String> = pivots.iter()
+            let included_symbols: std::collections::HashSet<String> = pivots
+                .iter()
                 .map(|p| p.symbol.clone())
                 .chain(context.iter().map(|c| c.symbol.clone()))
                 .collect();
 
-            let mut sibling_files: Vec<String> = file_counts.into_iter()
+            let mut sibling_files: Vec<String> = file_counts
+                .into_iter()
                 .filter(|(_, count)| *count >= 2)
                 .map(|(file, _)| file)
                 .collect();
@@ -759,7 +856,13 @@ impl QueryEngine {
             let sib_query_lower = clean_query.to_lowercase();
             let sib_cleaned: String = sib_query_lower
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
                 .collect();
             let sib_words: Vec<&str> = sib_cleaned
                 .split_whitespace()
@@ -768,7 +871,10 @@ impl QueryEngine {
 
             for file in &sibling_files {
                 // Skip large grab-bag files (conftest.py, utils, fixtures, etc.)
-                let total_in_file = self.graph.all_nodes().iter()
+                let total_in_file = self
+                    .graph
+                    .all_nodes()
+                    .iter()
                     .filter(|n| n.file == *file)
                     .count();
                 if total_in_file >= 10 {
@@ -786,9 +892,9 @@ impl QueryEngine {
                     .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
                     .filter(|p| p.len() >= 3)
                     .collect();
-                let file_relevant = sib_words.iter().any(|w| {
-                    file_segments.iter().any(|seg| *seg == *w)
-                });
+                let file_relevant = sib_words
+                    .iter()
+                    .any(|w| file_segments.iter().any(|seg| *seg == *w));
                 if !file_relevant {
                     continue;
                 }
@@ -806,7 +912,8 @@ impl QueryEngine {
                     let name_lower = node.name.to_lowercase();
                     let name_parts = split_identifier(&name_lower);
                     let sig_lower = node.signature.to_lowercase();
-                    let relevance: f64 = sib_words.iter()
+                    let relevance: f64 = sib_words
+                        .iter()
                         .filter(|w| {
                             // Direct containment
                             name_lower.contains(*w)
@@ -874,15 +981,19 @@ impl QueryEngine {
             let mut dep_added = 0usize;
 
             // Collect all currently included symbol names
-            let included_ids: std::collections::HashSet<String> = pivots.iter()
+            let included_ids: std::collections::HashSet<String> = pivots
+                .iter()
                 .map(|p| p.symbol.clone())
                 .chain(context.iter().map(|c| c.symbol.clone()))
                 .collect();
 
             // Only iterate dependencies of PIVOT nodes (high-confidence)
-            let pivot_node_ids: Vec<SymbolId> = pivots.iter()
+            let pivot_node_ids: Vec<SymbolId> = pivots
+                .iter()
                 .filter_map(|p| {
-                    self.graph.all_nodes().iter()
+                    self.graph
+                        .all_nodes()
+                        .iter()
                         .find(|n| n.name == p.symbol && n.file == p.file)
                         .map(|n| n.id.clone())
                 })
@@ -914,14 +1025,21 @@ impl QueryEngine {
                     // Keyword coherence: only include dependencies that share query keywords.
                     // Without this, login → get_db and login → dispatch_webhook_event
                     // waste context slots despite zero topical relevance to the auth query.
-                    if !has_keyword_coherence(&dep_node.name, &dep_node.signature, &dep_node.file, &scoring_q_words) {
+                    if !has_keyword_coherence(
+                        &dep_node.name,
+                        &dep_node.signature,
+                        &dep_node.file,
+                        &scoring_q_words,
+                    ) {
                         continue;
                     }
                     let sig_tokens = dep_node.signature.len() / CHARS_PER_TOKEN;
                     if dep_tokens_used + sig_tokens > dep_budget {
                         continue;
                     }
-                    let caller_name = self.graph.get_node(node_id)
+                    let caller_name = self
+                        .graph
+                        .get_node(node_id)
                         .map(|n| n.name.clone())
                         .unwrap_or_default();
                     context.push(ContextNode {
@@ -952,15 +1070,18 @@ impl QueryEngine {
         // Step 6: Retrieve relevant memories
         let memories = if let Some(ref ms) = self.memory_store {
             match ms.lock() {
-                Ok(store) => {
-                    store.search_by_keyword(query_text).unwrap_or_default()
-                        .into_iter().take(5).map(|m| {
-                            serde_json::json!({
-                                "content": m.content,
-                                "type": m.memory_type.as_str(),
-                            })
-                        }).collect()
-                }
+                Ok(store) => store
+                    .search_by_keyword(query_text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(5)
+                    .map(|m| {
+                        serde_json::json!({
+                            "content": m.content,
+                            "type": m.memory_type.as_str(),
+                        })
+                    })
+                    .collect(),
                 Err(_) => vec![], // Mutex poisoned — skip memories gracefully
             }
         } else {
@@ -981,9 +1102,16 @@ impl QueryEngine {
                 nodes_included,
                 engine_version: ENGINE_VERSION.to_string(),
                 seed_count: seed_hits.len(),
-                seed_symbols: seed_hits.iter()
+                seed_symbols: seed_hits
+                    .iter()
                     .take(15)
-                    .map(|(id, _)| format!("{}:{}", id.file.rsplit('/').next().unwrap_or(&id.file), id.name))
+                    .map(|(id, _)| {
+                        format!(
+                            "{}:{}",
+                            id.file.rsplit('/').next().unwrap_or(&id.file),
+                            id.name
+                        )
+                    })
                     .collect(),
             },
         }
@@ -994,6 +1122,11 @@ impl QueryEngine {
         &self.graph
     }
 
+    /// Get the underlying graph mutably for direct updates.
+    pub fn graph_mut(&mut self) -> &mut CodeGraph {
+        &mut self.graph
+    }
+
     /// Get a reference to the vector store (if available).
     pub fn vector_store(&self) -> &Option<VectorStore> {
         &self.vector_store
@@ -1001,13 +1134,14 @@ impl QueryEngine {
 
     /// Find a symbol by name (searches all nodes).
     pub fn find_symbol(&self, name: &str) -> Option<&GraphNode> {
-        self.graph.all_nodes().into_iter()
-            .find(|n| n.name == name)
+        self.graph.all_nodes().into_iter().find(|n| n.name == name)
     }
 
     /// Find all symbols in a file.
     pub fn file_symbols(&self, file: &str) -> Vec<&GraphNode> {
-        self.graph.all_nodes().into_iter()
+        self.graph
+            .all_nodes()
+            .into_iter()
             .filter(|n| n.file == file)
             .collect()
     }
@@ -1063,7 +1197,13 @@ impl QueryEngine {
         let query_lower = query_text.to_lowercase();
         let cleaned: String = query_lower
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    ' '
+                }
+            })
             .collect();
         let query_words: Vec<&str> = cleaned
             .split_whitespace()
@@ -1078,9 +1218,11 @@ impl QueryEngine {
         // Words appearing in many symbols (low IDF) contribute less to scores.
         let all_nodes = self.graph.all_nodes();
         let total_nodes = all_nodes.len().max(1) as f64;
-        let word_idf: HashMap<&str, f64> = query_words.iter()
+        let word_idf: HashMap<&str, f64> = query_words
+            .iter()
             .map(|w| {
-                let df = all_nodes.iter()
+                let df = all_nodes
+                    .iter()
                     .filter(|n| {
                         let nl = n.name.to_lowercase();
                         nl.contains(*w) || n.signature.to_lowercase().contains(*w)
@@ -1097,13 +1239,15 @@ impl QueryEngine {
         // this, auth queries fail because "token"/"password"/"user" have near-zero
         // IDF in codebases where those words are ubiquitous.
         let idf_floor = max_idf * 0.3;
-        let word_idf_floored: HashMap<&str, f64> = word_idf.iter()
+        let word_idf_floored: HashMap<&str, f64> = word_idf
+            .iter()
             .map(|(w, idf)| (*w, idf.max(idf_floor)))
             .collect();
         let max_idf_floored = word_idf_floored.values().cloned().fold(0.1f64, f64::max);
 
         // Pre-compute total IDF (sum of all floored word IDFs) — constant across nodes
-        let total_idf: f64 = query_words.iter()
+        let total_idf: f64 = query_words
+            .iter()
             .map(|w| word_idf_floored.get(*w).copied().unwrap_or(1.0))
             .sum();
 
@@ -1122,7 +1266,11 @@ impl QueryEngine {
             // Fast path: exact symbol name in query → high score.
             // IDF-weighted: exact match on a rare term scores higher than on a common one.
             if query_words.iter().any(|w| *w == name_lower) {
-                let idf_factor = word_idf_floored.get(name_lower.as_str()).copied().unwrap_or(max_idf_floored) / max_idf_floored;
+                let idf_factor = word_idf_floored
+                    .get(name_lower.as_str())
+                    .copied()
+                    .unwrap_or(max_idf_floored)
+                    / max_idf_floored;
                 let exact_score = if query_words.len() >= 5 {
                     match node.kind {
                         SymbolKind::Variable | SymbolKind::Constant => 0.5 * idf_factor,
@@ -1166,9 +1314,10 @@ impl QueryEngine {
                 }
                 // Name contains query word at a word boundary
                 else if name_lower.contains(word) {
-                    let is_boundary = name_lower.find(word).map(|pos| {
-                        pos == 0 || name_lower.as_bytes().get(pos - 1) == Some(&b'_')
-                    }).unwrap_or(false);
+                    let is_boundary = name_lower
+                        .find(word)
+                        .map(|pos| pos == 0 || name_lower.as_bytes().get(pos - 1) == Some(&b'_'))
+                        .unwrap_or(false);
                     word_score = if is_boundary { 0.7 } else { 0.4 };
                 }
                 // Name part exactly matches query word or query word starts with name part.
@@ -1178,13 +1327,15 @@ impl QueryEngine {
                 // (3 chars is too short — "log" ≠ "login" semantically). Exact matches
                 // keep the >= 3 threshold since they're unambiguous.
                 else if name_parts.iter().any(|part| {
-                    (part.len() >= 3 && *word == part.as_str()) || (part.len() >= 4 && word.starts_with(part.as_str()))
+                    (part.len() >= 3 && *word == part.as_str())
+                        || (part.len() >= 4 && word.starts_with(part.as_str()))
                 }) {
                     word_score = 0.5;
                 }
                 // Prefix match between name parts and query words
                 else if name_parts.iter().any(|part| {
-                    (part.len() >= 4 && word.starts_with(part.as_str())) || (part.len() >= 3 && part.starts_with(word))
+                    (part.len() >= 4 && word.starts_with(part.as_str()))
+                        || (part.len() >= 3 && part.starts_with(word))
                 }) {
                     word_score = 0.4;
                 }
@@ -1263,7 +1414,10 @@ impl QueryEngine {
         // tests from one file, starving real implementation files of seed slots.
         {
             let max_test_seeds = 3;
-            let test_count = scored.iter().filter(|(id, _)| is_test_file(&id.file)).count();
+            let test_count = scored
+                .iter()
+                .filter(|(id, _)| is_test_file(&id.file))
+                .count();
             if test_count > max_test_seeds {
                 // Collect non-test overflow candidates from the full scored list
                 let mut overflow_candidates: Vec<(SymbolId, f64)> = Vec::new();
@@ -1280,26 +1434,41 @@ impl QueryEngine {
                     let mut idf_ws: f64 = 0.0;
                     let mut wm = 0usize;
                     for word in &query_words {
-                        let idf_f = word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
+                        let idf_f =
+                            word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
                         let mut ws: f64 = 0.0;
-                        if name_lower.starts_with(word) { ws = 0.8; }
-                        else if name_lower.contains(word) { ws = 0.4; }
-                        else if name_parts.iter().any(|p| (p.len() >= 3 && *word == p.as_str()) || (p.len() >= 4 && word.starts_with(p.as_str()))) { ws = 0.5; }
-                        if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
+                        if name_lower.starts_with(word) {
+                            ws = 0.8;
+                        } else if name_lower.contains(word) {
+                            ws = 0.4;
+                        } else if name_parts.iter().any(|p| {
+                            (p.len() >= 3 && *word == p.as_str())
+                                || (p.len() >= 4 && word.starts_with(p.as_str()))
+                        }) {
+                            ws = 0.5;
+                        }
+                        if ws > 0.0 {
+                            wm += 1;
+                            idf_ws += ws * idf_f;
+                        }
                     }
-                    if wm == 0 { continue; }
+                    if wm == 0 {
+                        continue;
+                    }
                     let cov = wm as f64 / query_words.len() as f64;
                     let max_possible = total_idf / max_idf_floored;
                     let norm = if max_possible > 0.0 {
-                        (idf_ws / max_possible.min(query_words.len() as f64) * (0.5 + 0.5 * cov)).min(1.0)
-                    } else { 0.0 };
+                        (idf_ws / max_possible.min(query_words.len() as f64) * (0.5 + 0.5 * cov))
+                            .min(1.0)
+                    } else {
+                        0.0
+                    };
                     if norm > 0.05 {
                         overflow_candidates.push((node.id.clone(), norm));
                     }
                 }
-                overflow_candidates.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                overflow_candidates
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Remove excess test seeds (keep highest-scoring 3), replace with overflow
                 let mut test_kept = 0;
@@ -1334,14 +1503,12 @@ impl QueryEngine {
         // that scored well but got crowded out of top_k. Uses same IDF weighting
         // and exact segment matching as the main scoring loop.
         if scored.len() == top_k {
-            let selected_files: std::collections::HashSet<&str> = scored.iter()
-                .map(|(id, _)| id.file.as_str())
-                .collect();
+            let selected_files: std::collections::HashSet<&str> =
+                scored.iter().map(|(id, _)| id.file.as_str()).collect();
 
             let mut unrepresented: Vec<(SymbolId, f64)> = Vec::new();
             for node in &all_nodes {
-                if selected_files.contains(node.file.as_str())
-                    || is_lattice_own_source(&node.file)
+                if selected_files.contains(node.file.as_str()) || is_lattice_own_source(&node.file)
                 {
                     continue;
                 }
@@ -1352,9 +1519,9 @@ impl QueryEngine {
                     .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
                     .filter(|p| p.len() >= 3)
                     .collect();
-                let file_relevant = query_words.iter().any(|w| {
-                    file_segs.iter().any(|seg| *seg == *w)
-                });
+                let file_relevant = query_words
+                    .iter()
+                    .any(|w| file_segs.iter().any(|seg| *seg == *w));
                 if !file_relevant {
                     continue;
                 }
@@ -1363,24 +1530,45 @@ impl QueryEngine {
                 let mut wm = 0usize;
                 let name_parts = split_identifier(&name_lower);
                 for word in &query_words {
-                    let idf_f = word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
+                    let idf_f =
+                        word_idf_floored.get(*word).copied().unwrap_or(1.0) / max_idf_floored;
                     let mut ws: f64 = 0.0;
-                    if name_lower.starts_with(word) { ws = 0.8; }
-                    else if word.starts_with(&name_lower) && name_lower.len() >= 3 { ws = 0.6; }
-                    else if name_lower.contains(word) { ws = 0.4; }
-                    else if name_parts.iter().any(|p| (p.len() >= 3 && *word == p.as_str()) || (p.len() >= 4 && word.starts_with(p.as_str())) || (p.len() >= 3 && p.starts_with(word))) { ws = 0.5; }
+                    if name_lower.starts_with(word) {
+                        ws = 0.8;
+                    } else if word.starts_with(&name_lower) && name_lower.len() >= 3 {
+                        ws = 0.6;
+                    } else if name_lower.contains(word) {
+                        ws = 0.4;
+                    } else if name_parts.iter().any(|p| {
+                        (p.len() >= 3 && *word == p.as_str())
+                            || (p.len() >= 4 && word.starts_with(p.as_str()))
+                            || (p.len() >= 3 && p.starts_with(word))
+                    }) {
+                        ws = 0.5;
+                    }
                     // File path: exact segment match only
-                    if file_segs.iter().any(|seg| *seg == *word) { ws = ws.max(0.4); }
-                    if ws > 0.0 { wm += 1; idf_ws += ws * idf_f; }
+                    if file_segs.iter().any(|seg| *seg == *word) {
+                        ws = ws.max(0.4);
+                    }
+                    if ws > 0.0 {
+                        wm += 1;
+                        idf_ws += ws * idf_f;
+                    }
                 }
-                if wm == 0 { continue; }
-                if query_words.len() >= 3 && wm < 2 { continue; }
+                if wm == 0 {
+                    continue;
+                }
+                if query_words.len() >= 3 && wm < 2 {
+                    continue;
+                }
                 let cov = wm as f64 / query_words.len() as f64;
                 let max_possible = total_idf / max_idf_floored;
                 let norm = if max_possible > 0.0 {
                     let raw = idf_ws / max_possible.min(query_words.len() as f64);
                     (raw * (0.5 + 0.5 * cov) + 0.1).min(1.0)
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 if norm > 0.2 {
                     unrepresented.push((node.id.clone(), norm));
                 }
@@ -1390,7 +1578,9 @@ impl QueryEngine {
             let mut best_per_file: HashMap<String, (SymbolId, f64)> = HashMap::new();
             for (id, score) in unrepresented {
                 let file = id.file.clone();
-                let entry = best_per_file.entry(file).or_insert_with(|| (id.clone(), 0.0));
+                let entry = best_per_file
+                    .entry(file)
+                    .or_insert_with(|| (id.clone(), 0.0));
                 if score > entry.1 {
                     *entry = (id, score);
                 }
@@ -1487,12 +1677,7 @@ pub fn parse_query_filters(query: &str) -> (QueryFilter, String) {
 /// - Exact match: part.len() >= 3 (e.g., "auth" == "auth")
 /// - Query word starts with part: part.len() >= 4 (e.g., "authentication".starts_with("auth"))
 /// - Part starts with query word: part.len() >= 3 (e.g., "authenticate".starts_with("auth"))
-fn has_keyword_coherence(
-    name: &str,
-    signature: &str,
-    file: &str,
-    query_words: &[&str],
-) -> bool {
+fn has_keyword_coherence(name: &str, signature: &str, file: &str, query_words: &[&str]) -> bool {
     let name_parts = split_identifier(name);
     let sig_lower = signature.to_lowercase();
     let file_lower = file.to_lowercase();
@@ -1672,11 +1857,13 @@ fn split_identifier(name: &str) -> Vec<String> {
 /// Used for near-duplicate detection (e.g., copy-pasted handlers in different files).
 /// Returns 0.0..1.0 where 1.0 means identical content.
 fn line_overlap_ratio(a: &str, b: &str) -> f64 {
-    let lines_a: std::collections::HashSet<&str> = a.lines()
+    let lines_a: std::collections::HashSet<&str> = a
+        .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    let lines_b: std::collections::HashSet<&str> = b.lines()
+    let lines_b: std::collections::HashSet<&str> = b
+        .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
@@ -1692,31 +1879,50 @@ fn line_overlap_ratio(a: &str, b: &str) -> f64 {
 /// vs implementation logic. Used to deprioritize data classes for Explore intent.
 /// Returns true if < 15% of non-empty, non-comment lines contain logic indicators.
 fn is_schema_heavy(body: &str) -> bool {
-    let lines: Vec<&str> = body.lines()
+    let lines: Vec<&str> = body
+        .lines()
         .map(|l| l.trim())
         .filter(|l| {
             !l.is_empty()
-            && !l.starts_with('#')
-            && !l.starts_with("//")
-            && !l.starts_with("/*")
-            && !l.starts_with('*')
-            && *l != "}" && *l != "{" && *l != ")" && *l != "]"
+                && !l.starts_with('#')
+                && !l.starts_with("//")
+                && !l.starts_with("/*")
+                && !l.starts_with('*')
+                && *l != "}"
+                && *l != "{"
+                && *l != ")"
+                && *l != "]"
         })
         .collect();
-    if lines.len() < 3 { return false; }
+    if lines.len() < 3 {
+        return false;
+    }
 
-    let logic_count = lines.iter()
+    let logic_count = lines
+        .iter()
         .filter(|l| {
-            l.contains("if ") || l.contains("for ") || l.contains("while ")
-            || l.contains("return ") || l.contains("await ") || l.contains("yield ")
-            || l.contains("raise ") || l.contains("throw ")
-            || l.contains("match ") || l.contains("else {") || l.contains("else:")
-            || (l.contains('(')
-                && !l.starts_with("class ") && !l.starts_with("def ")
-                && !l.starts_with("fn ") && !l.starts_with("func ")
-                && !l.starts_with("pub fn") && !l.starts_with("pub(")
-                && !l.starts_with("type ") && !l.starts_with("interface ")
-                && !l.starts_with("struct ") && !l.starts_with("enum "))
+            l.contains("if ")
+                || l.contains("for ")
+                || l.contains("while ")
+                || l.contains("return ")
+                || l.contains("await ")
+                || l.contains("yield ")
+                || l.contains("raise ")
+                || l.contains("throw ")
+                || l.contains("match ")
+                || l.contains("else {")
+                || l.contains("else:")
+                || (l.contains('(')
+                    && !l.starts_with("class ")
+                    && !l.starts_with("def ")
+                    && !l.starts_with("fn ")
+                    && !l.starts_with("func ")
+                    && !l.starts_with("pub fn")
+                    && !l.starts_with("pub(")
+                    && !l.starts_with("type ")
+                    && !l.starts_with("interface ")
+                    && !l.starts_with("struct ")
+                    && !l.starts_with("enum "))
         })
         .count();
 
@@ -1726,12 +1932,10 @@ fn is_schema_heavy(body: &str) -> bool {
 
 /// Common English stop words filtered from keyword queries to avoid noisy matches.
 const STOP_WORDS: &[&str] = &[
-    "how", "does", "what", "where", "when", "why", "which", "who",
-    "the", "this", "that", "these", "those", "with", "from", "into",
-    "for", "and", "but", "not", "are", "was", "were", "been", "being",
-    "have", "has", "had", "will", "would", "could", "should", "can",
-    "may", "might", "shall", "must", "need", "use", "used", "using",
-    "work", "works", "working", "make", "made", "get", "set", "all",
-    "any", "each", "every", "some", "about", "also", "then", "than",
-    "very", "just", "only", "more", "most", "other", "new", "old",
+    "how", "does", "what", "where", "when", "why", "which", "who", "the", "this", "that", "these",
+    "those", "with", "from", "into", "for", "and", "but", "not", "are", "was", "were", "been",
+    "being", "have", "has", "had", "will", "would", "could", "should", "can", "may", "might",
+    "shall", "must", "need", "use", "used", "using", "work", "works", "working", "make", "made",
+    "get", "set", "all", "any", "each", "every", "some", "about", "also", "then", "than", "very",
+    "just", "only", "more", "most", "other", "new", "old",
 ];
