@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "lattice": {
-      "type": "stdio",
-      "command": "/home/pete/cadres/lattice/daemon/target/release/lattice",
-      "args": ["--stdio", "--workspace", "/home/pete/cadres/lattice"]
-    }
-  }
-}

@@ -1,6 +1,6 @@
 # Lattice
 
-Local AI context engine for VS Code and MCP-enabled coding assistants.
+Local AI context engine for MCP-enabled coding assistants, with an optional VS Code UI.
 
 Lattice indexes your codebase and repo Markdown into a dependency graph, then serves ranked context, workflow bundles, docs navigation, compact summaries, and persistent memory to assistants like Codex and Claude Code. Instead of sending whole files or relying on broad search, it returns the files, symbols, docs sections, tests, and prior decisions that are most likely to matter.
 
@@ -30,9 +30,26 @@ That synthetic workflow benchmark reflects the current compact workflow stack, i
 - optional dense wire format
 - restart-persistent `context_handle` reuse
 
-## What You Get In VS Code
+## How You Use Lattice
 
-After installing Lattice from the VS Code marketplace (`SPOGRMM.lattice-mcp`), you get:
+Lattice works in two complementary ways:
+
+- through MCP-enabled coding assistants and CLIs like Codex and Claude Code, where the assistant calls Lattice tools directly
+- through the VS Code extension, which layers visual navigation, status, and command surfaces on top of the same daemon
+
+### In CLI And MCP Clients
+
+When you run Lattice through an MCP client, you get:
+
+- workflow tools like `prepare_change`, `impact_from_diff`, `diagnose_failure`, and `expand_context`
+- docs tools like `get_docs_capsule`, `get_backlinks`, `get_outgoing_links`, and `find_stale_docs`
+- graph-backed code retrieval, project rules, test discovery, and workspace setup guidance
+- persistent memory and workflow outcome reuse across sessions
+- the same daemon and graph engine that powers the VS Code experience
+
+### In VS Code
+
+When you use the Lattice VS Code extension, you get everything above plus:
 
 - a Lattice activity-bar view with daemon status and index statistics
 - a **Knowledge Freshness** panel with changed-file context and likely stale docs
@@ -43,6 +60,25 @@ After installing Lattice from the VS Code marketplace (`SPOGRMM.lattice-mcp`), y
 - Command Palette actions for workflow tools like `Prepare Change`, `Analyze Diff Impact`, `Diagnose Failure`, and `Expand Context`
 - Command Palette actions for docs workflows like `Get Docs Capsule`, `Show Backlinks`, `Show Outgoing Links`, `Find Stale Docs`, and `Open Docs Graph`
 - a bundled daemon that starts automatically for the current workspace
+
+## Local Setup
+
+For local development or GitHub installs:
+
+```bash
+git clone https://github.com/pab299104200/Lattice.git
+cd Lattice/daemon
+cargo build --release
+cd ../extension
+npm install
+npm run compile
+```
+
+Then point your MCP client, coding CLI, or local VS Code extension setup at the built daemon:
+
+```text
+daemon/target/release/lattice
+```
 
 ## Which Tool First?
 
@@ -109,7 +145,7 @@ Practical rule:
 
 ## MCP Server Setup
 
-Add Lattice to your project's `.mcp.json`:
+Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any other MCP client:
 
 ```json
 {
@@ -302,7 +338,7 @@ cd ../extension
 
 Current test baseline:
 
-- `123` passing core tests
+- `130` passing core tests
 - `17` passing daemon tests
 - extension TypeScript build passes with `tsc --noEmit`
 

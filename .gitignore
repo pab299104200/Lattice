@@ -8,8 +8,13 @@ extension/out/
 extension/*.vsix
 
 # IDE
-.vscode/settings.json
+.vscode/
 .idea/
+
+# Assistant / local client config
+.claude/
+CLAUDE.md
+.mcp.json
 
 # GitHub config (user-specific workflows and skills)
 .github/
