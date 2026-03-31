@@ -64,6 +64,41 @@ impl Indexer {
         Ok(())
     }
 
+    /// Parse and index a batch of files, rebuilding the graph once at the end.
+    ///
+    /// This is much cheaper than calling `index_file_content` repeatedly for
+    /// cold-start indexing or explicit reindex requests.
+    pub async fn index_file_batch_contents(
+        &mut self,
+        files: Vec<(String, String)>,
+    ) -> anyhow::Result<usize> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+
+        let mut handles = Vec::new();
+        for (rel_path, content) in files {
+            handles.push(tokio::task::spawn_blocking(move || {
+                crate::parser::parse_file(&rel_path, &content)
+            }));
+        }
+
+        let mut count = 0usize;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(parsed)) => {
+                    self.parsed_files.insert(parsed.file.clone(), parsed);
+                    count += 1;
+                }
+                Ok(Err(e)) => tracing::warn!("Parse error: {}", e),
+                Err(e) => tracing::warn!("Task error: {}", e),
+            }
+        }
+
+        self.rebuild_graph();
+        Ok(count)
+    }
+
     /// Remove a file from the index and rebuild the graph.
     pub fn remove_file(&mut self, rel_path: &str) {
         self.parsed_files.remove(rel_path);
@@ -91,28 +126,7 @@ impl Indexer {
         dir: &std::path::Path,
     ) -> anyhow::Result<usize> {
         let files = self.collect_indexable_files(dir)?;
-        let mut handles = Vec::new();
-
-        for (rel_path, content) in files {
-            handles.push(tokio::task::spawn_blocking(move || {
-                crate::parser::parse_file(&rel_path, &content)
-            }));
-        }
-
-        let mut count = 0;
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(parsed)) => {
-                    self.parsed_files.insert(parsed.file.clone(), parsed);
-                    count += 1;
-                }
-                Ok(Err(e)) => tracing::warn!("Parse error: {}", e),
-                Err(e) => tracing::warn!("Task error: {}", e),
-            }
-        }
-
-        self.rebuild_graph();
-        Ok(count)
+        self.index_file_batch_contents(files).await
     }
 
     fn collect_indexable_files(

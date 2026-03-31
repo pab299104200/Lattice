@@ -192,6 +192,33 @@ async fn test_parallel_indexing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn test_batch_indexing_rebuilds_once_for_multiple_files() {
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    let files = vec![
+        (
+            "docs/auth.md".to_string(),
+            "# Auth\n\nUse `loginUser`.\n".to_string(),
+        ),
+        (
+            "src/auth.ts".to_string(),
+            "export function loginUser(): void {}".to_string(),
+        ),
+    ];
+
+    let count = indexer.index_file_batch_contents(files).await.unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(indexer.file_count(), 2);
+    assert!(
+        indexer.graph().all_nodes().iter().any(|node| node.file == "docs/auth.md"),
+        "markdown file should be present after batch indexing"
+    );
+    assert!(
+        indexer.graph().all_nodes().iter().any(|node| node.name == "loginUser"),
+        "code symbol should be present after batch indexing"
+    );
+}
+
 #[test]
 fn test_stale_memory_on_file_change() {
     use crate::memory::{Memory, MemoryScope, MemoryStore, MemoryType};

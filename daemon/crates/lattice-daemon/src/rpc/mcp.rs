@@ -3368,7 +3368,8 @@ impl McpHandler {
                     }
 
                     let security_filter = SecurityFilter::new(root);
-                    let entries = walk_directory_filtered(root, &security_filter);
+                    let mut entries = walk_directory_filtered(root, &security_filter);
+                    crate::prioritize_indexable_paths(root, &mut entries);
                     for entry_path in &entries {
                         let rel_path = entry_path
                             .strip_prefix(root)
@@ -3398,33 +3399,57 @@ impl McpHandler {
                 manager.unified_graph()
             } else {
                 let security_filter = SecurityFilter::new(&workspace_root);
-                let mut idx = indexer.lock().await;
-                let entries = walk_directory_filtered(&workspace_root, &security_filter);
-                for entry_path in &entries {
-                    let rel_path = entry_path
-                        .strip_prefix(&workspace_root)
-                        .unwrap_or(entry_path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                let mut entries = walk_directory_filtered(&workspace_root, &security_filter);
+                crate::prioritize_indexable_paths(&workspace_root, &mut entries);
 
-                    if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
-                        continue;
-                    }
+                for chunk in entries.chunks(100) {
+                    let mut batch = Vec::new();
+                    for entry_path in chunk {
+                        let rel_path = entry_path
+                            .strip_prefix(&workspace_root)
+                            .unwrap_or(entry_path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
 
-                    match std::fs::read_to_string(entry_path) {
-                        Ok(content) => {
-                            if idx.index_file_content(&rel_path, &content).is_ok() {
-                                files_indexed += 1;
-                            } else {
+                        if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
+                            continue;
+                        }
+
+                        match std::fs::read_to_string(entry_path) {
+                            Ok(content) => batch.push((rel_path, content)),
+                            Err(_) => {
                                 errors += 1;
                             }
                         }
-                        Err(_) => {
-                            errors += 1;
-                        }
                     }
+
+                    if batch.is_empty() {
+                        continue;
+                    }
+
+                    let snapshot = {
+                        let mut idx = indexer.lock().await;
+                        match idx.index_file_batch_contents(batch).await {
+                            Ok(indexed) => {
+                                files_indexed += indexed;
+                            }
+                            Err(_) => {
+                                errors += 1;
+                            }
+                        }
+                        idx.graph().clone()
+                    };
+
+                    {
+                        let gs = graph_store.lock().await;
+                        let _ = gs.save_graph(&snapshot);
+                    }
+
+                    let mut eng = engine.lock().await;
+                    eng.update_graph(snapshot);
                 }
 
+                let idx = indexer.lock().await;
                 idx.graph().clone()
             };
 

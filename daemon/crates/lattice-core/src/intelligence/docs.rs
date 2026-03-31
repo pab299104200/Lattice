@@ -159,15 +159,24 @@ pub fn get_docs_capsule(
     limit: usize,
 ) -> DocsCapsule {
     let query_tokens = tokenize(query);
-    let anchor_symbols: HashSet<String> =
-        symbols.iter().map(|value| value.to_lowercase()).collect();
-    let anchor_files: HashSet<String> = files.iter().map(|value| value.to_lowercase()).collect();
+    let anchor_symbols: HashSet<String> = resolve_anchor_symbols(graph, symbols)
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .collect();
+    let anchor_files: HashSet<String> = resolve_anchor_files(graph, files)
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .collect();
     let all_nodes = graph.all_nodes();
-    let doc_nodes: Vec<&GraphNode> = all_nodes.into_iter().filter(|node| is_doc_node(node)).collect();
+    let doc_nodes: Vec<&GraphNode> = all_nodes
+        .into_iter()
+        .filter(|node| is_doc_node(node))
+        .collect();
 
     let mut docs = Vec::new();
     for node in &doc_nodes {
-        let (score, reasons) = score_doc_node(graph, node, &query_tokens, &anchor_files, &anchor_symbols);
+        let (score, reasons) =
+            score_doc_node(graph, node, &query_tokens, &anchor_files, &anchor_symbols);
         if score <= 0.0 {
             continue;
         }
@@ -175,7 +184,9 @@ pub fn get_docs_capsule(
         let backlink_count = graph
             .get_dependents(&node.id)
             .into_iter()
-            .filter(|(source, edge)| source.language == Language::Markdown && *edge == EdgeKind::LinksTo)
+            .filter(|(source, edge)| {
+                source.language == Language::Markdown && *edge == EdgeKind::LinksTo
+            })
             .count();
         let outgoing_count = graph
             .get_dependencies(&node.id)
@@ -223,14 +234,16 @@ pub fn get_docs_capsule(
             }
 
             let key = (dep.file.clone(), dep.name.clone(), dep.line);
-            let entry = related_symbols.entry(key).or_insert_with(|| RelatedDocSymbol {
-                symbol: dep.name.clone(),
-                kind: dep.kind.short_code().to_string(),
-                file: dep.file.clone(),
-                line: dep.line,
-                mention_count: 0,
-                mentioned_from: Vec::new(),
-            });
+            let entry = related_symbols
+                .entry(key)
+                .or_insert_with(|| RelatedDocSymbol {
+                    symbol: dep.name.clone(),
+                    kind: dep.kind.short_code().to_string(),
+                    file: dep.file.clone(),
+                    line: dep.line,
+                    mention_count: 0,
+                    mentioned_from: Vec::new(),
+                });
             entry.mention_count += 1;
             let source_label = format!("{}:{}", hit.file, hit.symbol);
             if !entry.mentioned_from.contains(&source_label) {
@@ -369,67 +382,68 @@ pub fn find_stale_docs(
     let mut resolved_symbols = HashSet::new();
     let mut candidates: HashMap<SymbolId, StaleDocCandidate> = HashMap::new();
 
-    let all_nodes = graph.all_nodes();
-    let mut file_nodes: HashMap<&str, Vec<&GraphNode>> = HashMap::new();
-    let mut symbol_nodes: HashMap<&str, Vec<&GraphNode>> = HashMap::new();
-    for node in &all_nodes {
-        file_nodes.entry(node.file.as_str()).or_default().push(*node);
-        if !is_doc_node(node) {
-            symbol_nodes.entry(node.name.as_str()).or_default().push(*node);
-        }
-    }
-
     for file in &requested_files {
-        let Some(nodes) = file_nodes.get(file.as_str()) else {
+        let resolved_file_matches = match_graph_files(graph, file);
+        if resolved_file_matches.is_empty() {
             continue;
-        };
-        resolved_files.insert(file.clone());
+        }
 
-        for node in nodes {
-            if is_doc_node(node) {
+        for resolved_file in resolved_file_matches {
+            resolved_files.insert(resolved_file.clone());
+            let Some(nodes) = nodes_for_file(graph, &resolved_file) else {
+                continue;
+            };
+
+            for node in nodes {
+                if is_doc_node(node) {
+                    for (source, edge) in graph.get_dependents(&node.id) {
+                        if source.language != Language::Markdown || edge != EdgeKind::LinksTo {
+                            continue;
+                        }
+
+                        record_stale_candidate(
+                            &mut candidates,
+                            source,
+                            format!("doc:{}:{}", resolved_file, node.line),
+                            format!("links to changed doc {}", stale_target_label(node)),
+                            1.8,
+                            Some(&resolved_file),
+                            None,
+                        );
+                    }
+                    continue;
+                }
+
                 for (source, edge) in graph.get_dependents(&node.id) {
-                    if source.language != Language::Markdown || edge != EdgeKind::LinksTo {
+                    if source.language != Language::Markdown || edge != EdgeKind::Mentions {
                         continue;
                     }
 
                     record_stale_candidate(
                         &mut candidates,
                         source,
-                        format!("doc:{}:{}", file, node.line),
-                        format!("links to changed doc {}", stale_target_label(node)),
-                        1.8,
-                        Some(file),
-                        None,
+                        format!("file-symbol:{}:{}", resolved_file, node.name),
+                        format!(
+                            "mentions changed symbol {} from {}",
+                            node.name, resolved_file
+                        ),
+                        2.4,
+                        Some(&resolved_file),
+                        Some(&node.name),
                     );
                 }
-                continue;
-            }
-
-            for (source, edge) in graph.get_dependents(&node.id) {
-                if source.language != Language::Markdown || edge != EdgeKind::Mentions {
-                    continue;
-                }
-
-                record_stale_candidate(
-                    &mut candidates,
-                    source,
-                    format!("file-symbol:{}:{}", file, node.name),
-                    format!("mentions changed symbol {} from {}", node.name, file),
-                    2.4,
-                    Some(file),
-                    Some(&node.name),
-                );
             }
         }
     }
 
     for symbol in &requested_symbols {
-        let Some(nodes) = symbol_nodes.get(symbol.as_str()) else {
+        let resolved_nodes = resolve_symbol_nodes(graph, symbol);
+        if resolved_nodes.is_empty() {
             continue;
-        };
-        resolved_symbols.insert(symbol.clone());
+        }
 
-        for node in nodes {
+        for node in resolved_nodes {
+            resolved_symbols.insert(node.name.clone());
             for (source, edge) in graph.get_dependents(&node.id) {
                 if source.language != Language::Markdown || edge != EdgeKind::Mentions {
                     continue;
@@ -438,11 +452,11 @@ pub fn find_stale_docs(
                 record_stale_candidate(
                     &mut candidates,
                     source,
-                    format!("symbol:{}:{}", symbol, node.file),
-                    format!("mentions changed symbol {}", symbol),
+                    format!("symbol:{}:{}", node.name, node.file),
+                    format!("mentions changed symbol {}", node.name),
                     3.2,
                     Some(&node.file),
-                    Some(symbol),
+                    Some(&node.name),
                 );
             }
         }
@@ -523,7 +537,11 @@ fn score_doc_node(
     anchor_files: &HashSet<String>,
     anchor_symbols: &HashSet<String>,
 ) -> (f64, Vec<String>) {
-    let mut score = if node.kind == SymbolKind::Section { 0.4 } else { 0.1 };
+    let mut score = if node.kind == SymbolKind::Section {
+        0.4
+    } else {
+        0.1
+    };
     let mut reasons = Vec::new();
     let name_lower = node.name.to_lowercase();
     let file_lower = node.file.to_lowercase();
@@ -565,7 +583,10 @@ fn score_doc_node(
     }
 
     if file_anchor_hits > 0 {
-        reasons.push(format!("mentions {} anchor file symbol(s)", file_anchor_hits));
+        reasons.push(format!(
+            "mentions {} anchor file symbol(s)",
+            file_anchor_hits
+        ));
     }
     if symbol_anchor_hits > 0 {
         reasons.push(format!("mentions {} anchor symbol(s)", symbol_anchor_hits));
@@ -574,7 +595,9 @@ fn score_doc_node(
     let backlinks = graph
         .get_dependents(&node.id)
         .into_iter()
-        .filter(|(source, edge)| source.language == Language::Markdown && *edge == EdgeKind::LinksTo)
+        .filter(|(source, edge)| {
+            source.language == Language::Markdown && *edge == EdgeKind::LinksTo
+        })
         .count();
     if backlinks > 0 {
         score += (backlinks as f64).min(3.0) * 0.15;
@@ -608,11 +631,12 @@ fn resolve_target(graph: &CodeGraph, target: &str, kind: DocsTargetKind) -> Opti
 
 fn resolve_file_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarget> {
     let (file, anchor) = split_target_anchor(target);
-    let mut nodes: Vec<&GraphNode> = graph
-        .all_nodes()
-        .into_iter()
-        .filter(|node| node.file == file)
-        .collect();
+    let resolved_files = match_graph_files(graph, file);
+    if resolved_files.len() != 1 {
+        return None;
+    }
+    let resolved_file = &resolved_files[0];
+    let mut nodes = nodes_for_file(graph, resolved_file)?;
 
     if nodes.is_empty() {
         return None;
@@ -622,14 +646,17 @@ fn resolve_file_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarget
         let sections: Vec<&GraphNode> = nodes
             .iter()
             .copied()
-            .filter(|node| node.kind == SymbolKind::Section && normalize_anchor(&node.name) == normalize_anchor(anchor))
+            .filter(|node| {
+                node.kind == SymbolKind::Section
+                    && normalize_anchor(&node.name) == normalize_anchor(anchor)
+            })
             .collect();
         if !sections.is_empty() {
             return Some(make_resolved_target(
                 target,
-                file.to_string(),
+                format!("{}#{}", resolved_file, normalize_anchor(anchor)),
                 "section",
-                Some(file.to_string()),
+                Some(resolved_file.to_string()),
                 sections,
             ));
         }
@@ -638,19 +665,15 @@ fn resolve_file_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarget
     nodes.sort_by_key(|node| node.line);
     Some(make_resolved_target(
         target,
-        file.to_string(),
+        resolved_file.to_string(),
         "file",
-        Some(file.to_string()),
+        Some(resolved_file.to_string()),
         nodes,
     ))
 }
 
 fn resolve_symbol_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarget> {
-    let nodes: Vec<&GraphNode> = graph
-        .all_nodes()
-        .into_iter()
-        .filter(|node| !is_doc_node(node) && node.name == target)
-        .collect();
+    let nodes = resolve_symbol_nodes(graph, target);
 
     if nodes.is_empty() {
         return None;
@@ -658,7 +681,7 @@ fn resolve_symbol_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarg
 
     Some(make_resolved_target(
         target,
-        target.to_string(),
+        nodes[0].name.clone(),
         "symbol",
         nodes.first().map(|node| node.file.clone()),
         nodes,
@@ -671,7 +694,8 @@ fn resolve_doc_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTarget>
         .node_ids
         .into_iter()
         .filter(|id| {
-            graph.get_node(id)
+            graph
+                .get_node(id)
                 .map(|node| node.kind == SymbolKind::Document)
                 .unwrap_or(false)
         })
@@ -710,7 +734,15 @@ fn resolve_section_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTar
     let (path_or_name, anchor) = split_target_anchor(target);
     let wanted_anchor = anchor.unwrap_or(path_or_name);
     let wanted_anchor = normalize_anchor(wanted_anchor);
-    let file_filter = if anchor.is_some() { Some(path_or_name) } else { None };
+    let file_filter = if anchor.is_some() {
+        let matches = match_graph_files(graph, path_or_name);
+        if matches.is_empty() {
+            return None;
+        }
+        Some(matches)
+    } else {
+        None
+    };
 
     let nodes: Vec<&GraphNode> = graph
         .all_nodes()
@@ -718,7 +750,10 @@ fn resolve_section_target(graph: &CodeGraph, target: &str) -> Option<ResolvedTar
         .filter(|node| {
             node.kind == SymbolKind::Section
                 && normalize_anchor(&node.name) == wanted_anchor
-                && file_filter.map(|file| node.file == file).unwrap_or(true)
+                && file_filter
+                    .as_ref()
+                    .map(|files| files.iter().any(|file| node.file == *file))
+                    .unwrap_or(true)
         })
         .collect();
 
@@ -760,6 +795,141 @@ fn split_target_anchor(target: &str) -> (&str, Option<&str>) {
         Some((file, anchor)) => (file, Some(anchor)),
         None => (target, None),
     }
+}
+
+fn resolve_anchor_files(graph: &CodeGraph, files: &[String]) -> Vec<String> {
+    let mut resolved = HashSet::new();
+    for file in files {
+        for matched in match_graph_files(graph, file) {
+            resolved.insert(matched);
+        }
+    }
+    sorted_values(resolved)
+}
+
+fn resolve_anchor_symbols(graph: &CodeGraph, symbols: &[String]) -> Vec<String> {
+    let mut resolved = HashSet::new();
+    for symbol in symbols {
+        for node in resolve_symbol_nodes(graph, symbol) {
+            resolved.insert(node.name.clone());
+        }
+    }
+    sorted_values(resolved)
+}
+
+fn nodes_for_file<'a>(graph: &'a CodeGraph, file: &str) -> Option<Vec<&'a GraphNode>> {
+    let nodes: Vec<&GraphNode> = graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| node.file == file)
+        .collect();
+    if nodes.is_empty() {
+        None
+    } else {
+        Some(nodes)
+    }
+}
+
+fn match_graph_files(graph: &CodeGraph, target: &str) -> Vec<String> {
+    let normalized_target = normalize_file_path(target);
+    if normalized_target.is_empty() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<String> = graph
+        .all_nodes()
+        .into_iter()
+        .map(|node| node.file.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+
+    let exact: Vec<String> = files
+        .iter()
+        .filter(|file| normalize_file_path(file) == normalized_target)
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let suffix: Vec<String> = files
+        .iter()
+        .filter(|file| {
+            let normalized_file = normalize_file_path(file);
+            normalized_target == normalized_file
+                || normalized_target.ends_with(&format!("/{}", normalized_file))
+                || normalized_file.ends_with(&format!("/{}", normalized_target))
+        })
+        .cloned()
+        .collect();
+    if !suffix.is_empty() {
+        return suffix;
+    }
+
+    let target_basename = normalized_target
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized_target);
+    files
+        .into_iter()
+        .filter(|file| normalize_file_path(file).rsplit('/').next() == Some(target_basename))
+        .collect()
+}
+
+fn resolve_symbol_nodes<'a>(graph: &'a CodeGraph, target: &str) -> Vec<&'a GraphNode> {
+    let (file_hint, symbol_hint) = split_symbol_target(target);
+    let wanted_symbol = normalize_symbol_name(symbol_hint);
+    if wanted_symbol.is_empty() {
+        return Vec::new();
+    }
+
+    let matched_files = file_hint.map(|hint| match_graph_files(graph, hint));
+    let mut nodes: Vec<&GraphNode> = graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| {
+            !is_doc_node(node)
+                && matched_files
+                    .as_ref()
+                    .map(|files| files.iter().any(|file| node.file == *file))
+                    .unwrap_or(true)
+        })
+        .collect();
+
+    let exact: Vec<&GraphNode> = nodes
+        .iter()
+        .copied()
+        .filter(|node| normalize_symbol_name(&node.name) == wanted_symbol)
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let wanted_lower = wanted_symbol.to_lowercase();
+    nodes.retain(|node| normalize_symbol_name(&node.name).to_lowercase() == wanted_lower);
+    nodes
+}
+
+fn split_symbol_target(target: &str) -> (Option<&str>, &str) {
+    let trimmed = target.trim();
+
+    if let Some((file, symbol)) = trimmed.rsplit_once("::") {
+        if !file.trim().is_empty() && !symbol.trim().is_empty() {
+            return (Some(file), symbol);
+        }
+    }
+
+    if let Some((file, symbol)) = trimmed.rsplit_once(':') {
+        if !file.trim().is_empty()
+            && !symbol.trim().is_empty()
+            && (file.contains('/') || file.contains('\\') || file.contains('.'))
+        {
+            return (Some(file), symbol);
+        }
+    }
+
+    (None, trimmed)
 }
 
 fn link_reference(node: &GraphNode, edge: EdgeKind) -> LinkReference {
@@ -816,15 +986,19 @@ fn summarize_markdown(body: &str, max_len: usize) -> String {
 }
 
 fn truncate(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
+    let char_count = value.chars().count();
+    if char_count <= max_len {
         value.to_string()
     } else {
-        format!("{}...", &value[..max_len.saturating_sub(3)])
+        let visible_len = max_len.saturating_sub(3);
+        let truncated: String = value.chars().take(visible_len).collect();
+        format!("{}...", truncated)
     }
 }
 
 fn is_doc_node(node: &GraphNode) -> bool {
-    matches!(node.kind, SymbolKind::Document | SymbolKind::Section) || node.language == Language::Markdown
+    matches!(node.kind, SymbolKind::Document | SymbolKind::Section)
+        || node.language == Language::Markdown
 }
 
 fn tokenize(value: &str) -> Vec<String> {
@@ -856,6 +1030,24 @@ fn normalize_anchor(value: &str) -> String {
     }
 
     normalized.trim_matches('-').to_string()
+}
+
+fn normalize_file_path(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn normalize_symbol_name(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('`');
+    trimmed
+        .strip_suffix("()")
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 fn normalized_values(values: &[String]) -> Vec<String> {

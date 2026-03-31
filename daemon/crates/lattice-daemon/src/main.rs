@@ -41,10 +41,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Create EMPTY engine + stores — start server IMMEDIATELY ──────
-    // Everything else happens in background so MCP handshake isn't delayed.
-    let graph = CodeGraph::new();
-
     // Create .lattice dir for persistent storage
     let lattice_dir = workspace_root.join(".lattice");
     let _ = std::fs::create_dir_all(&lattice_dir);
@@ -77,6 +73,37 @@ async fn main() -> Result<()> {
         }
     };
 
+    let graph_path = lattice_dir.join("graph.db");
+    let graph_store = match GraphStore::open(&graph_path) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to open persistent graph store at {}: {}. Falling back to memory-only graph store.",
+                graph_path.display(),
+                e
+            );
+            GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
+        }
+    };
+    let graph = match graph_store.load_graph() {
+        Ok(loaded) => {
+            let stats = loaded.stats();
+            if stats.node_count > 0 {
+                tracing::info!(
+                    "Warm-loaded persisted graph: {} nodes, {} edges, {} files",
+                    stats.node_count,
+                    stats.edge_count,
+                    stats.file_count
+                );
+            }
+            loaded
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load persisted graph: {}", e);
+            CodeGraph::new()
+        }
+    };
+
     let engine = QueryEngine::new(
         graph,
         vector_store,
@@ -84,9 +111,7 @@ async fn main() -> Result<()> {
     );
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
-    let graph_store = Arc::new(Mutex::new(
-        GraphStore::open_in_memory().expect("Failed to create in-memory graph store"),
-    ));
+    let graph_store = Arc::new(Mutex::new(graph_store));
 
     // Multi-repo workspace manager (only used when multiple workspaces)
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = if is_multi_repo {
@@ -152,25 +177,48 @@ async fn main() -> Result<()> {
 
                 let mut total_indexed = 0usize;
                 for chunk in all_files.chunks(100) {
-                    {
+                    let mut batch = Vec::new();
+                    for path in chunk {
+                        let rel_path = path
+                            .strip_prefix(&ws)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        match std::fs::read_to_string(path) {
+                            Ok(content) => batch.push((rel_path, content)),
+                            Err(e) => tracing::warn!("Failed to read {}: {}", path.display(), e),
+                        }
+                    }
+
+                    if batch.is_empty() {
+                        continue;
+                    }
+
+                    let snapshot = {
                         let mut idx = indexer_bg.lock().await;
-                        for path in chunk {
-                            let rel_path = path
-                                .strip_prefix(&ws)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .replace('\\', "/");
-                            if let Ok(content) = std::fs::read_to_string(path) {
-                                if idx.index_file_content(&rel_path, &content).is_ok() {
-                                    total_indexed += 1;
-                                }
+                        match idx.index_file_batch_contents(batch).await {
+                            Ok(indexed) => {
+                                total_indexed += indexed;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Batch indexing failed: {}", e);
                             }
                         }
-                        // Push graph snapshot to engine after each batch
-                        let snapshot = idx.graph().clone();
+                        idx.graph().clone()
+                    };
+
+                    {
+                        let gs = graph_store_bg.lock().await;
+                        if let Err(e) = gs.save_graph(&snapshot) {
+                            tracing::warn!("Failed to save graph checkpoint: {}", e);
+                        }
+                    }
+
+                    {
                         let mut eng = engine_bg.lock().await;
                         eng.update_graph(snapshot);
                     }
+
                     tracing::info!("Indexed {}/{} files", total_indexed, all_files.len());
                 }
                 total_indexed
@@ -417,7 +465,49 @@ fn index_workspace_via_manager(
 fn collect_indexable_files(root: &PathBuf, security_filter: &SecurityFilter) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_files_recursive(root, root, security_filter, &mut files);
+    prioritize_indexable_paths(root, &mut files);
     files
+}
+
+pub(crate) fn prioritize_indexable_paths(root: &Path, files: &mut Vec<PathBuf>) {
+    files.sort_by(|a, b| {
+        let a_rel = a
+            .strip_prefix(root)
+            .unwrap_or(a.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let b_rel = b
+            .strip_prefix(root)
+            .unwrap_or(b.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        indexing_priority(&a_rel)
+            .cmp(&indexing_priority(&b_rel))
+            .then_with(|| a_rel.cmp(&b_rel))
+    });
+}
+
+fn indexing_priority(rel_path: &str) -> (u8, u8) {
+    let normalized = rel_path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let lower = normalized.to_ascii_lowercase();
+
+    let is_markdown = lower.ends_with(".md");
+    let is_doc_dir = lower.starts_with("docs/");
+    let is_repo_guide = matches!(
+        file_name,
+        "README.md" | "CLAUDE.md" | "AGENTS.md" | "CONTRIBUTING.md"
+    );
+
+    if is_repo_guide || (is_markdown && is_doc_dir) {
+        (0, 0)
+    } else if is_markdown {
+        (0, 1)
+    } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
+        (1, 0)
+    } else {
+        (2, 0)
+    }
 }
 
 /// Recursively collect indexable files into the output vec.
