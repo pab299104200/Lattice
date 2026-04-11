@@ -1,8 +1,10 @@
 use crate::graph::model::{CodeGraph, EdgeKind};
+use crate::storage::{SharedVectorIndex, VectorIndex, VectorSearchResult};
 use crate::symbols::{Language, SymbolId, SymbolKind};
+use std::sync::Arc;
 
 use super::capsule::QueryIntent;
-use super::engine::{QueryEngine, parse_query_filters};
+use super::engine::{merge_seed_hits, parse_query_filters, QueryEngine};
 use super::intent::detect_intent;
 
 // ─── Intent detection tests ─────────────────────────────────────────
@@ -19,7 +21,10 @@ fn test_detect_fix_bug_intent() {
 
 #[test]
 fn test_detect_refactor_intent() {
-    assert_eq!(detect_intent("Refactor the auth module"), QueryIntent::Refactor);
+    assert_eq!(
+        detect_intent("Refactor the auth module"),
+        QueryIntent::Refactor
+    );
 }
 
 #[test]
@@ -41,10 +46,7 @@ fn test_detect_keyword_heavy_explore() {
 
 #[test]
 fn test_detect_explore_with_flow_keyword() {
-    assert_eq!(
-        detect_intent("user auth flow"),
-        QueryIntent::Explore,
-    );
+    assert_eq!(detect_intent("user auth flow"), QueryIntent::Explore,);
 }
 
 // ─── Engine tests ───────────────────────────────────────────────────
@@ -72,7 +74,9 @@ fn build_test_graph() -> CodeGraph {
         "function loginUser(creds: Credentials): Promise<Session>".to_string(),
         "function loginUser(creds) { return hash(creds); }".to_string(),
         "src/auth.ts".to_string(),
-        1, 5, true,
+        1,
+        5,
+        true,
         Language::TypeScript,
     );
 
@@ -83,7 +87,9 @@ fn build_test_graph() -> CodeGraph {
         "function hashPassword(plain: string): string".to_string(),
         "function hashPassword(plain) { return bcrypt.hash(plain); }".to_string(),
         "src/crypto.ts".to_string(),
-        1, 3, true,
+        1,
+        3,
+        true,
         Language::TypeScript,
     );
 
@@ -94,7 +100,9 @@ fn build_test_graph() -> CodeGraph {
         "function validateToken(token: string): boolean".to_string(),
         "function validateToken(token) { return jwt.verify(token); }".to_string(),
         "src/auth.ts".to_string(),
-        10, 15, true,
+        10,
+        15,
+        true,
         Language::TypeScript,
     );
 
@@ -105,7 +113,9 @@ fn build_test_graph() -> CodeGraph {
         "function formatDate(d: Date): string".to_string(),
         "function formatDate(d) { return d.toISOString(); }".to_string(),
         "src/utils.ts".to_string(),
-        1, 3, false,
+        1,
+        3,
+        false,
         Language::TypeScript,
     );
 
@@ -115,6 +125,134 @@ fn build_test_graph() -> CodeGraph {
     graph.add_edge(&id_login, &id_validate, EdgeKind::Calls);
 
     graph
+}
+
+fn build_lattice_workflow_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+
+    let context_id = make_id(
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs",
+        "get_context_capsule",
+        0,
+    );
+    let render_id = make_id(
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs",
+        "wrap_workflow_tool_result",
+        1,
+    );
+    let summary_id = make_id(
+        "daemon/crates/lattice-core/src/intelligence/agent.rs",
+        "summarize_subsystem",
+        0,
+    );
+    let readme_id = make_id("README.md", "Why Lattice", 0);
+    let workflow_doc_id = make_id("README.md", "Workflow Commands", 1);
+
+    graph.add_node(
+        context_id.clone(),
+        SymbolKind::Function,
+        "get_context_capsule".to_string(),
+        "fn get_context_capsule(render: RenderMode, context_handle: &str)".to_string(),
+        "fn get_context_capsule(...) { /* render context_handle */ }".to_string(),
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs".to_string(),
+        10,
+        45,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        render_id.clone(),
+        SymbolKind::Function,
+        "wrap_workflow_tool_result".to_string(),
+        "fn wrap_workflow_tool_result(render: RenderMode, context_handle: &str, prepare_change: bool)".to_string(),
+        "fn wrap_workflow_tool_result(...) { /* render context_handle prepare_change */ }".to_string(),
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs".to_string(),
+        50,
+        95,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        summary_id.clone(),
+        SymbolKind::Function,
+        "summarize_subsystem".to_string(),
+        "fn summarize_subsystem(prepare_change: bool, diagnose_failure: bool, expand_context: bool)".to_string(),
+        "fn summarize_subsystem(...) { /* prepare_change diagnose_failure expand_context */ }".to_string(),
+        "daemon/crates/lattice-core/src/intelligence/agent.rs".to_string(),
+        20,
+        75,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        readme_id,
+        SymbolKind::Section,
+        "Why Lattice".to_string(),
+        "section Why Lattice get_context_capsule prepare_change diagnose_failure expand_context render context_handle".to_string(),
+        "Why Lattice: get_context_capsule prepare_change diagnose_failure expand_context render context_handle".to_string(),
+        "README.md".to_string(),
+        1,
+        20,
+        false,
+        Language::Markdown,
+    );
+    graph.add_node(
+        workflow_doc_id,
+        SymbolKind::Section,
+        "Workflow Commands".to_string(),
+        "section Workflow Commands summarize_subsystem get_context_capsule prepare_change render context_handle".to_string(),
+        "Workflow Commands: summarize_subsystem get_context_capsule prepare_change render context_handle".to_string(),
+        "README.md".to_string(),
+        22,
+        48,
+        false,
+        Language::Markdown,
+    );
+
+    graph.add_edge(&render_id, &context_id, EdgeKind::Calls);
+    graph.add_edge(&summary_id, &context_id, EdgeKind::Calls);
+
+    graph
+}
+
+struct StubVectorIndex {
+    hits: Vec<VectorSearchResult>,
+}
+
+impl VectorIndex for StubVectorIndex {
+    fn initialize(&self, _dimension: usize) -> Result<(), crate::error::LatticeError> {
+        Ok(())
+    }
+
+    fn upsert_vector(
+        &self,
+        _file: &str,
+        _name: &str,
+        _byte_offset: usize,
+        _vector: &[f32],
+    ) -> Result<(), crate::error::LatticeError> {
+        Ok(())
+    }
+
+    fn delete_by_file(&self, _file: &str) -> Result<(), crate::error::LatticeError> {
+        Ok(())
+    }
+
+    fn clear_all(&self) -> Result<(), crate::error::LatticeError> {
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        _query: &[f32],
+        _top_k: usize,
+    ) -> Result<Vec<VectorSearchResult>, crate::error::LatticeError> {
+        Ok(self.hits.clone())
+    }
+
+    fn implementation_name(&self) -> &'static str {
+        "stub"
+    }
 }
 
 #[test]
@@ -148,6 +286,25 @@ fn test_query_engine_produces_capsule() {
         "formatDate should be excluded, got: {:?}",
         all_symbols
     );
+}
+
+#[test]
+fn test_query_engine_uses_vector_index_abstraction_for_semantic_hits() {
+    let graph = build_test_graph();
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex {
+        hits: vec![(
+            "hashPassword".to_string(),
+            "src/crypto.ts".to_string(),
+            0,
+            0.91,
+        )],
+    });
+    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+
+    let capsule = engine.query("credential hashing", Some(&[0.1, 0.2, 0.3]), false);
+
+    assert!(!capsule.pivots.is_empty());
+    assert_eq!(capsule.pivots[0].symbol, "hashPassword");
 }
 
 #[test]
@@ -246,6 +403,70 @@ Run `prepare_change` before editing.
         all_symbols.contains(&"Setup") || all_symbols.contains(&"Guide"),
         "expected markdown doc symbols in results, got: {:?}",
         all_symbols
+    );
+}
+
+#[test]
+fn test_query_engine_prefers_source_over_markdown_for_workflow_queries() {
+    let graph = build_lattice_workflow_graph();
+    let mut engine = QueryEngine::new(graph, None, None);
+
+    let capsule = engine.query(
+        "Lattice agent workflow path for summarize_subsystem, get_context_capsule, prepare_change, diagnose_failure, expand_context, render modes, and context_handle reuse",
+        None,
+        true,
+    );
+
+    let lead_file = capsule
+        .pivots
+        .first()
+        .map(|item| item.file.as_str())
+        .or_else(|| capsule.context.first().map(|item| item.file.as_str()));
+
+    assert!(
+        matches!(
+            lead_file,
+            Some("daemon/crates/lattice-daemon/src/rpc/mcp.rs")
+                | Some("daemon/crates/lattice-core/src/intelligence/agent.rs")
+        ),
+        "expected source-first lead file for workflow query, got pivots={:?} context={:?}",
+        capsule
+            .pivots
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>(),
+        capsule
+            .context
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_merge_seed_hits_keeps_keyword_matches_when_semantic_hits_exist() {
+    let semantic_hits = vec![(make_id("README.md", "Why Lattice", 0), 0.91)];
+    let keyword_hits = vec![(
+        make_id(
+            "daemon/crates/lattice-daemon/src/rpc/mcp.rs",
+            "get_context_capsule",
+            0,
+        ),
+        0.74,
+    )];
+
+    let merged = merge_seed_hits(semantic_hits, keyword_hits, 4);
+
+    assert!(
+        merged.iter().any(|(id, _)| {
+            id.file == "daemon/crates/lattice-daemon/src/rpc/mcp.rs"
+                && id.name == "get_context_capsule"
+        }),
+        "expected merged seed hits to keep direct keyword-matched source anchors: {:?}",
+        merged
+            .iter()
+            .map(|(id, score)| format!("{}::{}:{:.2}", id.file, id.name, score))
+            .collect::<Vec<_>>()
     );
 }
 

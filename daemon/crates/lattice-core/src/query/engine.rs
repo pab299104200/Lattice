@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
-use crate::storage::VectorStore;
+use crate::storage::SharedVectorIndex;
 use crate::symbols::{SymbolId, SymbolKind};
 
 use super::capsule::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
@@ -38,6 +38,22 @@ const NAME_STOP_WORDS: &[&str] = &[
     "ctx",
 ];
 
+/// Queries with these keywords are asking for docs-first results rather than
+/// source-first implementation context.
+const DOCUMENT_RESULT_QUERY_KEYWORDS: &[&str] = &[
+    "docs",
+    "documentation",
+    "document",
+    "markdown",
+    "readme",
+    "guide",
+    "manual",
+    "runbook",
+    "adr",
+    "section",
+    "sections",
+];
+
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
     node: &'a GraphNode,
@@ -54,7 +70,7 @@ struct ScoredCandidate<'a> {
 /// ranking, and budget allocation to produce Context Capsules.
 pub struct QueryEngine {
     graph: CodeGraph,
-    vector_store: Option<VectorStore>,
+    vector_index: Option<SharedVectorIndex>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
     query_history: HashMap<String, usize>,
 }
@@ -64,12 +80,12 @@ impl QueryEngine {
     /// and optional memory store.
     pub fn new(
         graph: CodeGraph,
-        vector_store: Option<VectorStore>,
+        vector_index: Option<SharedVectorIndex>,
         memory_store: Option<Arc<Mutex<MemoryStore>>>,
     ) -> Self {
         Self {
             graph,
-            vector_store,
+            vector_index,
             memory_store,
             query_history: HashMap::new(),
         }
@@ -94,6 +110,7 @@ impl QueryEngine {
         // Step 1: Detect intent (use clean query without filter tokens)
         let intent = detect_intent(&clean_query);
         let params = IntentParams::for_intent(intent);
+        let prefer_markdown_results = query_prefers_markdown_results(&clean_query);
 
         // Step 2: Semantic search or keyword fallback (use clean query for matching)
         let mut seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
@@ -105,21 +122,8 @@ impl QueryEngine {
         // even when function names don't match any query word directly.
         // Seed scores are IDF-weighted: files matching rare query words score higher.
         if intent == QueryIntent::Explore {
-            let q_lower = clean_query.to_lowercase();
-            let q_cleaned: String = q_lower
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        ' '
-                    }
-                })
-                .collect();
-            let q_words: Vec<&str> = q_cleaned
-                .split_whitespace()
-                .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
-                .collect();
+            let q_word_storage = extract_query_terms(&clean_query);
+            let q_words: Vec<&str> = q_word_storage.iter().map(|word| word.as_str()).collect();
 
             if !q_words.is_empty() {
                 let seed_ids: std::collections::HashSet<SymbolId> =
@@ -157,10 +161,7 @@ impl QueryEngine {
                 let mut file_match_counts: HashMap<String, usize> = HashMap::new();
 
                 for node in &all_fp_nodes {
-                    if seed_ids.contains(&node.id)
-                        || is_lattice_own_source(&node.file)
-                        || is_test_file(&node.file)
-                    {
+                    if seed_ids.contains(&node.id) || is_test_file(&node.file) {
                         continue;
                     }
                     if !matches!(node.kind, SymbolKind::Function | SymbolKind::Method) {
@@ -498,26 +499,16 @@ impl QueryEngine {
         let nodes_evaluated = candidate_ids.len();
 
         // Pre-compute query words for keyword coherence check on graph-traversed nodes.
-        let scoring_q_lower = clean_query.to_lowercase();
-        let scoring_q_cleaned: String = scoring_q_lower
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    ' '
-                }
-            })
-            .collect();
-        let scoring_q_words: Vec<&str> = scoring_q_cleaned
-            .split_whitespace()
-            .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
+        let scoring_q_word_storage = extract_query_terms(&clean_query);
+        let scoring_q_words: Vec<&str> = scoring_q_word_storage
+            .iter()
+            .map(|word| word.as_str())
             .collect();
 
         for (id, semantic_sim) in &candidate_ids {
             if let Some(node) = self.graph.get_node(id) {
-                // Skip Lattice's own source and apply query filters
-                if is_lattice_own_source(&node.file) || !filter.matches(node) {
+                // Apply query filters before scoring.
+                if !filter.matches(node) {
                     continue;
                 }
 
@@ -645,6 +636,10 @@ impl QueryEngine {
                         }
                         _ => {}
                     }
+                }
+
+                if !prefer_markdown_results && is_markdown_node(node) {
+                    score *= 0.15;
                 }
 
                 let rel_detail = relationship_paths
@@ -853,21 +848,8 @@ impl QueryEngine {
             sibling_files.sort();
 
             // Reuse query words for ranking siblings
-            let sib_query_lower = clean_query.to_lowercase();
-            let sib_cleaned: String = sib_query_lower
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        ' '
-                    }
-                })
-                .collect();
-            let sib_words: Vec<&str> = sib_cleaned
-                .split_whitespace()
-                .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
-                .collect();
+            let sib_word_storage = extract_query_terms(&clean_query);
+            let sib_words: Vec<&str> = sib_word_storage.iter().map(|word| word.as_str()).collect();
 
             for file in &sibling_files {
                 // Skip large grab-bag files (conftest.py, utils, fixtures, etc.)
@@ -1019,7 +1001,9 @@ impl QueryEngine {
                     if included_ids.contains(&dep_node.name) {
                         continue;
                     }
-                    if is_lattice_own_source(&dep_node.file) || is_test_file(&dep_node.file) {
+                    if is_test_file(&dep_node.file)
+                        || (!prefer_markdown_results && is_markdown_node(dep_node))
+                    {
                         continue;
                     }
                     // Keyword coherence: only include dependencies that share query keywords.
@@ -1128,8 +1112,8 @@ impl QueryEngine {
     }
 
     /// Get a reference to the vector store (if available).
-    pub fn vector_store(&self) -> &Option<VectorStore> {
-        &self.vector_store
+    pub fn vector_index(&self) -> Option<SharedVectorIndex> {
+        self.vector_index.clone()
     }
 
     /// Find a symbol by name (searches all nodes).
@@ -1167,26 +1151,37 @@ impl QueryEngine {
         embedding: Option<&[f32]>,
         params: &IntentParams,
     ) -> Vec<(SymbolId, f64)> {
+        let prefer_markdown_results = query_prefers_markdown_results(query_text);
+        let keyword_hits = self.keyword_fallback(query_text, params.semantic_k);
+        if !prefer_markdown_results
+            && query_has_identifier_terms(query_text)
+            && !keyword_hits.is_empty()
+        {
+            return keyword_hits;
+        }
+
         // Try semantic search first
-        if let (Some(emb), Some(vs)) = (embedding, &self.vector_store) {
-            if let Ok(results) = vs.search(emb, params.semantic_k) {
-                let mut hits = Vec::new();
+        if let (Some(emb), Some(index)) = (embedding, &self.vector_index) {
+            if let Ok(results) = index.search(emb, params.semantic_k) {
+                let mut semantic_hits = Vec::new();
                 for (name, file, byte_offset, similarity) in results {
                     let id = SymbolId {
                         file,
                         name,
                         byte_offset,
                     };
-                    hits.push((id, similarity as f64));
+                    semantic_hits.push((id, similarity as f64));
                 }
-                if !hits.is_empty() {
-                    return hits;
+                if !semantic_hits.is_empty() {
+                    if prefer_markdown_results {
+                        return semantic_hits;
+                    }
+                    return merge_seed_hits(semantic_hits, keyword_hits, params.semantic_k * 2);
                 }
             }
         }
 
-        // Fallback: keyword matching on node names and signatures
-        self.keyword_fallback(query_text, params.semantic_k)
+        keyword_hits
     }
 
     /// Keyword-based fallback when no vector store or embedding is available.
@@ -1194,20 +1189,11 @@ impl QueryEngine {
     /// Uses IDF weighting so rare terms (e.g. "JWT") contribute more than
     /// common terms (e.g. "user") that appear in hundreds of symbols.
     fn keyword_fallback(&self, query_text: &str, top_k: usize) -> Vec<(SymbolId, f64)> {
-        let query_lower = query_text.to_lowercase();
-        let cleaned: String = query_lower
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    ' '
-                }
-            })
-            .collect();
-        let query_words: Vec<&str> = cleaned
-            .split_whitespace()
-            .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
+        let prefer_markdown_results = query_prefers_markdown_results(query_text);
+        let query_word_storage = extract_query_terms(query_text);
+        let query_words: Vec<&str> = query_word_storage
+            .iter()
+            .map(|word| word.as_str())
             .collect();
 
         if query_words.is_empty() {
@@ -1250,18 +1236,17 @@ impl QueryEngine {
             .iter()
             .map(|w| word_idf_floored.get(*w).copied().unwrap_or(1.0))
             .sum();
+        let effective_query_word_count = query_words.len().clamp(1, 8);
+        let effective_query_word_count_f = effective_query_word_count as f64;
+        let has_identifier_words = query_words.iter().any(|word| word.contains('_'));
 
         let mut scored: Vec<(SymbolId, f64)> = Vec::new();
 
         for node in &all_nodes {
-            // Skip Lattice's own source code — never relevant to user queries
-            if is_lattice_own_source(&node.file) {
-                continue;
-            }
-
             let name_lower = node.name.to_lowercase();
             let sig_lower = node.signature.to_lowercase();
             let file_lower = node.file.to_lowercase();
+            let body_lower = has_identifier_words.then(|| node.body.to_lowercase());
 
             // Fast path: exact symbol name in query → high score.
             // IDF-weighted: exact match on a rare term scores higher than on a common one.
@@ -1343,6 +1328,17 @@ impl QueryEngine {
                 else if sig_lower.contains(word) {
                     word_score = 0.2;
                 }
+                // Exact workflow/tool identifier in source body. This helps
+                // public MCP tool names like get_context_capsule map to the
+                // Rust handlers that advertise them in schema bodies.
+                else if word.contains('_')
+                    && body_lower
+                        .as_ref()
+                        .map(|body| body.contains(word))
+                        .unwrap_or(false)
+                {
+                    word_score = 0.35;
+                }
 
                 // File path match — exact segment matching only.
                 // "user" matches "user" segment but NOT "users" or "users_linux".
@@ -1373,11 +1369,11 @@ impl QueryEngine {
             // Score: IDF-weighted sum normalized by word count, with coverage scaling.
             // This naturally suppresses nodes matching only common terms while boosting
             // those matching rare terms or multiple terms.
-            let coverage = words_matched as f64 / query_words.len() as f64;
+            let coverage = words_matched as f64 / effective_query_word_count_f;
             let file_bonus = if has_file_match { 0.1 } else { 0.0 };
             let max_possible_score = total_idf / max_idf_floored; // max if all words matched at 1.0
             let mut normalized = if max_possible_score > 0.0 {
-                let raw = idf_weighted_score / max_possible_score.min(query_words.len() as f64);
+                let raw = idf_weighted_score / max_possible_score.min(effective_query_word_count_f);
                 (raw * (0.5 + 0.5 * coverage) + file_bonus).min(1.0)
             } else {
                 0.0
@@ -1390,8 +1386,12 @@ impl QueryEngine {
             // 5 words: × 0.15 (very unlikely to be relevant)
             // 8+ words: × 0.05 (essentially excluded)
             if query_words.len() >= 2 && words_matched == 1 {
-                let penalty = (0.50 / query_words.len() as f64).max(0.05);
+                let penalty = (0.50 / effective_query_word_count_f).max(0.05);
                 normalized *= penalty;
+            }
+
+            if !prefer_markdown_results && is_markdown_node(node) {
+                normalized *= 0.15;
             }
 
             if normalized > 0.05 {
@@ -1422,7 +1422,7 @@ impl QueryEngine {
                 // Collect non-test overflow candidates from the full scored list
                 let mut overflow_candidates: Vec<(SymbolId, f64)> = Vec::new();
                 for node in &all_nodes {
-                    if is_test_file(&node.file) || is_lattice_own_source(&node.file) {
+                    if is_test_file(&node.file) {
                         continue;
                     }
                     // Check if already in scored
@@ -1455,10 +1455,11 @@ impl QueryEngine {
                     if wm == 0 {
                         continue;
                     }
-                    let cov = wm as f64 / query_words.len() as f64;
+                    let cov = wm as f64 / effective_query_word_count_f;
                     let max_possible = total_idf / max_idf_floored;
                     let norm = if max_possible > 0.0 {
-                        (idf_ws / max_possible.min(query_words.len() as f64) * (0.5 + 0.5 * cov))
+                        (idf_ws / max_possible.min(effective_query_word_count_f)
+                            * (0.5 + 0.5 * cov))
                             .min(1.0)
                     } else {
                         0.0
@@ -1508,8 +1509,7 @@ impl QueryEngine {
 
             let mut unrepresented: Vec<(SymbolId, f64)> = Vec::new();
             for node in &all_nodes {
-                if selected_files.contains(node.file.as_str()) || is_lattice_own_source(&node.file)
-                {
+                if selected_files.contains(node.file.as_str()) {
                     continue;
                 }
                 let name_lower = node.name.to_lowercase();
@@ -1561,10 +1561,10 @@ impl QueryEngine {
                 if query_words.len() >= 3 && wm < 2 {
                     continue;
                 }
-                let cov = wm as f64 / query_words.len() as f64;
+                let cov = wm as f64 / effective_query_word_count_f;
                 let max_possible = total_idf / max_idf_floored;
                 let norm = if max_possible > 0.0 {
-                    let raw = idf_ws / max_possible.min(query_words.len() as f64);
+                    let raw = idf_ws / max_possible.min(effective_query_word_count_f);
                     (raw * (0.5 + 0.5 * cov) + 0.1).min(1.0)
                 } else {
                     0.0
@@ -1781,15 +1781,91 @@ fn file_directory(file_path: &str) -> String {
         .to_string()
 }
 
-/// Detect if a file path belongs to the Lattice daemon's own source code.
-/// These should be excluded from query results when the user is querying
-/// a different project's codebase — the daemon's own symbols are never relevant.
-fn is_lattice_own_source(file_path: &str) -> bool {
-    let lower = file_path.to_lowercase();
-    lower.contains("/lattice-core/")
-        || lower.contains("/lattice-daemon/")
-        || lower.contains("/lattice/daemon/")
-        || lower.contains("/lattice/extension/")
+fn is_markdown_node(node: &GraphNode) -> bool {
+    matches!(node.kind, SymbolKind::Document | SymbolKind::Section)
+        || node.language == crate::symbols::Language::Markdown
+}
+
+fn query_prefers_markdown_results(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    DOCUMENT_RESULT_QUERY_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+fn extract_query_terms(query: &str) -> Vec<String> {
+    let cleaned: String = query
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in cleaned.split_whitespace() {
+        if raw.len() >= 3 && !STOP_WORDS.contains(&raw) && seen.insert(raw.to_string()) {
+            terms.push(raw.to_string());
+        }
+
+        if raw.contains('_') {
+            for part in raw.split('_') {
+                if part.len() >= 3 && !STOP_WORDS.contains(&part) {
+                    let part = part.to_string();
+                    if seen.insert(part.clone()) {
+                        terms.push(part);
+                    }
+                }
+            }
+        }
+    }
+
+    terms
+}
+
+fn query_has_identifier_terms(query: &str) -> bool {
+    query.split_whitespace().any(|part| {
+        part.contains('_')
+            || part.contains("::")
+            || part.ends_with(".rs")
+            || part.ends_with(".ts")
+            || part.ends_with(".tsx")
+            || part.ends_with(".js")
+            || part.ends_with(".py")
+            || part.ends_with(".go")
+            || part.ends_with(".java")
+    })
+}
+
+pub(super) fn merge_seed_hits(
+    semantic_hits: Vec<(SymbolId, f64)>,
+    keyword_hits: Vec<(SymbolId, f64)>,
+    limit: usize,
+) -> Vec<(SymbolId, f64)> {
+    let mut merged: HashMap<SymbolId, f64> = HashMap::new();
+
+    for (id, score) in semantic_hits.into_iter().chain(keyword_hits) {
+        merged
+            .entry(id)
+            .and_modify(|existing| *existing = existing.max(score))
+            .or_insert(score);
+    }
+
+    let mut hits: Vec<(SymbolId, f64)> = merged.into_iter().collect();
+    hits.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.file.cmp(&b.0.file))
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    hits.truncate(limit.max(1));
+    hits
 }
 
 /// Detect if a file path is a test file based on common naming conventions.
@@ -1805,8 +1881,10 @@ fn is_test_file(file_path: &str) -> bool {
     filename.starts_with("test_")
         || filename.starts_with("test.")
         || filename.contains("_test.")
+        || filename.contains("_tests.")
         || filename.contains(".test.")
         || filename.contains(".spec.")
+        || filename == "tests.rs"
         || filename == "conftest.py"
         || lower.contains("/tests/")
         || lower.contains("/__tests__/")
@@ -1937,5 +2015,5 @@ const STOP_WORDS: &[&str] = &[
     "being", "have", "has", "had", "will", "would", "could", "should", "can", "may", "might",
     "shall", "must", "need", "use", "used", "using", "work", "works", "working", "make", "made",
     "get", "set", "all", "any", "each", "every", "some", "about", "also", "then", "than", "very",
-    "just", "only", "more", "most", "other", "new", "old",
+    "just", "only", "more", "most", "other", "new", "old", "lattice",
 ];

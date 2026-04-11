@@ -9,15 +9,19 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
 
     let ts_language = tree_sitter_rust::LANGUAGE.into();
 
-    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: format!("Failed to set Rust language: {}", e),
-    })?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: format!("Failed to set Rust language: {}", e),
+        })?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: "Failed to parse Rust source".to_string(),
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: "Failed to parse Rust source".to_string(),
+        })?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -120,11 +124,7 @@ fn build_signature(node: Node, source: &[u8]) -> String {
 }
 
 /// Extract a Rust function item.
-fn extract_function(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_function(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -153,11 +153,7 @@ fn extract_function(
 }
 
 /// Extract a Rust struct item.
-fn extract_struct(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_struct(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -185,11 +181,7 @@ fn extract_struct(
 }
 
 /// Extract a Rust enum item.
-fn extract_enum(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_enum(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -217,15 +209,12 @@ fn extract_enum(
 }
 
 /// Extract methods from an impl block.
-fn extract_impl(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Vec<Symbol> {
+fn extract_impl(node: Node, source: &[u8], file_path: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     // Get the type name from the impl block
-    let type_name = node.child_by_field_name("type")
+    let type_name = node
+        .child_by_field_name("type")
         .map(|n| node_text(n, source))
         .unwrap_or_default();
 
@@ -269,11 +258,7 @@ fn extract_impl(
 }
 
 /// Extract a Rust trait item.
-fn extract_trait(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_trait(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -301,11 +286,7 @@ fn extract_trait(
 }
 
 /// Extract a Rust type alias.
-fn extract_type_alias(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_type_alias(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -333,11 +314,7 @@ fn extract_type_alias(
 }
 
 /// Extract a Rust const or static item.
-fn extract_constant(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_constant(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -405,11 +382,7 @@ fn extract_use(node: Node, source: &[u8]) -> Option<ImportInfo> {
 }
 
 /// Extract a Rust module declaration.
-fn extract_module(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_module(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);

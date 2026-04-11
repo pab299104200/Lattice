@@ -2,26 +2,59 @@ use super::capsule::QueryIntent;
 
 /// Keywords that indicate a FixBug intent.
 const FIX_BUG_KEYWORDS: &[&str] = &[
-    "fix", "bug", "error", "crash", "fail", "broken", "debug", "issue", "wrong", "exception",
+    "fix",
+    "bug",
+    "error",
+    "crash",
+    "fail",
+    "broken",
+    "debug",
+    "issue",
+    "wrong",
+    "exception",
 ];
 
 /// Keywords that indicate a Refactor intent.
 const REFACTOR_KEYWORDS: &[&str] = &[
-    "refactor", "clean up", "cleanup", "restructure", "reorganize", "simplify", "improve",
+    "refactor",
+    "clean up",
+    "cleanup",
+    "restructure",
+    "reorganize",
+    "simplify",
+    "improve",
     "optimize",
 ];
 
 /// Keywords that indicate an AddFeature intent.
 const ADD_FEATURE_KEYWORDS: &[&str] = &[
-    "add", "implement", "create", "build", "new", "introduce", "support for",
+    "add",
+    "implement",
+    "create",
+    "build",
+    "new",
+    "introduce",
+    "support for",
 ];
 
 /// Keywords that indicate an Explore intent.
 /// Includes both question words ("how", "what") and architectural nouns
 /// ("flow", "pipeline") that signal understanding-oriented queries.
 const EXPLORE_KEYWORDS: &[&str] = &[
-    "how", "what", "explain", "describe", "show", "where", "understand", "overview",
-    "flow", "pipeline", "architecture", "trace", "lifecycle", "walkthrough",
+    "how",
+    "what",
+    "explain",
+    "describe",
+    "show",
+    "where",
+    "understand",
+    "overview",
+    "flow",
+    "pipeline",
+    "architecture",
+    "trace",
+    "lifecycle",
+    "walkthrough",
 ];
 
 /// Per-intent tuning parameters.
@@ -105,10 +138,22 @@ pub fn detect_intent(query: &str) -> QueryIntent {
     let lower = query.to_lowercase();
 
     let scores = [
-        (QueryIntent::FixBug, count_keyword_matches(&lower, FIX_BUG_KEYWORDS)),
-        (QueryIntent::Refactor, count_keyword_matches(&lower, REFACTOR_KEYWORDS)),
-        (QueryIntent::AddFeature, count_keyword_matches(&lower, ADD_FEATURE_KEYWORDS)),
-        (QueryIntent::Explore, count_keyword_matches(&lower, EXPLORE_KEYWORDS)),
+        (
+            QueryIntent::FixBug,
+            count_keyword_matches(&lower, FIX_BUG_KEYWORDS),
+        ),
+        (
+            QueryIntent::Refactor,
+            count_keyword_matches(&lower, REFACTOR_KEYWORDS),
+        ),
+        (
+            QueryIntent::AddFeature,
+            count_keyword_matches(&lower, ADD_FEATURE_KEYWORDS),
+        ),
+        (
+            QueryIntent::Explore,
+            count_keyword_matches(&lower, EXPLORE_KEYWORDS),
+        ),
     ];
 
     if let Some((intent, _)) = scores

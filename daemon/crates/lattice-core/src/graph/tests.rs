@@ -121,12 +121,7 @@ fn test_n_hop_neighbors() {
     let id_c = make_id("src/c.ts", "c");
     let id_d = make_id("src/d.ts", "d");
 
-    for (id, name) in [
-        (&id_a, "a"),
-        (&id_b, "b"),
-        (&id_c, "c"),
-        (&id_d, "d"),
-    ] {
+    for (id, name) in [(&id_a, "a"), (&id_b, "b"), (&id_c, "c"), (&id_d, "d")] {
         graph.add_node(
             id.clone(),
             SymbolKind::Function,
@@ -249,8 +244,8 @@ fn test_graph_stats() {
 
 #[test]
 fn test_build_graph_from_parsed_files() {
-    use crate::parser::parse_file;
     use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
 
     let auth_source = r#"
 import { hashPassword } from './crypto';
@@ -360,8 +355,8 @@ export function prepare_change(): string {
 
 #[test]
 fn test_intra_file_call_edges() {
-    use crate::parser::parse_file;
     use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
 
     // Two functions in the same file where helper() is called by main_func()
     let source = r#"
@@ -380,10 +375,14 @@ function main_func(): string {
     let graph = builder.build();
 
     // Find the IDs
-    let main_id = graph.all_nodes().iter()
+    let main_id = graph
+        .all_nodes()
+        .iter()
         .find(|n| n.name == "main_func")
         .map(|n| n.id.clone());
-    let helper_id = graph.all_nodes().iter()
+    let helper_id = graph
+        .all_nodes()
+        .iter()
         .find(|n| n.name == "helper")
         .map(|n| n.id.clone());
 
@@ -392,15 +391,20 @@ function main_func(): string {
 
     // main_func should have a Calls edge to helper
     let deps = graph.get_dependencies(&main_id.unwrap());
-    let calls_helper = deps.iter().any(|(n, edge)| n.name == "helper" && *edge == EdgeKind::Calls);
-    assert!(calls_helper, "main_func should have a Calls edge to helper, deps: {:?}",
-        deps.iter().map(|(n, e)| (&n.name, e)).collect::<Vec<_>>());
+    let calls_helper = deps
+        .iter()
+        .any(|(n, edge)| n.name == "helper" && *edge == EdgeKind::Calls);
+    assert!(
+        calls_helper,
+        "main_func should have a Calls edge to helper, deps: {:?}",
+        deps.iter().map(|(n, e)| (&n.name, e)).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_no_self_loop_edges() {
-    use crate::parser::parse_file;
     use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
 
     // Recursive function — should NOT create a self-loop edge
     let source = r#"
@@ -415,14 +419,19 @@ function recursive(n: number): number {
     builder.add_file(parsed);
     let graph = builder.build();
 
-    let rec_id = graph.all_nodes().iter()
+    let rec_id = graph
+        .all_nodes()
+        .iter()
         .find(|n| n.name == "recursive")
         .map(|n| n.id.clone())
         .expect("recursive should exist");
 
     let deps = graph.get_dependencies(&rec_id);
     let self_loop = deps.iter().any(|(n, _)| n.name == "recursive");
-    assert!(!self_loop, "recursive should NOT have a self-loop Calls edge");
+    assert!(
+        !self_loop,
+        "recursive should NOT have a self-loop Calls edge"
+    );
 }
 
 #[test]
@@ -433,16 +442,18 @@ fn test_find_call_paths() {
     let id_c = make_id("src/c.ts", "c");
     let id_d = make_id("src/d.ts", "d");
 
-    for (id, name) in [
-        (&id_a, "a"),
-        (&id_b, "b"),
-        (&id_c, "c"),
-        (&id_d, "d"),
-    ] {
+    for (id, name) in [(&id_a, "a"), (&id_b, "b"), (&id_c, "c"), (&id_d, "d")] {
         graph.add_node(
-            id.clone(), SymbolKind::Function, name.to_string(),
-            String::new(), String::new(), format!("src/{}.ts", name),
-            1, 1, false, Language::TypeScript,
+            id.clone(),
+            SymbolKind::Function,
+            name.to_string(),
+            String::new(),
+            String::new(),
+            format!("src/{}.ts", name),
+            1,
+            1,
+            false,
+            Language::TypeScript,
         );
     }
 
@@ -463,7 +474,10 @@ fn test_find_call_paths() {
 
     // max_depth limits results
     let short = graph.find_call_paths(&id_a, &id_d, 2, 10);
-    assert!(short.is_empty(), "max_depth=2 should not reach d from a (needs 3 hops)");
+    assert!(
+        short.is_empty(),
+        "max_depth=2 should not reach d from a (needs 3 hops)"
+    );
 }
 
 #[test]
@@ -473,14 +487,28 @@ fn test_find_call_paths_disconnected() {
     let id_b = make_id("src/b.ts", "b");
 
     graph.add_node(
-        id_a.clone(), SymbolKind::Function, "a".to_string(),
-        String::new(), String::new(), "src/a.ts".to_string(),
-        1, 1, false, Language::TypeScript,
+        id_a.clone(),
+        SymbolKind::Function,
+        "a".to_string(),
+        String::new(),
+        String::new(),
+        "src/a.ts".to_string(),
+        1,
+        1,
+        false,
+        Language::TypeScript,
     );
     graph.add_node(
-        id_b.clone(), SymbolKind::Function, "b".to_string(),
-        String::new(), String::new(), "src/b.ts".to_string(),
-        1, 1, false, Language::TypeScript,
+        id_b.clone(),
+        SymbolKind::Function,
+        "b".to_string(),
+        String::new(),
+        String::new(),
+        "src/b.ts".to_string(),
+        1,
+        1,
+        false,
+        Language::TypeScript,
     );
 
     // No edges — should find no paths

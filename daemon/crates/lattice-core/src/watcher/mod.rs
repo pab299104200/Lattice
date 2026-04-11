@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests;
 
+use crate::symbols::Language;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use crate::symbols::Language;
 
 #[derive(Debug, Clone)]
 pub struct FileEvent {
@@ -20,15 +20,36 @@ pub enum FileEventKind {
 }
 
 pub const EXCLUDED_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "dist", "build", "out",
-    "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
-    ".next", ".nuxt", ".svelte-kit", "coverage", ".lattice",
-    ".claude", ".codex",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    "coverage",
+    ".lattice",
+    ".claude",
+    ".codex",
 ];
 
 const EXCLUDED_PATTERNS: &[&str] = &[
-    ".env", "credentials", "id_rsa", "id_ed25519",
-    ".pem", ".key", ".pfx", ".p12", ".jks",
+    ".env",
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".pem",
+    ".key",
+    ".pfx",
+    ".p12",
+    ".jks",
 ];
 
 /// Returns true if the given path should be indexed.

@@ -17,7 +17,7 @@ use lattice_core::intelligence::{
 use lattice_core::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
 use lattice_core::query::{ContextCapsule, QueryEngine};
 use lattice_core::security::SecurityFilter;
-use lattice_core::storage::GraphStore;
+use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::watcher::should_index_file;
 use lattice_core::workspace::WorkspaceManager;
 
@@ -33,6 +33,7 @@ pub struct McpHandler {
     memory_store: Arc<Mutex<MemoryStore>>,
     graph_store: Arc<Mutex<GraphStore>>,
     embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+    vector_index: Option<SharedVectorIndex>,
     workspace_root: PathBuf,
     session_id: String,
     #[allow(dead_code)]
@@ -65,11 +66,19 @@ enum WorkflowWireFormat {
     Dense,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowRenderMode {
+    Json,
+    Markdown,
+    Hybrid,
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowResponseOptions {
     budget: WorkflowBudget,
     max_tokens: Option<usize>,
     wire_format: WorkflowWireFormat,
+    render: WorkflowRenderMode,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +106,7 @@ impl McpHandler {
         memory_store: Arc<Mutex<MemoryStore>>,
         graph_store: Arc<Mutex<GraphStore>>,
         embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        vector_index: Option<SharedVectorIndex>,
         workspace_root: PathBuf,
         context_cache_path: PathBuf,
         session_id: String,
@@ -110,6 +120,7 @@ impl McpHandler {
             memory_store,
             graph_store,
             embedding_engine,
+            vector_index,
             workspace_root,
             session_id,
             workspace_manager,
@@ -144,7 +155,7 @@ impl McpHandler {
             "tools": [
                 {
                     "name": "get_context_capsule",
-                    "description": "Most relevant code for your task — returns pivots (full source) and context nodes (signatures).",
+                    "description": "First discovery tool when you do not yet know which files matter. Returns the most relevant source pivots plus nearby symbols, along with a reusable context_handle and suggested_expand target, so you can avoid broad file reads.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -157,6 +168,12 @@ impl McpHandler {
                                 "description": "Result mode: 'full' (default, multiple pivots + context) or 'focused' (max 1 pivot, max 5 context, minimal budget)",
                                 "enum": ["full", "focused"],
                                 "default": "full"
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": ["query"]
@@ -164,7 +181,7 @@ impl McpHandler {
                 },
                 {
                     "name": "prepare_change",
-                    "description": "Agent-oriented change bundle: likely edit files, symbols, tests, memories, and risks for a coding task.",
+                    "description": "First workflow tool for fix/add/refactor tasks once you know the area. Returns likely edit files, symbols, tests, risks, and reusable memory in one bundle.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -201,6 +218,12 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": ["query"]
@@ -236,7 +259,7 @@ impl McpHandler {
                 },
                 {
                     "name": "impact_from_diff",
-                    "description": "Analyze a unified diff to find changed symbols, downstream impact, risky areas, and relevant tests.",
+                    "description": "First review tool for a local diff. Summarizes changed symbols, downstream impact, risks, review checklist, and relevant tests.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -274,6 +297,12 @@ impl McpHandler {
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
                             },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
+                            },
                             "hops": {
                                 "type": "integer",
                                 "description": "Dependent traversal depth (default: 2)",
@@ -285,7 +314,7 @@ impl McpHandler {
                 },
                 {
                     "name": "get_working_set_context",
-                    "description": "Build a compact working-set bundle from active files, focused symbols, recent memories, and likely tests.",
+                    "description": "Use when several files are already open or known, not as the first discovery call. Compresses the working set into one bundle of files, symbols, tests, and memory.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -322,6 +351,12 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": []
@@ -329,7 +364,7 @@ impl McpHandler {
                 },
                 {
                     "name": "summarize_subsystem",
-                    "description": "Return a compressed subsystem map with key files, symbols, tests, and durable memory highlights.",
+                    "description": "Summary-first map for an unfamiliar subsystem. Returns key files, symbols, tests, and durable memory without loading full source.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -366,6 +401,12 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": ["query"]
@@ -373,7 +414,7 @@ impl McpHandler {
                 },
                 {
                     "name": "get_repo_playbook",
-                    "description": "Return a compact repo playbook with architecture, conventions, high-signal files, and durable patterns.",
+                    "description": "Repo-wide startup summary of architecture, conventions, high-signal files, and durable patterns.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -396,6 +437,12 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": []
@@ -507,7 +554,7 @@ impl McpHandler {
                 },
                 {
                     "name": "diagnose_failure",
-                    "description": "Turn compiler errors, failing tests, or stack traces into likely culprit symbols, nearby code, and suggested tests.",
+                    "description": "First failure tool for compiler errors, failing tests, and stack traces. Turns raw failure text into suspects, related code, tests, and next steps.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -538,6 +585,12 @@ impl McpHandler {
                                 "type": "string",
                                 "description": "Response wire format: 'standard' or 'dense' (optional; auto may choose dense for strict budgets)",
                                 "enum": ["standard", "dense"]
+                            },
+                            "render": {
+                                "type": "string",
+                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
+                                "enum": ["json", "markdown", "hybrid"],
+                                "default": "hybrid"
                             }
                         },
                         "required": ["input"]
@@ -588,13 +641,13 @@ impl McpHandler {
                 },
                 {
                     "name": "expand_context",
-                    "description": "Expand a cached workflow handle into focused delta context for one symbol, file, test, or memory target.",
+                    "description": "Follow-up to a result with a context_handle, including get_context_capsule and the workflow tools. Expands one suggested file, symbol, test, or memory target without repeating the broad search.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "handle": {
                                 "type": "string",
-                                "description": "A context handle returned by a prior workflow tool such as prepare_change or get_working_set_context"
+                                "description": "A context handle returned by a prior result such as get_context_capsule, prepare_change, or get_working_set_context"
                             },
                             "focus": {
                                 "type": "string",
@@ -1144,6 +1197,7 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let focused = args["mode"].as_str().unwrap_or("full") == "focused";
+        let render = parse_workflow_response_options(args).render;
 
         // Embed query text if embedding engine is available (graceful fallback to keyword)
         let embedding = self
@@ -1153,9 +1207,17 @@ impl McpHandler {
 
         let mut engine = self.engine.lock().await;
         let capsule = engine.query(query, embedding.as_deref(), focused);
-        serde_json::to_value(&capsule)
-            .map(|v| wrap_tool_result(v))
-            .map_err(|e| (-32603, format!("Serialization error: {}", e)))
+        drop(engine);
+
+        let handle = self
+            .store_context_handle("get_context_capsule", seed_from_context_capsule(&capsule))
+            .await;
+        let mut value = serde_json::to_value(&capsule)
+            .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
+        attach_context_handle(&mut value, &handle, "get_context_capsule");
+        attach_context_capsule_suggested_expand(&mut value, &capsule);
+
+        Ok(wrap_workflow_tool_result(value, render))
     }
 
     async fn tool_prepare_change(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -2050,7 +2112,7 @@ impl McpHandler {
             value = densify_workflow_value(value);
         }
 
-        Ok(wrap_tool_result(value))
+        Ok(wrap_workflow_tool_result(value, response_options.render))
     }
 
     async fn session_pruning_profile(&self) -> SessionPruningProfile {
@@ -3351,6 +3413,8 @@ impl McpHandler {
         let graph_store = Arc::clone(&self.graph_store);
         let indexing = Arc::clone(&self.indexing);
         let workspace_manager = self.workspace_manager.clone();
+        let embedding_engine = Arc::clone(&self.embedding_engine);
+        let vector_index = self.vector_index.clone();
 
         indexing.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
@@ -3460,6 +3524,30 @@ impl McpHandler {
 
             let mut eng = engine.lock().await;
             eng.update_graph(new_graph);
+            drop(eng);
+
+            if let (Some(embedding_engine), Some(vector_index)) =
+                (embedding_engine.get(), vector_index.as_ref())
+            {
+                let graph_snapshot = {
+                    let eng = engine.lock().await;
+                    eng.graph().clone()
+                };
+                match crate::vector_sync::sync_full_graph_embeddings(
+                    &graph_snapshot,
+                    embedding_engine.as_ref(),
+                    vector_index.as_ref(),
+                ) {
+                    Ok(embedded) => tracing::info!(
+                        "Reindex semantic sync complete: {} vectors via {}",
+                        embedded,
+                        vector_index.implementation_name()
+                    ),
+                    Err(err) => {
+                        tracing::warn!("Reindex graph updated but semantic sync failed: {}", err)
+                    }
+                }
+            }
 
             indexing.store(false, Ordering::Relaxed);
             tracing::info!(
@@ -3698,6 +3786,11 @@ fn parse_workflow_response_options(args: &Value) -> WorkflowResponseOptions {
         Some("standard") => WorkflowWireFormat::Standard,
         _ => WorkflowWireFormat::Auto,
     };
+    let render = match args["render"].as_str() {
+        Some("json") => WorkflowRenderMode::Json,
+        Some("markdown") => WorkflowRenderMode::Markdown,
+        _ => WorkflowRenderMode::Hybrid,
+    };
     let max_tokens = args["max_tokens"]
         .as_u64()
         .map(|value| (value as usize).clamp(80, 4000));
@@ -3706,6 +3799,7 @@ fn parse_workflow_response_options(args: &Value) -> WorkflowResponseOptions {
         budget,
         max_tokens,
         wire_format,
+        render,
     }
 }
 
@@ -4826,6 +4920,34 @@ fn seed_from_task_bundle(bundle: &TaskBundle) -> ExpandContextSeed {
     }
 }
 
+fn seed_from_context_capsule(capsule: &ContextCapsule) -> ExpandContextSeed {
+    let mut files: Vec<String> = capsule
+        .pivots
+        .iter()
+        .map(|item| item.file.clone())
+        .chain(capsule.context.iter().map(|item| item.file.clone()))
+        .collect();
+    files.sort();
+    files.dedup();
+
+    let mut symbols: Vec<String> = capsule
+        .pivots
+        .iter()
+        .map(|item| item.symbol.clone())
+        .chain(capsule.context.iter().map(|item| item.symbol.clone()))
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+
+    ExpandContextSeed {
+        query: Some(capsule.query.clone()),
+        files,
+        symbols,
+        tests: Vec::new(),
+        memories: capsule.memories.clone(),
+    }
+}
+
 fn seed_from_diff_impact(report: &DiffImpactReport) -> ExpandContextSeed {
     let mut files: Vec<String> = report
         .changed_files
@@ -4984,6 +5106,36 @@ fn attach_context_handle(value: &mut Value, handle: &str, origin: &str) {
     }
 }
 
+fn attach_context_capsule_suggested_expand(value: &mut Value, capsule: &ContextCapsule) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("suggested_expand") {
+        return;
+    }
+
+    if let Some(pivot) = capsule.pivots.first() {
+        object.insert(
+            "suggested_expand".to_string(),
+            json!({
+                "focus": format!("symbol:{}", pivot.symbol),
+                "reason": "Expand the lead pivot to inspect nearby code and relationships."
+            }),
+        );
+        return;
+    }
+
+    if let Some(context) = capsule.context.first() {
+        object.insert(
+            "suggested_expand".to_string(),
+            json!({
+                "focus": format!("symbol:{}", context.symbol),
+                "reason": "Expand the top supporting symbol to inspect nearby implementation details."
+            }),
+        );
+    }
+}
+
 fn attach_playbook_memory(value: &mut Value, playbook_memory: Value) {
     if let Some(object) = value.as_object_mut() {
         object.insert("playbook_memory".to_string(), playbook_memory);
@@ -4999,15 +5151,20 @@ fn extract_wrapped_tool_metrics(
     Option<String>,
     ToolCallMetadata,
 ) {
-    let text = value["content"]
+    let texts: Vec<&str> = value["content"]
         .as_array()
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("text"))
-        .and_then(|item| item.as_str())
-        .unwrap_or("");
-    let payload_bytes = text.len();
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|inner| inner.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let payload_bytes = texts.iter().map(|text| text.len()).sum();
     let approx_tokens = payload_bytes / 4;
-    let parsed = serde_json::from_str::<Value>(text).ok();
+    let parsed = texts
+        .iter()
+        .find_map(|text| parse_wrapped_tool_payload(text));
 
     let context_handle = parsed
         .as_ref()
@@ -5068,6 +5225,29 @@ fn extract_wrapped_tool_metrics(
         context_origin,
         metadata,
     )
+}
+
+fn parse_wrapped_tool_payload(text: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .or_else(|| parse_json_fenced_block(text))
+        .or_else(|| parse_markdown_metrics_comment(text))
+        .or_else(|| {
+            text.split_once("\n\nStructured payload:\n")
+                .and_then(|(_, payload)| serde_json::from_str::<Value>(payload).ok())
+        })
+}
+
+fn parse_json_fenced_block(text: &str) -> Option<Value> {
+    let (_, rest) = text.split_once("\n\n### Structured Payload\n```json\n")?;
+    let payload = rest.strip_suffix("\n```")?;
+    serde_json::from_str::<Value>(payload).ok()
+}
+
+fn parse_markdown_metrics_comment(text: &str) -> Option<Value> {
+    let (_, payload) = text.rsplit_once("<!-- lattice-metrics: ")?;
+    let payload = payload.strip_suffix(" -->")?;
+    serde_json::from_str::<Value>(payload).ok()
 }
 
 fn dedupe_memory_values(values: &mut Vec<Value>) {
@@ -5203,7 +5383,7 @@ mod tests {
     use super::{
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
         memory_seed_values, report_memory_highlights, summarize_workflow_outcome_content,
-        wrap_tool_result,
+        wrap_tool_result, wrap_workflow_tool_result, WorkflowRenderMode,
     };
     use serde_json::json;
 
@@ -5318,6 +5498,145 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_workflow_tool_result_hybrid_prefixes_summary_before_json_payload() {
+        let wrapped = wrap_workflow_tool_result(
+            json!({
+                "overview": "Likely edit: auth. focus loginUser.",
+                "context_handle": "ctx-9",
+                "context_origin": "prepare_change",
+                "delivery_mode": "compact",
+                "primary_files": [
+                    { "file": "src/auth.ts" }
+                ],
+                "symbols": [
+                    { "symbol": "loginUser" }
+                ],
+                "suggested_expand": {
+                    "focus": "file:src/auth.ts",
+                    "reason": "top file"
+                }
+            }),
+            WorkflowRenderMode::Hybrid,
+        );
+
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("expected text payload");
+        assert!(text.contains("### Summary"));
+        assert!(text.contains("- Overview: Likely edit: auth. focus loginUser."));
+        assert!(text.contains("- Top file: `src/auth.ts`"));
+        assert!(text.contains("- Top symbol: `loginUser`"));
+        assert!(text.contains("### Structured Payload"));
+        assert!(text.contains("```json"));
+
+        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
+        assert_eq!(handle.as_deref(), Some("ctx-9"));
+        assert_eq!(origin.as_deref(), Some("prepare_change"));
+        assert_eq!(metadata.delivery_mode.as_deref(), Some("compact"));
+        assert_eq!(
+            metadata.suggested_expand_focus.as_deref(),
+            Some("file:src/auth.ts")
+        );
+    }
+
+    #[test]
+    fn test_wrap_workflow_tool_result_summarizes_context_capsule_payload() {
+        let wrapped = wrap_workflow_tool_result(
+            json!({
+                "query": "how does auth login work",
+                "intent": "Explore",
+                "pivots": [
+                    {
+                        "file": "src/auth.ts",
+                        "symbol": "loginUser",
+                        "line": 12,
+                        "kind": "fn",
+                        "source": "fn loginUser() {}",
+                        "score": 9.8,
+                        "reason": "keyword"
+                    }
+                ],
+                "context": [
+                    {
+                        "file": "src/session.ts",
+                        "symbol": "validateSession",
+                        "line": 44,
+                        "kind": "fn",
+                        "skeleton": "fn validateSession(...)",
+                        "relationship": "dependency",
+                        "score": 5.1
+                    }
+                ],
+                "context_handle": "ctx-11",
+                "context_origin": "get_context_capsule",
+                "suggested_expand": {
+                    "focus": "symbol:loginUser",
+                    "reason": "Expand the lead pivot to inspect nearby code and relationships."
+                }
+            }),
+            WorkflowRenderMode::Hybrid,
+        );
+
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("expected text payload");
+        assert!(text.contains("### Summary"));
+        assert!(text.contains("- Query: how does auth login work"));
+        assert!(text.contains("- Top file: `src/auth.ts`"));
+        assert!(text.contains("- Top symbol: `loginUser`"));
+        assert!(text.contains("- Suggested expand: `symbol:loginUser`"));
+        assert!(text.contains("### Structured Payload"));
+
+        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
+        assert_eq!(handle.as_deref(), Some("ctx-11"));
+        assert_eq!(origin.as_deref(), Some("get_context_capsule"));
+        assert_eq!(
+            metadata.suggested_expand_focus.as_deref(),
+            Some("symbol:loginUser")
+        );
+    }
+
+    #[test]
+    fn test_wrap_workflow_tool_result_markdown_keeps_hidden_metrics_comment() {
+        let wrapped = wrap_workflow_tool_result(
+            json!({
+                "overview": "Likely edit: auth. focus loginUser.",
+                "context_handle": "ctx-10",
+                "context_origin": "prepare_change",
+                "delivery_mode": "compact",
+                "primary_files": [
+                    { "file": "src/auth.ts" }
+                ],
+                "symbols": [
+                    { "symbol": "loginUser" }
+                ],
+                "suggested_expand": {
+                    "focus": "file:src/auth.ts",
+                    "reason": "top file"
+                }
+            }),
+            WorkflowRenderMode::Markdown,
+        );
+
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("expected text payload");
+        assert!(text.contains("### Summary"));
+        assert!(text.contains("- Overview: Likely edit: auth. focus loginUser."));
+        assert!(!text.contains("### Structured Payload"));
+        assert!(text.contains("<!-- lattice-metrics: "));
+
+        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
+        assert_eq!(handle.as_deref(), Some("ctx-10"));
+        assert_eq!(origin.as_deref(), Some("prepare_change"));
+        assert_eq!(metadata.delivery_mode.as_deref(), Some("compact"));
+        assert_eq!(
+            metadata.suggested_expand_focus.as_deref(),
+            Some("file:src/auth.ts")
+        );
+    }
+
+    #[test]
     fn test_count_outcome_memory_reuse_only_counts_workflow_outcomes() {
         let count = count_outcome_memory_reuse(&[
             json!({"refresh_key": "workflow_outcome::cert-tenant"}),
@@ -5400,12 +5719,282 @@ fn detect_project_rules(
 
 /// Wrap a tool result in the MCP content format.
 fn wrap_tool_result(value: Value) -> Value {
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+    wrap_text_result(text)
+}
+
+fn wrap_workflow_tool_result(value: Value, render: WorkflowRenderMode) -> Value {
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+    let summary = build_tool_result_summary(&value)
+        .unwrap_or_else(|| "- Structured workflow result ready.".to_string());
+
+    match render {
+        WorkflowRenderMode::Json => wrap_text_result(serialized),
+        WorkflowRenderMode::Markdown => {
+            let mut text = format!("### Summary\n{}", summary);
+            if let Some(comment) = build_workflow_metrics_comment(&value) {
+                text.push_str("\n\n");
+                text.push_str(&comment);
+            }
+            wrap_text_result(text)
+        }
+        WorkflowRenderMode::Hybrid => wrap_text_result(format!(
+            "### Summary\n{summary}\n\n### Structured Payload\n```json\n{serialized}\n```"
+        )),
+    }
+}
+
+fn wrap_text_result(text: String) -> Value {
     json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+            "text": text
         }]
     })
+}
+
+fn build_workflow_metrics_comment(value: &Value) -> Option<String> {
+    let metadata = build_workflow_metrics_payload(value)?;
+    let serialized = serde_json::to_string(&metadata).ok()?;
+    Some(format!("<!-- lattice-metrics: {} -->", serialized))
+}
+
+fn build_workflow_metrics_payload(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut metadata = serde_json::Map::new();
+
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "context_handle",
+        &["context_handle", "h"],
+    );
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "context_origin",
+        &["context_origin", "o"],
+    );
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "delivery_mode",
+        &["delivery_mode", "dm"],
+    );
+    copy_object_alias_value(object, &mut metadata, "wire_format", &["wire_format", "wf"]);
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "single_anchor_used",
+        &["single_anchor_used", "sa"],
+    );
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "semantic_fallback_used",
+        &["semantic_fallback_used", "se"],
+    );
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "outcome_memory_reuse_count",
+        &["outcome_memory_reuse_count", "or"],
+    );
+
+    if let Some(suggested_expand) =
+        object_get(object, &["suggested_expand", "x"]).and_then(|item| item.as_object())
+    {
+        let mut suggested = serde_json::Map::new();
+        copy_object_alias_value(suggested_expand, &mut suggested, "focus", &["focus", "fo"]);
+        copy_object_alias_value(suggested_expand, &mut suggested, "reason", &["reason", "r"]);
+        if !suggested.is_empty() {
+            metadata.insert("suggested_expand".to_string(), Value::Object(suggested));
+        }
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn copy_object_alias_value(
+    source: &serde_json::Map<String, Value>,
+    target: &mut serde_json::Map<String, Value>,
+    key: &str,
+    aliases: &[&str],
+) {
+    if let Some(value) = object_get(source, aliases) {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn object_get<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn build_tool_result_summary(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    let mut lines = Vec::new();
+    let overview = object_get(object, &["overview", "ov"])
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+
+    if overview.is_none() {
+        if let Some(query) = object_get(object, &["query", "q"])
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            lines.push(format!("- Query: {}", truncate_text_value(query, 96)));
+        }
+    }
+
+    if let Some(overview) = overview {
+        lines.push(format!("- Overview: {}", overview));
+    }
+
+    if let Some(file) = first_result_file(object) {
+        lines.push(format!("- Top file: `{}`", file));
+    }
+
+    if let Some(symbol) = first_result_symbol(object) {
+        lines.push(format!("- Top symbol: `{}`", symbol));
+    }
+
+    if let Some(step) = object_get(object, &["next_steps", "nx"])
+        .and_then(|item| item.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        lines.push(format!("- Next step: {}", step));
+    }
+
+    if let Some(suggested_expand) =
+        object_get(object, &["suggested_expand", "x"]).and_then(|item| item.as_object())
+    {
+        let focus = suggested_expand
+            .get("focus")
+            .or_else(|| suggested_expand.get("fo"))
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty());
+        let reason = suggested_expand
+            .get("reason")
+            .or_else(|| suggested_expand.get("r"))
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty());
+
+        if let Some(focus) = focus {
+            match reason {
+                Some(reason) => lines.push(format!("- Suggested expand: `{}` ({})", focus, reason)),
+                None => lines.push(format!("- Suggested expand: `{}`", focus)),
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn first_result_file(object: &serde_json::Map<String, Value>) -> Option<String> {
+    [
+        "pivots",
+        "context",
+        "primary_files",
+        "pf",
+        "changed_files",
+        "cf",
+        "files",
+        "fs",
+        "key_files",
+        "kf",
+        "tests",
+        "ts",
+        "extracted_files",
+        "ef",
+        "changed_symbols",
+        "cs",
+    ]
+    .iter()
+    .find_map(|key| {
+        object
+            .get(*key)
+            .and_then(|item| item.as_array())
+            .and_then(|items| items.first())
+            .and_then(first_item_file)
+    })
+}
+
+fn first_result_symbol(object: &serde_json::Map<String, Value>) -> Option<String> {
+    [
+        "pivots",
+        "context",
+        "symbols",
+        "sy",
+        "active_symbols",
+        "as",
+        "key_symbols",
+        "ks",
+        "suspects",
+        "su",
+        "related_symbols",
+        "ry",
+        "changed_symbols",
+        "cs",
+        "notable_symbols",
+        "no",
+    ]
+    .iter()
+    .find_map(|key| {
+        object
+            .get(*key)
+            .and_then(|item| item.as_array())
+            .and_then(|items| items.first())
+            .and_then(first_item_symbol)
+    })
+}
+
+fn first_item_file(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    value
+        .get("file")
+        .or_else(|| value.get("f"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+}
+
+fn first_item_symbol(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    value
+        .get("symbol")
+        .or_else(|| value.get("s"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
 }
 
 /// Recursively walk a directory, collecting all file paths.

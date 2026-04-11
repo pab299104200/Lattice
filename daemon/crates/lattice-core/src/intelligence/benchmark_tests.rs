@@ -119,7 +119,11 @@ fn build_certificate_guardrail_graph() -> CodeGraph {
     let mut graph = CodeGraph::new();
 
     let cert_id = make_id("routers/certificates.py", "_verify_org_access", 0);
-    let shared_id = make_id("routers/compliance_mgmt/_shared.py", "_verify_org_access", 0);
+    let shared_id = make_id(
+        "routers/compliance_mgmt/_shared.py",
+        "_verify_org_access",
+        0,
+    );
     let policy_id = make_id("routers/certificates.py", "upsert_renewal_policy", 1);
     let cert_model_id = make_id("models/certificates.py", "CertificateRenewalPolicy", 0);
     let account_id = make_id("models/account.py", "Organization", 0);
@@ -256,8 +260,14 @@ fn benchmark_memory(
         memory_type,
         scope: MemoryScope::Repo,
         confidence: 1.0,
-        linked_symbols: linked_symbols.iter().map(|value| (*value).to_string()).collect(),
-        linked_files: linked_files.iter().map(|value| (*value).to_string()).collect(),
+        linked_symbols: linked_symbols
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        linked_files: linked_files
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         workspace_id: Some("lattice-benchmark".to_string()),
         branch: Some("main".to_string()),
         refresh_key: None,
@@ -374,9 +384,8 @@ fn bench_diagnose_failure(graph: &CodeGraph) -> WorkflowResult {
     let rules = project_rules(graph);
     let file = "daemon/crates/lattice-core/src/memory/store.rs";
     let line = benchmark_symbol_line(graph, file, "search_across_sessions");
-    let failure = format!(
-        "{file}:{line}:9 error: search_across_sessions failed during session recall"
-    );
+    let failure =
+        format!("{file}:{line}:9 error: search_across_sessions failed during session recall");
     let report = diagnose_failure(
         graph,
         &failure,
@@ -442,7 +451,11 @@ fn bench_memory_recall() -> WorkflowResult {
         .expect("Failed to mark stale benchmark memories");
 
     let recalled = store
-        .search_across_sessions("previous session recall new session", Some("session-current"), 5)
+        .search_across_sessions(
+            "previous session recall new session",
+            Some("session-current"),
+            5,
+        )
         .expect("Failed to run recall benchmark");
     let stale = store
         .list_stale(None, 10)
@@ -624,7 +637,10 @@ fn workflow_guardrail_certificate_noise_case() {
         .iter()
         .position(|item| item.file == "models/account.py");
     assert!(
-        cert_model_index.zip(account_model_index).map(|(cert, account)| cert < account).unwrap_or(true),
+        cert_model_index
+            .zip(account_model_index)
+            .map(|(cert, account)| cert < account)
+            .unwrap_or(true),
         "expected certificate-local model to outrank broad account model: {:?}",
         bundle
             .primary_files

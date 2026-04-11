@@ -42,6 +42,27 @@ const DEFAULT_EXPAND_MAX_TOKENS: usize = 1200;
 const MIN_EXPAND_MAX_TOKENS: usize = 200;
 const MAX_EXPAND_MAX_TOKENS: usize = 4000;
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+const SUBSYSTEM_DOCUMENT_QUERY_KEYWORDS: &[&str] = &[
+    "docs",
+    "documentation",
+    "markdown",
+    "readme",
+    "runbook",
+    "manual",
+    "guide",
+    "adr",
+    "heading",
+    "section",
+];
+const SUBSYSTEM_TEST_QUERY_KEYWORDS: &[&str] = &[
+    "test",
+    "tests",
+    "spec",
+    "coverage",
+    "regression",
+    "failure",
+    "failing",
+];
 
 const PATH_STOP_WORDS: &[&str] = &[
     "src",
@@ -831,11 +852,8 @@ pub fn prepare_change(
         .take(mode.symbol_limit())
         .collect();
 
-    let test_anchor_files = prepare_change_test_anchor_files(
-        entry_files,
-        &primary_files,
-        mode.primary_file_limit(),
-    );
+    let test_anchor_files =
+        prepare_change_test_anchor_files(entry_files, &primary_files, mode.primary_file_limit());
     let test_anchor_symbols = prepare_change_test_anchor_symbols(entry_symbols, &symbols);
     let test_report = find_relevant_tests(
         graph,
@@ -927,13 +945,8 @@ pub fn prepare_change(
         &risks,
         &memory_highlights,
     );
-    let suggested_expand = suggest_task_bundle_expand(
-        mode,
-        &primary_files,
-        &secondary_files,
-        &symbols,
-        &tests,
-    );
+    let suggested_expand =
+        suggest_task_bundle_expand(mode, &primary_files, &secondary_files, &symbols, &tests);
     let compact_memories = compact_response_memories(&capsule.memories, mode);
 
     TaskBundle {
@@ -1004,12 +1017,9 @@ pub fn find_relevant_tests(
 
     let all_nodes = graph.all_nodes();
     let all_files = unique_graph_files(graph);
-    for test_file in all_files
-        .into_iter()
-        .filter(|file| {
-            is_test_file(file) && !is_test_support_file(file) && is_queryable_graph_file(file)
-        })
-    {
+    for test_file in all_files.into_iter().filter(|file| {
+        is_test_file(file) && !is_test_support_file(file) && is_queryable_graph_file(file)
+    }) {
         let test_tokens = tokenize_path(&test_file);
         let test_token_set: HashSet<String> = test_tokens.iter().cloned().collect();
         let test_nodes: Vec<&GraphNode> = all_nodes
@@ -1552,6 +1562,10 @@ pub fn summarize_subsystem(
     mode: BundleMode,
 ) -> SubsystemSummary {
     let all_nodes = graph.all_nodes();
+    let prefer_document_files = query_prefers_subsystem_documents(query);
+    let anchor_files = normalize_subsystem_explicit_files(files, prefer_document_files);
+    let candidate_files = subsystem_candidate_files(graph, prefer_document_files);
+    let prefer_test_files = query_prefers_subsystem_tests(query, &anchor_files);
     let mut file_scores: HashMap<String, FileAccumulator> = HashMap::new();
     let mut symbol_scores: HashMap<(String, String), SymbolAccumulator> = HashMap::new();
     let mut seed_nodes: Vec<&GraphNode> = Vec::new();
@@ -1559,7 +1573,7 @@ pub fn summarize_subsystem(
     let mut rationale = Vec::new();
     let query_tokens: HashSet<String> = tokenize_path(query).into_iter().collect();
 
-    for file in files {
+    for file in &anchor_files {
         if !is_queryable_graph_file(file) {
             continue;
         }
@@ -1572,7 +1586,11 @@ pub fn summarize_subsystem(
     }
 
     for symbol in symbols {
-        for node in find_symbol_matches(graph, symbol, files).into_iter().take(4) {
+        for node in find_symbol_matches(graph, symbol, &anchor_files)
+            .into_iter()
+            .filter(|node| prefer_document_files || !is_markdown_graph_file(&node.file))
+            .take(4)
+        {
             add_file_score(
                 &mut file_scores,
                 &node.file,
@@ -1592,7 +1610,7 @@ pub fn summarize_subsystem(
         }
     }
 
-    for file in unique_graph_files(graph)
+    for file in candidate_files
         .into_iter()
         .filter(|file| !is_test_file(file) && is_queryable_graph_file(file))
     {
@@ -1602,16 +1620,16 @@ pub fn summarize_subsystem(
         let path_overlap = overlap_count(&query_tokens, &tokenize_path(&file));
         if path_overlap > 0 {
             delta += path_overlap as f64;
-            reasons.push(format!("shares {} path token(s) with the subsystem query", path_overlap));
+            reasons.push(format!(
+                "shares {} path token(s) with the subsystem query",
+                path_overlap
+            ));
         }
 
         let focus_overlap = overlap_count(&query_tokens, &focus_tokens_for_file(&file));
         if focus_overlap > 0 {
             delta += 2.0 * focus_overlap as f64;
-            reasons.push(format!(
-                "matches {} core subsystem token(s)",
-                focus_overlap
-            ));
+            reasons.push(format!("matches {} core subsystem token(s)", focus_overlap));
         }
 
         let symbol_overlap = file_symbol_token_overlap(&all_nodes, &file, &query_tokens);
@@ -1631,10 +1649,14 @@ pub fn summarize_subsystem(
     }
 
     let mut ranked_files = finalize_file_recommendations(file_scores.clone());
-    ranked_files = promote_explicit_files(ranked_files, files);
-    ranked_files = prioritize_entry_scope_files(ranked_files, files);
+    ranked_files = promote_explicit_files(ranked_files, &anchor_files);
+    ranked_files = prioritize_entry_scope_files(ranked_files, &anchor_files);
     if ranked_files.is_empty() {
-        ranked_files = fallback_repo_file_recommendations(graph, mode.working_file_limit());
+        ranked_files = fallback_repo_file_recommendations(
+            graph,
+            mode.working_file_limit(),
+            prefer_document_files,
+        );
     }
     calibrate_file_recommendations(&mut ranked_files);
 
@@ -1669,6 +1691,12 @@ pub fn summarize_subsystem(
             .into_iter()
             .take(3)
         {
+            if !prefer_test_files && is_test_file(&dependency.file) {
+                continue;
+            }
+            if !prefer_document_files && is_markdown_graph_file(&dependency.file) {
+                continue;
+            }
             add_file_score(
                 &mut file_scores,
                 &dependency.file,
@@ -1690,6 +1718,12 @@ pub fn summarize_subsystem(
             .into_iter()
             .take(3)
         {
+            if !prefer_test_files && is_test_file(&dependent.file) {
+                continue;
+            }
+            if !prefer_document_files && is_markdown_graph_file(&dependent.file) {
+                continue;
+            }
             add_file_score(
                 &mut file_scores,
                 &dependent.file,
@@ -1709,20 +1743,57 @@ pub fn summarize_subsystem(
     }
 
     let mut ranked_files = finalize_file_recommendations(file_scores);
-    ranked_files = promote_explicit_files(ranked_files, files);
-    ranked_files = prioritize_entry_scope_files(ranked_files, files);
+    ranked_files = promote_explicit_files(ranked_files, &anchor_files);
+    ranked_files = prioritize_entry_scope_files(ranked_files, &anchor_files);
     if ranked_files.is_empty() {
-        ranked_files = fallback_repo_file_recommendations(graph, mode.working_file_limit());
+        ranked_files = fallback_repo_file_recommendations(
+            graph,
+            mode.working_file_limit(),
+            prefer_document_files,
+        );
     }
     calibrate_file_recommendations(&mut ranked_files);
 
     let mut ranked_symbols =
         prefer_symbols_in_files(finalize_symbol_recommendations(symbol_scores), &seed_files);
+    if !prefer_test_files && ranked_symbols.iter().any(|item| !is_test_file(&item.file)) {
+        ranked_symbols.retain(|item| !is_test_file(&item.file));
+    }
     calibrate_symbol_recommendations(&mut ranked_symbols);
 
     let key_files = compress_file_summaries(&ranked_files, mode.working_file_limit());
-    let key_symbols = compress_symbol_summaries(&ranked_symbols, mode.symbol_limit().min(6));
     let key_file_names: Vec<String> = key_files.iter().map(|item| item.file.clone()).collect();
+    let mut visible_ranked_symbols: Vec<SymbolRecommendation> = ranked_symbols
+        .iter()
+        .filter(|item| key_file_names.iter().any(|file| file == &item.file))
+        .cloned()
+        .collect();
+    if visible_ranked_symbols.is_empty() {
+        for file in &key_file_names {
+            for (index, node) in rank_file_focus_nodes(graph, &all_nodes, file)
+                .into_iter()
+                .take(2)
+                .enumerate()
+            {
+                visible_ranked_symbols.push(SymbolRecommendation {
+                    symbol: node.name.clone(),
+                    kind: node.kind.short_code().to_string(),
+                    file: node.file.clone(),
+                    line: node.line,
+                    role: "file_reference".to_string(),
+                    score: (4.0 - index as f64).max(1.5),
+                    confidence_band: "medium".to_string(),
+                    evidence: vec!["direct_symbol".to_string()],
+                });
+            }
+        }
+        calibrate_symbol_recommendations(&mut visible_ranked_symbols);
+    }
+    let key_symbols = if visible_ranked_symbols.is_empty() {
+        compress_symbol_summaries(&ranked_symbols, mode.symbol_limit().min(6))
+    } else {
+        compress_symbol_summaries(&visible_ranked_symbols, mode.symbol_limit().min(6))
+    };
     let key_symbol_names: Vec<String> =
         key_symbols.iter().map(|item| item.symbol.clone()).collect();
 
@@ -1754,7 +1825,8 @@ pub fn summarize_subsystem(
         ));
     }
     if !test_report.tests.is_empty() {
-        rationale.push("Included the most relevant tests so follow-up work can stay local.".to_string());
+        rationale
+            .push("Included the most relevant tests so follow-up work can stay local.".to_string());
     }
     if !memory_highlights.is_empty() {
         rationale.push(format!(
@@ -1869,14 +1941,16 @@ pub fn get_repo_playbook(
 
     let mut ranked_files = finalize_file_recommendations(file_scores);
     if ranked_files.is_empty() {
-        ranked_files = fallback_repo_file_recommendations(graph, mode.working_file_limit());
+        ranked_files = fallback_repo_file_recommendations(graph, mode.working_file_limit(), true);
     }
     calibrate_file_recommendations(&mut ranked_files);
     let key_files = compress_file_summaries(&ranked_files, mode.working_file_limit());
     let key_file_names: Vec<String> = key_files.iter().map(|item| item.file.clone()).collect();
 
-    let mut ranked_symbols =
-        prefer_symbols_in_files(finalize_symbol_recommendations(symbol_scores), &key_file_names);
+    let mut ranked_symbols = prefer_symbols_in_files(
+        finalize_symbol_recommendations(symbol_scores),
+        &key_file_names,
+    );
     calibrate_symbol_recommendations(&mut ranked_symbols);
     let notable_symbols = compress_symbol_summaries(&ranked_symbols, mode.symbol_limit().min(6));
 
@@ -2385,7 +2459,10 @@ pub fn diagnose_failure(
         );
     }
     if !test_report.tests.is_empty() {
-        rationale.push("Suggested tests based on direct failure anchors, suspect files, and symbol hints.".to_string());
+        rationale.push(
+            "Suggested tests based on direct failure anchors, suspect files, and symbol hints."
+                .to_string(),
+        );
     }
 
     if failure_kind == "compiler" {
@@ -2439,20 +2516,10 @@ pub fn diagnose_failure(
     let test_count = tests.len();
     let extracted_file_count = extracted_files.len();
     let extracted_symbol_count = extracted_symbols.len();
-    let overview = build_failure_overview(
-        &failure_kind,
-        &suspects,
-        &tests,
-        &likely_causes,
-        &[],
-    );
+    let overview = build_failure_overview(&failure_kind, &suspects, &tests, &likely_causes, &[]);
     let suggested_expand = suggest_failure_expand(mode, &suspects, &extracted_files);
-    let mut next_steps = build_failure_next_steps(
-        &failure_kind,
-        &suspects,
-        &tests,
-        &extracted_files,
-    );
+    let mut next_steps =
+        build_failure_next_steps(&failure_kind, &suspects, &tests, &extracted_files);
     if matches!(mode, BundleMode::Compact) {
         ultra_compactify_next_steps(&mut next_steps);
     }
@@ -2689,10 +2756,9 @@ pub fn impact_from_diff(
 }
 
 fn find_exact_node<'a>(graph: &'a CodeGraph, file: &str, symbol: &str) -> Option<&'a GraphNode> {
-    graph
-        .all_nodes()
-        .into_iter()
-        .find(|node| is_queryable_graph_file(&node.file) && node.file == file && node.name == symbol)
+    graph.all_nodes().into_iter().find(|node| {
+        is_queryable_graph_file(&node.file) && node.file == file && node.name == symbol
+    })
 }
 
 fn resolve_expansion_target(seed: &ExpandContextSeed, focus: &str) -> ExpansionTarget {
@@ -3092,12 +3158,9 @@ fn extract_failure_file_refs(graph: &CodeGraph, input: &str) -> Vec<(String, Opt
                 let line_hint = parse_line_hint_after_path(&line[index + file.len()..]);
                 if let Some(line_hint) = line_hint {
                     saw_specific_line = true;
-                    if !refs
-                        .iter()
-                        .any(|(existing_file, existing_line)| {
-                            existing_file == &file && *existing_line == Some(line_hint)
-                        })
-                    {
+                    if !refs.iter().any(|(existing_file, existing_line)| {
+                        existing_file == &file && *existing_line == Some(line_hint)
+                    }) {
                         refs.push((file.clone(), Some(line_hint)));
                     }
                 }
@@ -3207,7 +3270,8 @@ fn find_symbol_matches<'a>(
         .all_nodes()
         .into_iter()
         .filter(|node| {
-            is_queryable_graph_file(&node.file) && (node.name == symbol || node.name.ends_with(symbol))
+            is_queryable_graph_file(&node.file)
+                && (node.name == symbol || node.name.ends_with(symbol))
         })
         .collect();
 
@@ -3339,21 +3403,19 @@ fn finalize_symbol_recommendations(
     items
 }
 
-fn compress_file_summaries(
-    items: &[FileRecommendation],
-    limit: usize,
-) -> Vec<CompactFileSummary> {
-    items.iter()
+fn compress_file_summaries(items: &[FileRecommendation], limit: usize) -> Vec<CompactFileSummary> {
+    items
+        .iter()
         .take(limit.max(1))
         .map(|item| CompactFileSummary {
             file: item.file.clone(),
             summary: truncate_text(&summarize_file_recommendation(item), 48),
             why: truncate_text(
                 &item
-                .reasons
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "ranked as part of the current focus".to_string()),
+                    .reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "ranked as part of the current focus".to_string()),
                 40,
             ),
             confidence_band: item.confidence_band.clone(),
@@ -3365,7 +3427,8 @@ fn compress_symbol_summaries(
     items: &[SymbolRecommendation],
     limit: usize,
 ) -> Vec<CompactSymbolSummary> {
-    items.iter()
+    items
+        .iter()
         .take(limit.max(1))
         .map(|item| CompactSymbolSummary {
             symbol: item.symbol.clone(),
@@ -3478,13 +3541,14 @@ fn file_symbol_token_overlap(
 fn fallback_repo_file_recommendations(
     graph: &CodeGraph,
     limit: usize,
+    prefer_document_files: bool,
 ) -> Vec<FileRecommendation> {
     let mut file_scores: HashMap<String, FileAccumulator> = HashMap::new();
-    for node in graph
-        .all_nodes()
-        .into_iter()
-        .filter(|node| !is_test_file(&node.file) && is_queryable_graph_file(&node.file))
-    {
+    for node in graph.all_nodes().into_iter().filter(|node| {
+        !is_test_file(&node.file)
+            && is_queryable_graph_file(&node.file)
+            && (prefer_document_files || !is_markdown_graph_file(&node.file))
+    }) {
         let delta = graph.centrality(&node.id).max(0.5) + if node.is_exported { 1.5 } else { 0.0 };
         add_file_score(
             &mut file_scores,
@@ -3498,6 +3562,9 @@ fn fallback_repo_file_recommendations(
         );
     }
     let mut items = finalize_file_recommendations(file_scores);
+    if items.is_empty() && !prefer_document_files {
+        return fallback_repo_file_recommendations(graph, limit, true);
+    }
     items.truncate(limit.max(1));
     items
 }
@@ -3771,9 +3838,7 @@ fn reprioritize_compact_failure_suspects(items: &mut Vec<SymbolRecommendation>) 
     items.sort_by(|a, b| {
         (a.file != lead_file)
             .cmp(&(b.file != lead_file))
-            .then_with(|| is_test_file(&a.file)
-            .cmp(&is_test_file(&b.file))
-            )
+            .then_with(|| is_test_file(&a.file).cmp(&is_test_file(&b.file)))
             .then_with(|| (a.kind != "F" && a.kind != "M").cmp(&(b.kind != "F" && b.kind != "M")))
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.file.cmp(&b.file))
@@ -3795,13 +3860,15 @@ fn suggest_task_bundle_expand(
     if let Some(symbol) = symbols.first() {
         return Some(ExpandSuggestion {
             focus: format!("symbol:{}", symbol.symbol),
-            reason: "Inspect the top ranked symbol to see nearby code and relationships.".to_string(),
+            reason: "Inspect the top ranked symbol to see nearby code and relationships."
+                .to_string(),
         });
     }
     if primary_files.len() > 1 || !secondary_files.is_empty() || !tests.is_empty() {
         return primary_files.first().map(|file| ExpandSuggestion {
             focus: format!("file:{}", file.file),
-            reason: "Expand the top file to inspect its local symbols before widening further.".to_string(),
+            reason: "Expand the top file to inspect its local symbols before widening further."
+                .to_string(),
         });
     }
 
@@ -3844,8 +3911,9 @@ fn suggest_failure_expand(
     if let Some(suspect) = suspects.first() {
         return Some(ExpandSuggestion {
             focus: format!("symbol:{}", suspect.symbol),
-            reason: "Expand the top suspect symbol to inspect its body, dependencies, and dependents."
-                .to_string(),
+            reason:
+                "Expand the top suspect symbol to inspect its body, dependencies, and dependents."
+                    .to_string(),
         });
     }
 
@@ -3875,7 +3943,8 @@ fn suggest_diff_expand(
 
     changed_files.first().map(|file| ExpandSuggestion {
         focus: format!("file:{}", file.file),
-        reason: "Expand the changed file to inspect the affected region with nearby symbols.".to_string(),
+        reason: "Expand the changed file to inspect the affected region with nearby symbols."
+            .to_string(),
     })
 }
 
@@ -3898,7 +3967,8 @@ fn suggest_summary_expand(
 
     key_files.first().map(|file| ExpandSuggestion {
         focus: format!("file:{}", file.file),
-        reason: "Expand the lead file to inspect the concrete structure behind the summary.".to_string(),
+        reason: "Expand the lead file to inspect the concrete structure behind the summary."
+            .to_string(),
     })
 }
 
@@ -4075,7 +4145,14 @@ fn estimate_subsystem_summary_tokens(
             .sum::<usize>()
         + tests
             .iter()
-            .map(|item| item.file.len() + item.reasons.iter().map(|reason| reason.len()).sum::<usize>())
+            .map(|item| {
+                item.file.len()
+                    + item
+                        .reasons
+                        .iter()
+                        .map(|reason| reason.len())
+                        .sum::<usize>()
+            })
             .sum::<usize>()
         + rules.iter().map(|item| item.len()).sum::<usize>()
         + memories
@@ -4252,7 +4329,10 @@ fn build_failure_next_steps(
             suspect.symbol, suspect.file, suspect.line
         ));
     } else if let Some(file) = extracted_files.first() {
-        steps.push(format!("Inspect {} first because it was referenced directly.", file));
+        steps.push(format!(
+            "Inspect {} first because it was referenced directly.",
+            file
+        ));
     }
 
     if let Some(test) = tests.first() {
@@ -4260,7 +4340,8 @@ fn build_failure_next_steps(
     }
 
     steps.push(match kind {
-        "compiler" => "Keep the compiler error line as the primary anchor before widening context.".to_string(),
+        "compiler" => "Keep the compiler error line as the primary anchor before widening context."
+            .to_string(),
         "test" => "Use the failing assertion path before exploring broader neighbors.".to_string(),
         _ => "Use the top stack frame before widening to broader graph neighbors.".to_string(),
     });
@@ -4731,6 +4812,72 @@ fn is_queryable_graph_file(file: &str) -> bool {
     !is_assistant_artifact_path(file)
 }
 
+fn is_markdown_graph_file(file: &str) -> bool {
+    file.to_ascii_lowercase().ends_with(".md")
+}
+
+fn query_prefers_subsystem_documents(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    SUBSYSTEM_DOCUMENT_QUERY_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+fn query_prefers_subsystem_tests(query: &str, files: &[String]) -> bool {
+    if files.iter().any(|file| is_test_file(file)) {
+        return true;
+    }
+
+    let query_tokens: HashSet<String> = tokenize_path(query).into_iter().collect();
+    SUBSYSTEM_TEST_QUERY_KEYWORDS
+        .iter()
+        .any(|keyword| query_tokens.contains(*keyword))
+}
+
+fn normalize_subsystem_explicit_files(
+    files: &[String],
+    prefer_document_files: bool,
+) -> Vec<String> {
+    let mut normalized: Vec<String> = files
+        .iter()
+        .filter(|file| is_queryable_graph_file(file))
+        .cloned()
+        .collect();
+    dedupe_strings(&mut normalized);
+
+    if prefer_document_files {
+        return normalized;
+    }
+
+    let code_files: Vec<String> = normalized
+        .into_iter()
+        .filter(|file| !is_markdown_graph_file(file))
+        .collect();
+    if !code_files.is_empty() {
+        return code_files;
+    }
+
+    Vec::new()
+}
+
+fn subsystem_candidate_files(graph: &CodeGraph, prefer_document_files: bool) -> Vec<String> {
+    let all_files = unique_graph_files(graph);
+    if prefer_document_files {
+        return all_files;
+    }
+
+    let code_files: Vec<String> = all_files
+        .iter()
+        .filter(|file| !is_markdown_graph_file(file))
+        .cloned()
+        .collect();
+    if !code_files.is_empty() {
+        return code_files;
+    }
+
+    all_files
+}
+
 fn promote_explicit_files(
     ranked_files: Vec<FileRecommendation>,
     explicit_files: &[String],
@@ -4743,7 +4890,10 @@ fn promote_explicit_files(
     let mut promoted = Vec::new();
 
     for explicit in explicit_files {
-        if let Some(item) = ranked_files.iter().find(|candidate| candidate.file == *explicit) {
+        if let Some(item) = ranked_files
+            .iter()
+            .find(|candidate| candidate.file == *explicit)
+        {
             promoted.push(item.clone());
         } else {
             promoted.push(FileRecommendation {
@@ -4778,11 +4928,7 @@ fn prioritize_entry_scope_files(
     scoped.sort_by(|a, b| {
         entry_scope_rank(&a.file, &entry_set, entry_files)
             .cmp(&entry_scope_rank(&b.file, &entry_set, entry_files))
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(Ordering::Equal)
-            })
+            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
             .then_with(|| a.file.cmp(&b.file))
     });
     scoped
@@ -5063,8 +5209,10 @@ fn is_test_file(file: &str) -> bool {
         || file.contains("/tests/")
         || file.contains("/test/")
         || file.contains("/__tests__/")
+        || file.contains("_tests.")
         || file.contains(".test.")
         || file.contains(".spec.")
+        || file.ends_with("tests.rs")
         || file.ends_with("_test.rs")
         || file.ends_with("_test.go")
         || file.ends_with("_test.py")
@@ -5128,7 +5276,8 @@ fn normalize_token(part: &str) -> String {
 fn file_matches_entry_scope(file: &str, entry_files: &[String]) -> bool {
     let file_focus_tokens: HashSet<String> = focus_tokens_for_file(file).into_iter().collect();
     entry_files.iter().any(|entry| {
-        let entry_focus_tokens: HashSet<String> = focus_tokens_for_file(entry).into_iter().collect();
+        let entry_focus_tokens: HashSet<String> =
+            focus_tokens_for_file(entry).into_iter().collect();
         shared_directory_prefix_len(entry, file) > 0
             || overlap_count_set(&file_focus_tokens, &entry_focus_tokens) > 0
     })
@@ -5153,7 +5302,10 @@ fn overlap_count(left: &HashSet<String>, right: &[String]) -> usize {
 }
 
 fn overlap_count_set(left: &HashSet<String>, right: &HashSet<String>) -> usize {
-    right.iter().filter(|item| left.contains(item.as_str())).count()
+    right
+        .iter()
+        .filter(|item| left.contains(item.as_str()))
+        .count()
 }
 
 fn extract_diff_files(diff: Option<&str>) -> Vec<String> {
@@ -5316,9 +5468,7 @@ fn calibrate_band(
 
     match kind {
         RecommendationKind::File => {
-            if evidence.iter().any(|item| item == "entry")
-                || (strength >= 6.0 && relative >= 0.7)
-            {
+            if evidence.iter().any(|item| item == "entry") || (strength >= 6.0 && relative >= 0.7) {
                 "high".to_string()
             } else if has_structural_support && strength >= 3.0 && relative >= 0.35 {
                 "medium".to_string()
@@ -5366,8 +5516,7 @@ fn calibrate_symbol_band(
     let graph_only = evidence
         .iter()
         .all(|item| matches!(item.as_str(), "graph" | "direct_symbol"));
-    let is_related_context =
-        role.starts_with("dependency:") || role.starts_with("dependent:");
+    let is_related_context = role.starts_with("dependency:") || role.starts_with("dependent:");
 
     if has_direct_anchor && strength >= 5.0 && relative >= 0.55 {
         "high".to_string()
@@ -5377,8 +5526,7 @@ fn calibrate_symbol_band(
         } else {
             "low".to_string()
         }
-    } else if (has_structural_support || has_direct_anchor) && strength >= 4.0 && relative >= 0.4
-    {
+    } else if (has_structural_support || has_direct_anchor) && strength >= 4.0 && relative >= 0.4 {
         "medium".to_string()
     } else {
         "low".to_string()
@@ -5411,8 +5559,12 @@ fn relative_score(score: f64, top_score: f64) -> f64 {
 fn calibrate_file_recommendations(items: &mut [FileRecommendation]) {
     let top_score = items.first().map(|item| item.score).unwrap_or(0.0);
     for item in items {
-        item.confidence_band =
-            calibrate_band(item.score, top_score, &item.evidence, RecommendationKind::File);
+        item.confidence_band = calibrate_band(
+            item.score,
+            top_score,
+            &item.evidence,
+            RecommendationKind::File,
+        );
     }
 }
 

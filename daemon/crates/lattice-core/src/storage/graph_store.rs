@@ -1,10 +1,10 @@
-use std::path::Path;
-use rusqlite::{Connection, params};
+use super::schema::CREATE_TABLES;
 use crate::error::LatticeError;
 use crate::graph::model::CodeGraph;
-use crate::symbols::{Language, SymbolId, SymbolKind};
 use crate::graph::model::EdgeKind;
-use super::schema::CREATE_TABLES;
+use crate::symbols::{Language, SymbolId, SymbolKind};
+use rusqlite::{params, Connection};
+use std::path::Path;
 
 /// Persistent storage for the code dependency graph backed by SQLite.
 pub struct GraphStore {
@@ -27,8 +27,9 @@ impl GraphStore {
 
     /// Open an in-memory SQLite database (for tests).
     pub fn open_in_memory() -> Result<Self, LatticeError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| LatticeError::Storage(format!("Failed to open in-memory database: {}", e)))?;
+        let conn = Connection::open_in_memory().map_err(|e| {
+            LatticeError::Storage(format!("Failed to open in-memory database: {}", e))
+        })?;
 
         let store = Self { conn };
         store.initialize()?;
@@ -45,7 +46,9 @@ impl GraphStore {
 
     /// Save a CodeGraph to the database, replacing any previous data.
     pub fn save_graph(&self, graph: &CodeGraph) -> Result<(), LatticeError> {
-        let tx = self.conn.unchecked_transaction()
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|e| LatticeError::Storage(format!("Failed to begin transaction: {}", e)))?;
 
         // Delete all existing data
@@ -158,13 +161,28 @@ impl GraphStore {
             .map_err(|e| LatticeError::Storage(format!("Failed to query nodes: {}", e)))?;
 
         for row in node_rows {
-            let (file, name, byte_offset, kind_str, signature, body, line, end_line, is_exported, language_str, edit_count, last_modified) =
+            let (
+                file,
+                name,
+                byte_offset,
+                kind_str,
+                signature,
+                body,
+                line,
+                end_line,
+                is_exported,
+                language_str,
+                edit_count,
+                last_modified,
+            ) =
                 row.map_err(|e| LatticeError::Storage(format!("Failed to read node row: {}", e)))?;
 
-            let kind = parse_symbol_kind(&kind_str)
-                .ok_or_else(|| LatticeError::Storage(format!("Unknown SymbolKind: {}", kind_str)))?;
-            let language = parse_language(&language_str)
-                .ok_or_else(|| LatticeError::Storage(format!("Unknown Language: {}", language_str)))?;
+            let kind = parse_symbol_kind(&kind_str).ok_or_else(|| {
+                LatticeError::Storage(format!("Unknown SymbolKind: {}", kind_str))
+            })?;
+            let language = parse_language(&language_str).ok_or_else(|| {
+                LatticeError::Storage(format!("Unknown Language: {}", language_str))
+            })?;
 
             let id = SymbolId {
                 file: file.clone(),
@@ -210,7 +228,15 @@ impl GraphStore {
                 let to_offset: i64 = row.get(5)?;
                 let kind_str: String = row.get(6)?;
 
-                Ok((from_file, from_name, from_offset, to_file, to_name, to_offset, kind_str))
+                Ok((
+                    from_file,
+                    from_name,
+                    from_offset,
+                    to_file,
+                    to_name,
+                    to_offset,
+                    kind_str,
+                ))
             })
             .map_err(|e| LatticeError::Storage(format!("Failed to query edges: {}", e)))?;
 

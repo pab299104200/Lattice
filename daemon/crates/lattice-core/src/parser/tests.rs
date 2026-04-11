@@ -11,9 +11,16 @@ export function greet(name: string): string {
 
     let result = parse_file("test.ts", source).expect("Failed to parse");
     assert_eq!(result.language, crate::symbols::Language::TypeScript);
-    assert!(!result.symbols.is_empty(), "Should extract at least one symbol");
+    assert!(
+        !result.symbols.is_empty(),
+        "Should extract at least one symbol"
+    );
 
-    let func = result.symbols.iter().find(|s| s.name == "greet").expect("Should find 'greet'");
+    let func = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "greet")
+        .expect("Should find 'greet'");
     assert_eq!(func.kind, SymbolKind::Function);
     assert!(func.is_exported, "greet should be exported");
     assert!(
@@ -225,13 +232,22 @@ See [[runbook#Checklist]] and [Overview](./overview.md).
         "Markdown sections should capture inline code references"
     );
 
-    assert_eq!(result.links.len(), 2, "Should extract both Markdown and wiki links");
+    assert_eq!(
+        result.links.len(),
+        2,
+        "Should extract both Markdown and wiki links"
+    );
     assert!(
-        result.links.iter().any(|link| link.target == "runbook" && link.heading.as_deref() == Some("Checklist") && link.is_wiki),
+        result.links.iter().any(|link| link.target == "runbook"
+            && link.heading.as_deref() == Some("Checklist")
+            && link.is_wiki),
         "Should extract wiki-links with section targets"
     );
     assert!(
-        result.links.iter().any(|link| link.target == "./overview.md" && !link.is_wiki),
+        result
+            .links
+            .iter()
+            .any(|link| link.target == "./overview.md" && !link.is_wiki),
         "Should extract Markdown links"
     );
 }
@@ -378,12 +394,16 @@ from collections import OrderedDict, defaultdict
         .find(|i| i.source == "collections")
         .expect("Should find collections import");
     assert!(
-        collections_import.names.contains(&"OrderedDict".to_string()),
+        collections_import
+            .names
+            .contains(&"OrderedDict".to_string()),
         "Should contain 'OrderedDict', got: {:?}",
         collections_import.names
     );
     assert!(
-        collections_import.names.contains(&"defaultdict".to_string()),
+        collections_import
+            .names
+            .contains(&"defaultdict".to_string()),
         "Should contain 'defaultdict', got: {:?}",
         collections_import.names
     );
@@ -434,38 +454,63 @@ impl Config {
     assert_eq!(result.language, Language::Rust);
 
     // Function
-    let process = result.symbols.iter().find(|s| s.name == "process_data")
+    let process = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "process_data")
         .expect("Should find 'process_data'");
     assert_eq!(process.kind, SymbolKind::Function);
     assert!(process.is_exported, "process_data should be pub");
-    assert!(process.signature.contains("process_data"), "Sig: {}", process.signature);
+    assert!(
+        process.signature.contains("process_data"),
+        "Sig: {}",
+        process.signature
+    );
 
-    let helper = result.symbols.iter().find(|s| s.name == "private_helper")
+    let helper = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "private_helper")
         .expect("Should find 'private_helper'");
     assert!(!helper.is_exported, "private_helper should not be pub");
 
     // Struct
-    let config = result.symbols.iter().find(|s| s.name == "Config" && s.kind == SymbolKind::Struct)
+    let config = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Config" && s.kind == SymbolKind::Struct)
         .expect("Should find Config struct");
     assert!(config.is_exported);
 
     // Enum
-    let status = result.symbols.iter().find(|s| s.name == "Status" && s.kind == SymbolKind::Enum)
+    let status = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Status" && s.kind == SymbolKind::Enum)
         .expect("Should find Status enum");
     assert!(status.is_exported);
 
     // Trait
-    let processor = result.symbols.iter().find(|s| s.name == "Processor" && s.kind == SymbolKind::Trait)
+    let processor = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Processor" && s.kind == SymbolKind::Trait)
         .expect("Should find Processor trait");
     assert!(processor.is_exported);
 
     // Impl methods
-    let new_method = result.symbols.iter().find(|s| s.name == "Config.new")
+    let new_method = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Config.new")
         .expect("Should find Config.new");
     assert_eq!(new_method.kind, SymbolKind::Method);
     assert!(new_method.is_exported);
 
-    let validate = result.symbols.iter().find(|s| s.name == "Config.validate")
+    let validate = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Config.validate")
         .expect("Should find Config.validate");
     assert!(!validate.is_exported, "validate should not be pub");
 }
@@ -509,33 +554,52 @@ func (c *Config) Validate() bool {
     assert_eq!(result.language, Language::Go);
 
     // Function
-    let process = result.symbols.iter().find(|s| s.name == "ProcessData")
+    let process = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "ProcessData")
         .expect("Should find 'ProcessData'");
     assert_eq!(process.kind, SymbolKind::Function);
     assert!(process.is_exported, "ProcessData starts with uppercase");
 
-    let helper = result.symbols.iter().find(|s| s.name == "privateHelper")
+    let helper = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "privateHelper")
         .expect("Should find 'privateHelper'");
     assert!(!helper.is_exported, "privateHelper starts with lowercase");
 
     // Struct
-    let config = result.symbols.iter().find(|s| s.name == "Config" && s.kind == SymbolKind::Struct)
+    let config = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Config" && s.kind == SymbolKind::Struct)
         .expect("Should find Config struct");
     assert!(config.is_exported);
 
     // Interface
-    let processor = result.symbols.iter().find(|s| s.name == "Processor" && s.kind == SymbolKind::Interface)
+    let processor = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Processor" && s.kind == SymbolKind::Interface)
         .expect("Should find Processor interface");
     assert!(processor.is_exported);
 
     // Method
-    let validate = result.symbols.iter().find(|s| s.name == "Config.Validate")
+    let validate = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "Config.Validate")
         .expect("Should find Config.Validate method");
     assert_eq!(validate.kind, SymbolKind::Method);
     assert!(validate.is_exported);
 
     // Imports
-    assert!(result.imports.len() >= 2, "Should find at least 2 imports, found {}", result.imports.len());
+    assert!(
+        result.imports.len() >= 2,
+        "Should find at least 2 imports, found {}",
+        result.imports.len()
+    );
 }
 
 // ==================== Java Tests ====================
@@ -577,35 +641,51 @@ public enum Status {
     assert_eq!(result.language, Language::Java);
 
     // Class
-    let class_sym = result.symbols.iter()
+    let class_sym = result
+        .symbols
+        .iter()
         .find(|s| s.name == "UserService" && s.kind == SymbolKind::Class)
         .expect("Should find UserService class");
     assert!(class_sym.is_exported);
 
     // Methods
-    let get_users = result.symbols.iter().find(|s| s.name == "UserService.getUsers")
+    let get_users = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "UserService.getUsers")
         .expect("Should find UserService.getUsers");
     assert_eq!(get_users.kind, SymbolKind::Method);
     assert!(get_users.is_exported, "getUsers should be public");
 
-    let log_action = result.symbols.iter().find(|s| s.name == "UserService.logAction")
+    let log_action = result
+        .symbols
+        .iter()
+        .find(|s| s.name == "UserService.logAction")
         .expect("Should find UserService.logAction");
     assert!(!log_action.is_exported, "logAction should not be public");
 
     // Interface
-    let repo = result.symbols.iter()
+    let repo = result
+        .symbols
+        .iter()
         .find(|s| s.name == "Repository" && s.kind == SymbolKind::Interface)
         .expect("Should find Repository interface");
     assert!(repo.is_exported);
 
     // Enum
-    let status = result.symbols.iter()
+    let status = result
+        .symbols
+        .iter()
         .find(|s| s.name == "Status" && s.kind == SymbolKind::Enum)
         .expect("Should find Status enum");
     assert!(status.is_exported);
 
     // Imports
-    assert!(result.imports.len() >= 2, "Should find at least 2 imports, found {}", result.imports.len());
+    assert!(
+        result.imports.len() >= 2,
+        "Should find at least 2 imports, found {}",
+        result.imports.len()
+    );
 }
 
 #[test]
@@ -631,7 +711,9 @@ class HypervisorDiscovery(Base):
     let result = parse_file("models/discovery.py", source).expect("Failed to parse");
 
     // HypervisorDiscovery should have references to Host and CloudMetadata via relationship()
-    let hyp = result.symbols.iter()
+    let hyp = result
+        .symbols
+        .iter()
         .find(|s| s.name == "HypervisorDiscovery" && s.kind == SymbolKind::Class)
         .expect("Should find HypervisorDiscovery class");
 
@@ -654,7 +736,9 @@ class HypervisorDiscovery(Base):
     );
 
     // Host class should have organizations ref from ForeignKey
-    let host = result.symbols.iter()
+    let host = result
+        .symbols
+        .iter()
         .find(|s| s.name == "Host" && s.kind == SymbolKind::Class)
         .expect("Should find Host class");
     assert!(

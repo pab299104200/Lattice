@@ -1,12 +1,14 @@
 use super::model::{Memory, MemoryScope, MemoryType};
 use crate::error::LatticeError;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MEMORY_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 const MEMORY_DB_AUTO_CHECKPOINT_PAGES: u32 = 100;
 const MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES: u32 = 1_048_576;
+const MEMORIES_FTS_TABLE: &str = "memories_fts";
 
 /// SQLite-backed store for session memories.
 pub struct MemoryStore {
@@ -67,9 +69,7 @@ impl MemoryStore {
                 CREATE INDEX IF NOT EXISTS idx_memories_created
                     ON memories(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memories_type
-                    ON memories(memory_type);
-                CREATE INDEX IF NOT EXISTS idx_memories_session
-                    ON memories(session_id);",
+                    ON memories(memory_type);",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory schema: {}", e))
@@ -97,6 +97,35 @@ impl MemoryStore {
         let _ = self
             .conn
             .execute("ALTER TABLE memories ADD COLUMN refresh_key TEXT", []);
+
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_memories_created
+                    ON memories(created_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_memories_type
+                    ON memories(memory_type);
+                 CREATE INDEX IF NOT EXISTS idx_memories_session
+                    ON memories(session_id);",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to initialize memory indexes: {}", e))
+            })?;
+
+        self.conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    memory_id UNINDEXED,
+                    content,
+                    linked_symbols,
+                    linked_files,
+                    tokenize = 'unicode61 remove_diacritics 2'
+                );",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to initialize memory FTS5 schema: {}", e))
+            })?;
+
+        self.rebuild_fts()?;
 
         Ok(())
     }
@@ -152,6 +181,8 @@ impl MemoryStore {
                 ],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to store memory: {}", e)))?;
+
+        self.upsert_fts_row(&memory)?;
 
         Ok(memory.id)
     }
@@ -271,10 +302,7 @@ impl MemoryStore {
                  LIMIT 1",
             )
             .map_err(|e| {
-                LatticeError::Storage(format!(
-                    "Failed to prepare refresh-key lookup query: {}",
-                    e
-                ))
+                LatticeError::Storage(format!("Failed to prepare refresh-key lookup query: {}", e))
             })?;
 
         let row = stmt
@@ -312,79 +340,34 @@ impl MemoryStore {
 
     /// Search memories by keyword (per-word AND match on content + linked_symbols). Excludes invalidated.
     pub fn search_by_keyword(&self, keyword: &str) -> Result<Vec<Memory>, LatticeError> {
-        // Split into individual words — each must match content or linked_symbols
-        let words: Vec<String> = keyword
-            .split_whitespace()
-            .filter(|w| w.len() >= 2)
-            .map(|w| {
-                let escaped = w.replace('%', "\\%").replace('_', "\\_");
-                format!("%{}%", escaped)
-            })
-            .collect();
-
-        let mut where_clauses = vec!["is_invalidated = 0".to_string()];
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1usize;
-
-        for pattern in &words {
-            where_clauses.push(format!(
-                "(content LIKE ?{p} ESCAPE '\\' OR linked_symbols LIKE ?{p} ESCAPE '\\' OR linked_files LIKE ?{p} ESCAPE '\\')",
-                p = param_idx
-            ));
-            params_vec.push(Box::new(pattern.clone()));
-            param_idx += 1;
-        }
-
-        let sql = format!(
-            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                    linked_files, workspace_id, branch, refresh_key, source_query,
-                    created_at, last_accessed, access_count, is_stale, stale_reason
-             FROM memories
-             WHERE {}
-             ORDER BY created_at DESC",
-            where_clauses.join(" AND ")
-        );
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-
-        let memories = {
-            let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-                LatticeError::Storage(format!("Failed to prepare search query: {}", e))
-            })?;
-
-            let rows = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok(MemoryRow {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        content: row.get(2)?,
-                        memory_type_str: row.get(3)?,
-                        scope_str: row.get(4)?,
-                        confidence: row.get(5)?,
-                        linked_json: row.get(6)?,
-                        linked_files_json: row.get(7)?,
-                        workspace_id: row.get(8)?,
-                        branch: row.get(9)?,
-                        refresh_key: row.get(10)?,
-                        source_query: row.get(11)?,
-                        created_at: row.get(12)?,
-                        last_accessed: row.get(13)?,
-                        access_count: row.get(14)?,
-                        is_stale: row.get(15)?,
-                        stale_reason: row.get(16)?,
-                    })
-                })
-                .map_err(|e| LatticeError::Storage(format!("Failed to search memories: {}", e)))?;
-
-            let mut memories = Vec::new();
-            for row in rows {
-                let r = row.map_err(|e| {
-                    LatticeError::Storage(format!("Failed to read memory row: {}", e))
-                })?;
-                memories.push(r.into_memory());
-            }
-            memories
+        let memories = if let Some(fts_query) = build_fts_query(keyword) {
+            let sql = format!(
+                "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                        memories.scope, memories.confidence, memories.linked_symbols,
+                        memories.linked_files, memories.workspace_id, memories.branch,
+                        memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.last_accessed, memories.access_count, memories.is_stale,
+                        memories.stale_reason
+                 FROM memories
+                 INNER JOIN {table}
+                    ON {table}.memory_id = memories.id
+                 WHERE memories.is_invalidated = 0
+                   AND {table} MATCH ?1
+                 ORDER BY memories.created_at DESC",
+                table = MEMORIES_FTS_TABLE,
+            );
+            self.query_memories(&sql, params![fts_query], "search memories")?
+        } else {
+            self.query_memories(
+                "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                        linked_files, workspace_id, branch, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0
+                 ORDER BY created_at DESC",
+                [],
+                "search memories",
+            )?
         };
 
         // Touch each returned memory to update last_accessed
@@ -443,6 +426,11 @@ impl MemoryStore {
             .conn
             .execute("DELETE FROM memories", [])
             .map_err(|e| LatticeError::Storage(format!("Failed to clear memories: {}", e)))?;
+        self.conn
+            .execute(&format!("DELETE FROM {}", MEMORIES_FTS_TABLE), [])
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to clear memory FTS index: {}", e))
+            })?;
         Ok(count)
     }
 
@@ -454,6 +442,7 @@ impl MemoryStore {
                 params![id],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to invalidate memory: {}", e)))?;
+        self.delete_fts_row(id)?;
         Ok(())
     }
 
@@ -473,6 +462,7 @@ impl MemoryStore {
                 id
             )));
         }
+        self.sync_fts_by_id(id)?;
         Ok(())
     }
 
@@ -591,6 +581,7 @@ impl MemoryStore {
             )));
         }
 
+        self.sync_fts_by_id(id)?;
         Ok(())
     }
 
@@ -620,6 +611,21 @@ impl MemoryStore {
         stale_days: u64,
     ) -> Result<usize, LatticeError> {
         let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
+        self.conn
+            .execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE memory_id IN (
+                         SELECT id FROM memories
+                         WHERE confidence < ?1 AND last_accessed < ?2 AND is_invalidated = 0
+                     )",
+                    table = MEMORIES_FTS_TABLE,
+                ),
+                params![min_confidence, cutoff as i64],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prune memory FTS entries: {}", e))
+            })?;
         let count = self
             .conn
             .execute(
@@ -705,93 +711,77 @@ impl MemoryStore {
         exclude_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Memory>, LatticeError> {
-        // Split query into individual words and AND them together.
-        // "project architecture patterns" → content LIKE '%project%' AND content LIKE '%architecture%' AND content LIKE '%patterns%'
-        // Also search linked_symbols JSON column for each word.
-        let words: Vec<String> = keyword
-            .split_whitespace()
-            .filter(|w| w.len() >= 2) // skip single-char noise
-            .map(|w| {
-                let escaped = w.replace('%', "\\%").replace('_', "\\_");
-                format!("%{}%", escaped)
-            })
-            .collect();
-
-        let mut where_clauses = vec!["is_invalidated = 0".to_string()];
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1usize;
-
-        // Per-word: match content OR linked_symbols
-        for pattern in &words {
-            where_clauses.push(format!(
-                "(content LIKE ?{p} ESCAPE '\\' OR linked_symbols LIKE ?{p} ESCAPE '\\' OR linked_files LIKE ?{p} ESCAPE '\\')",
-                p = param_idx
-            ));
-            params_vec.push(Box::new(pattern.clone()));
-            param_idx += 1;
-        }
-
-        if let Some(excl) = exclude_session {
-            where_clauses.push(format!("session_id != ?{}", param_idx));
-            params_vec.push(Box::new(excl.to_string()));
-            param_idx += 1;
-        }
-
-        let sql = format!(
-            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                    linked_files, workspace_id, branch, refresh_key, source_query,
-                    created_at, last_accessed, access_count, is_stale, stale_reason
-             FROM memories
-             WHERE {}
-             ORDER BY created_at DESC
-             LIMIT ?{}",
-            where_clauses.join(" AND "),
-            param_idx
-        );
-        params_vec.push(Box::new(limit as i64));
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-
-        let memories = {
-            let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-                LatticeError::Storage(format!("Failed to prepare cross-session query: {}", e))
-            })?;
-
-            let rows = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok(MemoryRow {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        content: row.get(2)?,
-                        memory_type_str: row.get(3)?,
-                        scope_str: row.get(4)?,
-                        confidence: row.get(5)?,
-                        linked_json: row.get(6)?,
-                        linked_files_json: row.get(7)?,
-                        workspace_id: row.get(8)?,
-                        branch: row.get(9)?,
-                        refresh_key: row.get(10)?,
-                        source_query: row.get(11)?,
-                        created_at: row.get(12)?,
-                        last_accessed: row.get(13)?,
-                        access_count: row.get(14)?,
-                        is_stale: row.get(15)?,
-                        stale_reason: row.get(16)?,
-                    })
-                })
-                .map_err(|e| {
-                    LatticeError::Storage(format!("Failed to search across sessions: {}", e))
-                })?;
-
-            let mut memories = Vec::new();
-            for row in rows {
-                let r = row.map_err(|e| {
-                    LatticeError::Storage(format!("Failed to read memory row: {}", e))
-                })?;
-                memories.push(r.into_memory());
+        let memories = match (build_fts_query(keyword), exclude_session) {
+            (Some(fts_query), Some(session_id)) => {
+                let sql = format!(
+                    "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                            memories.scope, memories.confidence, memories.linked_symbols,
+                            memories.linked_files, memories.workspace_id, memories.branch,
+                            memories.refresh_key, memories.source_query, memories.created_at,
+                            memories.last_accessed, memories.access_count, memories.is_stale,
+                            memories.stale_reason
+                     FROM memories
+                     INNER JOIN {table}
+                        ON {table}.memory_id = memories.id
+                     WHERE memories.is_invalidated = 0
+                       AND memories.session_id != ?1
+                       AND {table} MATCH ?2
+                     ORDER BY memories.created_at DESC
+                     LIMIT ?3",
+                    table = MEMORIES_FTS_TABLE,
+                );
+                self.query_memories(
+                    &sql,
+                    params![session_id, fts_query, limit as i64],
+                    "search across sessions",
+                )?
             }
-            memories
+            (Some(fts_query), None) => {
+                let sql = format!(
+                    "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                            memories.scope, memories.confidence, memories.linked_symbols,
+                            memories.linked_files, memories.workspace_id, memories.branch,
+                            memories.refresh_key, memories.source_query, memories.created_at,
+                            memories.last_accessed, memories.access_count, memories.is_stale,
+                            memories.stale_reason
+                     FROM memories
+                     INNER JOIN {table}
+                        ON {table}.memory_id = memories.id
+                     WHERE memories.is_invalidated = 0
+                       AND {table} MATCH ?1
+                     ORDER BY memories.created_at DESC
+                     LIMIT ?2",
+                    table = MEMORIES_FTS_TABLE,
+                );
+                self.query_memories(
+                    &sql,
+                    params![fts_query, limit as i64],
+                    "search across sessions",
+                )?
+            }
+            (None, Some(session_id)) => self.query_memories(
+                "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                        linked_files, workspace_id, branch, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0
+                   AND session_id != ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                params![session_id, limit as i64],
+                "search across sessions",
+            )?,
+            (None, None) => self.query_memories(
+                "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                        linked_files, workspace_id, branch, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason
+                 FROM memories
+                 WHERE is_invalidated = 0
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+                params![limit as i64],
+                "search across sessions",
+            )?,
         };
 
         // Touch returned memories
@@ -808,81 +798,133 @@ impl MemoryStore {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Memory>, LatticeError> {
-        let words: Vec<String> = query
-            .unwrap_or("")
-            .split_whitespace()
-            .filter(|w| w.len() >= 2)
-            .map(|w| {
-                let escaped = w.replace('%', "\\%").replace('_', "\\_");
-                format!("%{}%", escaped)
-            })
-            .collect();
-
-        let mut where_clauses = vec!["is_invalidated = 0".to_string(), "is_stale = 1".to_string()];
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1usize;
-
-        for pattern in &words {
-            where_clauses.push(format!(
-                "(content LIKE ?{p} ESCAPE '\\' OR linked_symbols LIKE ?{p} ESCAPE '\\' OR linked_files LIKE ?{p} ESCAPE '\\')",
-                p = param_idx
-            ));
-            params_vec.push(Box::new(pattern.clone()));
-            param_idx += 1;
+        if let Some(fts_query) = build_fts_query(query.unwrap_or_default()) {
+            let sql = format!(
+                "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                        memories.scope, memories.confidence, memories.linked_symbols,
+                        memories.linked_files, memories.workspace_id, memories.branch,
+                        memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.last_accessed, memories.access_count, memories.is_stale,
+                        memories.stale_reason
+                 FROM memories
+                 INNER JOIN {table}
+                    ON {table}.memory_id = memories.id
+                 WHERE memories.is_invalidated = 0
+                   AND memories.is_stale = 1
+                   AND {table} MATCH ?1
+                 ORDER BY memories.created_at DESC
+                 LIMIT ?2",
+                table = MEMORIES_FTS_TABLE,
+            );
+            return self.query_memories(
+                &sql,
+                params![fts_query, limit as i64],
+                "list stale memories",
+            );
         }
 
-        let sql = format!(
+        self.query_memories(
             "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
                     linked_files, workspace_id, branch, refresh_key, source_query,
                     created_at, last_accessed, access_count, is_stale, stale_reason
              FROM memories
-             WHERE {}
+             WHERE is_invalidated = 0
+               AND is_stale = 1
              ORDER BY created_at DESC
-             LIMIT ?{}",
-            where_clauses.join(" AND "),
-            param_idx
-        );
-        params_vec.push(Box::new(limit as i64));
+             LIMIT ?1",
+            params![limit as i64],
+            "list stale memories",
+        )
+    }
 
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-            LatticeError::Storage(format!("Failed to prepare stale memory query: {}", e))
+    fn rebuild_fts(&self) -> Result<(), LatticeError> {
+        self.conn
+            .execute(&format!("DELETE FROM {}", MEMORIES_FTS_TABLE), [])
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to rebuild memory FTS index: {}", e))
+            })?;
+
+        for memory in self.list_all()? {
+            self.upsert_fts_row(&memory)?;
+        }
+
+        Ok(())
+    }
+
+    fn upsert_fts_row(&self, memory: &Memory) -> Result<(), LatticeError> {
+        let document = build_memory_search_document(memory);
+        self.delete_fts_row(&memory.id)?;
+        self.conn
+            .execute(
+                &format!(
+                    "INSERT INTO {} (memory_id, content, linked_symbols, linked_files)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    MEMORIES_FTS_TABLE
+                ),
+                params![
+                    memory.id,
+                    document.content,
+                    document.linked_symbols,
+                    document.linked_files,
+                ],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to upsert memory FTS row for '{}': {}",
+                    memory.id, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn delete_fts_row(&self, id: &str) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                &format!("DELETE FROM {} WHERE memory_id = ?1", MEMORIES_FTS_TABLE),
+                params![id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to delete memory FTS row for '{}': {}",
+                    id, e
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn sync_fts_by_id(&self, id: &str) -> Result<(), LatticeError> {
+        match self.get_by_id(id)? {
+            Some(memory) => self.upsert_fts_row(&memory),
+            None => self.delete_fts_row(id),
+        }
+    }
+
+    fn query_memories<P>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &str,
+    ) -> Result<Vec<Memory>, LatticeError>
+    where
+        P: rusqlite::Params,
+    {
+        let mut stmt = self.conn.prepare(sql).map_err(|e| {
+            LatticeError::Storage(format!("Failed to prepare {} query: {}", context, e))
         })?;
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(MemoryRow {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    content: row.get(2)?,
-                    memory_type_str: row.get(3)?,
-                    scope_str: row.get(4)?,
-                    confidence: row.get(5)?,
-                    linked_json: row.get(6)?,
-                    linked_files_json: row.get(7)?,
-                    workspace_id: row.get(8)?,
-                    branch: row.get(9)?,
-                    refresh_key: row.get(10)?,
-                    source_query: row.get(11)?,
-                    created_at: row.get(12)?,
-                    last_accessed: row.get(13)?,
-                    access_count: row.get(14)?,
-                    is_stale: row.get(15)?,
-                    stale_reason: row.get(16)?,
-                })
-            })
-            .map_err(|e| LatticeError::Storage(format!("Failed to list stale memories: {}", e)))?;
+        let rows = stmt.query_map(params, memory_row_from_row).map_err(|e| {
+            LatticeError::Storage(format!("Failed to execute {} query: {}", context, e))
+        })?;
 
         let mut memories = Vec::new();
         for row in rows {
-            let r = row.map_err(|e| {
-                LatticeError::Storage(format!("Failed to read stale memory row: {}", e))
-            })?;
-            memories.push(r.into_memory());
+            memories.push(
+                row.map_err(|e| {
+                    LatticeError::Storage(format!("Failed to read {} row: {}", context, e))
+                })?
+                .into_memory(),
+            );
         }
-
         Ok(memories)
     }
 }
@@ -906,6 +948,28 @@ struct MemoryRow {
     access_count: i64,
     is_stale: i32,
     stale_reason: Option<String>,
+}
+
+fn memory_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
+    Ok(MemoryRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        content: row.get(2)?,
+        memory_type_str: row.get(3)?,
+        scope_str: row.get(4)?,
+        confidence: row.get(5)?,
+        linked_json: row.get(6)?,
+        linked_files_json: row.get(7)?,
+        workspace_id: row.get(8)?,
+        branch: row.get(9)?,
+        refresh_key: row.get(10)?,
+        source_query: row.get(11)?,
+        created_at: row.get(12)?,
+        last_accessed: row.get(13)?,
+        access_count: row.get(14)?,
+        is_stale: row.get(15)?,
+        stale_reason: row.get(16)?,
+    })
 }
 
 impl MemoryRow {
@@ -933,6 +997,110 @@ impl MemoryRow {
             is_stale: self.is_stale != 0,
             stale_reason: self.stale_reason,
         }
+    }
+}
+
+struct MemorySearchDocument {
+    content: String,
+    linked_symbols: String,
+    linked_files: String,
+}
+
+fn build_memory_search_document(memory: &Memory) -> MemorySearchDocument {
+    MemorySearchDocument {
+        content: augment_search_text(&memory.content),
+        linked_symbols: memory
+            .linked_symbols
+            .iter()
+            .map(|symbol| augment_search_text(symbol))
+            .collect::<Vec<_>>()
+            .join(" "),
+        linked_files: memory
+            .linked_files
+            .iter()
+            .map(|file| augment_search_text(file))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn build_fts_query(keyword: &str) -> Option<String> {
+    let groups: Vec<String> = keyword
+        .split_whitespace()
+        .filter_map(|raw| {
+            let variants = expand_search_terms(raw);
+            if variants.is_empty() {
+                None
+            } else if variants.len() == 1 {
+                Some(format!("{}*", variants[0]))
+            } else {
+                Some(format!(
+                    "({})",
+                    variants
+                        .into_iter()
+                        .map(|term| format!("{}*", term))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                ))
+            }
+        })
+        .collect();
+
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups.join(" AND "))
+    }
+}
+
+fn augment_search_text(text: &str) -> String {
+    let expansions = expand_search_terms(text);
+    if expansions.is_empty() {
+        text.to_string()
+    } else {
+        format!("{} {}", text, expansions.join(" "))
+    }
+}
+
+fn expand_search_terms(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+
+    for raw in text.split_whitespace() {
+        let compact: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        push_term(&mut seen, &mut terms, compact);
+
+        let mut current = String::new();
+        let mut prev_lowercase = false;
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() {
+                let is_uppercase = ch.is_ascii_uppercase();
+                if is_uppercase && prev_lowercase && !current.is_empty() {
+                    push_term(&mut seen, &mut terms, std::mem::take(&mut current));
+                }
+                current.push(ch.to_ascii_lowercase());
+                prev_lowercase = ch.is_ascii_lowercase();
+            } else {
+                push_term(&mut seen, &mut terms, std::mem::take(&mut current));
+                prev_lowercase = false;
+            }
+        }
+        push_term(&mut seen, &mut terms, current);
+    }
+
+    terms
+}
+
+fn push_term(seen: &mut HashSet<String>, terms: &mut Vec<String>, term: String) {
+    if term.len() < 2 {
+        return;
+    }
+    if seen.insert(term.clone()) {
+        terms.push(term);
     }
 }
 

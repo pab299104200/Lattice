@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod rpc;
+mod vector_sync;
 mod watcher;
 
 use anyhow::Result;
@@ -15,7 +16,9 @@ use lattice_core::indexer::Indexer;
 use lattice_core::memory::MemoryStore;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
-use lattice_core::storage::{GraphStore, VectorStore};
+use lattice_core::storage::{
+    GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
+};
 use lattice_core::watcher as core_watcher;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
@@ -51,27 +54,7 @@ async fn main() -> Result<()> {
     let memory_store = Arc::new(Mutex::new(ms));
     let ms_for_engine =
         MemoryStore::open(&memories_path).expect("Failed to open memory store for engine");
-    let vector_store = {
-        let vs_path = lattice_dir.join("vectors.db");
-        match VectorStore::open(&vs_path.to_string_lossy()) {
-            Ok(vs) => {
-                if let Err(e) = vs.initialize(384) {
-                    tracing::warn!("Failed to initialize vector store: {}", e);
-                    None
-                } else {
-                    let _ = vs.load_cache(); // Warm start from previous run
-                    Some(vs)
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open vector store, semantic search disabled: {}",
-                    e
-                );
-                None
-            }
-        }
-    };
+    let vector_index = open_vector_index(&lattice_dir);
 
     let graph_path = lattice_dir.join("graph.db");
     let graph_store = match GraphStore::open(&graph_path) {
@@ -106,7 +89,7 @@ async fn main() -> Result<()> {
 
     let engine = QueryEngine::new(
         graph,
-        vector_store,
+        vector_index.clone(),
         Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
     );
     let engine = Arc::new(Mutex::new(engine));
@@ -137,6 +120,7 @@ async fn main() -> Result<()> {
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
         let lattice_dir_bg = ws_root.join(".lattice");
+        let vector_index_bg = vector_index.clone();
 
         tokio::spawn(async move {
             tracing::info!("Background indexing starting...");
@@ -263,24 +247,30 @@ async fn main() -> Result<()> {
                         let emb = Arc::new(emb_engine);
                         let _ = embedding_engine_bg.set(Arc::clone(&emb));
 
-                        let eng = engine_bg.lock().await;
-                        let nodes = eng.graph().all_nodes();
-                        let mut embedded = 0usize;
-                        for node in &nodes {
-                            let text = format!("{} {}", node.name, node.signature);
-                            if let Ok(vec) = emb.embed(&text) {
-                                if let Some(vs) = eng.vector_store() {
-                                    let _ = vs.upsert_vector(
-                                        &node.file,
-                                        &node.name,
-                                        node.id.byte_offset,
-                                        &vec,
+                        let graph_snapshot = {
+                            let eng = engine_bg.lock().await;
+                            eng.graph().clone()
+                        };
+                        if let Some(index) = vector_index_bg.as_ref() {
+                            match crate::vector_sync::sync_full_graph_embeddings(
+                                &graph_snapshot,
+                                emb.as_ref(),
+                                index.as_ref(),
+                            ) {
+                                Ok(embedded) => {
+                                    tracing::info!(
+                                        "Embedded {} nodes into {}",
+                                        embedded,
+                                        index.implementation_name()
                                     );
                                 }
-                                embedded += 1;
+                                Err(e) => {
+                                    tracing::warn!("Failed to sync semantic index: {}", e);
+                                }
                             }
+                        } else {
+                            tracing::info!("No vector index configured, semantic search disabled");
                         }
-                        tracing::info!("Embedded {} nodes", embedded);
                     }
                     Err(e) => {
                         tracing::info!("No ONNX model: {}", e);
@@ -301,6 +291,8 @@ async fn main() -> Result<()> {
         let graph_store = Arc::clone(&graph_store);
         let workspace_manager = workspace_manager.clone();
         let workspace_roots = workspace_roots.clone();
+        let embedding_engine = Arc::clone(&embedding_engine);
+        let vector_index = vector_index.clone();
 
         tokio::spawn(async move {
             for root in workspace_roots {
@@ -310,6 +302,8 @@ async fn main() -> Result<()> {
                     workspace_manager.clone(),
                     Arc::clone(&graph_store),
                     Arc::clone(&engine),
+                    Arc::clone(&embedding_engine),
+                    vector_index.clone(),
                 );
 
                 tokio::spawn(async move {
@@ -348,6 +342,7 @@ async fn main() -> Result<()> {
         memory_store,
         graph_store,
         embedding_engine,
+        vector_index,
         workspace_root,
         context_cache_path,
         session_id,
@@ -361,6 +356,70 @@ async fn main() -> Result<()> {
     tracing::info!("Stdio server exited");
 
     Ok(())
+}
+
+fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
+    let sqlite_path = lattice_dir.join("vectors.db");
+    let ann_path = lattice_dir.join("vectors.usearch");
+
+    match UsearchVectorIndex::open(sqlite_path.to_string_lossy().as_ref(), ann_path.clone()) {
+        Ok(index) => match index.initialize(384).and_then(|_| index.warm()) {
+            Ok(()) => {
+                tracing::info!(
+                    "Semantic search backend ready: {} ({})",
+                    index.implementation_name(),
+                    ann_path.display()
+                );
+                Some(Arc::new(index) as SharedVectorIndex)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to initialize USearch backend at {}: {}. Falling back to SQLite exact search.",
+                    ann_path.display(),
+                    err
+                );
+                open_sqlite_vector_fallback(&sqlite_path)
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                "Failed to open USearch backend at {}: {}. Falling back to SQLite exact search.",
+                ann_path.display(),
+                err
+            );
+            open_sqlite_vector_fallback(&sqlite_path)
+        }
+    }
+}
+
+fn open_sqlite_vector_fallback(path: &Path) -> Option<SharedVectorIndex> {
+    match VectorStore::open(path.to_string_lossy().as_ref()) {
+        Ok(store) => match store.initialize(384).and_then(|_| store.warm()) {
+            Ok(()) => {
+                tracing::info!(
+                    "Semantic search backend ready: sqlite-exact ({})",
+                    path.display()
+                );
+                Some(Arc::new(store) as SharedVectorIndex)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to initialize SQLite vector fallback at {}: {}. Semantic search disabled.",
+                    path.display(),
+                    err
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                "Failed to open SQLite vector fallback at {}: {}. Semantic search disabled.",
+                path.display(),
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Parse workspace roots from command-line args.

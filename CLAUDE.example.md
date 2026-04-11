@@ -4,8 +4,12 @@
 
 Lattice provides a dependency graph and context engine for this codebase.
 
+- Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
+- If you would otherwise open 3 or more unfamiliar files, call `get_context_capsule`, `prepare_change`, or `summarize_subsystem` first.
+- If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
+- If you have raw failure text, pass it to `diagnose_failure` before grep-driven triage.
 - Default to `prepare_change` for implementation tasks once the likely change area is known.
-- Default to `get_context_capsule` for understanding unfamiliar subsystems.
+- Default to `get_context_capsule` for understanding unfamiliar subsystems, then use its handle with `expand_context` instead of restarting discovery.
 - Start with `diagnose_failure` when the task begins from a failing test, compiler error, stack trace, or runtime failure.
 - Use `get_docs_capsule` when the answer is likely in Markdown docs, ADRs, runbooks, or scorecards.
 - Use `get_backlinks`, `get_outgoing_links`, and `find_stale_docs` for doc-to-code navigation and documentation review.

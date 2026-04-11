@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use crate::symbols::{Language, SymbolId, SymbolKind};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
 use serde::{Deserialize, Serialize};
-use crate::symbols::{Language, SymbolId, SymbolKind};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// The kind of relationship between two symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -395,9 +395,11 @@ impl CodeGraph {
         };
 
         // Map our from/to indices through the subgraph
-        let sub_from = calls_only.node_indices()
+        let sub_from = calls_only
+            .node_indices()
             .find(|&idx| calls_only[idx] == from_idx);
-        let sub_to = calls_only.node_indices()
+        let sub_to = calls_only
+            .node_indices()
             .find(|&idx| calls_only[idx] == to_idx);
 
         let (sub_from, sub_to) = match (sub_from, sub_to) {
@@ -407,17 +409,27 @@ impl CodeGraph {
 
         // max_depth is number of edges/hops; intermediate_nodes = edges - 1
         let max_intermediates = max_depth.saturating_sub(1);
-        let paths: Vec<Vec<petgraph::graph::NodeIndex>> =
-            petgraph::algo::all_simple_paths(&calls_only, sub_from, sub_to, 0, Some(max_intermediates))
-                .take(max_results)
-                .collect();
+        let paths: Vec<Vec<petgraph::graph::NodeIndex>> = petgraph::algo::all_simple_paths(
+            &calls_only,
+            sub_from,
+            sub_to,
+            0,
+            Some(max_intermediates),
+        )
+        .take(max_results)
+        .collect();
 
-        paths.iter().map(|path| {
-            path.iter().map(|&sub_idx| {
-                let original_idx = calls_only[sub_idx];
-                &self.graph[original_idx]
-            }).collect()
-        }).collect()
+        paths
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|&sub_idx| {
+                        let original_idx = calls_only[sub_idx];
+                        &self.graph[original_idx]
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }
 

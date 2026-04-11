@@ -120,10 +120,7 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
 
             let start_offset = heading.byte_offset;
             let end_offset = if end_line < total_lines {
-                line_offsets
-                    .get(end_line)
-                    .copied()
-                    .unwrap_or(source.len())
+                line_offsets.get(end_line).copied().unwrap_or(source.len())
             } else {
                 source.len()
             };
@@ -340,10 +337,9 @@ fn looks_like_reference(candidate: &str) -> bool {
     }
 
     let has_alpha = candidate.chars().any(|ch| ch.is_ascii_alphabetic());
-    let allowed = candidate.chars().all(|ch| {
-        ch.is_ascii_alphanumeric()
-            || matches!(ch, '_' | '-' | '/' | '.' | ':' | '#' )
-    });
+    let allowed = candidate
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.' | ':' | '#'));
 
     has_alpha && allowed
 }

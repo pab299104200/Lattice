@@ -97,8 +97,18 @@ fn bench_precision_auth() {
     );
 
     let keywords = &[
-        "auth", "jwt", "token", "login", "password", "verify", "session", "credential", "user",
-        "permission", "role", "group",
+        "auth",
+        "jwt",
+        "token",
+        "login",
+        "password",
+        "verify",
+        "session",
+        "credential",
+        "user",
+        "permission",
+        "role",
+        "group",
     ];
     let (precision, relevant, total) = measure_precision(&capsule, keywords);
 
@@ -181,7 +191,14 @@ fn bench_precision_host() {
     let capsule = engine.query("host management and discovery", None, false);
 
     let keywords = &[
-        "host", "discover", "device", "network", "scan", "manage", "inventory", "asset",
+        "host",
+        "discover",
+        "device",
+        "network",
+        "scan",
+        "manage",
+        "inventory",
+        "asset",
     ];
     let (precision, relevant, total) = measure_precision(&capsule, keywords);
 
@@ -217,7 +234,14 @@ fn bench_precision_snmp() {
     let capsule = engine.query("SNMP polling credential encryption", None, false);
 
     let keywords = &[
-        "snmp", "poll", "credential", "encrypt", "decrypt", "cipher", "secret", "community",
+        "snmp",
+        "poll",
+        "credential",
+        "encrypt",
+        "decrypt",
+        "cipher",
+        "secret",
+        "community",
     ];
     let (precision, relevant, total) = measure_precision(&capsule, keywords);
 

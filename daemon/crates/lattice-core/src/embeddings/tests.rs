@@ -6,7 +6,9 @@ mod tests {
     #[ignore] // Requires ONNX model file
     fn test_embed_single_text() {
         let engine = EmbeddingEngine::new("models/all-MiniLM-L6-v2.onnx").unwrap();
-        let embedding = engine.embed("function loginUser authenticates a user").unwrap();
+        let embedding = engine
+            .embed("function loginUser authenticates a user")
+            .unwrap();
         assert_eq!(embedding.len(), 384);
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.1);

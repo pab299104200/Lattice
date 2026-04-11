@@ -1,5 +1,5 @@
-use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IndexEntry {
@@ -9,11 +9,11 @@ pub struct IndexEntry {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum IndexPriority {
-    OpenInEditor = 5,      // Highest
+    OpenInEditor = 5, // Highest
     SameDirectory = 4,
     DirectImport = 3,
     RecentlyModified = 2,
-    Background = 1,        // Lowest
+    Background = 1, // Lowest
 }
 
 impl Ord for IndexEntry {
@@ -36,7 +36,10 @@ pub struct LazyIndexQueue {
 
 impl LazyIndexQueue {
     pub fn new() -> Self {
-        Self { queue: BinaryHeap::new(), indexed: HashSet::new() }
+        Self {
+            queue: BinaryHeap::new(),
+            indexed: HashSet::new(),
+        }
     }
 
     pub fn enqueue(&mut self, path: String, priority: IndexPriority) {

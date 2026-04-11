@@ -1,14 +1,15 @@
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
+use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::indexer::Indexer;
 use lattice_core::query::QueryEngine;
-use lattice_core::storage::GraphStore;
-use lattice_core::workspace::WorkspaceManager;
+use lattice_core::storage::{GraphStore, SharedVectorIndex};
+use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 
@@ -19,6 +20,8 @@ pub struct FileWatcher {
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
     graph_store: Arc<Mutex<GraphStore>>,
     query_engine: Arc<Mutex<QueryEngine>>,
+    embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+    vector_index: Option<SharedVectorIndex>,
 }
 
 impl FileWatcher {
@@ -28,6 +31,8 @@ impl FileWatcher {
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
         graph_store: Arc<Mutex<GraphStore>>,
         query_engine: Arc<Mutex<QueryEngine>>,
+        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        vector_index: Option<SharedVectorIndex>,
     ) -> Self {
         Self {
             workspace_root,
@@ -35,6 +40,8 @@ impl FileWatcher {
             workspace_manager,
             graph_store,
             query_engine,
+            embedding_engine,
+            vector_index,
         }
     }
 
@@ -101,6 +108,7 @@ impl FileWatcher {
         if let Some(workspace_manager) = &self.workspace_manager {
             let repo_name = crate::repo_name_for_root(&self.workspace_root);
             let mut graph_changed = false;
+            let mut changed_graph_files = Vec::new();
             let mut manager = workspace_manager.lock().await;
 
             for path in paths {
@@ -108,6 +116,7 @@ impl FileWatcher {
                     Ok(p) => p.to_string_lossy().to_string(),
                     Err(_) => continue,
                 };
+                let graph_path = repo_rel_path(&repo_name, &rel_path);
 
                 if path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&path) {
@@ -117,6 +126,7 @@ impl FileWatcher {
                         );
                         if manager.index_file(&repo_name, &rel_path, &content).is_ok() {
                             graph_changed = true;
+                            changed_graph_files.push(graph_path);
                         }
                     }
                 } else {
@@ -126,6 +136,7 @@ impl FileWatcher {
                     );
                     manager.remove_file(&repo_name, &rel_path);
                     graph_changed = true;
+                    changed_graph_files.push(graph_path);
                 }
             }
 
@@ -133,7 +144,8 @@ impl FileWatcher {
                 manager.detect_cross_repo_edges();
                 let new_graph = manager.unified_graph();
                 drop(manager);
-                self.persist_and_publish(new_graph).await;
+                self.persist_publish_and_sync(new_graph, changed_graph_files)
+                    .await;
             }
             return;
         }
@@ -142,6 +154,7 @@ impl FileWatcher {
             return;
         };
         let mut graph_changed = false;
+        let mut changed_graph_files = Vec::new();
         let mut indexer = indexer_handle.lock().await;
 
         for path in paths {
@@ -156,12 +169,14 @@ impl FileWatcher {
                     info!("Incremental index update: {}", rel_path);
                     if let Ok(_) = indexer.index_file_content(&rel_path, &content) {
                         graph_changed = true;
+                        changed_graph_files.push(rel_path.clone());
                     }
                 }
             } else {
                 info!("Removing file from index: {}", rel_path);
                 indexer.remove_file(&rel_path);
                 graph_changed = true;
+                changed_graph_files.push(rel_path.clone());
             }
         }
 
@@ -169,17 +184,48 @@ impl FileWatcher {
             // This clone is now cheap/instant due to Arc<str> optimization
             let new_graph = indexer.graph().clone();
             drop(indexer);
-            self.persist_and_publish(new_graph).await;
+            self.persist_publish_and_sync(new_graph, changed_graph_files)
+                .await;
         }
     }
 
-    async fn persist_and_publish(&self, new_graph: lattice_core::graph::CodeGraph) {
+    async fn persist_publish_and_sync(
+        &self,
+        new_graph: lattice_core::graph::CodeGraph,
+        changed_graph_files: Vec<String>,
+    ) {
         {
             let graph_store = self.graph_store.lock().await;
             let _ = graph_store.save_graph(&new_graph);
         }
 
         let mut engine = self.query_engine.lock().await;
-        engine.update_graph(new_graph);
+        engine.update_graph(new_graph.clone());
+        drop(engine);
+
+        let Some(vector_index) = self.vector_index.as_ref() else {
+            return;
+        };
+        let Some(embedding_engine) = self.embedding_engine.get() else {
+            return;
+        };
+
+        match crate::vector_sync::sync_changed_files_embeddings(
+            &new_graph,
+            &changed_graph_files,
+            embedding_engine.as_ref(),
+            vector_index.as_ref(),
+        ) {
+            Ok(updated) => {
+                if !changed_graph_files.is_empty() {
+                    info!(
+                        "Updated {} semantic vectors across {} changed files",
+                        updated,
+                        changed_graph_files.len()
+                    );
+                }
+            }
+            Err(err) => tracing::warn!("Failed to sync semantic index after file change: {}", err),
+        }
     }
 }

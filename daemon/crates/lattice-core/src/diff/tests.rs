@@ -1,5 +1,5 @@
-use crate::symbols::{Language, Symbol, SymbolId, SymbolKind};
 use super::{diff_symbols, ChangeKind};
+use crate::symbols::{Language, Symbol, SymbolId, SymbolKind};
 
 fn make_symbol(name: &str, file: &str, body: &str) -> Symbol {
     Symbol {
@@ -24,12 +24,22 @@ fn make_symbol(name: &str, file: &str, body: &str) -> Symbol {
 
 #[test]
 fn test_detect_added_function() {
-    let old = vec![
-        make_symbol("loginUser", "src/auth.ts", "function loginUser() { return true; }"),
-    ];
+    let old = vec![make_symbol(
+        "loginUser",
+        "src/auth.ts",
+        "function loginUser() { return true; }",
+    )];
     let new = vec![
-        make_symbol("loginUser", "src/auth.ts", "function loginUser() { return true; }"),
-        make_symbol("logoutUser", "src/auth.ts", "function logoutUser() { session.destroy(); }"),
+        make_symbol(
+            "loginUser",
+            "src/auth.ts",
+            "function loginUser() { return true; }",
+        ),
+        make_symbol(
+            "logoutUser",
+            "src/auth.ts",
+            "function logoutUser() { session.destroy(); }",
+        ),
     ];
 
     let changes = diff_symbols(&old, &new);
@@ -41,12 +51,22 @@ fn test_detect_added_function() {
 #[test]
 fn test_detect_removed_function() {
     let old = vec![
-        make_symbol("loginUser", "src/auth.ts", "function loginUser() { return true; }"),
-        make_symbol("logoutUser", "src/auth.ts", "function logoutUser() { session.destroy(); }"),
+        make_symbol(
+            "loginUser",
+            "src/auth.ts",
+            "function loginUser() { return true; }",
+        ),
+        make_symbol(
+            "logoutUser",
+            "src/auth.ts",
+            "function logoutUser() { session.destroy(); }",
+        ),
     ];
-    let new = vec![
-        make_symbol("loginUser", "src/auth.ts", "function loginUser() { return true; }"),
-    ];
+    let new = vec![make_symbol(
+        "loginUser",
+        "src/auth.ts",
+        "function loginUser() { return true; }",
+    )];
 
     let changes = diff_symbols(&old, &new);
     assert_eq!(changes.len(), 1);
@@ -56,12 +76,16 @@ fn test_detect_removed_function() {
 
 #[test]
 fn test_detect_modified_function() {
-    let old = vec![
-        make_symbol("hashPassword", "src/crypto.ts", "function hashPassword(p) { return md5(p); }"),
-    ];
-    let new = vec![
-        make_symbol("hashPassword", "src/crypto.ts", "function hashPassword(p) { return bcrypt(p, 12); }"),
-    ];
+    let old = vec![make_symbol(
+        "hashPassword",
+        "src/crypto.ts",
+        "function hashPassword(p) { return md5(p); }",
+    )];
+    let new = vec![make_symbol(
+        "hashPassword",
+        "src/crypto.ts",
+        "function hashPassword(p) { return bcrypt(p, 12); }",
+    )];
 
     let changes = diff_symbols(&old, &new);
     assert_eq!(changes.len(), 1);
@@ -72,8 +96,16 @@ fn test_detect_modified_function() {
 #[test]
 fn test_no_changes() {
     let symbols = vec![
-        make_symbol("loginUser", "src/auth.ts", "function loginUser() { return true; }"),
-        make_symbol("hashPassword", "src/crypto.ts", "function hashPassword(p) { return bcrypt(p); }"),
+        make_symbol(
+            "loginUser",
+            "src/auth.ts",
+            "function loginUser() { return true; }",
+        ),
+        make_symbol(
+            "hashPassword",
+            "src/crypto.ts",
+            "function hashPassword(p) { return bcrypt(p); }",
+        ),
     ];
 
     let changes = diff_symbols(&symbols, &symbols);

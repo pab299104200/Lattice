@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::path::Path;
 
 /// Manages file exclusions from .gitignore, .lattice_ignore, and default patterns.
 pub struct SecurityFilter {
@@ -30,19 +30,58 @@ impl SecurityFilter {
         let gitignore = builder.build().ok();
 
         let default_patterns = vec![
-            "*.env*", "*credentials*", "*.pem", "*.key", "*.pfx",
-            "*id_rsa*", "*id_ed25519*", "*.p12", "*.jks",
-        ].into_iter().map(String::from).collect();
+            "*.env*",
+            "*credentials*",
+            "*.pem",
+            "*.key",
+            "*.pfx",
+            "*id_rsa*",
+            "*id_ed25519*",
+            "*.p12",
+            "*.jks",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
         let excluded_dirs = vec![
-            "node_modules", ".git", "target", "dist", "build", "out",
-            "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
-            ".next", ".nuxt", ".svelte-kit", "coverage", ".lattice",
-            ".claude", ".codex", "lib", "lib64", ".eggs", "vendor", "third_party",
-            "site-packages", "bower_components", ".cargo", ".gradle",
-        ].into_iter().map(String::from).collect();
+            "node_modules",
+            ".git",
+            "target",
+            "dist",
+            "build",
+            "out",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".tox",
+            ".mypy_cache",
+            ".next",
+            ".nuxt",
+            ".svelte-kit",
+            "coverage",
+            ".lattice",
+            ".claude",
+            ".codex",
+            "lib",
+            "lib64",
+            ".eggs",
+            "vendor",
+            "third_party",
+            "site-packages",
+            "bower_components",
+            ".cargo",
+            ".gradle",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
-        Self { gitignore, default_patterns, excluded_dirs }
+        Self {
+            gitignore,
+            default_patterns,
+            excluded_dirs,
+        }
     }
 
     /// Check if a directory name should be skipped during traversal.
@@ -69,7 +108,8 @@ impl SecurityFilter {
         }
 
         // Check default security patterns
-        let filename = Path::new(rel_path).file_name()
+        let filename = Path::new(rel_path)
+            .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -88,22 +128,33 @@ impl SecurityFilter {
     pub fn redact_content(source: &str) -> String {
         let mut result = source.to_string();
         let patterns = [
-            "password=", "secret=", "api_key=", "token=",
-            "aws_access_key_id=", "aws_secret_access_key=",
-            "AKIA",  // AWS access key prefix
+            "password=",
+            "secret=",
+            "api_key=",
+            "token=",
+            "aws_access_key_id=",
+            "aws_secret_access_key=",
+            "AKIA", // AWS access key prefix
         ];
 
         for pattern in &patterns {
-            if result.to_lowercase().find(&pattern.to_lowercase()).is_some() {
+            if result
+                .to_lowercase()
+                .find(&pattern.to_lowercase())
+                .is_some()
+            {
                 // Redact the line containing the pattern
                 let lines: Vec<&str> = result.lines().collect();
-                let redacted_lines: Vec<String> = lines.iter().map(|line| {
-                    if line.to_lowercase().contains(&pattern.to_lowercase()) {
-                        "[REDACTED]".to_string()
-                    } else {
-                        line.to_string()
-                    }
-                }).collect();
+                let redacted_lines: Vec<String> = lines
+                    .iter()
+                    .map(|line| {
+                        if line.to_lowercase().contains(&pattern.to_lowercase()) {
+                            "[REDACTED]".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect();
                 result = redacted_lines.join("\n");
             }
         }

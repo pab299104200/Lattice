@@ -211,7 +211,7 @@ impl WorkspaceManager {
     }
 }
 
-fn repo_rel_path(repo_name: &str, rel_path: &str) -> String {
+pub fn repo_rel_path(repo_name: &str, rel_path: &str) -> String {
     let normalized = rel_path.replace('\\', "/");
     let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
     if trimmed.is_empty() {

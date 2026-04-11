@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use crate::symbols::Symbol;
+use std::collections::HashMap;
 
 /// The kind of change detected between two snapshots of symbols.
 #[derive(Debug, Clone, PartialEq, Eq)]

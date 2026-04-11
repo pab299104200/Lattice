@@ -9,15 +9,19 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
 
     let ts_language = tree_sitter_go::LANGUAGE.into();
 
-    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: format!("Failed to set Go language: {}", e),
-    })?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: format!("Failed to set Go language: {}", e),
+        })?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: "Failed to parse Go source".to_string(),
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: "Failed to parse Go source".to_string(),
+        })?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -63,11 +67,13 @@ fn extract_from_node(
                 symbols.append(&mut type_symbols);
             }
             "const_declaration" => {
-                let mut const_symbols = extract_const_or_var(child, source, file_path, SymbolKind::Constant);
+                let mut const_symbols =
+                    extract_const_or_var(child, source, file_path, SymbolKind::Constant);
                 symbols.append(&mut const_symbols);
             }
             "var_declaration" => {
-                let mut var_symbols = extract_const_or_var(child, source, file_path, SymbolKind::Variable);
+                let mut var_symbols =
+                    extract_const_or_var(child, source, file_path, SymbolKind::Variable);
                 symbols.append(&mut var_symbols);
             }
             "import_declaration" => {
@@ -81,7 +87,10 @@ fn extract_from_node(
 
 /// Check if a Go identifier is exported (first letter is uppercase).
 fn is_exported_go(name: &str) -> bool {
-    name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+    name.chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
 }
 
 /// Build a signature: everything before the body block `{`.
@@ -95,11 +104,7 @@ fn build_signature(node: Node, source: &[u8]) -> String {
 }
 
 /// Extract a Go function declaration.
-fn extract_function(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_function(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -128,16 +133,13 @@ fn extract_function(
 }
 
 /// Extract a Go method declaration.
-fn extract_method(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_method(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let method_name = node_text(name_node, source);
 
     // Get the receiver type name
-    let receiver_name = node.child_by_field_name("receiver")
+    let receiver_name = node
+        .child_by_field_name("receiver")
         .and_then(|recv| {
             // The receiver is a parameter_list; find the type inside
             let mut cursor = recv.walk();
@@ -187,11 +189,7 @@ fn extract_method(
 }
 
 /// Extract type declarations (struct, interface).
-fn extract_type_declaration(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Vec<Symbol> {
+fn extract_type_declaration(node: Node, source: &[u8], file_path: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     let mut cursor = node.walk();
@@ -207,11 +205,7 @@ fn extract_type_declaration(
 }
 
 /// Extract a single type spec (struct_type, interface_type, etc.).
-fn extract_type_spec(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_type_spec(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -297,15 +291,15 @@ fn extract_imports(node: Node, source: &[u8]) -> Vec<ImportInfo> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "import_spec" {
-            let path_text = child.child_by_field_name("path")
-                .map(|n| {
-                    let text = node_text(n, source);
-                    text.trim_matches('"').to_string()
-                });
+            let path_text = child.child_by_field_name("path").map(|n| {
+                let text = node_text(n, source);
+                text.trim_matches('"').to_string()
+            });
 
             if let Some(path) = path_text {
                 let leaf = path.rsplit('/').next().unwrap_or(&path).to_string();
-                let name = child.child_by_field_name("name")
+                let name = child
+                    .child_by_field_name("name")
                     .map(|n| node_text(n, source))
                     .unwrap_or_else(|| leaf.clone());
 
@@ -321,15 +315,15 @@ fn extract_imports(node: Node, source: &[u8]) -> Vec<ImportInfo> {
             let mut list_cursor = child.walk();
             for spec in child.children(&mut list_cursor) {
                 if spec.kind() == "import_spec" {
-                    let path_text = spec.child_by_field_name("path")
-                        .map(|n| {
-                            let text = node_text(n, source);
-                            text.trim_matches('"').to_string()
-                        });
+                    let path_text = spec.child_by_field_name("path").map(|n| {
+                        let text = node_text(n, source);
+                        text.trim_matches('"').to_string()
+                    });
 
                     if let Some(path) = path_text {
                         let leaf = path.rsplit('/').next().unwrap_or(&path).to_string();
-                        let name = spec.child_by_field_name("name")
+                        let name = spec
+                            .child_by_field_name("name")
                             .map(|n| node_text(n, source))
                             .unwrap_or_else(|| leaf.clone());
 

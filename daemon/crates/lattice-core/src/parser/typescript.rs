@@ -4,7 +4,11 @@ use crate::error::LatticeError;
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
 
 /// Parse a TypeScript or JavaScript source file and extract symbols.
-pub fn parse(file_path: &str, source: &str, language: Language) -> Result<ParsedFile, LatticeError> {
+pub fn parse(
+    file_path: &str,
+    source: &str,
+    language: Language,
+) -> Result<ParsedFile, LatticeError> {
     let mut parser = Parser::new();
 
     let ts_language = match language {
@@ -18,15 +22,19 @@ pub fn parse(file_path: &str, source: &str, language: Language) -> Result<Parsed
         }
     };
 
-    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: format!("Failed to set language: {}", e),
-    })?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: format!("Failed to set language: {}", e),
+        })?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: "Failed to parse source".to_string(),
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: "Failed to parse source".to_string(),
+        })?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -34,7 +42,14 @@ pub fn parse(file_path: &str, source: &str, language: Language) -> Result<Parsed
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
 
-    extract_from_node(root, source_bytes, file_path, language, &mut symbols, &mut imports);
+    extract_from_node(
+        root,
+        source_bytes,
+        file_path,
+        language,
+        &mut symbols,
+        &mut imports,
+    );
 
     Ok(ParsedFile {
         file: file_path.to_string(),
@@ -114,21 +129,27 @@ fn extract_declaration(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_declaration" => {
-                if let Some(sym) = extract_function(child, source, file_path, language, is_exported) {
+                if let Some(sym) = extract_function(child, source, file_path, language, is_exported)
+                {
                     symbols.push(sym);
                 }
             }
             "class_declaration" => {
-                let mut class_symbols = extract_class(child, source, file_path, language, is_exported);
+                let mut class_symbols =
+                    extract_class(child, source, file_path, language, is_exported);
                 symbols.append(&mut class_symbols);
             }
             "interface_declaration" => {
-                if let Some(sym) = extract_interface(child, source, file_path, language, is_exported) {
+                if let Some(sym) =
+                    extract_interface(child, source, file_path, language, is_exported)
+                {
                     symbols.push(sym);
                 }
             }
             "type_alias_declaration" => {
-                if let Some(sym) = extract_type_alias(child, source, file_path, language, is_exported) {
+                if let Some(sym) =
+                    extract_type_alias(child, source, file_path, language, is_exported)
+                {
                     symbols.push(sym);
                 }
             }
@@ -138,7 +159,8 @@ fn extract_declaration(
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
-                let mut var_symbols = extract_variable(child, source, file_path, language, is_exported);
+                let mut var_symbols =
+                    extract_variable(child, source, file_path, language, is_exported);
                 symbols.append(&mut var_symbols);
             }
             "import_statement" => {
@@ -241,7 +263,9 @@ fn extract_class(
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
             if child.kind() == "method_definition" {
-                if let Some(method) = extract_method(child, source, file_path, language, &class_name) {
+                if let Some(method) =
+                    extract_method(child, source, file_path, language, &class_name)
+                {
                     symbols.push(method);
                 }
             }
@@ -439,12 +463,11 @@ fn extract_variable(
 /// Extract an import statement into an ImportInfo.
 fn extract_import(node: Node, source: &[u8]) -> Option<ImportInfo> {
     // Find the source/module path (the string literal at the end)
-    let source_path = node.child_by_field_name("source")
-        .map(|n| {
-            let text = node_text(n, source);
-            // Strip quotes from the string literal
-            text.trim_matches(|c| c == '\'' || c == '"').to_string()
-        })?;
+    let source_path = node.child_by_field_name("source").map(|n| {
+        let text = node_text(n, source);
+        // Strip quotes from the string literal
+        text.trim_matches(|c| c == '\'' || c == '"').to_string()
+    })?;
 
     let mut names = Vec::new();
     let mut is_default = false;

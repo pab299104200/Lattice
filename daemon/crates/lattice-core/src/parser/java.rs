@@ -9,15 +9,19 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
 
     let ts_language = tree_sitter_java::LANGUAGE.into();
 
-    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: format!("Failed to set Java language: {}", e),
-    })?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: format!("Failed to set Java language: {}", e),
+        })?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: "Failed to parse Java source".to_string(),
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: "Failed to parse Java source".to_string(),
+        })?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -94,11 +98,7 @@ fn build_signature(node: Node, source: &[u8]) -> String {
 }
 
 /// Extract a Java class and its methods/fields.
-fn extract_class(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Vec<Symbol> {
+fn extract_class(node: Node, source: &[u8], file_path: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     let name_node = match node.child_by_field_name("name") {
@@ -152,11 +152,7 @@ fn extract_class(
 }
 
 /// Extract a Java interface and its methods.
-fn extract_interface(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Vec<Symbol> {
+fn extract_interface(node: Node, source: &[u8], file_path: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     let name_node = match node.child_by_field_name("name") {
@@ -203,11 +199,7 @@ fn extract_interface(
 }
 
 /// Extract a Java enum declaration.
-fn extract_enum(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_enum(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -235,12 +227,7 @@ fn extract_enum(
 }
 
 /// Extract a Java method from a class or interface body.
-fn extract_method(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-    class_name: &str,
-) -> Option<Symbol> {
+fn extract_method(node: Node, source: &[u8], file_path: &str, class_name: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let method_name = node_text(name_node, source);
     let qualified_name = format!("{}.{}", class_name, method_name);
@@ -270,12 +257,7 @@ fn extract_method(
 }
 
 /// Extract Java field declarations.
-fn extract_field(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-    class_name: &str,
-) -> Vec<Symbol> {
+fn extract_field(node: Node, source: &[u8], file_path: &str, class_name: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     let mut cursor = node.walk();

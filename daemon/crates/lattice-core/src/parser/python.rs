@@ -9,15 +9,19 @@ pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> 
 
     let ts_language = tree_sitter_python::LANGUAGE.into();
 
-    parser.set_language(&ts_language).map_err(|e| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: format!("Failed to set Python language: {}", e),
-    })?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|e| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: format!("Failed to set Python language: {}", e),
+        })?;
 
-    let tree = parser.parse(source, None).ok_or_else(|| LatticeError::Parse {
-        file: file_path.to_string(),
-        message: "Failed to parse Python source".to_string(),
-    })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| LatticeError::Parse {
+            file: file_path.to_string(),
+            message: "Failed to parse Python source".to_string(),
+        })?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -77,12 +81,7 @@ fn extract_from_node(
 }
 
 /// Extract a decorated definition (e.g., @staticmethod def ...).
-fn extract_decorated(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-    symbols: &mut Vec<Symbol>,
-) {
+fn extract_decorated(node: Node, source: &[u8], file_path: &str, symbols: &mut Vec<Symbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -101,11 +100,7 @@ fn extract_decorated(
 }
 
 /// Extract a Python function definition.
-fn extract_function(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Option<Symbol> {
+fn extract_function(node: Node, source: &[u8], file_path: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -147,11 +142,7 @@ fn build_python_signature(node: Node, source: &[u8]) -> String {
 }
 
 /// Extract a Python class definition and its methods.
-fn extract_class(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-) -> Vec<Symbol> {
+fn extract_class(node: Node, source: &[u8], file_path: &str) -> Vec<Symbol> {
     let mut symbols = Vec::new();
 
     let name_node = match node.child_by_field_name("name") {
@@ -219,7 +210,9 @@ fn extract_class(
                     let mut dec_cursor = child.walk();
                     for dec_child in child.children(&mut dec_cursor) {
                         if dec_child.kind() == "function_definition" {
-                            if let Some(method) = extract_method(dec_child, source, file_path, &class_name) {
+                            if let Some(method) =
+                                extract_method(dec_child, source, file_path, &class_name)
+                            {
                                 symbols.push(method);
                             }
                         }
@@ -234,12 +227,7 @@ fn extract_class(
 }
 
 /// Extract a method from a class body.
-fn extract_method(
-    node: Node,
-    source: &[u8],
-    file_path: &str,
-    class_name: &str,
-) -> Option<Symbol> {
+fn extract_method(node: Node, source: &[u8], file_path: &str, class_name: &str) -> Option<Symbol> {
     let name_node = node.child_by_field_name("name")?;
     let method_name = node_text(name_node, source);
     let body_text = node_text(node, source);
@@ -303,7 +291,8 @@ fn extract_import(node: Node, source: &[u8]) -> Option<ImportInfo> {
 /// Extract a `from X import Y` statement.
 fn extract_import_from(node: Node, source: &[u8]) -> Option<ImportInfo> {
     // Find the module name (after "from")
-    let module_name = node.child_by_field_name("module_name")
+    let module_name = node
+        .child_by_field_name("module_name")
         .map(|n| node_text(n, source));
 
     let source_path = module_name.unwrap_or_default();
@@ -415,7 +404,8 @@ fn collect_string_model_refs(node: Node, source: &[u8], refs: &mut Vec<String>) 
                 "identifier" => node_text(func_node, source),
                 "attribute" => {
                     // e.g., orm.relationship — use the attribute name
-                    func_node.child_by_field_name("attribute")
+                    func_node
+                        .child_by_field_name("attribute")
                         .map(|a| node_text(a, source))
                         .unwrap_or_default()
                 }

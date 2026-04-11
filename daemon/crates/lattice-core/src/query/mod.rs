@@ -1,10 +1,10 @@
 pub mod capsule;
-pub mod intent;
 pub mod engine;
+pub mod intent;
 
 #[cfg(test)]
 mod tests;
 
-pub use capsule::{ContextCapsule, ContextNode, CapsuleStats, PivotNode, QueryIntent};
+pub use capsule::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
+pub use engine::{parse_query_filters, QueryEngine, QueryFilter};
 pub use intent::{detect_intent, IntentParams};
-pub use engine::{QueryEngine, QueryFilter, parse_query_filters};

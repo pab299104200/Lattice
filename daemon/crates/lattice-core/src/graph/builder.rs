@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
+use std::collections::HashMap;
 
 /// Builds a CodeGraph from parsed source files using a two-pass approach:
 /// 1. Add all symbols as nodes and build a name→SymbolId lookup.
@@ -182,7 +182,8 @@ impl GraphBuilder {
 
                     // Fall back to any global match
                     let target = target.or_else(|| {
-                        name_lookup.get(simple_name)
+                        name_lookup
+                            .get(simple_name)
                             .and_then(|ids| ids.first().cloned())
                     });
 
@@ -290,9 +291,11 @@ fn find_symbol_in_file_by_kind(
     file_lookup: &HashMap<String, Vec<SymbolId>>,
     kind_lookup: &HashMap<SymbolId, SymbolKind>,
 ) -> Option<SymbolId> {
-    file_lookup
-        .get(target_file)
-        .and_then(|ids| ids.iter().find(|id| kind_lookup.get(*id).copied() == Some(kind)).cloned())
+    file_lookup.get(target_file).and_then(|ids| {
+        ids.iter()
+            .find(|id| kind_lookup.get(*id).copied() == Some(kind))
+            .cloned()
+    })
 }
 
 fn find_section_in_file(
@@ -356,7 +359,12 @@ fn resolve_relative_path(from_file: &str, target: &str, default_ext: &str) -> St
     }
 
     let resolved = parts.join("/");
-    if resolved.contains('.') && resolved.rsplit('/').next().map_or(false, |item| item.contains('.')) {
+    if resolved.contains('.')
+        && resolved
+            .rsplit('/')
+            .next()
+            .map_or(false, |item| item.contains('.'))
+    {
         resolved
     } else {
         format!("{}.{}", resolved, default_ext)
@@ -405,7 +413,12 @@ fn resolve_import_path(from_file: &str, import_source: &str) -> String {
     let from_ext = from_file.rsplit('.').next().unwrap_or("ts");
 
     // If the resolved path already has an extension, use it as-is
-    if resolved.contains('.') && resolved.rsplit('/').next().map_or(false, |f| f.contains('.')) {
+    if resolved.contains('.')
+        && resolved
+            .rsplit('/')
+            .next()
+            .map_or(false, |f| f.contains('.'))
+    {
         resolved
     } else {
         // Append the same extension as the source file

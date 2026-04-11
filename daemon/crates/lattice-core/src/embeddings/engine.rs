@@ -58,7 +58,11 @@ impl EmbeddingEngine {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         // 2. Find max sequence length and build padded input arrays
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
 
         let mut input_ids_data = vec![0i64; batch_size * max_len];
         let mut attention_mask_data = vec![0i64; batch_size * max_len];
@@ -83,8 +87,9 @@ impl EmbeddingEngine {
         // 3. Create ORT tensors
         let input_ids_tensor = Tensor::from_array((shape.clone(), input_ids_data))
             .map_err(|e| anyhow::anyhow!("Failed to create input_ids tensor: {}", e))?;
-        let attention_mask_tensor = Tensor::from_array((shape.clone(), attention_mask_data.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to create attention_mask tensor: {}", e))?;
+        let attention_mask_tensor =
+            Tensor::from_array((shape.clone(), attention_mask_data.clone()))
+                .map_err(|e| anyhow::anyhow!("Failed to create attention_mask tensor: {}", e))?;
         let token_type_ids_tensor = Tensor::from_array((shape.clone(), token_type_ids_data))
             .map_err(|e| anyhow::anyhow!("Failed to create token_type_ids tensor: {}", e))?;
 

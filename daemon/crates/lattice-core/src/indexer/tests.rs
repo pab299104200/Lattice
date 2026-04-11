@@ -210,11 +210,19 @@ async fn test_batch_indexing_rebuilds_once_for_multiple_files() {
     assert_eq!(count, 2);
     assert_eq!(indexer.file_count(), 2);
     assert!(
-        indexer.graph().all_nodes().iter().any(|node| node.file == "docs/auth.md"),
+        indexer
+            .graph()
+            .all_nodes()
+            .iter()
+            .any(|node| node.file == "docs/auth.md"),
         "markdown file should be present after batch indexing"
     );
     assert!(
-        indexer.graph().all_nodes().iter().any(|node| node.name == "loginUser"),
+        indexer
+            .graph()
+            .all_nodes()
+            .iter()
+            .any(|node| node.name == "loginUser"),
         "code symbol should be present after batch indexing"
     );
 }

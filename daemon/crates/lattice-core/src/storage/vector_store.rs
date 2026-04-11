@@ -1,9 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use rusqlite::{Connection, params};
 use crate::error::LatticeError;
+use crate::storage::vector_index::{VectorIndex, VectorSearchResult};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
-const CREATE_VECTORS_TABLE: &str = r#"
+const CREATE_VECTORS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS vectors (
     file TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -12,22 +13,47 @@ CREATE TABLE IF NOT EXISTS vectors (
     PRIMARY KEY (file, name, byte_offset)
 );
 CREATE INDEX IF NOT EXISTS idx_vectors_file ON vectors(file);
+
+CREATE TABLE IF NOT EXISTS vector_keys (
+    ann_key INTEGER PRIMARY KEY,
+    file TEXT NOT NULL,
+    name TEXT NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    UNIQUE (file, name, byte_offset)
+);
+CREATE INDEX IF NOT EXISTS idx_vector_keys_file ON vector_keys(file);
+
+CREATE TABLE IF NOT EXISTS vector_index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
-/// Cache key: (file, name, byte_offset).
+const VECTOR_META_DIMENSION: &str = "dimension";
+const VECTOR_META_GENERATION: &str = "generation";
+
 type CacheKey = (String, String, usize);
 
-/// Stores embedding vectors as BLOBs in SQLite with cosine similarity search.
-/// Maintains an in-memory cache for fast similarity lookups without SQLite overhead.
-pub struct VectorStore {
+pub(crate) struct StoredVectorRecord {
+    pub ann_key: u64,
+    pub file: String,
+    pub name: String,
+    pub byte_offset: usize,
+    pub vector: Vec<f32>,
+}
+
+struct SqliteVectorState {
     conn: Connection,
-    /// In-memory vector cache for fast similarity search.
-    /// Loaded via `load_cache()`, updated on upsert/delete.
-    cache: RefCell<HashMap<CacheKey, Vec<f32>>>,
+    cache: HashMap<CacheKey, Vec<f32>>,
+}
+
+/// Compatibility vector backend that stores embeddings as SQLite BLOBs and
+/// performs an exact brute-force cosine search.
+pub struct VectorStore {
+    state: Mutex<SqliteVectorState>,
 }
 
 impl VectorStore {
-    /// Open a file-based SQLite database with WAL mode enabled.
     pub fn open(path: &str) -> Result<Self, LatticeError> {
         let conn = Connection::open(path)
             .map_err(|e| LatticeError::Storage(format!("Failed to open vector store: {}", e)))?;
@@ -35,52 +61,84 @@ impl VectorStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
 
-        Ok(Self { conn, cache: RefCell::new(HashMap::new()) })
+        Ok(Self {
+            state: Mutex::new(SqliteVectorState {
+                conn,
+                cache: HashMap::new(),
+            }),
+        })
     }
 
-    /// Open an in-memory SQLite database (for tests).
     pub fn open_in_memory() -> Result<Self, LatticeError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| LatticeError::Storage(format!("Failed to open in-memory vector store: {}", e)))?;
+        let conn = Connection::open_in_memory().map_err(|e| {
+            LatticeError::Storage(format!("Failed to open in-memory vector store: {}", e))
+        })?;
 
-        Ok(Self { conn, cache: RefCell::new(HashMap::new()) })
+        Ok(Self {
+            state: Mutex::new(SqliteVectorState {
+                conn,
+                cache: HashMap::new(),
+            }),
+        })
     }
 
-    /// Create the vectors table if it doesn't exist.
-    /// The `_dimension` parameter is reserved for future use (e.g., validation).
-    pub fn initialize(&self, _dimension: usize) -> Result<(), LatticeError> {
-        self.conn
-            .execute_batch(CREATE_VECTORS_TABLE)
-            .map_err(|e| LatticeError::Storage(format!("Failed to initialize vector schema: {}", e)))?;
+    pub fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
+        let state = self.lock_state("initialize vector store")?;
+        state
+            .conn
+            .execute_batch(CREATE_VECTORS_SCHEMA)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to initialize vector schema: {}", e))
+            })?;
+
+        ensure_meta_value(&state.conn, VECTOR_META_GENERATION, "0")?;
+        ensure_dimension(&state.conn, dimension)?;
+        backfill_vector_keys(&state.conn)?;
+        remove_orphaned_vector_keys(&state.conn)?;
+
         Ok(())
     }
 
-    /// Load all vectors from SQLite into the in-memory cache.
-    /// Call this after initialization to enable fast in-memory searches.
     pub fn load_cache(&self) -> Result<(), LatticeError> {
-        let mut cache = self.cache.borrow_mut();
-        cache.clear();
-        let mut stmt = self.conn.prepare(
-            "SELECT file, name, byte_offset, embedding FROM vectors"
-        ).map_err(|e| LatticeError::Storage(format!("Failed to prepare cache load: {}", e)))?;
+        let mut state = self.lock_state("load vector cache")?;
+        state.cache.clear();
 
-        let rows = stmt.query_map([], |row| {
-            let file: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let offset: i64 = row.get(2)?;
-            let blob: Vec<u8> = row.get(3)?;
-            Ok((file, name, offset as usize, blob))
-        }).map_err(|e| LatticeError::Storage(format!("Failed to load cache: {}", e)))?;
+        let cached_rows = {
+            let mut stmt = state
+                .conn
+                .prepare("SELECT file, name, byte_offset, embedding FROM vectors")
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to prepare cache load: {}", e))
+                })?;
 
-        for row in rows {
-            let (file, name, offset, blob) =
-                row.map_err(|e| LatticeError::Storage(format!("Failed to read cache row: {}", e)))?;
-            cache.insert((file, name, offset), bytes_to_f32_slice(&blob));
+            let rows = stmt
+                .query_map([], |row| {
+                    let file: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let offset: i64 = row.get(2)?;
+                    let blob: Vec<u8> = row.get(3)?;
+                    Ok((file, name, offset as usize, blob))
+                })
+                .map_err(|e| LatticeError::Storage(format!("Failed to load cache: {}", e)))?;
+
+            let mut cached_rows = Vec::new();
+            for row in rows {
+                cached_rows.push(row.map_err(|e| {
+                    LatticeError::Storage(format!("Failed to read cache row: {}", e))
+                })?);
+            }
+            cached_rows
+        };
+
+        for (file, name, offset, blob) in cached_rows {
+            state
+                .cache
+                .insert((file, name, offset), bytes_to_f32_slice(&blob));
         }
+
         Ok(())
     }
 
-    /// Insert or replace a vector for a given (file, name, byte_offset) triple.
     pub fn upsert_vector(
         &self,
         file: &str,
@@ -88,49 +146,110 @@ impl VectorStore {
         byte_offset: usize,
         vector: &[f32],
     ) -> Result<(), LatticeError> {
+        self.upsert_vector_with_key(file, name, byte_offset, vector)
+            .map(|_| ())
+    }
+
+    pub(crate) fn upsert_vector_with_key(
+        &self,
+        file: &str,
+        name: &str,
+        byte_offset: usize,
+        vector: &[f32],
+    ) -> Result<u64, LatticeError> {
+        let mut state = self.lock_state("upsert vector")?;
         let blob = f32_slice_to_bytes(vector);
 
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO vectors (file, name, byte_offset, embedding) VALUES (?1, ?2, ?3, ?4)",
-                params![file, name, byte_offset as i64, blob],
-            )
-            .map_err(|e| LatticeError::Storage(format!("Failed to upsert vector: {}", e)))?;
+        let tx = state.conn.transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to start vector upsert transaction: {}", e))
+        })?;
+        let ann_key = load_or_create_ann_key(&tx, file, name, byte_offset)?;
+        tx.execute(
+            "INSERT INTO vectors (file, name, byte_offset, embedding)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file, name, byte_offset) DO UPDATE SET embedding = excluded.embedding",
+            params![file, name, byte_offset as i64, blob],
+        )
+        .map_err(|e| LatticeError::Storage(format!("Failed to upsert vector: {}", e)))?;
+        bump_generation(&tx)?;
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit vector upsert: {}", e)))?;
 
-        // Update in-memory cache
-        self.cache.borrow_mut().insert(
+        state.cache.insert(
             (file.to_string(), name.to_string(), byte_offset),
             vector.to_vec(),
         );
 
-        Ok(())
+        Ok(ann_key)
     }
 
-    /// Delete all vectors belonging to a given file.
     pub fn delete_by_file(&self, file: &str) -> Result<(), LatticeError> {
-        self.conn
+        let mut state = self.lock_state("delete vectors by file")?;
+        let tx = state.conn.transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to start vector delete transaction: {}", e))
+        })?;
+
+        let deleted = tx
             .execute("DELETE FROM vectors WHERE file = ?1", params![file])
-            .map_err(|e| LatticeError::Storage(format!("Failed to delete vectors by file: {}", e)))?;
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to delete vectors by file '{}': {}",
+                    file, e
+                ))
+            })?;
+        tx.execute("DELETE FROM vector_keys WHERE file = ?1", params![file])
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to delete vector keys for file '{}': {}",
+                    file, e
+                ))
+            })?;
+        if deleted > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit vector delete: {}", e)))?;
 
-        // Remove from in-memory cache
-        self.cache.borrow_mut().retain(|(f, _, _), _| f != file);
-
+        state
+            .cache
+            .retain(|(cached_file, _, _), _| cached_file != file);
         Ok(())
     }
 
-    /// Search for the top-k most similar vectors to the query using cosine similarity.
-    /// Returns Vec<(name, file, byte_offset, similarity)> sorted by descending similarity.
-    ///
-    /// Uses the in-memory cache if populated; otherwise falls back to SQLite.
+    pub fn clear_all(&self) -> Result<(), LatticeError> {
+        let mut state = self.lock_state("clear vector store")?;
+        let tx = state.conn.transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to start vector clear transaction: {}", e))
+        })?;
+
+        let deleted = tx
+            .execute("DELETE FROM vectors", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear vectors: {}", e)))?;
+        tx.execute("DELETE FROM vector_keys", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear vector keys: {}", e)))?;
+        if deleted > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit vector clear: {}", e)))?;
+
+        state.cache.clear();
+        Ok(())
+    }
+
     pub fn search(
         &self,
         query: &[f32],
         top_k: usize,
-    ) -> Result<Vec<(String, String, usize, f32)>, LatticeError> {
-        let cache = self.cache.borrow();
-        if !cache.is_empty() {
-            // Fast path: iterate in-memory cache
-            let mut results: Vec<(String, String, usize, f32)> = cache
+    ) -> Result<Vec<VectorSearchResult>, LatticeError> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let state = self.lock_state("search vectors")?;
+        if !state.cache.is_empty() {
+            let mut results: Vec<VectorSearchResult> = state
+                .cache
                 .iter()
                 .map(|((file, name, offset), vec)| {
                     let similarity = cosine_similarity(query, vec);
@@ -142,10 +261,8 @@ impl VectorStore {
             results.truncate(top_k);
             return Ok(results);
         }
-        drop(cache);
 
-        // Slow path: query SQLite directly
-        let mut stmt = self
+        let mut stmt = state
             .conn
             .prepare("SELECT file, name, byte_offset, embedding FROM vectors")
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare search query: {}", e)))?;
@@ -156,33 +273,305 @@ impl VectorStore {
                 let name: String = row.get(1)?;
                 let byte_offset: i64 = row.get(2)?;
                 let embedding_blob: Vec<u8> = row.get(3)?;
-                Ok((file, name, byte_offset, embedding_blob))
+                Ok((file, name, byte_offset as usize, embedding_blob))
             })
             .map_err(|e| LatticeError::Storage(format!("Failed to execute search query: {}", e)))?;
 
-        let mut results: Vec<(String, String, usize, f32)> = Vec::new();
-
+        let mut results: Vec<VectorSearchResult> = Vec::new();
         for row in rows {
-            let (file, name, byte_offset, embedding_blob) =
-                row.map_err(|e| LatticeError::Storage(format!("Failed to read vector row: {}", e)))?;
-
+            let (file, name, byte_offset, embedding_blob) = row
+                .map_err(|e| LatticeError::Storage(format!("Failed to read vector row: {}", e)))?;
             let stored_vec = bytes_to_f32_slice(&embedding_blob);
             let similarity = cosine_similarity(query, &stored_vec);
-
-            results.push((name, file, byte_offset as usize, similarity));
+            results.push((name, file, byte_offset, similarity));
         }
 
-        // Sort by descending similarity
         results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Take top-k
         results.truncate(top_k);
-
         Ok(results)
+    }
+
+    pub(crate) fn load_all_records(&self) -> Result<Vec<StoredVectorRecord>, LatticeError> {
+        let state = self.lock_state("load vectors for ann sync")?;
+        let mut stmt = state
+            .conn
+            .prepare(
+                "SELECT k.ann_key, v.file, v.name, v.byte_offset, v.embedding
+                 FROM vectors v
+                 INNER JOIN vector_keys k
+                   ON k.file = v.file
+                  AND k.name = v.name
+                  AND k.byte_offset = v.byte_offset",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare vector record load: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let ann_key: i64 = row.get(0)?;
+                let file: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let byte_offset: i64 = row.get(3)?;
+                let embedding: Vec<u8> = row.get(4)?;
+                Ok(StoredVectorRecord {
+                    ann_key: ann_key as u64,
+                    file,
+                    name,
+                    byte_offset: byte_offset as usize,
+                    vector: bytes_to_f32_slice(&embedding),
+                })
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to query vector records for ann sync: {}",
+                    e
+                ))
+            })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|e| {
+                LatticeError::Storage(format!("Failed to read vector record: {}", e))
+            })?);
+        }
+
+        Ok(records)
+    }
+
+    pub(crate) fn ann_keys_for_file(&self, file: &str) -> Result<Vec<u64>, LatticeError> {
+        let state = self.lock_state("load ann keys by file")?;
+        let mut stmt = state
+            .conn
+            .prepare("SELECT ann_key FROM vector_keys WHERE file = ?1")
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare ann-key lookup: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(params![file], |row| {
+                let key: i64 = row.get(0)?;
+                Ok(key as u64)
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to query ann keys for file '{}': {}",
+                    file, e
+                ))
+            })?;
+
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row.map_err(|e| {
+                LatticeError::Storage(format!("Failed to read ann key for file '{}': {}", file, e))
+            })?);
+        }
+        Ok(keys)
+    }
+
+    pub(crate) fn vector_count(&self) -> Result<usize, LatticeError> {
+        let state = self.lock_state("count vectors")?;
+        let count: i64 = state
+            .conn
+            .query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0))
+            .map_err(|e| LatticeError::Storage(format!("Failed to count vectors: {}", e)))?;
+        Ok(count as usize)
+    }
+
+    pub(crate) fn configured_dimension(&self) -> Result<Option<usize>, LatticeError> {
+        let state = self.lock_state("load vector dimension")?;
+        meta_u64(&state.conn, VECTOR_META_DIMENSION).map(|value| value.map(|v| v as usize))
+    }
+
+    pub(crate) fn current_generation(&self) -> Result<u64, LatticeError> {
+        let state = self.lock_state("load vector generation")?;
+        Ok(meta_u64(&state.conn, VECTOR_META_GENERATION)?.unwrap_or(0))
+    }
+
+    fn lock_state(&self, context: &str) -> Result<MutexGuard<'_, SqliteVectorState>, LatticeError> {
+        self.state.lock().map_err(|_| {
+            LatticeError::Storage(format!(
+                "Vector store mutex poisoned while trying to {}",
+                context
+            ))
+        })
     }
 }
 
-/// Serialize a slice of f32 values to a byte vector (little-endian).
+impl VectorIndex for VectorStore {
+    fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
+        VectorStore::initialize(self, dimension)
+    }
+
+    fn warm(&self) -> Result<(), LatticeError> {
+        self.load_cache()
+    }
+
+    fn upsert_vector(
+        &self,
+        file: &str,
+        name: &str,
+        byte_offset: usize,
+        vector: &[f32],
+    ) -> Result<(), LatticeError> {
+        VectorStore::upsert_vector(self, file, name, byte_offset, vector)
+    }
+
+    fn delete_by_file(&self, file: &str) -> Result<(), LatticeError> {
+        VectorStore::delete_by_file(self, file)
+    }
+
+    fn clear_all(&self) -> Result<(), LatticeError> {
+        VectorStore::clear_all(self)
+    }
+
+    fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorSearchResult>, LatticeError> {
+        VectorStore::search(self, query, top_k)
+    }
+
+    fn implementation_name(&self) -> &'static str {
+        "sqlite-exact"
+    }
+}
+
+fn ensure_dimension(conn: &Connection, dimension: usize) -> Result<(), LatticeError> {
+    if dimension == 0 {
+        return Err(LatticeError::Storage(
+            "Vector store dimension must be greater than zero".to_string(),
+        ));
+    }
+
+    match meta_u64(conn, VECTOR_META_DIMENSION)? {
+        Some(existing) if existing != dimension as u64 => Err(LatticeError::Storage(format!(
+            "Vector store dimension mismatch: database has {}, requested {}",
+            existing, dimension
+        ))),
+        Some(_) => Ok(()),
+        None => conn
+            .execute(
+                "INSERT INTO vector_index_meta (key, value) VALUES (?1, ?2)",
+                params![VECTOR_META_DIMENSION, dimension.to_string()],
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to persist vector dimension: {}", e))
+            }),
+    }
+}
+
+fn ensure_meta_value(conn: &Connection, key: &str, value: &str) -> Result<(), LatticeError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO vector_index_meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        LatticeError::Storage(format!(
+            "Failed to initialize vector metadata '{}': {}",
+            key, e
+        ))
+    })
+}
+
+fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>, LatticeError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM vector_index_meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            LatticeError::Storage(format!("Failed to read vector metadata '{}': {}", key, e))
+        })?;
+
+    raw.map(|value| {
+        value.parse::<u64>().map_err(|e| {
+            LatticeError::Storage(format!(
+                "Invalid vector metadata '{}' value '{}': {}",
+                key, value, e
+            ))
+        })
+    })
+    .transpose()
+}
+
+fn backfill_vector_keys(conn: &Connection) -> Result<(), LatticeError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO vector_keys (file, name, byte_offset)
+         SELECT file, name, byte_offset FROM vectors",
+        [],
+    )
+    .map(|_| ())
+    .map_err(|e| LatticeError::Storage(format!("Failed to backfill vector keys: {}", e)))
+}
+
+fn remove_orphaned_vector_keys(conn: &Connection) -> Result<(), LatticeError> {
+    conn.execute(
+        "DELETE FROM vector_keys
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM vectors
+             WHERE vectors.file = vector_keys.file
+               AND vectors.name = vector_keys.name
+               AND vectors.byte_offset = vector_keys.byte_offset
+         )",
+        [],
+    )
+    .map(|_| ())
+    .map_err(|e| LatticeError::Storage(format!("Failed to clean orphaned vector keys: {}", e)))
+}
+
+fn load_or_create_ann_key(
+    tx: &Transaction<'_>,
+    file: &str,
+    name: &str,
+    byte_offset: usize,
+) -> Result<u64, LatticeError> {
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT ann_key FROM vector_keys
+             WHERE file = ?1 AND name = ?2 AND byte_offset = ?3",
+            params![file, name, byte_offset as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| {
+            LatticeError::Storage(format!(
+                "Failed to look up vector key for '{}:{}@{}': {}",
+                file, name, byte_offset, e
+            ))
+        })?;
+
+    if let Some(key) = existing {
+        return Ok(key as u64);
+    }
+
+    tx.execute(
+        "INSERT INTO vector_keys (file, name, byte_offset) VALUES (?1, ?2, ?3)",
+        params![file, name, byte_offset as i64],
+    )
+    .map_err(|e| {
+        LatticeError::Storage(format!(
+            "Failed to create vector key for '{}:{}@{}': {}",
+            file, name, byte_offset, e
+        ))
+    })?;
+
+    Ok(tx.last_insert_rowid() as u64)
+}
+
+fn bump_generation(tx: &Transaction<'_>) -> Result<(), LatticeError> {
+    tx.execute(
+        "UPDATE vector_index_meta
+         SET value = CAST(value AS INTEGER) + 1
+         WHERE key = ?1",
+        params![VECTOR_META_GENERATION],
+    )
+    .map(|_| ())
+    .map_err(|e| LatticeError::Storage(format!("Failed to bump vector generation: {}", e)))
+}
+
 fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(slice.len() * 4);
     for &val in slice {
@@ -191,8 +580,7 @@ fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Deserialize a byte slice to a vector of f32 values (little-endian).
-fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|chunk| {
@@ -202,9 +590,7 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Compute cosine similarity between two vectors: dot(a,b) / (norm(a) * norm(b)).
-/// Returns 0.0 if either vector has zero magnitude.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

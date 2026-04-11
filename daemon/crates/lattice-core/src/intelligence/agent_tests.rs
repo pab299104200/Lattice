@@ -3,8 +3,8 @@ use serde_json::json;
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
-    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem,
-    BundleMode, ExpandContextSeed, RulesDetector,
+    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem, BundleMode,
+    ExpandContextSeed, RulesDetector,
 };
 use crate::query::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
 use crate::symbols::{Language, SymbolId, SymbolKind};
@@ -262,7 +262,11 @@ fn build_duplicate_symbol_graph() -> CodeGraph {
     let mut graph = CodeGraph::new();
 
     let cert_id = make_id("routers/certificates.py", "_verify_org_access", 0);
-    let shared_id = make_id("routers/compliance_mgmt/_shared.py", "_verify_org_access", 0);
+    let shared_id = make_id(
+        "routers/compliance_mgmt/_shared.py",
+        "_verify_org_access",
+        0,
+    );
     let policy_id = make_id("routers/certificates.py", "upsert_renewal_policy", 1);
     let cert_test_id = make_id(
         "tests/test_certificate_tenant_isolation.py",
@@ -584,7 +588,10 @@ fn test_find_relevant_tests_matches_certificate_domain_tokens() {
     let report = find_relevant_tests(
         &graph,
         &["routers/certificates.py".to_string()],
-        &["_verify_org_access".to_string(), "upsert_renewal_policy".to_string()],
+        &[
+            "_verify_org_access".to_string(),
+            "upsert_renewal_policy".to_string(),
+        ],
         None,
         &rules,
         5,
@@ -839,11 +846,118 @@ fn test_summarize_subsystem_compresses_key_files_symbols_and_tests() {
         report.key_symbols
     );
     assert!(
-        report.tests.iter().any(|item| item.file == "tests/auth.test.ts"),
+        report
+            .tests
+            .iter()
+            .any(|item| item.file == "tests/auth.test.ts"),
         "expected auth test in subsystem summary: {:?}",
         report.tests
     );
     assert_eq!(report.memories.len(), 1);
+}
+
+#[test]
+fn test_summarize_subsystem_ignores_markdown_only_explicit_files_for_code_query() {
+    let graph = build_agent_graph();
+    let rules = RulesDetector::new().detect_rules(&[
+        "src/auth.ts".to_string(),
+        "src/session.ts".to_string(),
+        "src/routes/auth.ts".to_string(),
+        "src/api/auth_service.ts".to_string(),
+        "tests/auth.test.ts".to_string(),
+        "tests/session.test.ts".to_string(),
+        "README.md".to_string(),
+        "AGENTS.md".to_string(),
+        "CLAUDE.example.md".to_string(),
+    ]);
+
+    let report = summarize_subsystem(
+        &graph,
+        "auth login flow",
+        &[
+            "README.md".to_string(),
+            "AGENTS.md".to_string(),
+            "CLAUDE.example.md".to_string(),
+        ],
+        &[],
+        &[],
+        &rules,
+        BundleMode::Compact,
+    );
+
+    assert!(
+        report
+            .key_files
+            .iter()
+            .all(|item| !item.file.ends_with(".md")),
+        "expected code files to displace markdown-only explicit anchors: {:?}",
+        report.key_files
+    );
+    assert!(
+        report
+            .key_files
+            .iter()
+            .any(|item| item.file == "src/routes/auth.ts" || item.file == "src/auth.ts"),
+        "expected auth code files in subsystem summary after dropping markdown anchors: {:?}",
+        report.key_files
+    );
+}
+
+#[test]
+fn test_summarize_subsystem_skips_test_helpers_for_code_review_query() {
+    let graph = build_agent_graph();
+    let rules = RulesDetector::new().detect_rules(&[
+        "src/auth.ts".to_string(),
+        "src/session.ts".to_string(),
+        "src/routes/auth.ts".to_string(),
+        "src/api/auth_service.ts".to_string(),
+        "tests/auth.test.ts".to_string(),
+        "tests/session.test.ts".to_string(),
+    ]);
+
+    let report = summarize_subsystem(
+        &graph,
+        "auth login route workflow",
+        &[
+            "src/auth.ts".to_string(),
+            "src/routes/auth.ts".to_string(),
+            "src/api/auth_service.ts".to_string(),
+        ],
+        &[],
+        &[],
+        &rules,
+        BundleMode::Compact,
+    );
+
+    assert!(
+        report
+            .key_symbols
+            .iter()
+            .all(|item| !item.file.starts_with("tests/")),
+        "expected code review summary to avoid test helper symbols: {:?}",
+        report
+            .key_symbols
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        report
+            .key_symbols
+            .iter()
+            .all(|item| report.key_files.iter().any(|file| file.file == item.file)),
+        "expected key symbols to stay within the visible key files: key_files={:?} key_symbols={:?}",
+        report
+            .key_files
+            .iter()
+            .map(|item| item.file.clone())
+            .collect::<Vec<_>>(),
+        report
+            .key_symbols
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1165,7 +1279,10 @@ fn test_prepare_change_promotes_entry_file_over_duplicate_symbol_helpers() {
         &graph,
         &capsule,
         &["routers/certificates.py".to_string()],
-        &["_verify_org_access".to_string(), "upsert_renewal_policy".to_string()],
+        &[
+            "_verify_org_access".to_string(),
+            "upsert_renewal_policy".to_string(),
+        ],
         &rules,
         BundleMode::Compact,
     );
@@ -1226,7 +1343,10 @@ fn test_prepare_change_test_selection_stays_anchored_to_entry_files() {
         &graph,
         &capsule,
         &["routers/certificates.py".to_string()],
-        &["_verify_org_access".to_string(), "upsert_renewal_policy".to_string()],
+        &[
+            "_verify_org_access".to_string(),
+            "upsert_renewal_policy".to_string(),
+        ],
         &rules,
         BundleMode::Compact,
     );
@@ -1275,7 +1395,10 @@ fn test_prepare_change_test_selection_stays_anchored_to_entry_files() {
             .collect::<Vec<_>>()
     );
     assert!(
-        bundle.risks.iter().all(|item| item.file != "models/account.py"),
+        bundle
+            .risks
+            .iter()
+            .all(|item| item.file != "models/account.py"),
         "expected broad account-model risks to be filtered out of certificate-local bundle: {:?}",
         bundle
             .risks

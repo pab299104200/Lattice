@@ -253,17 +253,14 @@ fn test_get_docs_capsule_resolves_absolute_anchor_inputs() {
 #[test]
 fn test_get_docs_capsule_handles_unicode_markdown_previews() {
     let mut builder = GraphBuilder::new();
-    builder
-        .add_file(
-            parse_file(
-                "docs/unicode.md",
-                "# Unicode\n\n## Diagram\n\n┌────────────────────┐\nUse `loginUser` here.\n",
-            )
-            .unwrap(),
-        );
     builder.add_file(
-        parse_file("src/auth.ts", "export function loginUser(): void {}").unwrap(),
+        parse_file(
+            "docs/unicode.md",
+            "# Unicode\n\n## Diagram\n\n┌────────────────────┐\nUse `loginUser` here.\n",
+        )
+        .unwrap(),
     );
+    builder.add_file(parse_file("src/auth.ts", "export function loginUser(): void {}").unwrap());
     let graph = builder.build();
 
     let report = get_docs_capsule(&graph, "diagram", &[], &["loginUser".to_string()], 5);

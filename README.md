@@ -10,7 +10,7 @@ Lattice indexes your codebase and repo Markdown into a dependency graph, then se
 - Workflow tools like `prepare_change`, `impact_from_diff`, and `diagnose_failure` collapse multi-step coding tasks into one or two calls
 - Markdown docs, runbooks, and decisions are first-class graph nodes with backlinks, outgoing links, and code mentions
 - `find_stale_docs` helps catch docs that likely drifted after code or runbook changes
-- `expand_context` reuses a prior handle and returns only the next delta
+- `expand_context` reuses a prior handle from `get_context_capsule` or a workflow tool and returns only the next delta
 - Memory is persistent, scoped, refreshable, and stale-aware
 - Compact workflow shaping now defaults to small assistant-friendly responses instead of large generic payloads
 
@@ -45,6 +45,9 @@ When you run Lattice through an MCP client, you get:
 - docs tools like `get_docs_capsule`, `get_backlinks`, `get_outgoing_links`, and `find_stale_docs`
 - graph-backed code retrieval, project rules, test discovery, and workspace setup guidance
 - persistent memory and workflow outcome reuse across sessions
+- persisted ANN semantic search under `.lattice/` with automatic SQLite exact-search fallback
+- SQLite FTS5-backed memory keyword search with automatic backfill for existing memory databases
+- graceful stdio shutdown: the daemon now aborts in-flight requests on client cancellation or disconnect so abandoned sub-agent calls do not linger
 - the same daemon and graph engine that powers the VS Code experience
 
 ### In VS Code
@@ -80,33 +83,37 @@ Then point your MCP client, coding CLI, or local VS Code extension setup at the 
 daemon/target/release/lattice
 ```
 
+At runtime Lattice keeps assistant state under the workspace-local `.lattice/` directory:
+
+- `graph.db` stores the persisted graph snapshot
+- `memories.db` stores memory rows, plus an FTS5 keyword index that is rebuilt automatically on open
+- `vectors.db` stores semantic vectors as the durable source of truth and exact-search fallback
+- `vectors.usearch` stores the persisted ANN index used on the semantic-search hot path
+
+If the USearch index cannot be opened or synchronized, the daemon falls back to exact SQLite vector search without changing MCP response shapes.
+
 ## Which Tool First?
 
-If you are not sure which tool to call, use this order:
+If you are not sure which tool to call, choose one of these three first-call tools:
 
 1. `diagnose_failure`
-   First choice when the task starts from a failing test, stack trace, compiler error, or runtime failure.
+   Use for failing tests, stack traces, compiler errors, or runtime failures.
 2. `prepare_change`
-   First choice for implementation work once the problem area is known: fix a bug, add a feature, refactor a path, or plan an edit.
+   Use for fix/add/refactor tasks once the likely change area is known.
 3. `get_context_capsule`
-   First choice for understanding work: unfamiliar subsystems, broad architecture questions, or "how does X work?"
-4. `get_skeleton`
-   Use before opening a large file when you want structure without full source.
-5. `summarize_subsystem`
-   Use when you want a summary-first map of a subsystem instead of a broad capsule.
-6. `impact_from_diff`
-   Use when you already have a diff or local edits and want downstream impact plus tests.
-7. `find_relevant_tests`
-   Use when test selection is the main question.
-8. `expand_context`
-   Use after a workflow tool returns a `context_handle` and you only want the next focused delta.
-9. `get_docs_capsule`
-   Use when the question is really about how the repo explains a subsystem: runbooks, decisions, design docs, or implementation notes.
+   Use for unfamiliar subsystems, broad architecture questions, or "how does X work?"
 
-Lower-priority helpers:
+Then use `expand_context` when one of those results returns a `context_handle` or `suggested_expand`.
+
+Use these helpers only when they match the situation more closely:
 
 - `get_working_set_context` is best when the assistant already has a few open files and wants them compressed into one bundle
 - `get_repo_playbook` is best for quickly refreshing repo-wide conventions and architecture patterns
+- `summarize_subsystem` is best when you explicitly want a summary-first map instead of ranked pivots
+- `get_skeleton` is best before opening a large file when structure matters more than retrieval
+- `impact_from_diff` is best when you already have a diff or local edits and want downstream impact plus tests
+- `find_relevant_tests` is best when test selection is the main question
+- `get_docs_capsule` is best when the answer is more likely to be in Markdown docs, runbooks, or design notes
 - `get_backlinks` and `get_outgoing_links` are best for walking the local docs graph around a known symbol, file, document, or section
 - `find_stale_docs` is best after a diff or active edit when you want to see what docs may now be out of date
 - memory hygiene tools matter most in long-running or repeated assistant sessions where observations and outcomes are actually being written
@@ -166,9 +173,11 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 - `get_skeleton`
   Fast file map: symbols, kinds, and structure before loading source.
 - `get_context_capsule`
-  Broad discovery tool for unfamiliar subsystems or architectural questions.
+  Broad discovery tool for unfamiliar subsystems or architectural questions. Returns ranked pivots plus a reusable `context_handle` and `suggested_expand`.
+  For implementation-oriented queries, it favors source files over Markdown docs; use `get_docs_capsule` for doc-first questions.
 - `summarize_subsystem`
   Summary-first subsystem map: key files, key symbols, tests, and memories in a compact bundle.
+  For code-oriented queries, Markdown/meta file hints do not outrank real code anchors; use `get_docs_capsule` for doc-first questions.
 - `get_repo_playbook`
   Repo-wide architecture and convention summary for fast session startup.
 - `prepare_change`
@@ -178,7 +187,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 - `diagnose_failure`
   Failure triage bundle: likely culprit symbols, tests, likely causes, and next steps.
 - `expand_context`
-  Focused delta expansion from a prior `context_handle`.
+  Focused delta expansion from a prior `context_handle`, including one returned by `get_context_capsule`.
 
 ### Tests, Working Set, And Refactoring
 
@@ -248,7 +257,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 
 ## Workflow Response Controls
 
-Workflow tools support assistant-oriented response shaping:
+Workflow tools, plus `get_context_capsule`, support assistant-oriented response shaping where documented:
 
 - `mode`
   Existing high-level mode selection (`auto`, `compact`, `full`)
@@ -258,12 +267,14 @@ Workflow tools support assistant-oriented response shaping:
   Approximate hard cap for returned payload size
 - `wire_format`
   `standard` or `dense`
+- `render`
+  `hybrid` (default markdown summary + JSON payload), `markdown`, or `json`
 
 What this means in practice:
 
 - Lattice can auto-select `tiny`, `compact`, or `full` depending on confidence and signal quality
 - high-confidence results may collapse to a single anchor plus `suggested_expand`
-- workflow responses can include a `context_handle` and a `suggested_expand` target
+- `get_context_capsule` and workflow responses can include a `context_handle` and a `suggested_expand` target
 - `expand_context` handles persist across daemon restarts
 - `get_session_metrics` exposes how often tiny/dense/single-anchor paths are actually being used
 
@@ -350,13 +361,17 @@ Add this to your assistant's project memory (`CLAUDE.md`, `AGENTS.md`, Codex ins
 ### Lattice Context Engine — Available Tools
 
 Lattice provides a dependency graph and context engine for this codebase.
+Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
+If you would otherwise open 3 or more unfamiliar files, call `get_context_capsule`, `prepare_change`, or `summarize_subsystem` first.
+If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
+If you have raw failure text, pass it to `diagnose_failure` before grep-driven triage.
 If you're unsure which tool to use, default to `prepare_change` for implementation tasks and `get_context_capsule` for understanding tasks.
 If the task starts from a failing test, stack trace, or compiler error, start with `diagnose_failure` and use `prepare_change` after it narrows the likely culprit.
 
 Use these tools when they're the best fit:
 
 - `prepare_change` — first choice for "fix/add/refactor X" once you know the area to change
-- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions
+- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it can now hand off directly to `expand_context`
 - `get_docs_capsule` — first choice for "what docs or runbooks explain this?" questions
 - `get_skeleton` — use before opening a large file
 - `summarize_subsystem` — use for a summary-first subsystem map
@@ -364,10 +379,10 @@ Use these tools when they're the best fit:
 - `impact_from_diff` — use when reviewing a diff or local change
 - `find_relevant_tests` — use when deciding what tests to run
 - `diagnose_failure` — first choice when a fix starts from a failing test or error
-- `expand_context` — use when a prior workflow call returned a handle and you want the next delta
+- `expand_context` — use when a prior `get_context_capsule` or workflow call returned a handle and you want the next delta
 - `get_backlinks` / `get_outgoing_links` — walk the local docs graph around a known section, file, or symbol
 - `find_stale_docs` — check docs after code changes or before a release
-- `get_working_set_context` — only when batching several already-known open files is cheaper than reading them one by one
+- `get_working_set_context` — only when batching several already-known open files is cheaper than reading them one by one; not as a first discovery call
 - `get_impact_graph` — before refactoring to understand blast radius
 - `search_symbols` — when looking for a symbol by name
 - `search_logic_flow` — to trace call chains between functions

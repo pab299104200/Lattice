@@ -1,5 +1,6 @@
 use super::model::{Memory, MemoryScope, MemoryType};
 use super::store::MemoryStore;
+use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -120,6 +121,64 @@ fn test_search_memories_by_keyword() {
         .expect("Failed to search memories");
     assert_eq!(results.len(), 1);
     assert!(results[0].content.contains("JWT"));
+}
+
+#[test]
+fn test_open_backfills_fts_for_legacy_memory_rows() {
+    let path = temp_db_path("legacy-fts");
+    cleanup_db_files(&path);
+
+    {
+        let conn = Connection::open(&path).expect("Failed to create legacy memory database");
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id              TEXT PRIMARY KEY,
+                content         TEXT NOT NULL,
+                memory_type     TEXT NOT NULL,
+                confidence      REAL NOT NULL DEFAULT 1.0,
+                linked_symbols  TEXT NOT NULL DEFAULT '[]',
+                source_query    TEXT,
+                created_at      INTEGER NOT NULL,
+                last_accessed   INTEGER NOT NULL,
+                access_count    INTEGER NOT NULL DEFAULT 0,
+                is_stale        INTEGER NOT NULL DEFAULT 0,
+                stale_reason    TEXT,
+                is_invalidated  INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("Failed to create legacy memory schema");
+        conn.execute(
+            "INSERT INTO memories
+                (id, content, memory_type, confidence, linked_symbols, source_query,
+                 created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, 0, NULL, 0)",
+            rusqlite::params![
+                "legacy-1",
+                "JWT refresh flow uses loginUser",
+                "pattern",
+                1.0f64,
+                "[\"loginUser\"]",
+                1i64,
+                1i64
+            ],
+        )
+        .expect("Failed to seed legacy memory row");
+    }
+
+    let store = MemoryStore::open(&path).expect("Failed to open migrated memory store");
+    let jwt_results = store
+        .search_by_keyword("JWT refresh")
+        .expect("Failed to search migrated content");
+    assert_eq!(jwt_results.len(), 1);
+    assert_eq!(jwt_results[0].id, "legacy-1");
+
+    let symbol_results = store
+        .search_by_keyword("login")
+        .expect("Failed to search migrated linked symbol");
+    assert_eq!(symbol_results.len(), 1);
+    assert_eq!(symbol_results[0].id, "legacy-1");
+
+    cleanup_db_files(&path);
 }
 
 #[test]
@@ -480,11 +539,7 @@ fn test_list_stale_memories_with_query() {
 fn test_refresh_memory_updates_content_and_metadata() {
     let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
 
-    let mut mem = make_memory(
-        "JWT auth decision",
-        MemoryType::Decision,
-        vec!["loginUser"],
-    );
+    let mut mem = make_memory("JWT auth decision", MemoryType::Decision, vec!["loginUser"]);
     mem.scope = MemoryScope::Branch;
     mem.linked_files = vec!["src/auth.ts".to_string()];
     mem.workspace_id = Some("workspace-a".to_string());
@@ -596,8 +651,11 @@ fn test_find_by_refresh_key_prefers_matching_workspace_and_branch() {
     repo_mem.refresh_key = Some("repo_playbook".to_string());
     store.store(repo_mem).expect("Failed to store repo memory");
 
-    let mut branch_mem =
-        make_memory("Branch-specific auth playbook", MemoryType::Pattern, vec!["loginUser"]);
+    let mut branch_mem = make_memory(
+        "Branch-specific auth playbook",
+        MemoryType::Pattern,
+        vec!["loginUser"],
+    );
     branch_mem.scope = MemoryScope::Branch;
     branch_mem.workspace_id = Some("workspace-a".to_string());
     branch_mem.branch = Some("feature/auth".to_string());

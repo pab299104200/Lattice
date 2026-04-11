@@ -97,6 +97,7 @@ struct SessionTask {
     single_anchor_used: bool,
     suggested_expand_focus: Option<String>,
     expanded: bool,
+    used_follow_up_tool: bool,
     semantic_fallback_used: bool,
     outcome_memory_reuse_count: usize,
     started_at: u64,
@@ -223,7 +224,8 @@ impl SessionMetrics {
             self.total_payload_tokens / self.total_tool_calls
         };
 
-        let tool_calls_per_task: Vec<usize> = self.tasks.iter().map(|task| task.tool_calls).collect();
+        let tool_calls_per_task: Vec<usize> =
+            self.tasks.iter().map(|task| task.tool_calls).collect();
         let payload_bytes_per_task: Vec<usize> =
             self.tasks.iter().map(|task| task.payload_bytes).collect();
         let payload_tokens_per_task: Vec<usize> =
@@ -275,7 +277,7 @@ impl SessionMetrics {
                 matches!(
                     task.delivery_mode.as_deref(),
                     Some("compact") | Some("tiny")
-                ) && !task.expanded
+                ) && !task.used_follow_up_tool
             })
             .count();
 
@@ -373,6 +375,7 @@ impl SessionMetrics {
                 single_anchor_used: metadata.single_anchor_used,
                 suggested_expand_focus: metadata.suggested_expand_focus,
                 expanded: false,
+                used_follow_up_tool: false,
                 semantic_fallback_used: metadata.semantic_fallback_used,
                 outcome_memory_reuse_count: metadata.outcome_memory_reuse_count,
                 started_at: timestamp,
@@ -402,6 +405,9 @@ impl SessionMetrics {
             if tool == "expand_context" {
                 task.expanded = true;
             }
+            if is_follow_up_tool(tool) {
+                task.used_follow_up_tool = true;
+            }
             if task.context_handle.is_none() {
                 task.context_handle = context_handle.map(|item| item.to_string());
             }
@@ -429,6 +435,7 @@ impl SessionMetrics {
                 single_anchor_used: metadata.single_anchor_used,
                 suggested_expand_focus: metadata.suggested_expand_focus,
                 expanded: tool == "expand_context",
+                used_follow_up_tool: is_follow_up_tool(tool),
                 semantic_fallback_used: metadata.semantic_fallback_used,
                 outcome_memory_reuse_count: metadata.outcome_memory_reuse_count,
                 started_at: timestamp,
@@ -465,6 +472,30 @@ fn is_task_starter(tool: &str) -> bool {
             | "diagnose_failure"
             | "summarize_subsystem"
             | "get_repo_playbook"
+    )
+}
+
+fn is_follow_up_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "expand_context"
+            | "get_symbol"
+            | "get_dependencies"
+            | "get_dependents"
+            | "get_impact_graph"
+            | "search_symbols"
+            | "search_logic_flow"
+            | "get_docs_capsule"
+            | "get_backlinks"
+            | "get_outgoing_links"
+            | "find_stale_docs"
+            | "list_observations"
+            | "list_stale_memories"
+            | "search_memory"
+            | "get_session_context"
+            | "workspace_setup"
+            | "index_status"
+            | "get_project_rules"
     )
 }
 
@@ -525,6 +556,7 @@ mod tests {
         assert_eq!(report.context_handle_reuses, 1);
         assert_eq!(report.recent_tasks[0].tool_calls, 2);
         assert_eq!(report.compact_to_expand_count, 1);
+        assert_eq!(report.follow_up_avoided_count, 0);
         assert_eq!(report.tiny_task_count, 1);
         assert_eq!(report.dense_wire_count, 1);
         assert_eq!(report.single_anchor_task_count, 1);
@@ -555,5 +587,36 @@ mod tests {
         assert_eq!(report.workflow_tool_calls, 1);
         assert_eq!(report.semantic_fallback_uses, 1);
         assert_eq!(report.outcome_memory_reuse_count, 2);
+    }
+
+    #[test]
+    fn test_session_metrics_only_counts_true_follow_up_avoidance() {
+        let mut metrics = SessionMetrics::new();
+        metrics.record_tool_call(
+            "prepare_change",
+            420,
+            105,
+            Some("ctx-3"),
+            Some("prepare_change"),
+            ToolCallMetadata {
+                delivery_mode: Some("compact".to_string()),
+                ..ToolCallMetadata::default()
+            },
+        );
+        metrics.record_tool_call(
+            "get_symbol",
+            180,
+            45,
+            None,
+            Some("prepare_change"),
+            ToolCallMetadata::default(),
+        );
+
+        let report = metrics.snapshot();
+        assert_eq!(report.task_count, 1);
+        assert_eq!(report.compact_task_count, 1);
+        assert_eq!(report.compact_to_expand_count, 0);
+        assert_eq!(report.follow_up_avoided_count, 0);
+        assert_eq!(report.follow_up_avoidance_rate, 0.0);
     }
 }

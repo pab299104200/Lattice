@@ -16,19 +16,19 @@ use std::collections::HashMap;
 pub use agent::{
     diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
     get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem,
-    AffectedSymbolImpact, BundleMode, ChangedFileImpact, ChangedSymbolImpact,
-    CompactFileSummary, CompactSymbolSummary, DiffImpactReport, DiffImpactStats,
-    ExpandContextSeed, ExpandedContext, ExpandedContextStats, ExpandedFileContext,
-    ExpandedFileSymbolContext, ExpandedRelationshipContext, ExpandedSymbolContext,
-    ExpandedTestContext, FailureDiagnosis, FailureDiagnosisStats, FileRecommendation,
-    MemoryHighlight, RepoPlaybook, RepoPlaybookStats, ReviewChecklistItem, RiskRecommendation,
-    SubsystemSummary, SubsystemSummaryStats, SymbolRecommendation, TaskBundle, TaskBundleStats,
-    TestRecommendation, TestSelectionReport, WorkingSetContext, WorkingSetStats,
+    AffectedSymbolImpact, BundleMode, ChangedFileImpact, ChangedSymbolImpact, CompactFileSummary,
+    CompactSymbolSummary, DiffImpactReport, DiffImpactStats, ExpandContextSeed, ExpandedContext,
+    ExpandedContextStats, ExpandedFileContext, ExpandedFileSymbolContext,
+    ExpandedRelationshipContext, ExpandedSymbolContext, ExpandedTestContext, FailureDiagnosis,
+    FailureDiagnosisStats, FileRecommendation, MemoryHighlight, RepoPlaybook, RepoPlaybookStats,
+    ReviewChecklistItem, RiskRecommendation, SubsystemSummary, SubsystemSummaryStats,
+    SymbolRecommendation, TaskBundle, TaskBundleStats, TestRecommendation, TestSelectionReport,
+    WorkingSetContext, WorkingSetStats,
 };
 pub use docs::{
-    find_stale_docs, get_backlinks, get_docs_capsule, get_outgoing_links, BacklinksReport,
-    DocHit, DocsCapsule, DocsCapsuleStats, DocsTargetKind, LinkReference,
-    OutgoingLinksReport, RelatedDocSymbol, StaleDocHit, StaleDocsReport, StaleDocsStats,
+    find_stale_docs, get_backlinks, get_docs_capsule, get_outgoing_links, BacklinksReport, DocHit,
+    DocsCapsule, DocsCapsuleStats, DocsTargetKind, LinkReference, OutgoingLinksReport,
+    RelatedDocSymbol, StaleDocHit, StaleDocsReport, StaleDocsStats,
 };
 
 /// Tracks symbol-level changes during a coding session to detect patterns

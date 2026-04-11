@@ -1,7 +1,10 @@
-use crate::graph::model::{CodeGraph, EdgeKind};
-use crate::symbols::{Language, SymbolId, SymbolKind};
 use super::graph_store::GraphStore;
+use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::storage::VectorStore;
+use crate::storage::{UsearchVectorIndex, VectorIndex};
+use crate::symbols::{Language, SymbolId, SymbolKind};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
     SymbolId {
@@ -46,6 +49,23 @@ fn build_sample_graph() -> CodeGraph {
     graph.add_edge(&id_a, &id_b, EdgeKind::Calls);
 
     graph
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("lattice-storage-{name}-{unique}"))
+}
+
+fn cleanup_vector_backend(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("vectors.db"));
+    let _ = std::fs::remove_file(dir.join("vectors.db-wal"));
+    let _ = std::fs::remove_file(dir.join("vectors.db-shm"));
+    let _ = std::fs::remove_file(dir.join("vectors.usearch"));
+    let _ = std::fs::remove_file(dir.join("vectors.usearch.meta.json"));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -137,9 +157,15 @@ fn test_vector_store_and_search() {
     vec_b[0] = 1.0;
     let vec_c = vec![-1.0f32; 384];
 
-    store.upsert_vector("src/auth.ts", "loginUser", 0, &vec_a).unwrap();
-    store.upsert_vector("src/crypto.ts", "hashPassword", 0, &vec_b).unwrap();
-    store.upsert_vector("src/other.ts", "unrelated", 0, &vec_c).unwrap();
+    store
+        .upsert_vector("src/auth.ts", "loginUser", 0, &vec_a)
+        .unwrap();
+    store
+        .upsert_vector("src/crypto.ts", "hashPassword", 0, &vec_b)
+        .unwrap();
+    store
+        .upsert_vector("src/other.ts", "unrelated", 0, &vec_c)
+        .unwrap();
 
     let results = store.search(&vec_a, 2).unwrap();
     assert_eq!(results.len(), 2);
@@ -152,9 +178,15 @@ fn test_vector_delete_by_file() {
     store.initialize(384).unwrap();
 
     let vec_a = vec![1.0f32; 384];
-    store.upsert_vector("src/auth.ts", "login", 0, &vec_a).unwrap();
-    store.upsert_vector("src/auth.ts", "logout", 10, &vec_a).unwrap();
-    store.upsert_vector("src/other.ts", "helper", 0, &vec_a).unwrap();
+    store
+        .upsert_vector("src/auth.ts", "login", 0, &vec_a)
+        .unwrap();
+    store
+        .upsert_vector("src/auth.ts", "logout", 10, &vec_a)
+        .unwrap();
+    store
+        .upsert_vector("src/other.ts", "helper", 0, &vec_a)
+        .unwrap();
 
     store.delete_by_file("src/auth.ts").unwrap();
 
@@ -172,7 +204,9 @@ fn test_vector_store_cache_performance() {
     for i in 0..100 {
         let mut vec = vec![0.0f32; 384];
         vec[i % 384] = 1.0;
-        store.upsert_vector(&format!("file{}.ts", i), &format!("func{}", i), 0, &vec).unwrap();
+        store
+            .upsert_vector(&format!("file{}.ts", i), &format!("func{}", i), 0, &vec)
+            .unwrap();
     }
 
     store.load_cache().unwrap();
@@ -185,4 +219,104 @@ fn test_vector_store_cache_performance() {
     store.delete_by_file("file0.ts").unwrap();
     let results2 = store.search(&query, 100).unwrap();
     assert_eq!(results2.len(), 99);
+}
+
+#[test]
+fn test_usearch_index_persists_and_searches() {
+    let dir = unique_temp_dir("usearch-persist");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sqlite_path = dir.join("vectors.db");
+    let ann_path = dir.join("vectors.usearch");
+
+    {
+        let index =
+            UsearchVectorIndex::open(sqlite_path.to_string_lossy().as_ref(), ann_path).unwrap();
+        index.initialize(384).unwrap();
+        index.warm().unwrap();
+
+        let vec_a = vec![1.0f32; 384];
+        let mut vec_b = vec![0.0f32; 384];
+        vec_b[0] = 1.0;
+        let vec_c = vec![-1.0f32; 384];
+
+        index
+            .upsert_vector("src/auth.ts", "loginUser", 0, &vec_a)
+            .unwrap();
+        index
+            .upsert_vector("src/crypto.ts", "hashPassword", 0, &vec_b)
+            .unwrap();
+        index
+            .upsert_vector("src/other.ts", "unrelated", 0, &vec_c)
+            .unwrap();
+        index.flush().unwrap();
+
+        let results = index.search(&vec_a, 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "loginUser");
+    }
+
+    {
+        let index = UsearchVectorIndex::open(
+            sqlite_path.to_string_lossy().as_ref(),
+            dir.join("vectors.usearch"),
+        )
+        .unwrap();
+        index.initialize(384).unwrap();
+        index.warm().unwrap();
+
+        let query = vec![1.0f32; 384];
+        let results = index.search(&query, 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "loginUser");
+    }
+
+    cleanup_vector_backend(&dir);
+}
+
+#[test]
+fn test_usearch_delete_by_file_updates_persisted_index() {
+    let dir = unique_temp_dir("usearch-delete");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sqlite_path = dir.join("vectors.db");
+
+    {
+        let index = UsearchVectorIndex::open(
+            sqlite_path.to_string_lossy().as_ref(),
+            dir.join("vectors.usearch"),
+        )
+        .unwrap();
+        index.initialize(384).unwrap();
+
+        let vec_a = vec![1.0f32; 384];
+        index
+            .upsert_vector("src/auth.ts", "login", 0, &vec_a)
+            .unwrap();
+        index
+            .upsert_vector("src/auth.ts", "logout", 10, &vec_a)
+            .unwrap();
+        index
+            .upsert_vector("src/other.ts", "helper", 0, &vec_a)
+            .unwrap();
+        index.flush().unwrap();
+
+        index.delete_by_file("src/auth.ts").unwrap();
+        index.flush().unwrap();
+    }
+
+    {
+        let index = UsearchVectorIndex::open(
+            sqlite_path.to_string_lossy().as_ref(),
+            dir.join("vectors.usearch"),
+        )
+        .unwrap();
+        index.initialize(384).unwrap();
+        index.warm().unwrap();
+
+        let query = vec![1.0f32; 384];
+        let results = index.search(&query, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "helper");
+    }
+
+    cleanup_vector_backend(&dir);
 }

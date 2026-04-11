@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 use super::protocol::{format_response, parse_request, JsonRpcResponse};
+use serde_json::Value;
+use tokio::task::JoinHandle;
 
 /// Trait for handling JSON-RPC requests.
 #[async_trait::async_trait]
@@ -37,6 +40,8 @@ impl StdioServer {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::unbounded_channel::<JsonRpcResponse>();
 
         // Stdin reader in a dedicated blocking thread.
         std::thread::spawn(move || {
@@ -56,10 +61,23 @@ impl StdioServer {
         });
 
         // Process messages from the channel.
+        let mut active_requests: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let mut cancelled_requests = HashSet::new();
+        let mut shutting_down = false;
+
         loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    let Some(message) = msg else { break };
+                    let Some(message) = msg else {
+                        if !active_requests.is_empty() {
+                            tracing::info!(
+                                "Client disconnected; aborting {} in-flight request(s)",
+                                active_requests.len()
+                            );
+                        }
+                        abort_all_requests(&mut active_requests);
+                        break;
+                    };
                     let request = match parse_request(&message) {
                         Ok(req) => req,
                         Err(e) => {
@@ -74,17 +92,96 @@ impl StdioServer {
                     };
 
                     let is_notification = request.id.is_null();
-                    let response = match self.handler.handle(&request.method, request.params).await {
-                        Ok(result) => JsonRpcResponse::success(request.id, result),
-                        Err((code, message)) => JsonRpcResponse::error(request.id, code, message),
-                    };
+                    let request_id = request_id_key(&request.id);
 
-                    if !is_notification {
-                        write_response_sync(&response);
+                    match request.method.as_str() {
+                        "notifications/cancelled" => {
+                            if cancel_active_request(
+                                &mut active_requests,
+                                &mut cancelled_requests,
+                                &request.params,
+                            ) {
+                                tracing::info!("Aborted cancelled in-flight request");
+                            }
+                            continue;
+                        }
+                        "shutdown" => {
+                            shutting_down = true;
+                            if !is_notification {
+                                write_response_sync(&JsonRpcResponse::success(
+                                    request.id,
+                                    serde_json::json!({}),
+                                ));
+                            }
+                            continue;
+                        }
+                        "exit" => {
+                            tracing::info!(
+                                "Received exit; aborting {} in-flight request(s)",
+                                active_requests.len()
+                            );
+                            abort_all_requests(&mut active_requests);
+                            break;
+                        }
+                        _ => {}
+                    }
+
+                    if shutting_down {
+                        if !is_notification {
+                            write_response_sync(&JsonRpcResponse::error(
+                                request.id,
+                                -32000,
+                                "Server is shutting down".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+
+                    let handler = Arc::clone(&self.handler);
+                    if let Some(key) = request_id {
+                        cancelled_requests.remove(&key);
+
+                        let response_tx = response_tx.clone();
+                        let method = request.method;
+                        let params = request.params;
+                        let id = request.id;
+                        let task = tokio::spawn(async move {
+                            let response = match handler.handle(&method, params).await {
+                                Ok(result) => JsonRpcResponse::success(id, result),
+                                Err((code, message)) => JsonRpcResponse::error(id, code, message),
+                            };
+                            let _ = response_tx.send(response);
+                        });
+
+                        if let Some(previous) = active_requests.insert(key.clone(), task) {
+                            tracing::warn!("Replacing duplicate in-flight request id {}", key);
+                            cancelled_requests.insert(key);
+                            previous.abort();
+                        }
+                    } else {
+                        tokio::spawn(async move {
+                            let _ = handler.handle(&request.method, request.params).await;
+                        });
                     }
                 }
+                response = response_rx.recv() => {
+                    let Some(response) = response else { continue };
+
+                    if let Some(key) = request_id_key(&response.id) {
+                        active_requests.remove(&key);
+                        if cancelled_requests.remove(&key) {
+                            tracing::debug!("Dropping response for cancelled request {}", key);
+                            continue;
+                        }
+                    }
+                    write_response_sync(&response);
+                }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Received Ctrl+C, shutting down");
+                    tracing::info!(
+                        "Received Ctrl+C, aborting {} in-flight request(s)",
+                        active_requests.len()
+                    );
+                    abort_all_requests(&mut active_requests);
                     break;
                 }
             }
@@ -156,4 +253,153 @@ fn write_response_sync(response: &JsonRpcResponse) {
     let mut out = stdout.lock();
     let _ = out.write_all(&frame);
     let _ = out.flush();
+}
+
+fn request_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::Null => None,
+        Value::String(value) => Some(format!("string:{value}")),
+        Value::Number(value) => Some(format!("number:{value}")),
+        Value::Bool(value) => Some(format!("bool:{value}")),
+        other => serde_json::to_string(other)
+            .ok()
+            .map(|encoded| format!("json:{encoded}")),
+    }
+}
+
+fn cancelled_request_key(params: &Value) -> Option<String> {
+    params
+        .get("requestId")
+        .or_else(|| params.get("request_id"))
+        .or_else(|| params.get("id"))
+        .and_then(request_id_key)
+}
+
+fn cancel_active_request(
+    active_requests: &mut HashMap<String, JoinHandle<()>>,
+    cancelled_requests: &mut HashSet<String>,
+    params: &Value,
+) -> bool {
+    let Some(key) = cancelled_request_key(params) else {
+        return false;
+    };
+
+    cancelled_requests.insert(key.clone());
+    if let Some(handle) = active_requests.remove(&key) {
+        handle.abort();
+        return true;
+    }
+
+    false
+}
+
+fn abort_all_requests(active_requests: &mut HashMap<String, JoinHandle<()>>) {
+    for (_, handle) in active_requests.drain() {
+        handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{abort_all_requests, cancel_active_request, cancelled_request_key, request_id_key};
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    struct PendingUntilAborted {
+        signal: Option<oneshot::Sender<()>>,
+    }
+
+    impl Future for PendingUntilAborted {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUntilAborted {
+        fn drop(&mut self) {
+            if let Some(tx) = self.signal.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn pending_task() -> (JoinHandle<()>, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::spawn(PendingUntilAborted { signal: Some(tx) });
+        (handle, rx)
+    }
+
+    #[test]
+    fn test_cancelled_request_key_reads_mcp_request_id() {
+        assert_eq!(
+            cancelled_request_key(&json!({"requestId": 7})),
+            Some("number:7".to_string())
+        );
+        assert_eq!(
+            cancelled_request_key(&json!({"request_id": "child-req"})),
+            Some("string:child-req".to_string())
+        );
+        assert_eq!(
+            cancelled_request_key(&json!({"id": true})),
+            Some("bool:true".to_string())
+        );
+        assert!(cancelled_request_key(&json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_active_request_aborts_matching_task() {
+        let (handle, dropped) = pending_task();
+        let key = request_id_key(&json!(42)).expect("request key");
+        let mut active_requests = HashMap::from([(key.clone(), handle)]);
+        let mut cancelled_requests = HashSet::new();
+
+        assert!(cancel_active_request(
+            &mut active_requests,
+            &mut cancelled_requests,
+            &json!({"requestId": 42}),
+        ));
+        assert!(active_requests.is_empty());
+        assert!(cancelled_requests.contains(&key));
+
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("task should abort promptly")
+            .expect("drop signal should arrive");
+    }
+
+    #[tokio::test]
+    async fn test_abort_all_requests_aborts_every_in_flight_task() {
+        let (first_handle, first_dropped) = pending_task();
+        let (second_handle, second_dropped) = pending_task();
+        let mut active_requests = HashMap::from([
+            (
+                request_id_key(&json!(1)).expect("first request key"),
+                first_handle,
+            ),
+            (
+                request_id_key(&json!("second")).expect("second request key"),
+                second_handle,
+            ),
+        ]);
+
+        abort_all_requests(&mut active_requests);
+        assert!(active_requests.is_empty());
+
+        tokio::time::timeout(Duration::from_secs(1), first_dropped)
+            .await
+            .expect("first task should abort promptly")
+            .expect("first drop signal should arrive");
+        tokio::time::timeout(Duration::from_secs(1), second_dropped)
+            .await
+            .expect("second task should abort promptly")
+            .expect("second drop signal should arrive");
+    }
 }

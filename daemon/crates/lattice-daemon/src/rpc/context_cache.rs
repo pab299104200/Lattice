@@ -298,15 +298,17 @@ mod tests {
                 expires_at_epoch_secs: now_epoch_secs().saturating_sub(5),
             }],
         };
-        fs::write(&path, serde_json::to_vec(&persisted).expect("serialize"))
-            .expect("write cache");
+        fs::write(&path, serde_json::to_vec(&persisted).expect("serialize")).expect("write cache");
 
         let mut restored = ContextHandleCache::new_with_limits_and_persistence(
             4,
             Duration::from_secs(60),
             Some(path.clone()),
         );
-        assert!(restored.get("ctx-old").is_none(), "expired handle should not be restored");
+        assert!(
+            restored.get("ctx-old").is_none(),
+            "expired handle should not be restored"
+        );
 
         let _ = fs::remove_file(path);
     }
