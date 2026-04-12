@@ -1,11 +1,14 @@
 use crate::error::LatticeError;
-use crate::storage::vector_index::{VectorIndex, VectorSearchResult};
-use crate::storage::vector_store::{cosine_similarity, StoredVectorRecord, VectorStore};
+use crate::storage::vector_index::{VectorIndex, VectorScope, VectorSearchResult};
+use crate::storage::vector_store::{
+    cosine_similarity, decode_vector_name_scope, encode_vector_name_for_scope, StoredVectorRecord,
+    VectorStore,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use tracing::warn;
+use tracing::{info, warn};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const ANN_OVERSAMPLE_FACTOR: usize = 4;
@@ -168,13 +171,14 @@ impl UsearchVectorIndex {
         &self,
         query: &[f32],
         top_k: usize,
+        scope: VectorScope,
         reason: &str,
     ) -> Result<Vec<VectorSearchResult>, LatticeError> {
         warn!(
             "USearch semantic lookup fell back to SQLite exact search: {}",
             reason
         );
-        self.store.search(query, top_k)
+        self.store.search_in_scope(query, top_k, scope)
     }
 
     fn lock_state(&self, context: &str) -> Result<MutexGuard<'_, UsearchState>, LatticeError> {
@@ -228,9 +232,20 @@ impl VectorIndex for UsearchVectorIndex {
         byte_offset: usize,
         vector: &[f32],
     ) -> Result<(), LatticeError> {
-        let ann_key = self
-            .store
-            .upsert_vector_with_key(file, name, byte_offset, vector)?;
+        self.upsert_vector_in_scope(file, name, byte_offset, VectorScope::Symbol, vector)
+    }
+
+    fn upsert_vector_in_scope(
+        &self,
+        file: &str,
+        name: &str,
+        byte_offset: usize,
+        scope: VectorScope,
+        vector: &[f32],
+    ) -> Result<(), LatticeError> {
+        let ann_key =
+            self.store
+                .upsert_vector_with_key_in_scope(file, name, byte_offset, scope, vector)?;
         let dimension = self.dimension()?;
         let mut state = self.lock_state("upsert USearch vector")?;
         state.dimension = Some(dimension);
@@ -255,9 +270,14 @@ impl VectorIndex for UsearchVectorIndex {
             ))
         })?;
 
-        state
-            .key_map
-            .insert(ann_key, (name.to_string(), file.to_string(), byte_offset));
+        state.key_map.insert(
+            ann_key,
+            (
+                encode_vector_name_for_scope(name, scope),
+                file.to_string(),
+                byte_offset,
+            ),
+        );
         state.dirty = true;
         Ok(())
     }
@@ -317,17 +337,31 @@ impl VectorIndex for UsearchVectorIndex {
     }
 
     fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorSearchResult>, LatticeError> {
+        self.search_in_scope(query, top_k, VectorScope::Symbol)
+    }
+
+    fn search_in_scope(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: VectorScope,
+    ) -> Result<Vec<VectorSearchResult>, LatticeError> {
         if top_k == 0 {
             return Ok(Vec::new());
         }
 
         if let Err(err) = self.ensure_index_ready() {
-            return self.fallback_exact_search(query, top_k, &format!("warm-up failed: {}", err));
+            return self.fallback_exact_search(
+                query,
+                top_k,
+                scope,
+                &format!("warm-up failed: {}", err),
+            );
         }
 
         let state = self.lock_state("search USearch index")?;
         let Some(index) = state.index.as_ref() else {
-            return self.fallback_exact_search(query, top_k, "index was not initialized");
+            return self.fallback_exact_search(query, top_k, scope, "index was not initialized");
         };
 
         if index.size() == 0 {
@@ -346,6 +380,7 @@ impl VectorIndex for UsearchVectorIndex {
                 return self.fallback_exact_search(
                     query,
                     top_k,
+                    scope,
                     &format!("ann search failed: {}", err),
                 );
             }
@@ -358,9 +393,14 @@ impl VectorIndex for UsearchVectorIndex {
                 return self.fallback_exact_search(
                     query,
                     top_k,
+                    scope,
                     &format!("missing metadata for ann key {}", key),
                 );
             };
+            let (stored_scope, logical_name) = decode_vector_name_scope(name);
+            if !scope_matches(stored_scope, scope) {
+                continue;
+            }
 
             let mut stored_vec = Vec::new();
             let similarity = match index.export::<f32>(*key, &mut stored_vec) {
@@ -374,7 +414,7 @@ impl VectorIndex for UsearchVectorIndex {
                 }
             };
 
-            results.push((name.clone(), file.clone(), *byte_offset, similarity));
+            results.push((logical_name, file.clone(), *byte_offset, similarity));
         }
 
         results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
@@ -390,9 +430,23 @@ impl VectorIndex for UsearchVectorIndex {
         }
 
         if state.key_map.is_empty() {
+            let index_bytes_before = file_size_bytes(&self.index_path);
+            let metadata_bytes_before = file_size_bytes(&self.metadata_path);
             let _ = fs::remove_file(&self.index_path);
             let _ = fs::remove_file(&self.metadata_path);
             state.dirty = false;
+            info!(
+                implementation = self.implementation_name(),
+                vectors = 0usize,
+                generation,
+                index_bytes_before,
+                metadata_bytes_before,
+                index_bytes_after = 0u64,
+                metadata_bytes_after = 0u64,
+                index_bytes_delta = -(index_bytes_before as i64),
+                metadata_bytes_delta = -(metadata_bytes_before as i64),
+                "USearch index flushed and cleared"
+            );
             return Ok(());
         }
 
@@ -406,6 +460,9 @@ impl VectorIndex for UsearchVectorIndex {
                 "USearch index was marked dirty without a configured dimension".to_string(),
             )
         })?;
+        let vector_count = state.key_map.len();
+        let index_bytes_before = file_size_bytes(&self.index_path);
+        let metadata_bytes_before = file_size_bytes(&self.metadata_path);
 
         if let Some(parent) = self.index_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -444,6 +501,22 @@ impl VectorIndex for UsearchVectorIndex {
                 e
             ))
         })?;
+
+        let index_bytes_after = file_size_bytes(&self.index_path);
+        let metadata_bytes_after = file_size_bytes(&self.metadata_path);
+        info!(
+            implementation = self.implementation_name(),
+            vectors = vector_count,
+            dimension,
+            generation,
+            index_bytes_before,
+            index_bytes_after,
+            index_bytes_delta = index_bytes_after as i64 - index_bytes_before as i64,
+            metadata_bytes_before,
+            metadata_bytes_after,
+            metadata_bytes_delta = metadata_bytes_after as i64 - metadata_bytes_before as i64,
+            "USearch index flush complete"
+        );
 
         state.dirty = false;
         Ok(())
@@ -517,4 +590,12 @@ fn metadata_path_for(index_path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("vectors.usearch");
     parent.join(format!("{}.meta.json", file_name))
+}
+
+fn file_size_bytes(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn scope_matches(stored: VectorScope, requested: VectorScope) -> bool {
+    matches!(requested, VectorScope::All) || stored == requested
 }

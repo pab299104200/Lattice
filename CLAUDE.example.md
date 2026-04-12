@@ -5,16 +5,19 @@
 Lattice provides a dependency graph and context engine for this codebase.
 
 - Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
-- If you would otherwise open 3 or more unfamiliar files, call `get_context_capsule`, `prepare_change`, or `summarize_subsystem` first.
-- If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
-- If you have raw failure text, pass it to `diagnose_failure` before grep-driven triage.
-- Default to `prepare_change` for implementation tasks once the likely change area is known.
-- Default to `get_context_capsule` for understanding unfamiliar subsystems, then use its handle with `expand_context` instead of restarting discovery.
-- Start with `diagnose_failure` when the task begins from a failing test, compiler error, stack trace, or runtime failure.
-- Use `get_docs_capsule` when the answer is likely in Markdown docs, ADRs, runbooks, or scorecards.
-- Use `get_backlinks`, `get_outgoing_links`, and `find_stale_docs` for doc-to-code navigation and documentation review.
-- Use `impact_from_diff` and `find_relevant_tests` when reviewing local edits or selecting test coverage.
-- Use memory tools when long-running sessions, repeated workflows, or prior observations are likely to help.
+- If you would otherwise open 3 or more unfamiliar files, start with `diagnose_failure`, `trace_scenario`, `prepare_change`, `plan_edit`, or `get_context_capsule` instead of broad file reads.
+- Use the tool that matches the task shape:
+  - `diagnose_failure` for failing tests, compiler errors, stack traces, or runtime failures
+  - `trace_scenario` for behavior-level debugging when you have a scenario but not the exact symbol
+  - `prepare_change` when the likely change area is known and you need edit files, symbols, tests, and risks
+  - `plan_edit` when you need a patch-oriented plan with candidate edit spans, affected callers/dependencies, docs, and recommended tests
+  - `get_context_capsule` for unfamiliar subsystems or architecture questions
+- Use `expand_context` when one of those tools returns a `context_handle` or `suggested_expand` instead of restarting discovery.
+- Prefer stable follow-up targets when provided. `expand_context` resolves exact `symbol_id:` and `file_id:` handles first, then legacy `symbol:` and `file:` targets for compatibility.
+- Use `summarize_subsystem`, `get_repo_playbook`, or `get_skeleton` when you explicitly want a summary-first map, repo-wide conventions, or file structure before opening source.
+- Use `get_docs_capsule` for doc-first questions and `get_backlinks`, `get_outgoing_links`, and `find_stale_docs` for docs-graph navigation and drift checks.
+- Use `impact_from_diff` and `find_relevant_tests` when reviewing local edits, checking blast radius, or deciding what to run.
+- Prefer durable, verified memory over weaker freeform recollection. Reuse or record repo-/branch-scoped workflow outcomes when they are verified, and treat structured memory fields like verification, provenance, evidence, freshness, and contradiction status as signals for trust.
 
 For targeted edits to already-known files, direct Read/Grep/Edit is still fine.
 Lattice adds the most value when you do not already know where to look.

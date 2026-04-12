@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
-use crate::query::{ContextCapsule, QueryIntent};
+use crate::query::{detect_intent, ContextCapsule, QueryIntent};
+use crate::symbols::{parse_stable_file_handle, stable_file_handle, SymbolId};
 
+use super::docs::find_stale_docs;
 use super::ProjectRule;
 
 const COMPACT_PRIMARY_FILE_LIMIT: usize = 4;
@@ -98,6 +100,42 @@ const PATH_STOP_WORDS: &[&str] = &[
 ];
 
 const ASSISTANT_ARTIFACT_DIRS: &[&str] = &[".claude", ".codex"];
+const SCENARIO_FAILURE_HINTS: &[&str] = &[
+    "fail",
+    "failure",
+    "error",
+    "panic",
+    "exception",
+    "timeout",
+    "forbidden",
+    "unauthorized",
+    "denied",
+    "status_code=4",
+    "status_code=5",
+];
+const SCENARIO_GUARD_HINTS: &[&str] = &[
+    "if ",
+    "match ",
+    "guard",
+    "validate",
+    "verify",
+    "check",
+    "ensure",
+    "authorize",
+    "require",
+];
+const SCENARIO_SIDE_EFFECT_HINTS: &[&str] = &[
+    "insert", "update", "delete", "write", "save", "commit", "publish", "emit", "send", "dispatch",
+    "enqueue", "persist", "cache", "create",
+];
+const COMPACT_SCENARIO_ENTRYPOINT_LIMIT: usize = 6;
+const FULL_SCENARIO_ENTRYPOINT_LIMIT: usize = 10;
+const COMPACT_SCENARIO_PATH_LIMIT: usize = 8;
+const FULL_SCENARIO_PATH_LIMIT: usize = 14;
+const COMPACT_SCENARIO_SIGNAL_LIMIT: usize = 5;
+const FULL_SCENARIO_SIGNAL_LIMIT: usize = 9;
+const ULTRA_COMPACT_SCENARIO_PATH_LIMIT: usize = 3;
+const ULTRA_COMPACT_SCENARIO_SIGNAL_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleMode {
@@ -190,6 +228,8 @@ pub struct FileRecommendation {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolRecommendation {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub file: String,
     pub line: usize,
@@ -259,6 +299,183 @@ pub struct TaskBundle {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EditSpanRecommendation {
+    pub file: String,
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
+    pub line_span: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub reason: String,
+    pub confidence_band: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEditImpact {
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub relationship: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEditDocRecommendation {
+    pub file: String,
+    pub line: usize,
+    pub summary: String,
+    pub score: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEditStats {
+    pub edit_file_count: usize,
+    pub supporting_file_count: usize,
+    pub symbol_count: usize,
+    pub span_count: usize,
+    pub caller_count: usize,
+    pub dependency_count: usize,
+    pub doc_count: usize,
+    pub stale_doc_signal_count: usize,
+    pub test_count: usize,
+    pub memory_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanEditBundle {
+    pub query: String,
+    pub intent: QueryIntent,
+    pub overview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_expand: Option<ExpandSuggestion>,
+    pub edit_files: Vec<FileRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supporting_files: Vec<FileRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<SymbolRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidate_spans: Vec<EditSpanRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affected_callers: Vec<PlanEditImpact>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affected_dependencies: Vec<PlanEditImpact>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relevant_docs: Vec<PlanEditDocRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_doc_signals: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<TestRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_gaps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_rules: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_highlights: Vec<MemoryHighlight>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<RiskRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rationale: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<PlanEditStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioPathSegment {
+    pub from_symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_symbol_handle: Option<String>,
+    pub from_kind: String,
+    pub from_file: String,
+    pub from_line: usize,
+    pub to_symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_symbol_handle: Option<String>,
+    pub to_kind: String,
+    pub to_file: String,
+    pub to_line: usize,
+    pub relationship: String,
+    pub score: f64,
+    pub confidence_band: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rationale: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioSignal {
+    pub signal_type: String,
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub summary: String,
+    pub score: f64,
+    pub confidence_band: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioTraceStats {
+    pub likely_entrypoint_count: usize,
+    pub plausible_entrypoint_count: usize,
+    pub execution_path_count: usize,
+    pub plausible_path_count: usize,
+    pub guard_count: usize,
+    pub side_effect_count: usize,
+    pub failure_branch_count: usize,
+    pub doc_count: usize,
+    pub test_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioTraceBundle {
+    pub scenario: String,
+    pub intent: QueryIntent,
+    pub overview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_expand: Option<ExpandSuggestion>,
+    pub likely_entrypoints: Vec<SymbolRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plausible_entrypoints: Vec<SymbolRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub execution_path: Vec<ScenarioPathSegment>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plausible_paths: Vec<ScenarioPathSegment>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<ScenarioSignal>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub side_effects: Vec<ScenarioSignal>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failure_branches: Vec<ScenarioSignal>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relevant_docs: Vec<PlanEditDocRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<TestRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_gaps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_rules: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rationale: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<ScenarioTraceStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TestSelectionReport {
     pub source_files: Vec<String>,
     pub tests: Vec<TestRecommendation>,
@@ -285,6 +502,8 @@ pub struct ChangedFileImpact {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedSymbolImpact {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub file: String,
     pub line: usize,
@@ -298,6 +517,8 @@ pub struct ChangedSymbolImpact {
 #[derive(Debug, Clone, Serialize)]
 pub struct AffectedSymbolImpact {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub file: String,
     pub line: usize,
@@ -392,6 +613,8 @@ pub struct CompactFileSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSymbolSummary {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub file: String,
     pub line: usize,
     pub role: String,
@@ -405,6 +628,16 @@ pub struct MemoryHighlight {
     pub memory_type: String,
     pub scope: String,
     pub is_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assertion_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_policy_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -520,6 +753,8 @@ pub struct ExpandContextSeed {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpandedRelationshipContext {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub file: String,
     pub line: usize,
@@ -529,6 +764,8 @@ pub struct ExpandedRelationshipContext {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpandedFileSymbolContext {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub line: usize,
     pub signature: String,
@@ -558,6 +795,8 @@ pub struct ExpandedTestContext {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpandedSymbolContext {
     pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_handle: Option<String>,
     pub kind: String,
     pub file: String,
     pub line: usize,
@@ -610,6 +849,7 @@ struct FileAccumulator {
 struct SymbolAccumulator {
     kind: String,
     line: usize,
+    byte_offset: Option<usize>,
     role: String,
     score: f64,
 }
@@ -624,8 +864,21 @@ struct TestAccumulator {
 struct AffectedAccumulator {
     kind: String,
     line: usize,
+    byte_offset: Option<usize>,
     via: Vec<String>,
     score: f64,
+}
+
+#[derive(Default)]
+struct ScenarioPathAccumulator {
+    from_kind: String,
+    from_line: usize,
+    from_offset: Option<usize>,
+    to_kind: String,
+    to_line: usize,
+    to_offset: Option<usize>,
+    score: f64,
+    rationale: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +900,7 @@ struct ParsedDiffFile {
 }
 
 enum ExpansionTarget {
+    SymbolId(SymbolId),
     Symbol(String),
     File(String),
     Test(String),
@@ -656,6 +910,7 @@ enum ExpansionTarget {
 impl ExpansionTarget {
     fn kind(&self) -> &'static str {
         match self {
+            Self::SymbolId(_) => "symbol",
             Self::Symbol(_) => "symbol",
             Self::File(_) => "file",
             Self::Test(_) => "test",
@@ -698,6 +953,7 @@ pub fn prepare_change(
         if !is_queryable_graph_file(&pivot.file) {
             continue;
         }
+        let pivot_exact = find_exact_node(graph, &pivot.file, &pivot.symbol);
         add_file_score(
             &mut file_scores,
             &pivot.file,
@@ -708,12 +964,13 @@ pub fn prepare_change(
             &mut symbol_scores,
             &pivot.file,
             &pivot.symbol,
+            pivot_exact.map(|node| &node.id),
             pivot.kind.clone(),
             pivot.line,
             "pivot".to_string(),
             4.0 + pivot.score,
         );
-        if let Some(node) = find_exact_node(graph, &pivot.file, &pivot.symbol) {
+        if let Some(node) = pivot_exact {
             push_seed_node(&mut seed_nodes, &mut seed_seen, node);
         }
     }
@@ -722,6 +979,7 @@ pub fn prepare_change(
         if !is_queryable_graph_file(&context.file) {
             continue;
         }
+        let context_exact = find_exact_node(graph, &context.file, &context.symbol);
         add_file_score(
             &mut file_scores,
             &context.file,
@@ -732,12 +990,13 @@ pub fn prepare_change(
             &mut symbol_scores,
             &context.file,
             &context.symbol,
+            context_exact.map(|node| &node.id),
             context.kind.clone(),
             context.line,
             "context".to_string(),
             1.75 + context.score,
         );
-        if let Some(node) = find_exact_node(graph, &context.file, &context.symbol) {
+        if let Some(node) = context_exact {
             push_seed_node(&mut seed_nodes, &mut seed_seen, node);
         }
     }
@@ -758,6 +1017,7 @@ pub fn prepare_change(
                 &mut symbol_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "entry_symbol".to_string(),
@@ -783,6 +1043,7 @@ pub fn prepare_change(
                 &mut symbol_scores,
                 &dep.file,
                 &dep.name,
+                Some(&dep.id),
                 dep.kind.short_code().to_string(),
                 dep.line,
                 format!("dependency:{}", short_edge(edge)),
@@ -805,6 +1066,7 @@ pub fn prepare_change(
                 &mut symbol_scores,
                 &dependent.file,
                 &dependent.name,
+                Some(&dependent.id),
                 dependent.kind.short_code().to_string(),
                 dependent.line,
                 format!("dependent:{}", short_edge(*edge)),
@@ -975,6 +1237,1366 @@ pub fn prepare_change(
         } else {
             None
         },
+    }
+}
+
+pub fn plan_edit(
+    graph: &CodeGraph,
+    capsule: &ContextCapsule,
+    entry_files: &[String],
+    entry_symbols: &[String],
+    rules: &[ProjectRule],
+    mode: BundleMode,
+) -> PlanEditBundle {
+    let task_bundle = prepare_change(graph, capsule, entry_files, entry_symbols, rules, mode);
+    let mut edit_files = task_bundle.primary_files.clone();
+    let mut supporting_files = task_bundle.secondary_files.clone();
+    let symbols = task_bundle.symbols.clone();
+    let mut candidate_spans = build_plan_edit_spans(graph, &symbols, mode);
+    let span_symbol_keys: HashSet<(String, String)> = candidate_spans
+        .iter()
+        .map(|span| (span.file.clone(), span.symbol.clone()))
+        .collect();
+
+    let mut affected_callers = collect_plan_edit_impacts(
+        graph,
+        &span_symbol_keys,
+        mode.affected_limit(),
+        &[EdgeKind::Calls],
+        "caller",
+        true,
+        false,
+    );
+    let mut affected_dependencies = collect_plan_edit_impacts(
+        graph,
+        &span_symbol_keys,
+        mode.affected_limit(),
+        &[
+            EdgeKind::Imports,
+            EdgeKind::Implements,
+            EdgeKind::Extends,
+            EdgeKind::TypeRef,
+        ],
+        "dependency",
+        false,
+        true,
+    );
+
+    let stale_doc_report = find_stale_docs(
+        graph,
+        &edit_files
+            .iter()
+            .chain(supporting_files.iter())
+            .map(|item| item.file.clone())
+            .collect::<Vec<_>>(),
+        &symbols
+            .iter()
+            .map(|item| item.symbol.clone())
+            .collect::<Vec<_>>(),
+        mode.affected_limit().max(6),
+    );
+    let mut relevant_docs = stale_doc_report
+        .docs
+        .iter()
+        .map(|item| PlanEditDocRecommendation {
+            file: item.file.clone(),
+            line: item.line,
+            summary: truncate_text(&item.summary, 140),
+            score: round_score(item.score),
+            matched_files: item.matched_files.clone(),
+            matched_symbols: item.matched_symbols.clone(),
+            reasons: item.reasons.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut stale_doc_signals = stale_doc_report
+        .docs
+        .iter()
+        .take(6)
+        .map(|item| {
+            let mut parts = Vec::new();
+            if !item.matched_symbols.is_empty() {
+                parts.push(format!(
+                    "mentions changed symbols {}",
+                    summarize_item_list(
+                        &item
+                            .matched_symbols
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    )
+                ));
+            }
+            if !item.matched_files.is_empty() {
+                parts.push(format!(
+                    "touches changed files {}",
+                    summarize_item_list(
+                        &item
+                            .matched_files
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    )
+                ));
+            }
+            if parts.is_empty() {
+                format!(
+                    "{}:{} may be stale against edit plan anchors",
+                    item.file, item.line
+                )
+            } else {
+                format!(
+                    "{}:{} {}",
+                    item.file,
+                    item.line,
+                    truncate_text(&parts.join("; "), 92)
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut rationale = task_bundle.rationale.clone();
+    if !candidate_spans.is_empty() {
+        rationale.push(format!(
+            "Candidate edit spans map likely symbols to concrete line ranges for first-pass edits."
+        ));
+    }
+    if !affected_callers.is_empty() {
+        rationale.push(format!(
+            "Caller impact was derived from direct call edges around the candidate edit spans."
+        ));
+    }
+    if !affected_dependencies.is_empty() {
+        rationale.push(format!(
+            "Dependency impact highlights imports, type references, and interface contracts near planned edits."
+        ));
+    }
+    if !relevant_docs.is_empty() {
+        rationale.push(format!(
+            "Found {} doc section(s) that may drift from the planned edits.",
+            relevant_docs.len()
+        ));
+    }
+    dedupe_strings(&mut rationale);
+
+    if matches!(mode, BundleMode::Compact) {
+        compactify_file_recommendations(&mut edit_files);
+        compactify_file_recommendations(&mut supporting_files);
+        compactify_plan_edit_impacts(&mut affected_callers);
+        compactify_plan_edit_impacts(&mut affected_dependencies);
+        compactify_plan_edit_docs(&mut relevant_docs);
+        ultra_compactify_plan_edit(
+            &mut supporting_files,
+            &mut candidate_spans,
+            &mut affected_callers,
+            &mut affected_dependencies,
+            &mut relevant_docs,
+            &mut stale_doc_signals,
+            &mut rationale,
+        );
+    }
+
+    let suggested_expand = candidate_spans
+        .first()
+        .and_then(|span| span.symbol_handle.clone())
+        .map(|focus| ExpandSuggestion {
+            focus,
+            reason: "Inspect the top candidate edit span to apply the first patch safely."
+                .to_string(),
+        })
+        .or(task_bundle.suggested_expand.clone());
+
+    let overview = build_plan_edit_overview(
+        &task_bundle.overview,
+        &candidate_spans,
+        &affected_callers,
+        &relevant_docs,
+    );
+    let stats = if matches!(mode, BundleMode::Full) {
+        Some(PlanEditStats {
+            edit_file_count: edit_files.len(),
+            supporting_file_count: supporting_files.len(),
+            symbol_count: symbols.len(),
+            span_count: candidate_spans.len(),
+            caller_count: affected_callers.len(),
+            dependency_count: affected_dependencies.len(),
+            doc_count: relevant_docs.len(),
+            stale_doc_signal_count: stale_doc_signals.len(),
+            test_count: task_bundle.tests.len(),
+            memory_count: task_bundle.memories.len(),
+        })
+    } else {
+        None
+    };
+
+    PlanEditBundle {
+        query: task_bundle.query,
+        intent: task_bundle.intent,
+        overview,
+        suggested_expand,
+        edit_files,
+        supporting_files,
+        symbols,
+        candidate_spans,
+        affected_callers,
+        affected_dependencies,
+        relevant_docs,
+        stale_doc_signals,
+        tests: task_bundle.tests,
+        test_gaps: task_bundle.test_gaps,
+        matched_rules: task_bundle.matched_rules,
+        memories: task_bundle.memories,
+        memory_highlights: task_bundle.memory_highlights,
+        risks: task_bundle.risks,
+        rationale,
+        stats,
+    }
+}
+
+pub fn trace_scenario(
+    graph: &CodeGraph,
+    scenario: &str,
+    entry_files: &[String],
+    entry_symbols: &[String],
+    rules: &[ProjectRule],
+    mode: BundleMode,
+) -> ScenarioTraceBundle {
+    let intent = detect_intent(scenario);
+    let all_nodes = graph.all_nodes();
+    let scenario_tokens: HashSet<String> = tokenize_path(scenario).into_iter().collect();
+    let scenario_lower = scenario.to_ascii_lowercase();
+    let scenario_has_failure_hints = SCENARIO_FAILURE_HINTS
+        .iter()
+        .any(|hint| scenario_lower.contains(hint));
+    let scenario_has_guard_hints = SCENARIO_GUARD_HINTS
+        .iter()
+        .any(|hint| scenario_lower.contains(hint));
+    let scenario_has_side_effect_hints = SCENARIO_SIDE_EFFECT_HINTS
+        .iter()
+        .any(|hint| scenario_lower.contains(hint));
+
+    let mut file_scores: HashMap<String, FileAccumulator> = HashMap::new();
+    let mut symbol_scores: HashMap<(String, String), SymbolAccumulator> = HashMap::new();
+    let mut seed_nodes: Vec<&GraphNode> = Vec::new();
+    let mut seed_seen: HashSet<(String, String)> = HashSet::new();
+    let mut rationale = Vec::new();
+
+    for file in entry_files {
+        if !is_queryable_graph_file(file) {
+            continue;
+        }
+        add_file_score(
+            &mut file_scores,
+            file,
+            8.5,
+            "user supplied scenario file anchor".to_string(),
+        );
+        for (index, node) in rank_file_focus_nodes(graph, &all_nodes, file)
+            .into_iter()
+            .take(3)
+            .enumerate()
+        {
+            let delta = (5.2 - index as f64 * 0.7).max(2.0);
+            add_symbol_score(
+                &mut symbol_scores,
+                &node.file,
+                &node.name,
+                Some(&node.id),
+                node.kind.short_code().to_string(),
+                node.line,
+                "entry_file".to_string(),
+                delta,
+            );
+            push_seed_node(&mut seed_nodes, &mut seed_seen, node);
+        }
+    }
+
+    for symbol in entry_symbols {
+        for (index, node) in find_symbol_matches(graph, symbol, entry_files)
+            .into_iter()
+            .take(4)
+            .enumerate()
+        {
+            let delta = (7.5 - index as f64 * 0.75).max(2.5);
+            add_file_score(
+                &mut file_scores,
+                &node.file,
+                delta,
+                format!("user supplied scenario symbol {}", symbol),
+            );
+            add_symbol_score(
+                &mut symbol_scores,
+                &node.file,
+                &node.name,
+                Some(&node.id),
+                node.kind.short_code().to_string(),
+                node.line,
+                "entry_symbol".to_string(),
+                delta,
+            );
+            push_seed_node(&mut seed_nodes, &mut seed_seen, node);
+        }
+    }
+
+    let mut lexical_candidates: Vec<(&GraphNode, f64, Vec<String>)> = Vec::new();
+    for node in &all_nodes {
+        if !is_queryable_graph_file(&node.file) || is_test_file(&node.file) {
+            continue;
+        }
+
+        let mut score = 0.0;
+        let mut reasons = Vec::new();
+        if input_mentions_symbol(scenario, &node.name) {
+            score += 5.0;
+            reasons.push("scenario text directly names this symbol".to_string());
+        }
+
+        let symbol_tokens: HashSet<String> = tokenize_path(&node.name).into_iter().collect();
+        let file_tokens: HashSet<String> = focus_tokens_for_file(&node.file).into_iter().collect();
+        let symbol_overlap = overlap_count_set(&scenario_tokens, &symbol_tokens);
+        if symbol_overlap > 0 {
+            score += symbol_overlap as f64 * 2.0;
+            reasons.push(format!(
+                "symbol name overlaps {} scenario token(s)",
+                symbol_overlap
+            ));
+        }
+        let file_overlap = overlap_count_set(&scenario_tokens, &file_tokens);
+        if file_overlap > 0 {
+            score += file_overlap as f64 * 1.4;
+            reasons.push(format!(
+                "file focus overlaps {} scenario token(s)",
+                file_overlap
+            ));
+        }
+
+        let lowered_name = node.name.to_ascii_lowercase();
+        let lowered_file = node.file.to_ascii_lowercase();
+        let substring_overlap =
+            scenario_substring_overlap_hits(&scenario_tokens, &node.name, &node.file);
+        if substring_overlap > 0 {
+            score += substring_overlap as f64 * 1.15;
+            reasons.push(format!(
+                "substring overlap on {} scenario token(s)",
+                substring_overlap
+            ));
+        }
+        if lowered_file.contains("/routes/") {
+            score += 2.0;
+            reasons.push("route-layer symbol is a likely runtime entrypoint".to_string());
+        }
+        if lowered_name.contains("route") {
+            score += 1.3;
+        }
+        if scenario_tokens.contains("refresh") && lowered_name.contains("refresh") {
+            score += 0.9;
+        }
+        if scenario_tokens.contains("login") && lowered_name.contains("login") {
+            score += 0.7;
+        }
+        if lowered_name.contains("fallback")
+            && (scenario_tokens.contains("refresh") || scenario_tokens.contains("fail"))
+        {
+            score -= 0.5;
+            reasons.push("fallback branch treated as plausible alternative".to_string());
+        }
+
+        if node.is_exported {
+            score += 0.35;
+        }
+        score += graph.centrality(&node.id).min(3.0) * 0.2;
+
+        if scenario_has_failure_hints && node_has_body_hint(node, SCENARIO_FAILURE_HINTS) {
+            score += 1.4;
+            reasons.push("contains failure-path hints in symbol body".to_string());
+        }
+        if scenario_has_guard_hints && node_has_body_hint(node, SCENARIO_GUARD_HINTS) {
+            score += 0.8;
+            reasons.push("contains guard logic hints in symbol body".to_string());
+        }
+        if scenario_has_side_effect_hints && node_has_body_hint(node, SCENARIO_SIDE_EFFECT_HINTS) {
+            score += 0.8;
+            reasons.push("contains side-effect hints in symbol body".to_string());
+        }
+
+        if score >= 1.5 {
+            lexical_candidates.push((node, score, reasons));
+        }
+    }
+
+    lexical_candidates.sort_by(|(node_a, score_a, _), (node_b, score_b, _)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                graph
+                    .centrality(&node_b.id)
+                    .partial_cmp(&graph.centrality(&node_a.id))
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| node_a.file.cmp(&node_b.file))
+            .then_with(|| node_a.line.cmp(&node_b.line))
+            .then_with(|| node_a.name.cmp(&node_b.name))
+    });
+    lexical_candidates.truncate(mode.symbol_limit().max(6) * 3);
+
+    for (index, (node, score, mut reasons)) in lexical_candidates.into_iter().enumerate() {
+        let delta = (score - index as f64 * 0.15).max(0.6);
+        dedupe_strings(&mut reasons);
+        let reason = reasons
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "scenario lexical overlap".to_string());
+
+        add_file_score(&mut file_scores, &node.file, delta, reason);
+        add_symbol_score(
+            &mut symbol_scores,
+            &node.file,
+            &node.name,
+            Some(&node.id),
+            node.kind.short_code().to_string(),
+            node.line,
+            "scenario_match".to_string(),
+            delta,
+        );
+        push_seed_node(&mut seed_nodes, &mut seed_seen, node);
+    }
+
+    for node in &seed_nodes {
+        for (dependency, edge) in rank_related_nodes(graph.get_dependencies(&node.id))
+            .into_iter()
+            .take(5)
+        {
+            let delta = match edge {
+                EdgeKind::Calls => 1.8,
+                EdgeKind::Contains => 0.9,
+                _ => 1.2,
+            };
+            add_file_score(
+                &mut file_scores,
+                &dependency.file,
+                delta,
+                format!("{} scenario dependency via {}", node.name, short_edge(edge)),
+            );
+            add_symbol_score(
+                &mut symbol_scores,
+                &dependency.file,
+                &dependency.name,
+                Some(&dependency.id),
+                dependency.kind.short_code().to_string(),
+                dependency.line,
+                format!("dependency:{}", short_edge(edge)),
+                delta,
+            );
+        }
+
+        for (dependent, edge) in rank_related_nodes(graph.get_dependents(&node.id))
+            .into_iter()
+            .take(4)
+        {
+            let delta = match edge {
+                EdgeKind::Calls => 1.6,
+                EdgeKind::Contains => 0.9,
+                _ => 1.1,
+            };
+            add_file_score(
+                &mut file_scores,
+                &dependent.file,
+                delta,
+                format!(
+                    "{} scenario dependent via {}",
+                    dependent.name,
+                    short_edge(edge)
+                ),
+            );
+            add_symbol_score(
+                &mut symbol_scores,
+                &dependent.file,
+                &dependent.name,
+                Some(&dependent.id),
+                dependent.kind.short_code().to_string(),
+                dependent.line,
+                format!("dependent:{}", short_edge(edge)),
+                delta,
+            );
+        }
+    }
+
+    let mut ranked_files = finalize_file_recommendations(file_scores);
+    ranked_files = promote_explicit_files(ranked_files, entry_files);
+    ranked_files = prioritize_entry_scope_files(ranked_files, entry_files);
+    calibrate_file_recommendations(&mut ranked_files);
+
+    let mut ranked_symbols =
+        prefer_symbols_in_files(finalize_symbol_recommendations(symbol_scores), entry_files);
+    calibrate_symbol_recommendations(&mut ranked_symbols);
+
+    let mut candidate_entrypoints: Vec<SymbolRecommendation> = ranked_symbols
+        .iter()
+        .filter(|item| !is_test_file(&item.file))
+        .cloned()
+        .collect();
+    if candidate_entrypoints.is_empty() {
+        candidate_entrypoints = ranked_symbols.clone();
+    }
+
+    let mut likely_entrypoints = Vec::new();
+    let mut plausible_entrypoints = Vec::new();
+    let entrypoint_sample_limit =
+        scenario_entrypoint_limit(mode) + scenario_plausible_entrypoint_limit(mode);
+    for item in candidate_entrypoints
+        .iter()
+        .take(entrypoint_sample_limit)
+        .cloned()
+    {
+        if item.confidence_band == "high" || item.confidence_band == "medium" {
+            likely_entrypoints.push(item);
+        } else {
+            plausible_entrypoints.push(item);
+        }
+    }
+    if likely_entrypoints.is_empty() {
+        if let Some(first) = candidate_entrypoints.first().cloned() {
+            likely_entrypoints.push(first);
+        }
+        plausible_entrypoints = candidate_entrypoints
+            .iter()
+            .skip(1)
+            .take(scenario_plausible_entrypoint_limit(mode))
+            .cloned()
+            .collect();
+    }
+    likely_entrypoints.truncate(scenario_entrypoint_limit(mode));
+    plausible_entrypoints.truncate(scenario_plausible_entrypoint_limit(mode));
+
+    let mut traced_nodes: Vec<&GraphNode> = Vec::new();
+    let mut traced_seen: HashSet<(String, String)> = HashSet::new();
+    for item in likely_entrypoints
+        .iter()
+        .chain(plausible_entrypoints.iter())
+    {
+        if let Some(node) = resolve_recommended_symbol_node(graph, item) {
+            push_seed_node(&mut traced_nodes, &mut traced_seen, node);
+        }
+    }
+
+    let mut path_scores: HashMap<
+        (String, String, String, String, String),
+        ScenarioPathAccumulator,
+    > = HashMap::new();
+    let mut add_path_segment =
+        |from: &GraphNode, to: &GraphNode, relationship: String, delta: f64, reason: String| {
+            if !is_queryable_graph_file(&from.file)
+                || !is_queryable_graph_file(&to.file)
+                || is_test_file(&from.file)
+            {
+                return;
+            }
+            let key = (
+                from.file.clone(),
+                from.name.clone(),
+                to.file.clone(),
+                to.name.clone(),
+                relationship.clone(),
+            );
+            let entry = path_scores.entry(key).or_default();
+            if entry.from_kind.is_empty() {
+                entry.from_kind = from.kind.short_code().to_string();
+            }
+            if entry.from_line == 0 {
+                entry.from_line = from.line;
+            }
+            if entry.from_offset.is_none() {
+                entry.from_offset = Some(from.id.byte_offset);
+            }
+            if entry.to_kind.is_empty() {
+                entry.to_kind = to.kind.short_code().to_string();
+            }
+            if entry.to_line == 0 {
+                entry.to_line = to.line;
+            }
+            if entry.to_offset.is_none() {
+                entry.to_offset = Some(to.id.byte_offset);
+            }
+            entry.score += delta;
+            entry.rationale.push(reason);
+        };
+
+    for node in &traced_nodes {
+        for (dependency, edge) in rank_related_nodes(graph.get_dependencies(&node.id))
+            .into_iter()
+            .take(5)
+        {
+            let mut delta = match edge {
+                EdgeKind::Calls => 2.3,
+                EdgeKind::Imports | EdgeKind::TypeRef => 1.45,
+                _ => 1.1,
+            };
+            delta +=
+                scenario_path_alignment_bonus(&scenario_tokens, &dependency.name, &dependency.file);
+            if scenario_tokens.contains("refresh")
+                && dependency.name.to_ascii_lowercase().contains("fallback")
+            {
+                delta -= 0.65;
+            }
+            if scenario_tokens.contains("fail")
+                && likely_failure_symbol_name(&dependency.name, &dependency.body)
+            {
+                delta += 0.7;
+            }
+            add_path_segment(
+                node,
+                dependency,
+                format!("forward:{}", short_edge(edge)),
+                delta,
+                format!("outgoing {} from {}", short_edge(edge), node.name),
+            );
+
+            if edge == EdgeKind::Calls {
+                for (next, next_edge) in rank_related_nodes(graph.get_dependencies(&dependency.id))
+                    .into_iter()
+                    .take(2)
+                {
+                    if next_edge != EdgeKind::Calls && next_edge != EdgeKind::TypeRef {
+                        continue;
+                    }
+                    let mut hop_delta = 0.95;
+                    hop_delta +=
+                        scenario_path_alignment_bonus(&scenario_tokens, &next.name, &next.file);
+                    if scenario_tokens.contains("refresh")
+                        && next.name.to_ascii_lowercase().contains("fallback")
+                    {
+                        hop_delta -= 0.45;
+                    }
+                    add_path_segment(
+                        dependency,
+                        next,
+                        format!("forward2:{}", short_edge(next_edge)),
+                        hop_delta,
+                        format!(
+                            "second-hop {} after {}",
+                            short_edge(next_edge),
+                            dependency.name
+                        ),
+                    );
+                }
+            }
+        }
+
+        for (dependent, edge) in rank_related_nodes(graph.get_dependents(&node.id))
+            .into_iter()
+            .take(4)
+        {
+            let mut delta = match edge {
+                EdgeKind::Calls => 1.95,
+                _ => 1.15,
+            };
+            delta +=
+                scenario_path_alignment_bonus(&scenario_tokens, &dependent.name, &dependent.file);
+            if scenario_tokens.contains("refresh")
+                && dependent.name.to_ascii_lowercase().contains("fallback")
+            {
+                delta -= 0.5;
+            }
+            add_path_segment(
+                dependent,
+                node,
+                format!("incoming:{}", short_edge(edge)),
+                delta,
+                format!("incoming {} into {}", short_edge(edge), node.name),
+            );
+        }
+    }
+
+    let mut all_path_segments = finalize_scenario_path_segments(path_scores);
+    let mut execution_path = Vec::new();
+    let mut plausible_paths = Vec::new();
+    for segment in all_path_segments.drain(..) {
+        if segment.confidence_band == "high" || segment.confidence_band == "medium" {
+            execution_path.push(segment);
+        } else {
+            plausible_paths.push(segment);
+        }
+    }
+    if execution_path.is_empty() && !plausible_paths.is_empty() {
+        execution_path.push(plausible_paths.remove(0));
+    }
+    execution_path.truncate(scenario_path_limit(mode));
+    plausible_paths.truncate(scenario_plausible_path_limit(mode));
+
+    let mut signal_nodes: Vec<&GraphNode> = Vec::new();
+    let mut signal_seen: HashSet<(String, String)> = HashSet::new();
+    for node in &traced_nodes {
+        push_seed_node(&mut signal_nodes, &mut signal_seen, node);
+    }
+    for segment in execution_path.iter().chain(plausible_paths.iter()) {
+        if let Some(node) = find_exact_node(graph, &segment.from_file, &segment.from_symbol) {
+            push_seed_node(&mut signal_nodes, &mut signal_seen, node);
+        }
+        if let Some(node) = find_exact_node(graph, &segment.to_file, &segment.to_symbol) {
+            push_seed_node(&mut signal_nodes, &mut signal_seen, node);
+        }
+    }
+    let likely_entrypoint_set: HashSet<(String, String)> = likely_entrypoints
+        .iter()
+        .map(|item| (item.file.clone(), item.symbol.clone()))
+        .collect();
+
+    let mut guards = collect_scenario_signals(
+        &signal_nodes,
+        "guard",
+        SCENARIO_GUARD_HINTS,
+        &likely_entrypoint_set,
+        &scenario_tokens,
+        scenario_signal_limit(mode),
+    );
+    let mut side_effects = collect_scenario_signals(
+        &signal_nodes,
+        "side_effect",
+        SCENARIO_SIDE_EFFECT_HINTS,
+        &likely_entrypoint_set,
+        &scenario_tokens,
+        scenario_signal_limit(mode),
+    );
+    let mut failure_branches = collect_scenario_signals(
+        &signal_nodes,
+        "failure_branch",
+        SCENARIO_FAILURE_HINTS,
+        &likely_entrypoint_set,
+        &scenario_tokens,
+        scenario_signal_limit(mode),
+    );
+
+    let mut doc_anchor_files: Vec<String> = likely_entrypoints
+        .iter()
+        .map(|item| item.file.clone())
+        .collect();
+    doc_anchor_files.extend(execution_path.iter().map(|item| item.from_file.clone()));
+    doc_anchor_files.extend(execution_path.iter().map(|item| item.to_file.clone()));
+    doc_anchor_files.extend(plausible_paths.iter().map(|item| item.from_file.clone()));
+    doc_anchor_files.extend(plausible_paths.iter().map(|item| item.to_file.clone()));
+    dedupe_strings(&mut doc_anchor_files);
+    doc_anchor_files.retain(|file| is_queryable_graph_file(file));
+
+    let mut doc_anchor_symbols: Vec<String> = likely_entrypoints
+        .iter()
+        .map(|item| item.symbol.clone())
+        .collect();
+    doc_anchor_symbols.extend(execution_path.iter().map(|item| item.from_symbol.clone()));
+    doc_anchor_symbols.extend(execution_path.iter().map(|item| item.to_symbol.clone()));
+    dedupe_strings(&mut doc_anchor_symbols);
+
+    let stale_doc_report = find_stale_docs(
+        graph,
+        &doc_anchor_files,
+        &doc_anchor_symbols,
+        scenario_doc_limit(mode),
+    );
+    let mut relevant_docs = stale_doc_report
+        .docs
+        .iter()
+        .map(|item| PlanEditDocRecommendation {
+            file: item.file.clone(),
+            line: item.line,
+            summary: truncate_text(&item.summary, 140),
+            score: round_score(item.score),
+            matched_files: item.matched_files.clone(),
+            matched_symbols: item.matched_symbols.clone(),
+            reasons: item.reasons.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let test_anchor_files: Vec<String> = doc_anchor_files
+        .iter()
+        .filter(|file| !is_test_file(file))
+        .cloned()
+        .collect();
+    let test_report = find_relevant_tests(
+        graph,
+        &test_anchor_files,
+        &doc_anchor_symbols,
+        None,
+        rules,
+        mode.test_limit(),
+    );
+    let mut tests = test_report.tests;
+    let mut test_gaps = test_report.gaps;
+    let mut matched_rules = test_report.matched_rules;
+
+    if !likely_entrypoints.is_empty() {
+        rationale.push(
+            "Likely entrypoints are ranked from scenario-token overlap, explicit anchors, and nearby graph structure."
+                .to_string(),
+        );
+    } else {
+        rationale.push(
+            "No high-confidence scenario entrypoint was found; consider adding file or symbol anchors."
+                .to_string(),
+        );
+    }
+    if !execution_path.is_empty() {
+        rationale.push(
+            "Execution path segments prioritize direct call edges and adjacent dependency hops from likely entrypoints."
+                .to_string(),
+        );
+    }
+    if !guards.is_empty() || !side_effects.is_empty() || !failure_branches.is_empty() {
+        rationale.push(
+            "Guard, side-effect, and failure signals are mined from candidate symbol bodies along the traced path."
+                .to_string(),
+        );
+    }
+    if !relevant_docs.is_empty() {
+        rationale.push(format!(
+            "Found {} relevant doc section(s) tied to the traced files and symbols.",
+            relevant_docs.len()
+        ));
+    }
+    if !tests.is_empty() {
+        rationale.push(format!(
+            "Suggested {} test target(s) using traced files/symbols and graph-linked test dependencies.",
+            tests.len()
+        ));
+    }
+    dedupe_strings(&mut rationale);
+
+    if matches!(mode, BundleMode::Compact) {
+        compactify_symbol_recommendations(&mut likely_entrypoints);
+        compactify_symbol_recommendations(&mut plausible_entrypoints);
+        compactify_scenario_path_segments(&mut execution_path);
+        compactify_scenario_path_segments(&mut plausible_paths);
+        compactify_scenario_signals(&mut guards);
+        compactify_scenario_signals(&mut side_effects);
+        compactify_scenario_signals(&mut failure_branches);
+        compactify_plan_edit_docs(&mut relevant_docs);
+        compactify_test_recommendations(&mut tests);
+        ultra_compactify_trace_scenario(
+            &mut plausible_entrypoints,
+            &mut execution_path,
+            &mut plausible_paths,
+            &mut guards,
+            &mut side_effects,
+            &mut failure_branches,
+            &mut relevant_docs,
+            &mut tests,
+            &mut test_gaps,
+            &mut matched_rules,
+            &mut rationale,
+        );
+    }
+
+    let overview = build_trace_scenario_overview(
+        scenario,
+        &likely_entrypoints,
+        &execution_path,
+        &failure_branches,
+        &tests,
+    );
+    let suggested_expand =
+        suggest_trace_scenario_expand(mode, &likely_entrypoints, &execution_path);
+    let likely_entrypoint_count = likely_entrypoints.len();
+    let plausible_entrypoint_count = plausible_entrypoints.len();
+    let execution_path_count = execution_path.len();
+    let plausible_path_count = plausible_paths.len();
+    let guard_count = guards.len();
+    let side_effect_count = side_effects.len();
+    let failure_branch_count = failure_branches.len();
+    let doc_count = relevant_docs.len();
+    let test_count = tests.len();
+    let stats = if matches!(mode, BundleMode::Full) {
+        Some(ScenarioTraceStats {
+            likely_entrypoint_count,
+            plausible_entrypoint_count,
+            execution_path_count,
+            plausible_path_count,
+            guard_count,
+            side_effect_count,
+            failure_branch_count,
+            doc_count,
+            test_count,
+        })
+    } else {
+        None
+    };
+
+    ScenarioTraceBundle {
+        scenario: scenario.to_string(),
+        intent,
+        overview,
+        suggested_expand,
+        likely_entrypoints,
+        plausible_entrypoints,
+        execution_path,
+        plausible_paths,
+        guards,
+        side_effects,
+        failure_branches,
+        relevant_docs,
+        tests,
+        test_gaps,
+        matched_rules,
+        rationale,
+        stats,
+    }
+}
+
+fn build_plan_edit_spans(
+    graph: &CodeGraph,
+    symbols: &[SymbolRecommendation],
+    mode: BundleMode,
+) -> Vec<EditSpanRecommendation> {
+    let span_limit = match mode {
+        BundleMode::Compact => 5,
+        BundleMode::Full => 12,
+    };
+    let mut spans = Vec::new();
+    let mut seen = HashSet::new();
+
+    for symbol in symbols.iter().take(span_limit.max(1)) {
+        let node = symbol
+            .symbol_handle
+            .as_deref()
+            .and_then(SymbolId::from_stable_handle)
+            .and_then(|id| find_exact_node_by_id(graph, &id))
+            .or_else(|| find_exact_node(graph, &symbol.file, &symbol.symbol));
+
+        let (start_line, end_line, line_span) = if let Some(node) = node {
+            (
+                node.line,
+                node.end_line.max(node.line),
+                format_line_span(node),
+            )
+        } else {
+            (symbol.line, symbol.line, symbol.line.to_string())
+        };
+
+        let key = (
+            symbol.file.clone(),
+            symbol.symbol.clone(),
+            start_line,
+            end_line,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        spans.push(EditSpanRecommendation {
+            file: symbol.file.clone(),
+            symbol: symbol.symbol.clone(),
+            symbol_handle: symbol.symbol_handle.clone(),
+            line_span,
+            start_line,
+            end_line,
+            reason: truncate_text(
+                &format!(
+                    "{} candidate from {}",
+                    symbol_role_label(&symbol.role),
+                    basename_without_extension(&symbol.file)
+                ),
+                96,
+            ),
+            confidence_band: symbol.confidence_band.clone(),
+        });
+    }
+
+    spans
+}
+
+fn collect_plan_edit_impacts(
+    graph: &CodeGraph,
+    span_symbol_keys: &HashSet<(String, String)>,
+    limit: usize,
+    edges: &[EdgeKind],
+    relationship_prefix: &str,
+    include_dependents: bool,
+    include_dependencies: bool,
+) -> Vec<PlanEditImpact> {
+    if span_symbol_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let edge_filter: HashSet<EdgeKind> = edges.iter().copied().collect();
+    let seed_nodes: Vec<&GraphNode> = graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| {
+            is_queryable_graph_file(&node.file)
+                && span_symbol_keys.contains(&(node.file.clone(), node.name.clone()))
+        })
+        .collect();
+
+    if seed_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scores: HashMap<(String, String, String), AffectedAccumulator> = HashMap::new();
+    let mut record_related = |related: &GraphNode, edge: EdgeKind, via: &str, delta: f64| {
+        if !edge_filter.contains(&edge) || !is_queryable_graph_file(&related.file) {
+            return;
+        }
+        let relationship = format!("{}:{}", relationship_prefix, short_edge(edge));
+        let key = (related.file.clone(), related.name.clone(), relationship);
+        let entry = scores.entry(key).or_default();
+        if entry.kind.is_empty() {
+            entry.kind = related.kind.short_code().to_string();
+        }
+        if entry.line == 0 {
+            entry.line = related.line;
+        }
+        if entry.byte_offset.is_none() {
+            entry.byte_offset = Some(related.id.byte_offset);
+        }
+        entry.score += delta;
+        entry.via.push(via.to_string());
+    };
+
+    for node in seed_nodes {
+        if include_dependents {
+            for (related, edge) in graph.get_dependents(&node.id) {
+                record_related(related, edge, &node.name, 1.25);
+            }
+        }
+        if include_dependencies {
+            for (related, edge) in graph.get_dependencies(&node.id) {
+                record_related(related, edge, &node.name, 1.1);
+            }
+        }
+    }
+
+    let mut impacts = scores
+        .into_iter()
+        .map(|((file, symbol, relationship), mut acc)| {
+            dedupe_strings(&mut acc.via);
+            acc.via.truncate(3);
+            let symbol_handle = acc.byte_offset.map(|byte_offset| {
+                SymbolId {
+                    file: file.clone(),
+                    name: symbol.clone(),
+                    byte_offset,
+                }
+                .stable_handle()
+            });
+            PlanEditImpact {
+                symbol,
+                symbol_handle,
+                kind: acc.kind,
+                file,
+                line: acc.line,
+                relationship,
+                via: acc.via,
+                score: round_score(acc.score),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    impacts.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+    impacts.truncate(limit.max(1));
+    impacts
+}
+
+fn scenario_entrypoint_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => COMPACT_SCENARIO_ENTRYPOINT_LIMIT,
+        BundleMode::Full => FULL_SCENARIO_ENTRYPOINT_LIMIT,
+    }
+}
+
+fn scenario_plausible_entrypoint_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => 3,
+        BundleMode::Full => 6,
+    }
+}
+
+fn scenario_path_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => COMPACT_SCENARIO_PATH_LIMIT,
+        BundleMode::Full => FULL_SCENARIO_PATH_LIMIT,
+    }
+}
+
+fn scenario_plausible_path_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => 4,
+        BundleMode::Full => 8,
+    }
+}
+
+fn scenario_signal_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => COMPACT_SCENARIO_SIGNAL_LIMIT,
+        BundleMode::Full => FULL_SCENARIO_SIGNAL_LIMIT,
+    }
+}
+
+fn scenario_doc_limit(mode: BundleMode) -> usize {
+    match mode {
+        BundleMode::Compact => 6,
+        BundleMode::Full => 12,
+    }
+}
+
+fn finalize_scenario_path_segments(
+    scores: HashMap<(String, String, String, String, String), ScenarioPathAccumulator>,
+) -> Vec<ScenarioPathSegment> {
+    let mut segments = scores
+        .into_iter()
+        .map(
+            |((from_file, from_symbol, to_file, to_symbol, relationship), mut acc)| {
+                dedupe_strings(&mut acc.rationale);
+                acc.rationale.truncate(3);
+                let score = round_score(acc.score);
+                let from_symbol_handle = acc.from_offset.map(|byte_offset| {
+                    SymbolId {
+                        file: from_file.clone(),
+                        name: from_symbol.clone(),
+                        byte_offset,
+                    }
+                    .stable_handle()
+                });
+                let to_symbol_handle = acc.to_offset.map(|byte_offset| {
+                    SymbolId {
+                        file: to_file.clone(),
+                        name: to_symbol.clone(),
+                        byte_offset,
+                    }
+                    .stable_handle()
+                });
+                ScenarioPathSegment {
+                    from_symbol,
+                    from_symbol_handle,
+                    from_kind: acc.from_kind,
+                    from_file,
+                    from_line: acc.from_line,
+                    to_symbol,
+                    to_symbol_handle,
+                    to_kind: acc.to_kind,
+                    to_file,
+                    to_line: acc.to_line,
+                    relationship,
+                    score,
+                    confidence_band: "low".to_string(),
+                    rationale: acc.rationale,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+
+    segments.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.from_file.cmp(&b.from_file))
+            .then_with(|| a.from_line.cmp(&b.from_line))
+            .then_with(|| a.to_file.cmp(&b.to_file))
+            .then_with(|| a.to_line.cmp(&b.to_line))
+            .then_with(|| a.from_symbol.cmp(&b.from_symbol))
+    });
+
+    let top_score = segments.first().map(|item| item.score).unwrap_or(0.0);
+    for item in &mut segments {
+        item.confidence_band = scenario_confidence_band(item.score, top_score);
+    }
+
+    segments
+}
+
+fn collect_scenario_signals(
+    nodes: &[&GraphNode],
+    signal_type: &str,
+    hints: &[&str],
+    likely_entrypoint_set: &HashSet<(String, String)>,
+    scenario_tokens: &HashSet<String>,
+    limit: usize,
+) -> Vec<ScenarioSignal> {
+    let mut items = Vec::new();
+
+    for node in nodes {
+        let Some(snippet) = extract_scenario_signal_hint(node, signal_type, hints) else {
+            continue;
+        };
+
+        let symbol_tokens: HashSet<String> = tokenize_path(&node.name).into_iter().collect();
+        let file_tokens: HashSet<String> = focus_tokens_for_file(&node.file).into_iter().collect();
+        let symbol_overlap = overlap_count_set(scenario_tokens, &symbol_tokens);
+        let file_overlap = overlap_count_set(scenario_tokens, &file_tokens);
+        let is_likely_entrypoint =
+            likely_entrypoint_set.contains(&(node.file.clone(), node.name.clone()));
+
+        let mut score = 1.5 + symbol_overlap as f64 * 0.8 + file_overlap as f64 * 0.5;
+        if is_likely_entrypoint {
+            score += 2.2;
+        }
+        if node.is_exported {
+            score += 0.35;
+        }
+
+        items.push(ScenarioSignal {
+            signal_type: signal_type.to_string(),
+            symbol: node.name.clone(),
+            symbol_handle: Some(symbol_focus_for_node(node)),
+            kind: node.kind.short_code().to_string(),
+            file: node.file.clone(),
+            line: node.line,
+            summary: truncate_text(&snippet, 140),
+            score: round_score(score),
+            confidence_band: "low".to_string(),
+        });
+    }
+
+    items.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+    items.dedup_by(|a, b| {
+        a.file == b.file && a.symbol == b.symbol && a.signal_type == b.signal_type
+    });
+    let top_score = items.first().map(|item| item.score).unwrap_or(0.0);
+    for item in &mut items {
+        item.confidence_band = scenario_confidence_band(item.score, top_score);
+    }
+    items.truncate(limit.max(1));
+    items
+}
+
+fn scenario_substring_overlap_hits(
+    scenario_tokens: &HashSet<String>,
+    symbol: &str,
+    file: &str,
+) -> usize {
+    let lowered_symbol = symbol.to_ascii_lowercase();
+    let lowered_file = file.to_ascii_lowercase();
+    scenario_tokens
+        .iter()
+        .filter(|token| {
+            lowered_symbol.contains(token.as_str()) || lowered_file.contains(token.as_str())
+        })
+        .count()
+}
+
+fn scenario_path_alignment_bonus(
+    scenario_tokens: &HashSet<String>,
+    symbol: &str,
+    file: &str,
+) -> f64 {
+    let hits = scenario_substring_overlap_hits(scenario_tokens, symbol, file);
+    if hits == 0 {
+        0.0
+    } else {
+        hits as f64 * 0.55
+    }
+}
+
+fn likely_failure_symbol_name(symbol: &str, body: &str) -> bool {
+    let lowered_symbol = symbol.to_ascii_lowercase();
+    let lowered_body = body.to_ascii_lowercase();
+    lowered_symbol.contains("reject")
+        || lowered_symbol.contains("deny")
+        || lowered_symbol.contains("forbid")
+        || lowered_symbol.contains("fail")
+        || lowered_symbol.contains("error")
+        || lowered_symbol.contains("unauthor")
+        || lowered_symbol.contains("expired")
+        || lowered_body.contains("401")
+        || lowered_body.contains("403")
+        || lowered_body.contains("404")
+        || lowered_body.contains("500")
+        || lowered_body.contains("throw")
+        || lowered_body.contains("panic")
+        || lowered_body.contains("error")
+}
+
+fn node_has_body_hint(node: &GraphNode, hints: &[&str]) -> bool {
+    let lower = node.body.to_ascii_lowercase();
+    hints.iter().any(|hint| lower.contains(hint))
+}
+
+fn extract_node_body_hint(node: &GraphNode, hints: &[&str]) -> Option<String> {
+    for line in node.body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if hints.iter().any(|hint| lower.contains(hint)) {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let body = node.body.trim();
+    if body.is_empty() || !node_has_body_hint(node, hints) {
+        return None;
+    }
+
+    Some(truncate_text(body, 140))
+}
+
+fn extract_scenario_signal_hint(
+    node: &GraphNode,
+    signal_type: &str,
+    hints: &[&str],
+) -> Option<String> {
+    if let Some(snippet) = extract_node_body_hint(node, hints) {
+        return Some(snippet);
+    }
+
+    let lowered_name = node.name.to_ascii_lowercase();
+    let lowered_signature = node.signature.to_ascii_lowercase();
+    let lowered_body = node.body.to_ascii_lowercase();
+
+    let keyword_hit = |keywords: &[&str]| {
+        keywords
+            .iter()
+            .any(|keyword| lowered_name.contains(keyword) || lowered_signature.contains(keyword))
+    };
+
+    match signal_type {
+        "guard" => keyword_hit(&[
+            "verify",
+            "validate",
+            "check",
+            "guard",
+            "authorize",
+            "require",
+        ])
+        .then(|| format!("{} appears to guard token/access checks", node.name)),
+        "side_effect" => keyword_hit(&[
+            "create", "update", "write", "save", "persist", "dispatch", "send", "publish",
+            "enqueue",
+        ])
+        .then(|| {
+            format!(
+                "{} appears to trigger a state or external side effect",
+                node.name
+            )
+        }),
+        "failure_branch" => (keyword_hit(&[
+            "reject", "deny", "forbid", "fail", "error", "unauthor", "expired",
+        ]) || lowered_body.contains("401")
+            || lowered_body.contains("403")
+            || lowered_body.contains("404")
+            || lowered_body.contains("500")
+            || lowered_body.contains("throw")
+            || lowered_body.contains("panic"))
+        .then(|| {
+            format!(
+                "{} appears to return or trigger failure handling",
+                node.name
+            )
+        }),
+        _ => None,
     }
 }
 
@@ -1251,6 +2873,7 @@ pub fn get_working_set_context(
                 &mut active_symbol_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "working_file".to_string(),
@@ -1277,6 +2900,7 @@ pub fn get_working_set_context(
                 &mut active_symbol_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "focus_symbol".to_string(),
@@ -1330,6 +2954,7 @@ pub fn get_working_set_context(
                     &mut active_symbol_scores,
                     &node.file,
                     &node.name,
+                    Some(&node.id),
                     node.kind.short_code().to_string(),
                     node.line,
                     "query_match".to_string(),
@@ -1341,6 +2966,7 @@ pub fn get_working_set_context(
                     &mut nearby_symbol_scores,
                     &node.file,
                     &node.name,
+                    Some(&node.id),
                     node.kind.short_code().to_string(),
                     node.line,
                     "query_overlap".to_string(),
@@ -1365,6 +2991,7 @@ pub fn get_working_set_context(
                 &mut nearby_symbol_scores,
                 &dependency.file,
                 &dependency.name,
+                Some(&dependency.id),
                 dependency.kind.short_code().to_string(),
                 dependency.line,
                 format!("dependency:{}", short_edge(edge)),
@@ -1386,6 +3013,7 @@ pub fn get_working_set_context(
                 &mut nearby_symbol_scores,
                 &dependent.file,
                 &dependent.name,
+                Some(&dependent.id),
                 dependent.kind.short_code().to_string(),
                 dependent.line,
                 format!("dependent:{}", short_edge(edge)),
@@ -1402,6 +3030,7 @@ pub fn get_working_set_context(
                 &mut nearby_symbol_scores,
                 &sibling.file,
                 &sibling.name,
+                Some(&sibling.id),
                 sibling.kind.short_code().to_string(),
                 sibling.line,
                 "same_file".to_string(),
@@ -1601,6 +3230,7 @@ pub fn summarize_subsystem(
                 &mut symbol_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "entry_symbol".to_string(),
@@ -1677,6 +3307,7 @@ pub fn summarize_subsystem(
                 &mut symbol_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "file_reference".to_string(),
@@ -1707,6 +3338,7 @@ pub fn summarize_subsystem(
                 &mut symbol_scores,
                 &dependency.file,
                 &dependency.name,
+                Some(&dependency.id),
                 dependency.kind.short_code().to_string(),
                 dependency.line,
                 format!("dependency:{}", short_edge(edge)),
@@ -1734,6 +3366,7 @@ pub fn summarize_subsystem(
                 &mut symbol_scores,
                 &dependent.file,
                 &dependent.name,
+                Some(&dependent.id),
                 dependent.kind.short_code().to_string(),
                 dependent.line,
                 format!("dependent:{}", short_edge(edge)),
@@ -1777,6 +3410,7 @@ pub fn summarize_subsystem(
             {
                 visible_ranked_symbols.push(SymbolRecommendation {
                     symbol: node.name.clone(),
+                    symbol_handle: Some(symbol_focus_for_node(node)),
                     kind: node.kind.short_code().to_string(),
                     file: node.file.clone(),
                     line: node.line,
@@ -1928,6 +3562,7 @@ pub fn get_repo_playbook(
             &mut symbol_scores,
             &node.file,
             &node.name,
+            Some(&node.id),
             node.kind.short_code().to_string(),
             node.line,
             if node.is_exported {
@@ -2073,6 +3708,37 @@ pub fn expand_context(
     let mut remaining_chars = max_tokens * CHARS_PER_TOKEN_ESTIMATE;
 
     match &target {
+        ExpansionTarget::SymbolId(symbol_id) => {
+            let exact = find_exact_node_by_id(graph, symbol_id);
+            let fallback =
+                exact.or_else(|| find_exact_node(graph, &symbol_id.file, &symbol_id.name));
+            if let Some(node) = fallback {
+                symbols.push(build_expanded_symbol_context(
+                    graph,
+                    &all_nodes,
+                    node,
+                    &mut remaining_chars,
+                ));
+                files.push(build_expanded_file_context(
+                    graph,
+                    &all_nodes,
+                    &node.file,
+                    seed,
+                    mode_file_symbol_limit(BundleMode::Compact),
+                ));
+                if exact.is_some() {
+                    rationale.push(format!(
+                        "Expanded exact symbol handle for '{}' in '{}'.",
+                        node.name, node.file
+                    ));
+                } else {
+                    rationale.push(format!(
+                        "Symbol handle did not resolve exactly; fell back to best symbol match '{}' in '{}'.",
+                        node.name, node.file
+                    ));
+                }
+            }
+        }
         ExpansionTarget::Symbol(symbol_name) => {
             if let Some(node) = find_symbol_matches(graph, symbol_name, &seed.files)
                 .into_iter()
@@ -2180,7 +3846,7 @@ pub fn expand_context(
 
     if files.is_empty() && symbols.is_empty() && tests.is_empty() {
         rationale.push(
-            "The requested focus did not map cleanly to cached symbols or files; use a file:, symbol:, test:, or memory: focus from the previous handle."
+            "The requested focus did not map cleanly to cached symbols or files; use a symbol_id:, file_id:, file:, symbol:, test:, or memory: focus from the previous handle."
                 .to_string(),
         );
     }
@@ -2274,6 +3940,7 @@ pub fn diagnose_failure(
                     &mut suspect_scores,
                     &node.file,
                     &node.name,
+                    Some(&node.id),
                     node.kind.short_code().to_string(),
                     node.line,
                     "line_reference".to_string(),
@@ -2289,6 +3956,7 @@ pub fn diagnose_failure(
                     &mut suspect_scores,
                     &node.file,
                     &node.name,
+                    Some(&node.id),
                     node.kind.short_code().to_string(),
                     node.line,
                     "file_reference".to_string(),
@@ -2307,6 +3975,7 @@ pub fn diagnose_failure(
                 &mut suspect_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "symbol_hint".to_string(),
@@ -2354,6 +4023,7 @@ pub fn diagnose_failure(
                 &mut suspect_scores,
                 &node.file,
                 &node.name,
+                Some(&node.id),
                 node.kind.short_code().to_string(),
                 node.line,
                 "token_overlap".to_string(),
@@ -2374,7 +4044,13 @@ pub fn diagnose_failure(
         .collect();
 
     for suspect in &suspects {
-        if let Some(node) = find_exact_node(graph, &suspect.file, &suspect.symbol) {
+        let exact_node = suspect
+            .symbol_handle
+            .as_deref()
+            .and_then(SymbolId::from_stable_handle)
+            .and_then(|symbol_id| find_exact_node_by_id(graph, &symbol_id))
+            .or_else(|| find_exact_node(graph, &suspect.file, &suspect.symbol));
+        if let Some(node) = exact_node {
             for (dependency, edge) in rank_related_nodes(graph.get_dependencies(&node.id))
                 .into_iter()
                 .take(3)
@@ -2386,6 +4062,7 @@ pub fn diagnose_failure(
                     &mut related_scores,
                     &dependency.file,
                     &dependency.name,
+                    Some(&dependency.id),
                     dependency.kind.short_code().to_string(),
                     dependency.line,
                     format!("dependency:{}", short_edge(edge)),
@@ -2404,6 +4081,7 @@ pub fn diagnose_failure(
                     &mut related_scores,
                     &dependent.file,
                     &dependent.name,
+                    Some(&dependent.id),
                     dependent.kind.short_code().to_string(),
                     dependent.line,
                     format!("dependent:{}", short_edge(edge)),
@@ -2598,6 +4276,7 @@ pub fn impact_from_diff(
 
             changed_symbols.push(ChangedSymbolImpact {
                 symbol: node.name.clone(),
+                symbol_handle: Some(symbol_focus_for_node(node)),
                 kind: node.kind.short_code().to_string(),
                 file: node.file.clone(),
                 line: node.line,
@@ -2761,14 +4440,60 @@ fn find_exact_node<'a>(graph: &'a CodeGraph, file: &str, symbol: &str) -> Option
     })
 }
 
+fn find_exact_node_by_id<'a>(graph: &'a CodeGraph, symbol_id: &SymbolId) -> Option<&'a GraphNode> {
+    graph
+        .get_node(symbol_id)
+        .filter(|node| is_queryable_graph_file(&node.file))
+}
+
+fn resolve_recommended_symbol_node<'a>(
+    graph: &'a CodeGraph,
+    recommendation: &SymbolRecommendation,
+) -> Option<&'a GraphNode> {
+    recommendation
+        .symbol_handle
+        .as_deref()
+        .and_then(SymbolId::from_stable_handle)
+        .and_then(|id| find_exact_node_by_id(graph, &id))
+        .or_else(|| find_exact_node(graph, &recommendation.file, &recommendation.symbol))
+}
+
+fn symbol_focus_for_id(symbol_id: &SymbolId) -> String {
+    symbol_id.stable_handle()
+}
+
+fn symbol_focus_for_node(node: &GraphNode) -> String {
+    symbol_focus_for_id(&node.id)
+}
+
+fn symbol_focus_for_recommendation(item: &SymbolRecommendation) -> String {
+    item.symbol_handle
+        .clone()
+        .unwrap_or_else(|| format!("symbol:{}", item.symbol))
+}
+
+fn file_focus(file: &str) -> String {
+    stable_file_handle(file)
+}
+
 fn resolve_expansion_target(seed: &ExpandContextSeed, focus: &str) -> ExpansionTarget {
     let focus = focus.trim();
 
+    if let Some(symbol_id) = SymbolId::from_stable_handle(focus) {
+        return ExpansionTarget::SymbolId(symbol_id);
+    }
+    if let Some(file) = parse_stable_file_handle(focus) {
+        return ExpansionTarget::File(file);
+    }
     if let Some(rest) = focus.strip_prefix("file:") {
         return ExpansionTarget::File(rest.trim().to_string());
     }
     if let Some(rest) = focus.strip_prefix("symbol:") {
-        return ExpansionTarget::Symbol(rest.trim().to_string());
+        let symbol = rest.trim();
+        if let Some(symbol_id) = SymbolId::from_stable_handle(symbol) {
+            return ExpansionTarget::SymbolId(symbol_id);
+        }
+        return ExpansionTarget::Symbol(symbol.to_string());
     }
     if let Some(rest) = focus.strip_prefix("test:") {
         return ExpansionTarget::Test(rest.trim().to_string());
@@ -2785,15 +4510,19 @@ fn resolve_expansion_target(seed: &ExpandContextSeed, focus: &str) -> ExpansionT
     if seed.files.iter().any(|file| file == focus) || focus.contains('/') {
         return ExpansionTarget::File(focus.to_string());
     }
+    if let Some(handle) = seed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.as_str() == focus)
+        .and_then(|symbol| SymbolId::from_stable_handle(symbol))
+    {
+        return ExpansionTarget::SymbolId(handle);
+    }
     if seed.symbols.iter().any(|symbol| symbol == focus) {
         return ExpansionTarget::Symbol(focus.to_string());
     }
 
-    if let Some(index) = seed
-        .memories
-        .iter()
-        .position(|memory| memory_matches_focus(memory, focus))
-    {
+    if let Some(index) = best_matching_memory_index(&seed.memories, focus) {
         return ExpansionTarget::Memory(index);
     }
 
@@ -2815,6 +4544,7 @@ fn build_expanded_symbol_context(
         .take(4)
         .map(|candidate| ExpandedRelationshipContext {
             symbol: candidate.name.clone(),
+            symbol_handle: Some(symbol_focus_for_node(candidate)),
             kind: candidate.kind.short_code().to_string(),
             file: candidate.file.clone(),
             line: candidate.line,
@@ -2824,6 +4554,7 @@ fn build_expanded_symbol_context(
 
     ExpandedSymbolContext {
         symbol: node.name.clone(),
+        symbol_handle: Some(symbol_focus_for_node(node)),
         kind: node.kind.short_code().to_string(),
         file: node.file.clone(),
         line: node.line,
@@ -2845,6 +4576,7 @@ fn build_expanded_relationships(
         .take(4)
         .map(|(node, edge)| ExpandedRelationshipContext {
             symbol: node.name.clone(),
+            symbol_handle: Some(symbol_focus_for_node(node)),
             kind: node.kind.short_code().to_string(),
             file: node.file.clone(),
             line: node.line,
@@ -2869,12 +4601,13 @@ fn build_expanded_file_context(
         .take(symbol_limit)
         .map(|node| ExpandedFileSymbolContext {
             symbol: node.name.clone(),
+            symbol_handle: Some(symbol_focus_for_node(node)),
             kind: node.kind.short_code().to_string(),
             line: node.line,
             signature: node.signature.to_string(),
-            role: if seed.symbols.iter().any(|symbol| symbol == &node.name) {
+            role: if seed_symbol_match(seed, node) {
                 "handle_symbol".to_string()
-            } else if seed.files.iter().any(|handle_file| handle_file == file) {
+            } else if seed_file_match(seed, file) {
                 "handle_file".to_string()
             } else if node.is_exported {
                 "exported".to_string()
@@ -2902,6 +4635,7 @@ fn build_expanded_test_context(
         .take(5)
         .map(|node| ExpandedFileSymbolContext {
             symbol: node.name.clone(),
+            symbol_handle: Some(symbol_focus_for_node(node)),
             kind: node.kind.short_code().to_string(),
             line: node.line,
             signature: node.signature.to_string(),
@@ -2927,6 +4661,28 @@ fn build_expanded_test_context(
         related_files,
         reasons,
     }
+}
+
+fn seed_symbol_match(seed: &ExpandContextSeed, node: &GraphNode) -> bool {
+    if seed.symbols.iter().any(|symbol| symbol == &node.name) {
+        return true;
+    }
+    seed.symbols.iter().any(|symbol| {
+        SymbolId::from_stable_handle(symbol)
+            .map(|value| value == node.id)
+            .unwrap_or(false)
+    })
+}
+
+fn seed_file_match(seed: &ExpandContextSeed, file: &str) -> bool {
+    if seed.files.iter().any(|handle_file| handle_file == file) {
+        return true;
+    }
+    seed.files.iter().any(|handle_file| {
+        parse_stable_file_handle(handle_file)
+            .map(|value| value == file)
+            .unwrap_or(false)
+    })
 }
 
 fn related_tests_for_file(file: &str, seed: &ExpandContextSeed) -> Vec<String> {
@@ -2974,15 +4730,20 @@ fn truncate_for_budget(source: &str, remaining_chars: &mut usize, max_tokens: us
 }
 
 fn select_memories_for_focus(memories: &[Value], focus: &str, limit: usize) -> Vec<Value> {
-    let mut matches: Vec<Value> = memories
-        .iter()
+    let mut matches: Vec<Value> = assistant_ordered_memory_values(memories)
+        .into_iter()
         .filter(|memory| memory_matches_focus(memory, focus))
-        .take(limit)
         .cloned()
         .collect();
+    matches.truncate(limit);
 
     if matches.is_empty() {
-        matches.extend(memories.iter().take(limit.min(1)).cloned());
+        matches.extend(
+            assistant_ordered_memory_values(memories)
+                .into_iter()
+                .take(limit.min(1))
+                .cloned(),
+        );
     }
 
     matches
@@ -2991,6 +4752,215 @@ fn select_memories_for_focus(memories: &[Value], focus: &str, limit: usize) -> V
 fn memory_matches_focus(memory: &Value, focus: &str) -> bool {
     let focus_lower = focus.to_lowercase();
     memory.to_string().to_lowercase().contains(&focus_lower)
+}
+
+fn assistant_ordered_memory_values(values: &[Value]) -> Vec<&Value> {
+    let mut ranked: Vec<&Value> = values.iter().collect();
+    ranked.sort_by(|a, b| compare_memory_priority(a, b));
+    ranked
+}
+
+fn best_matching_memory_index(memories: &[Value], focus: &str) -> Option<usize> {
+    let mut matches: Vec<usize> = memories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, memory)| memory_matches_focus(memory, focus).then_some(index))
+        .collect();
+
+    matches.sort_by(|left, right| {
+        compare_memory_priority(&memories[*left], &memories[*right]).then_with(|| left.cmp(right))
+    });
+
+    matches.into_iter().next()
+}
+
+fn compare_memory_priority(left: &Value, right: &Value) -> Ordering {
+    memory_priority_score(right)
+        .partial_cmp(&memory_priority_score(left))
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| memory_created_at(right).cmp(&memory_created_at(left)))
+        .then_with(|| memory_last_accessed(right).cmp(&memory_last_accessed(left)))
+        .then_with(|| memory_access_count(right).cmp(&memory_access_count(left)))
+        .then_with(|| memory_scope_rank(right).cmp(&memory_scope_rank(left)))
+        .then_with(|| memory_assertion_rank(right).cmp(&memory_assertion_rank(left)))
+        .then_with(|| memory_content(left).cmp(memory_content(right)))
+}
+
+fn memory_priority_score(value: &Value) -> f64 {
+    let mut score = memory_status_rank(value) as f64 * 100.0;
+    score += memory_scope_rank(value) as f64 * 10.0;
+    score += memory_assertion_rank(value) as f64 * 2.5;
+    score += memory_structured_evidence_score(value);
+    if non_empty_string_field(value, "confidence_reason").is_some() {
+        score += 0.8;
+    }
+    if non_empty_string_field(value, "supersedes_memory_id").is_some() {
+        score += 0.6;
+    }
+    if !truncated_string_array_field(value, "contradicts_memory_ids", 1).is_empty() {
+        score += 0.6;
+    }
+    score
+}
+
+fn memory_status_rank(value: &Value) -> usize {
+    match memory_effective_verification_status(value).as_deref() {
+        Some("verified") => 5,
+        Some("in_review") => 4,
+        Some("unverified") | None => 3,
+        Some("stale") => 2,
+        Some("superseded") => 1,
+        Some("contradicted") => 0,
+        Some(_) => 3,
+    }
+}
+
+fn memory_scope_rank(value: &Value) -> usize {
+    match value
+        .get("scope")
+        .and_then(|item| item.as_str())
+        .unwrap_or("session")
+    {
+        "repo" => 2,
+        "branch" => 1,
+        _ => 0,
+    }
+}
+
+fn memory_assertion_rank(value: &Value) -> usize {
+    match value
+        .get("assertion_type")
+        .or_else(|| value.get("type"))
+        .or_else(|| value.get("memory_type"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("observation")
+    {
+        "workflow_outcome" => 6,
+        "constraint" => 5,
+        "pattern" => 4,
+        "decision" => 4,
+        "anti_pattern" => 3,
+        "observation" => 2,
+        "exploration" => 1,
+        _ => 2,
+    }
+}
+
+fn memory_structured_evidence_score(value: &Value) -> f64 {
+    let provenance_count = value
+        .get("provenance")
+        .and_then(|item| item.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0)
+        .min(3);
+    let evidence_count = value
+        .get("evidence")
+        .and_then(|item| item.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0)
+        .min(3);
+
+    provenance_count as f64 * 0.7 + evidence_count as f64 * 0.9
+}
+
+fn memory_effective_verification_status(value: &Value) -> Option<String> {
+    if !truncated_string_array_field(value, "contradicted_by_memory_ids", 1).is_empty() {
+        return Some("contradicted".to_string());
+    }
+    if non_empty_string_field(value, "superseded_by_memory_id").is_some() {
+        return Some("superseded".to_string());
+    }
+    if value
+        .get("is_stale")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false)
+    {
+        return Some("stale".to_string());
+    }
+
+    non_empty_string_field(value, "verification_status")
+}
+
+fn memory_content(value: &Value) -> &str {
+    value
+        .get("content")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+}
+
+fn memory_created_at(value: &Value) -> u64 {
+    value
+        .get("created_at")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+}
+
+fn memory_last_accessed(value: &Value) -> u64 {
+    value
+        .get("last_accessed")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+}
+
+fn memory_access_count(value: &Value) -> u64 {
+    value
+        .get("access_count")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+}
+
+fn non_empty_string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+}
+
+fn truncated_string_array_field(value: &Value, key: &str, limit: usize) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .take(limit.max(1))
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn compact_memory_object_array(
+    value: &Value,
+    key: &str,
+    limit: usize,
+    text_limit: usize,
+) -> Vec<Value> {
+    value
+        .get(key)
+        .and_then(|item| item.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_object())
+        .take(limit.max(1))
+        .map(|item| {
+            let mut compact = serde_json::Map::new();
+            for field in ["source", "kind", "reference", "note", "detail"] {
+                if let Some(text) = item.get(field).and_then(|value| value.as_str()) {
+                    compact.insert(
+                        field.to_string(),
+                        json!(truncate_text(text.trim(), text_limit)),
+                    );
+                }
+            }
+            if let Some(captured_at) = item.get("captured_at").and_then(|value| value.as_u64()) {
+                compact.insert("captured_at".to_string(), json!(captured_at));
+            }
+            Value::Object(compact)
+        })
+        .collect()
 }
 
 fn finalize_expanded_context(
@@ -3319,6 +5289,7 @@ fn add_symbol_score(
     scores: &mut HashMap<(String, String), SymbolAccumulator>,
     file: &str,
     symbol: &str,
+    symbol_id: Option<&SymbolId>,
     kind: String,
     line: usize,
     role: String,
@@ -3332,6 +5303,9 @@ fn add_symbol_score(
     }
     if entry.line == 0 {
         entry.line = line;
+    }
+    if entry.byte_offset.is_none() {
+        entry.byte_offset = symbol_id.map(|item| item.byte_offset);
     }
     if entry.role.is_empty() || delta > entry.score {
         entry.role = role;
@@ -3380,8 +5354,17 @@ fn finalize_symbol_recommendations(
             let mut evidence = infer_symbol_evidence(&acc.role);
             dedupe_strings(&mut evidence);
             evidence.truncate(3);
+            let symbol_handle = acc.byte_offset.map(|byte_offset| {
+                SymbolId {
+                    file: file.clone(),
+                    name: symbol.clone(),
+                    byte_offset,
+                }
+                .stable_handle()
+            });
             SymbolRecommendation {
                 symbol,
+                symbol_handle,
                 kind: acc.kind,
                 file,
                 line: acc.line,
@@ -3432,6 +5415,7 @@ fn compress_symbol_summaries(
         .take(limit.max(1))
         .map(|item| CompactSymbolSummary {
             symbol: item.symbol.clone(),
+            symbol_handle: item.symbol_handle.clone(),
             file: item.file.clone(),
             line: item.line,
             role: item.role.clone(),
@@ -3574,8 +5558,8 @@ fn memory_highlights_from_values(
     limit: usize,
     text_limit: usize,
 ) -> Vec<MemoryHighlight> {
-    values
-        .iter()
+    assistant_ordered_memory_values(values)
+        .into_iter()
         .filter_map(|value| memory_highlight_from_value(value, text_limit))
         .take(limit.max(1))
         .collect()
@@ -3586,6 +5570,14 @@ fn memory_highlight_from_value(value: &Value, text_limit: usize) -> Option<Memor
     if content.is_empty() {
         return None;
     }
+
+    let verification_status = memory_effective_verification_status(value);
+    let confidence_reason =
+        non_empty_string_field(value, "confidence_reason").map(|reason| truncate_text(&reason, 72));
+    let freshness_policy =
+        non_empty_string_field(value, "freshness_policy").map(|policy| policy.to_string());
+    let freshness_policy_detail = non_empty_string_field(value, "freshness_policy_detail")
+        .map(|detail| truncate_text(&detail, 72));
 
     Some(MemoryHighlight {
         content: truncate_text(content, text_limit),
@@ -3604,6 +5596,11 @@ fn memory_highlight_from_value(value: &Value, text_limit: usize) -> Option<Memor
             .get("is_stale")
             .and_then(|item| item.as_bool())
             .unwrap_or(false),
+        assertion_type: non_empty_string_field(value, "assertion_type"),
+        verification_status,
+        confidence_reason,
+        freshness_policy,
+        freshness_policy_detail,
     })
 }
 
@@ -3629,7 +5626,37 @@ fn compact_response_memories(values: &[Value], mode: BundleMode) -> Vec<Value> {
 }
 
 fn memory_reference_phrase(memory: &MemoryHighlight) -> String {
-    format!("prior {} {}", memory.scope, memory.memory_type)
+    let assertion = memory
+        .assertion_type
+        .as_deref()
+        .unwrap_or(&memory.memory_type)
+        .replace('_', " ");
+
+    match memory.verification_status.as_deref() {
+        Some("verified") => format!("verified {} {}", memory.scope, assertion),
+        Some("in_review") => format!("in-review {} {}", memory.scope, assertion),
+        Some("stale") => format!("stale {} {}", memory.scope, assertion),
+        Some("superseded") => format!("superseded {} {}", memory.scope, assertion),
+        Some("contradicted") => format!("contradicted {} {}", memory.scope, assertion),
+        Some(status) if status != "unverified" => {
+            format!(
+                "{} {} {}",
+                status.replace('_', " "),
+                memory.scope,
+                assertion
+            )
+        }
+        _ => format!("prior {} {}", memory.scope, assertion),
+    }
+}
+
+fn memory_overview_phrase(memory: &MemoryHighlight) -> String {
+    match memory.verification_status.as_deref() {
+        Some("stale") | Some("superseded") | Some("contradicted") => {
+            format!("note {}", memory_reference_phrase(memory))
+        }
+        _ => format!("reuse {}", memory_reference_phrase(memory)),
+    }
 }
 
 fn compactify_file_recommendations(items: &mut [FileRecommendation]) {
@@ -3670,6 +5697,33 @@ fn compactify_affected_symbol_impacts(items: &mut [AffectedSymbolImpact]) {
     }
 }
 
+fn compactify_plan_edit_impacts(items: &mut [PlanEditImpact]) {
+    for item in items {
+        item.via.clear();
+    }
+}
+
+fn compactify_plan_edit_docs(items: &mut [PlanEditDocRecommendation]) {
+    for item in items {
+        item.reasons.clear();
+        item.matched_files.clear();
+        item.matched_symbols.clear();
+        item.summary = truncate_text(&item.summary, 96);
+    }
+}
+
+fn compactify_scenario_path_segments(items: &mut [ScenarioPathSegment]) {
+    for item in items {
+        item.rationale.clear();
+    }
+}
+
+fn compactify_scenario_signals(items: &mut [ScenarioSignal]) {
+    for item in items {
+        item.summary = truncate_text(&item.summary, 96);
+    }
+}
+
 fn ultra_compactify_task_bundle(
     primary_files: &mut Vec<FileRecommendation>,
     secondary_files: &mut Vec<FileRecommendation>,
@@ -3699,6 +5753,57 @@ fn ultra_compactify_task_bundle(
         matched_rules.truncate(1);
         rationale.truncate(1);
     }
+}
+
+fn ultra_compactify_plan_edit(
+    supporting_files: &mut Vec<FileRecommendation>,
+    candidate_spans: &mut Vec<EditSpanRecommendation>,
+    affected_callers: &mut Vec<PlanEditImpact>,
+    affected_dependencies: &mut Vec<PlanEditImpact>,
+    relevant_docs: &mut Vec<PlanEditDocRecommendation>,
+    stale_doc_signals: &mut Vec<String>,
+    rationale: &mut Vec<String>,
+) {
+    supporting_files.truncate(ULTRA_COMPACT_SECONDARY_FILE_LIMIT);
+    candidate_spans.truncate(ULTRA_COMPACT_SYMBOL_LIMIT + 1);
+    affected_callers.truncate(ULTRA_COMPACT_AFFECTED_SYMBOL_LIMIT + 1);
+    affected_dependencies.truncate(ULTRA_COMPACT_AFFECTED_SYMBOL_LIMIT + 1);
+    relevant_docs.truncate(ULTRA_COMPACT_PRIMARY_FILE_LIMIT);
+    stale_doc_signals.truncate(ULTRA_COMPACT_PRIMARY_FILE_LIMIT);
+    rationale.truncate(2);
+
+    for span in candidate_spans.iter_mut() {
+        span.reason = truncate_text(&span.reason, 52);
+    }
+    for doc in relevant_docs.iter_mut() {
+        doc.summary = truncate_text(&doc.summary, 88);
+    }
+}
+
+fn ultra_compactify_trace_scenario(
+    plausible_entrypoints: &mut Vec<SymbolRecommendation>,
+    execution_path: &mut Vec<ScenarioPathSegment>,
+    plausible_paths: &mut Vec<ScenarioPathSegment>,
+    guards: &mut Vec<ScenarioSignal>,
+    side_effects: &mut Vec<ScenarioSignal>,
+    failure_branches: &mut Vec<ScenarioSignal>,
+    relevant_docs: &mut Vec<PlanEditDocRecommendation>,
+    tests: &mut Vec<TestRecommendation>,
+    test_gaps: &mut Vec<String>,
+    matched_rules: &mut Vec<String>,
+    rationale: &mut Vec<String>,
+) {
+    plausible_entrypoints.truncate(2);
+    execution_path.truncate(ULTRA_COMPACT_SCENARIO_PATH_LIMIT);
+    plausible_paths.truncate(ULTRA_COMPACT_SCENARIO_PATH_LIMIT.saturating_sub(1));
+    guards.truncate(ULTRA_COMPACT_SCENARIO_SIGNAL_LIMIT);
+    side_effects.truncate(ULTRA_COMPACT_SCENARIO_SIGNAL_LIMIT);
+    failure_branches.truncate(ULTRA_COMPACT_SCENARIO_SIGNAL_LIMIT + 1);
+    relevant_docs.truncate(ULTRA_COMPACT_PRIMARY_FILE_LIMIT);
+    tests.truncate(ULTRA_COMPACT_TEST_LIMIT + 1);
+    test_gaps.truncate(1);
+    matched_rules.truncate(1);
+    rationale.truncate(2);
 }
 
 fn ultra_compactify_working_set(
@@ -3859,14 +5964,14 @@ fn suggest_task_bundle_expand(
 
     if let Some(symbol) = symbols.first() {
         return Some(ExpandSuggestion {
-            focus: format!("symbol:{}", symbol.symbol),
+            focus: symbol_focus_for_recommendation(symbol),
             reason: "Inspect the top ranked symbol to see nearby code and relationships."
                 .to_string(),
         });
     }
     if primary_files.len() > 1 || !secondary_files.is_empty() || !tests.is_empty() {
         return primary_files.first().map(|file| ExpandSuggestion {
-            focus: format!("file:{}", file.file),
+            focus: file_focus(&file.file),
             reason: "Expand the top file to inspect its local symbols before widening further."
                 .to_string(),
         });
@@ -3887,15 +5992,42 @@ fn suggest_working_set_expand(
 
     if let Some(symbol) = active_symbols.first().or_else(|| nearby_symbols.first()) {
         return Some(ExpandSuggestion {
-            focus: format!("symbol:{}", symbol.symbol),
+            focus: symbol_focus_for_recommendation(symbol),
             reason: "Expand the strongest working-set symbol to inspect surrounding implementation details."
                 .to_string(),
         });
     }
 
     files.first().map(|file| ExpandSuggestion {
-        focus: format!("file:{}", file.file),
+        focus: file_focus(&file.file),
         reason: "Expand the top working-set file to inspect its neighboring symbols.".to_string(),
+    })
+}
+
+fn suggest_trace_scenario_expand(
+    mode: BundleMode,
+    likely_entrypoints: &[SymbolRecommendation],
+    execution_path: &[ScenarioPathSegment],
+) -> Option<ExpandSuggestion> {
+    if !matches!(mode, BundleMode::Compact) {
+        return None;
+    }
+
+    if let Some(entrypoint) = likely_entrypoints.first() {
+        return Some(ExpandSuggestion {
+            focus: symbol_focus_for_recommendation(entrypoint),
+            reason: "Expand the lead scenario entrypoint to inspect its downstream behavior path."
+                .to_string(),
+        });
+    }
+
+    execution_path.first().map(|segment| ExpandSuggestion {
+        focus: segment
+            .from_symbol_handle
+            .clone()
+            .unwrap_or_else(|| file_focus(&segment.from_file)),
+        reason: "Expand the first traced path segment to inspect branch and failure behavior."
+            .to_string(),
     })
 }
 
@@ -3910,7 +6042,7 @@ fn suggest_failure_expand(
 
     if let Some(suspect) = suspects.first() {
         return Some(ExpandSuggestion {
-            focus: format!("symbol:{}", suspect.symbol),
+            focus: symbol_focus_for_recommendation(suspect),
             reason:
                 "Expand the top suspect symbol to inspect its body, dependencies, and dependents."
                     .to_string(),
@@ -3918,7 +6050,7 @@ fn suggest_failure_expand(
     }
 
     extracted_files.first().map(|file| ExpandSuggestion {
-        focus: format!("file:{}", file),
+        focus: file_focus(file),
         reason: "Expand the directly referenced file to inspect the failing path in local context."
             .to_string(),
     })
@@ -3935,14 +6067,17 @@ fn suggest_diff_expand(
 
     if let Some(symbol) = changed_symbols.first() {
         return Some(ExpandSuggestion {
-            focus: format!("symbol:{}", symbol.symbol),
+            focus: symbol
+                .symbol_handle
+                .clone()
+                .unwrap_or_else(|| format!("symbol:{}", symbol.symbol)),
             reason: "Expand the top changed symbol to inspect downstream impact in source context."
                 .to_string(),
         });
     }
 
     changed_files.first().map(|file| ExpandSuggestion {
-        focus: format!("file:{}", file.file),
+        focus: file_focus(&file.file),
         reason: "Expand the changed file to inspect the affected region with nearby symbols."
             .to_string(),
     })
@@ -3959,14 +6094,17 @@ fn suggest_summary_expand(
 
     if let Some(symbol) = key_symbols.first() {
         return Some(ExpandSuggestion {
-            focus: format!("symbol:{}", symbol.symbol),
+            focus: symbol
+                .symbol_handle
+                .clone()
+                .unwrap_or_else(|| format!("symbol:{}", symbol.symbol)),
             reason: "Expand the lead subsystem symbol to inspect the implementation details behind the summary."
                 .to_string(),
         });
     }
 
     key_files.first().map(|file| ExpandSuggestion {
-        focus: format!("file:{}", file.file),
+        focus: file_focus(&file.file),
         reason: "Expand the lead file to inspect the concrete structure behind the summary."
             .to_string(),
     })
@@ -4037,7 +6175,10 @@ fn build_subsystem_overview(
         parts.push(format!("rule {}", truncate_text(&rule.to_lowercase(), 28)));
     }
     if let Some(memory) = memories.first() {
-        parts.push(format!("memory {}", truncate_text(&memory.content, 28)));
+        parts.push(format!(
+            "memory {}",
+            truncate_text(&memory_reference_phrase(memory), 28)
+        ));
     }
 
     parts.join(". ") + "."
@@ -4081,7 +6222,10 @@ fn build_repo_playbook_overview(
         parts.push(format!("rule {}", truncate_text(rule, 32)));
     }
     if let Some(memory) = memories.first() {
-        parts.push(format!("pattern {}", truncate_text(&memory.content, 28)));
+        parts.push(format!(
+            "pattern {}",
+            truncate_text(&memory_reference_phrase(memory), 28)
+        ));
     }
 
     parts.join(". ") + "."
@@ -4157,7 +6301,7 @@ fn estimate_subsystem_summary_tokens(
         + rules.iter().map(|item| item.len()).sum::<usize>()
         + memories
             .iter()
-            .map(|item| item.content.len() + item.memory_type.len() + item.scope.len())
+            .map(estimate_memory_highlight_chars)
             .sum::<usize>()
         + rationale.iter().map(|item| item.len()).sum::<usize>();
     chars / CHARS_PER_TOKEN_ESTIMATE
@@ -4185,10 +6329,41 @@ fn estimate_repo_playbook_tokens(
             .sum::<usize>()
         + memories
             .iter()
-            .map(|item| item.content.len() + item.memory_type.len() + item.scope.len())
+            .map(estimate_memory_highlight_chars)
             .sum::<usize>()
         + rationale.iter().map(|item| item.len()).sum::<usize>();
     chars / CHARS_PER_TOKEN_ESTIMATE
+}
+
+fn estimate_memory_highlight_chars(item: &MemoryHighlight) -> usize {
+    item.content.len()
+        + item.memory_type.len()
+        + item.scope.len()
+        + item
+            .assertion_type
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
+        + item
+            .verification_status
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
+        + item
+            .confidence_reason
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
+        + item
+            .freshness_policy
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
+        + item
+            .freshness_policy_detail
+            .as_ref()
+            .map(|value| value.len())
+            .unwrap_or(0)
 }
 
 fn summarize_item_list(items: &[String]) -> String {
@@ -4205,11 +6380,11 @@ fn summarize_item_list(items: &[String]) -> String {
 }
 
 fn compress_memory_values(values: &[Value], limit: usize) -> Vec<Value> {
-    values
-        .iter()
+    assistant_ordered_memory_values(values)
+        .into_iter()
         .filter_map(|value| {
             let content = value.get("content")?.as_str()?;
-            Some(json!({
+            let mut compressed = json!({
                 "id": value.get("id"),
                 "content": truncate_text(content, 120),
                 "type": value.get("type").or_else(|| value.get("memory_type")),
@@ -4217,10 +6392,143 @@ fn compress_memory_values(values: &[Value], limit: usize) -> Vec<Value> {
                 "is_stale": value.get("is_stale").and_then(|item| item.as_bool()).unwrap_or(false),
                 "linked_files": value.get("linked_files").cloned().unwrap_or_else(|| json!([])),
                 "linked_symbols": value.get("linked_symbols").cloned().unwrap_or_else(|| json!([]))
-            }))
+            });
+
+            let object = compressed.as_object_mut()?;
+            if let Some(assertion_type) = non_empty_string_field(value, "assertion_type") {
+                object.insert("assertion_type".to_string(), json!(assertion_type));
+            }
+            if let Some(verification_status) = memory_effective_verification_status(value) {
+                object.insert(
+                    "verification_status".to_string(),
+                    json!(verification_status),
+                );
+            }
+            if let Some(confidence_reason) = non_empty_string_field(value, "confidence_reason") {
+                object.insert(
+                    "confidence_reason".to_string(),
+                    json!(truncate_text(&confidence_reason, 80)),
+                );
+            }
+            if let Some(supersedes_memory_id) =
+                non_empty_string_field(value, "supersedes_memory_id")
+            {
+                object.insert(
+                    "supersedes_memory_id".to_string(),
+                    json!(supersedes_memory_id),
+                );
+            }
+            if let Some(superseded_by_memory_id) =
+                non_empty_string_field(value, "superseded_by_memory_id")
+            {
+                object.insert(
+                    "superseded_by_memory_id".to_string(),
+                    json!(superseded_by_memory_id),
+                );
+            }
+
+            let contradicts_memory_ids =
+                truncated_string_array_field(value, "contradicts_memory_ids", 3);
+            if !contradicts_memory_ids.is_empty() {
+                object.insert(
+                    "contradicts_memory_ids".to_string(),
+                    json!(contradicts_memory_ids),
+                );
+            }
+            let contradicted_by_memory_ids =
+                truncated_string_array_field(value, "contradicted_by_memory_ids", 3);
+            if !contradicted_by_memory_ids.is_empty() {
+                object.insert(
+                    "contradicted_by_memory_ids".to_string(),
+                    json!(contradicted_by_memory_ids),
+                );
+            }
+            if let Some(freshness_policy) = non_empty_string_field(value, "freshness_policy") {
+                object.insert("freshness_policy".to_string(), json!(freshness_policy));
+            }
+            if let Some(freshness_policy_detail) =
+                non_empty_string_field(value, "freshness_policy_detail")
+            {
+                object.insert(
+                    "freshness_policy_detail".to_string(),
+                    json!(truncate_text(&freshness_policy_detail, 80)),
+                );
+            }
+
+            let provenance = compact_memory_object_array(value, "provenance", 2, 60);
+            if !provenance.is_empty() {
+                object.insert("provenance".to_string(), Value::Array(provenance));
+            }
+            let evidence = compact_memory_object_array(value, "evidence", 2, 60);
+            if !evidence.is_empty() {
+                object.insert("evidence".to_string(), Value::Array(evidence));
+            }
+
+            Some(compressed)
         })
         .take(limit.max(1))
         .collect()
+}
+
+fn build_plan_edit_overview(
+    base_overview: &str,
+    candidate_spans: &[EditSpanRecommendation],
+    affected_callers: &[PlanEditImpact],
+    relevant_docs: &[PlanEditDocRecommendation],
+) -> String {
+    let mut parts = vec![truncate_text(base_overview.trim(), 88)];
+
+    if let Some(span) = candidate_spans.first() {
+        parts.push(format!(
+            "first span {}:{} ({})",
+            basename_without_extension(&span.file),
+            span.symbol,
+            span.line_span
+        ));
+    }
+    if let Some(caller) = affected_callers.first() {
+        parts.push(format!(
+            "caller watch {}",
+            truncate_text(&caller.symbol, 28)
+        ));
+    }
+    if let Some(doc) = relevant_docs.first() {
+        parts.push(format!(
+            "doc check {}",
+            basename_without_extension(&doc.file)
+        ));
+    }
+
+    parts.join(". ") + "."
+}
+
+fn build_trace_scenario_overview(
+    scenario: &str,
+    likely_entrypoints: &[SymbolRecommendation],
+    execution_path: &[ScenarioPathSegment],
+    failure_branches: &[ScenarioSignal],
+    tests: &[TestRecommendation],
+) -> String {
+    let mut parts = vec![format!("Trace: {}", truncate_text(scenario, 52))];
+
+    if let Some(entrypoint) = likely_entrypoints.first() {
+        parts.push(format!("entry {}", entrypoint.symbol));
+    }
+    if let Some(segment) = execution_path.first() {
+        parts.push(format!(
+            "path {} -> {}",
+            truncate_text(&segment.from_symbol, 20),
+            truncate_text(&segment.to_symbol, 20)
+        ));
+    }
+    if let Some(branch) = failure_branches.first() {
+        parts.push(format!("failure {}", truncate_text(&branch.symbol, 24)));
+    }
+    if let Some(test) = tests.first() {
+        parts.push(format!("test {}", basename_without_extension(&test.file)));
+    }
+
+    parts.join(". ") + "."
 }
 
 fn build_task_bundle_overview(
@@ -4251,7 +6559,7 @@ fn build_task_bundle_overview(
         parts.push(format!("watch {}", truncate_text(&risk.symbol, 24)));
     }
     if let Some(memory) = memories.first() {
-        parts.push(format!("reuse {}", memory_reference_phrase(memory)));
+        parts.push(memory_overview_phrase(memory));
     }
 
     parts.join(". ") + "."
@@ -4284,7 +6592,7 @@ fn build_working_set_overview(
         parts.push(format!("test {}", basename_without_extension(&test.file)));
     }
     if let Some(memory) = memories.first() {
-        parts.push(format!("reuse {}", memory_reference_phrase(memory)));
+        parts.push(memory_overview_phrase(memory));
     }
 
     parts.join(". ") + "."
@@ -4309,7 +6617,7 @@ fn build_failure_overview(
         parts.push(truncate_text(cause, 52));
     }
     if let Some(memory) = memories.first() {
-        parts.push(format!("reuse {}", memory_reference_phrase(memory)));
+        parts.push(memory_overview_phrase(memory));
     }
 
     parts.join(". ") + "."
@@ -4401,6 +6709,9 @@ fn collect_affected_symbols(
             if entry.line == 0 {
                 entry.line = dependent.line;
             }
+            if entry.byte_offset.is_none() {
+                entry.byte_offset = Some(dependent.id.byte_offset);
+            }
             entry.score += 1.0;
             entry.via.push(node.name.clone());
         }
@@ -4411,8 +6722,17 @@ fn collect_affected_symbols(
         .map(|((file, symbol), mut acc)| {
             dedupe_strings(&mut acc.via);
             acc.via.truncate(3);
+            let symbol_handle = acc.byte_offset.map(|byte_offset| {
+                SymbolId {
+                    file: file.clone(),
+                    name: symbol.clone(),
+                    byte_offset,
+                }
+                .stable_handle()
+            });
             AffectedSymbolImpact {
                 symbol,
+                symbol_handle,
                 kind: acc.kind,
                 file,
                 line: acc.line,
@@ -5553,6 +7873,17 @@ fn relative_score(score: f64, top_score: f64) -> f64 {
         0.0
     } else {
         score / top_score
+    }
+}
+
+fn scenario_confidence_band(score: f64, top_score: f64) -> String {
+    let relative = relative_score(score, top_score);
+    if relative >= 0.72 && score >= 2.6 {
+        "high".to_string()
+    } else if relative >= 0.42 && score >= 1.35 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
     }
 }
 

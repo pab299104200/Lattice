@@ -1,5 +1,5 @@
 use crate::error::LatticeError;
-use crate::storage::vector_index::{VectorIndex, VectorSearchResult};
+use crate::storage::vector_index::{VectorIndex, VectorScope, VectorSearchResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS vector_index_meta (
 
 const VECTOR_META_DIMENSION: &str = "dimension";
 const VECTOR_META_GENERATION: &str = "generation";
+const FILE_SUMMARY_SCOPE_PREFIX: &str = "__lattice_file_summary__::";
 
 type CacheKey = (String, String, usize);
 
@@ -146,29 +147,42 @@ impl VectorStore {
         byte_offset: usize,
         vector: &[f32],
     ) -> Result<(), LatticeError> {
-        self.upsert_vector_with_key(file, name, byte_offset, vector)
-            .map(|_| ())
+        self.upsert_vector_in_scope(file, name, byte_offset, VectorScope::Symbol, vector)
     }
 
-    pub(crate) fn upsert_vector_with_key(
+    pub fn upsert_vector_in_scope(
         &self,
         file: &str,
         name: &str,
         byte_offset: usize,
+        scope: VectorScope,
+        vector: &[f32],
+    ) -> Result<(), LatticeError> {
+        self.upsert_vector_with_key_in_scope(file, name, byte_offset, scope, vector)
+            .map(|_| ())
+    }
+
+    pub(crate) fn upsert_vector_with_key_in_scope(
+        &self,
+        file: &str,
+        name: &str,
+        byte_offset: usize,
+        scope: VectorScope,
         vector: &[f32],
     ) -> Result<u64, LatticeError> {
         let mut state = self.lock_state("upsert vector")?;
         let blob = f32_slice_to_bytes(vector);
+        let stored_name = encode_vector_name_for_scope(name, scope);
 
         let tx = state.conn.transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to start vector upsert transaction: {}", e))
         })?;
-        let ann_key = load_or_create_ann_key(&tx, file, name, byte_offset)?;
+        let ann_key = load_or_create_ann_key(&tx, file, &stored_name, byte_offset)?;
         tx.execute(
             "INSERT INTO vectors (file, name, byte_offset, embedding)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(file, name, byte_offset) DO UPDATE SET embedding = excluded.embedding",
-            params![file, name, byte_offset as i64, blob],
+            params![file, stored_name, byte_offset as i64, blob],
         )
         .map_err(|e| LatticeError::Storage(format!("Failed to upsert vector: {}", e)))?;
         bump_generation(&tx)?;
@@ -176,7 +190,7 @@ impl VectorStore {
             .map_err(|e| LatticeError::Storage(format!("Failed to commit vector upsert: {}", e)))?;
 
         state.cache.insert(
-            (file.to_string(), name.to_string(), byte_offset),
+            (file.to_string(), stored_name, byte_offset),
             vector.to_vec(),
         );
 
@@ -242,6 +256,15 @@ impl VectorStore {
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<VectorSearchResult>, LatticeError> {
+        self.search_in_scope(query, top_k, VectorScope::Symbol)
+    }
+
+    pub fn search_in_scope(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: VectorScope,
+    ) -> Result<Vec<VectorSearchResult>, LatticeError> {
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -251,9 +274,13 @@ impl VectorStore {
             let mut results: Vec<VectorSearchResult> = state
                 .cache
                 .iter()
-                .map(|((file, name, offset), vec)| {
+                .filter_map(|((file, stored_name, offset), vec)| {
+                    let (stored_scope, logical_name) = decode_vector_name_scope(stored_name);
+                    if !scope_matches(stored_scope, scope) {
+                        return None;
+                    }
                     let similarity = cosine_similarity(query, vec);
-                    (name.clone(), file.clone(), *offset, similarity)
+                    Some((logical_name, file.clone(), *offset, similarity))
                 })
                 .collect();
 
@@ -279,11 +306,15 @@ impl VectorStore {
 
         let mut results: Vec<VectorSearchResult> = Vec::new();
         for row in rows {
-            let (file, name, byte_offset, embedding_blob) = row
+            let (file, stored_name, byte_offset, embedding_blob) = row
                 .map_err(|e| LatticeError::Storage(format!("Failed to read vector row: {}", e)))?;
+            let (stored_scope, logical_name) = decode_vector_name_scope(&stored_name);
+            if !scope_matches(stored_scope, scope) {
+                continue;
+            }
             let stored_vec = bytes_to_f32_slice(&embedding_blob);
             let similarity = cosine_similarity(query, &stored_vec);
-            results.push((name, file, byte_offset, similarity));
+            results.push((logical_name, file, byte_offset, similarity));
         }
 
         results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
@@ -398,6 +429,24 @@ impl VectorStore {
     }
 }
 
+pub(crate) fn encode_vector_name_for_scope(name: &str, scope: VectorScope) -> String {
+    match scope {
+        VectorScope::Symbol | VectorScope::All => name.to_string(),
+        VectorScope::FileSummary => format!("{FILE_SUMMARY_SCOPE_PREFIX}{name}"),
+    }
+}
+
+pub(crate) fn decode_vector_name_scope(stored_name: &str) -> (VectorScope, String) {
+    if let Some(rest) = stored_name.strip_prefix(FILE_SUMMARY_SCOPE_PREFIX) {
+        return (VectorScope::FileSummary, rest.to_string());
+    }
+    (VectorScope::Symbol, stored_name.to_string())
+}
+
+fn scope_matches(stored: VectorScope, requested: VectorScope) -> bool {
+    matches!(requested, VectorScope::All) || stored == requested
+}
+
 impl VectorIndex for VectorStore {
     fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
         VectorStore::initialize(self, dimension)
@@ -417,6 +466,17 @@ impl VectorIndex for VectorStore {
         VectorStore::upsert_vector(self, file, name, byte_offset, vector)
     }
 
+    fn upsert_vector_in_scope(
+        &self,
+        file: &str,
+        name: &str,
+        byte_offset: usize,
+        scope: VectorScope,
+        vector: &[f32],
+    ) -> Result<(), LatticeError> {
+        VectorStore::upsert_vector_in_scope(self, file, name, byte_offset, scope, vector)
+    }
+
     fn delete_by_file(&self, file: &str) -> Result<(), LatticeError> {
         VectorStore::delete_by_file(self, file)
     }
@@ -427,6 +487,15 @@ impl VectorIndex for VectorStore {
 
     fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorSearchResult>, LatticeError> {
         VectorStore::search(self, query, top_k)
+    }
+
+    fn search_in_scope(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: VectorScope,
+    ) -> Result<Vec<VectorSearchResult>, LatticeError> {
+        VectorStore::search_in_scope(self, query, top_k, scope)
     }
 
     fn implementation_name(&self) -> &'static str {

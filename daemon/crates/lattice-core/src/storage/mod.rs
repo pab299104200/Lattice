@@ -9,5 +9,5 @@ mod tests;
 
 pub use graph_store::GraphStore;
 pub use usearch_index::UsearchVectorIndex;
-pub use vector_index::{SharedVectorIndex, VectorIndex, VectorSearchResult};
+pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
 pub use vector_store::VectorStore;

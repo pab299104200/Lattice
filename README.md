@@ -7,10 +7,12 @@ Lattice indexes your codebase and repo Markdown into a dependency graph, then se
 ## Why Lattice
 
 - `get_skeleton` and `get_context_capsule` cut discovery cost before an assistant starts reading source
-- Workflow tools like `prepare_change`, `impact_from_diff`, and `diagnose_failure` collapse multi-step coding tasks into one or two calls
+- Workflow tools like `prepare_change`, `plan_edit`, `trace_scenario`, `impact_from_diff`, and `diagnose_failure` collapse multi-step coding tasks into one or two calls
 - Markdown docs, runbooks, and decisions are first-class graph nodes with backlinks, outgoing links, and code mentions
 - `find_stale_docs` helps catch docs that likely drifted after code or runbook changes
 - `expand_context` reuses a prior handle from `get_context_capsule` or a workflow tool and returns only the next delta
+- `plan_edit` adds a patch-oriented planning bundle with likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests
+- `trace_scenario` turns a behavior description into likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and related tests/docs, while keeping confidence separate from coverage
 - Memory is persistent, scoped, refreshable, and stale-aware
 - Compact workflow shaping now defaults to small assistant-friendly responses instead of large generic payloads
 
@@ -30,6 +32,22 @@ That synthetic workflow benchmark reflects the current compact workflow stack, i
 - optional dense wire format
 - restart-persistent `context_handle` reuse
 
+Richer semantic indexing now broadens those retrieval paths:
+
+- vector sync embeds symbol bodies with compact summaries, comments/docstrings, error strings, config keys, and route anchors instead of only `name + signature`
+- the first multi-granularity slice adds per-file summary vectors alongside symbol vectors, and the query engine can retrieve both scopes before reranking
+- semantic candidates are re-ranked with graph proximity, identifier overlap, and query-intent signals before final delivery
+- vector sync, watcher sync, and USearch flushes now emit structured rollout logs for payload size, throughput, and storage growth
+- assistant-style benchmark scorecards now cover natural-language and identifier-heavy prompts in the query and intelligence benchmark suites
+
+Compact follow-up targets now prefer stable handles when the graph node identity is known:
+
+- stable symbol follow-up targets use `symbol_id:{...}` and are derived from the graph identity already carried by `SymbolId` (`file`, `name`, and `byte_offset`)
+- stable file follow-up targets use `file_id:...`
+- `expand_context` resolves `symbol_id:` and `file_id:` first, then falls back to legacy `symbol:` and `file:` targets for compatibility
+- compact follow-up suggestions and cached seeds preserve stable handles when available in `get_context_capsule`, `prepare_change`, `impact_from_diff`, `get_working_set_context`, `summarize_subsystem`, `get_repo_playbook`, and `diagnose_failure`
+- `plan_edit` also preserves stable handles where the graph node is known and prefers the top candidate edit span for `suggested_expand`
+
 ## How You Use Lattice
 
 Lattice works in two complementary ways:
@@ -41,11 +59,11 @@ Lattice works in two complementary ways:
 
 When you run Lattice through an MCP client, you get:
 
-- workflow tools like `prepare_change`, `impact_from_diff`, `diagnose_failure`, and `expand_context`
+- workflow tools like `prepare_change`, `plan_edit`, `trace_scenario`, `impact_from_diff`, `diagnose_failure`, and `expand_context`
 - docs tools like `get_docs_capsule`, `get_backlinks`, `get_outgoing_links`, and `find_stale_docs`
 - graph-backed code retrieval, project rules, test discovery, and workspace setup guidance
 - persistent memory and workflow outcome reuse across sessions
-- persisted ANN semantic search under `.lattice/` with automatic SQLite exact-search fallback
+- persisted ANN semantic search under `.lattice/` with automatic SQLite exact-search fallback, plus scoped symbol and file-summary vector retrieval
 - SQLite FTS5-backed memory keyword search with automatic backfill for existing memory databases
 - graceful stdio shutdown: the daemon now aborts in-flight requests on client cancellation or disconnect so abandoned sub-agent calls do not linger
 - the same daemon and graph engine that powers the VS Code experience
@@ -94,13 +112,17 @@ If the USearch index cannot be opened or synchronized, the daemon falls back to 
 
 ## Which Tool First?
 
-If you are not sure which tool to call, choose one of these three first-call tools:
+If you are not sure which tool to call, choose one of these five first-call tools:
 
 1. `diagnose_failure`
    Use for failing tests, stack traces, compiler errors, or runtime failures.
-2. `prepare_change`
+2. `trace_scenario`
+   Use for behavior-level debugging when you have a scenario description and want likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and follow-up targets before editing.
+3. `prepare_change`
    Use for fix/add/refactor tasks once the likely change area is known.
-3. `get_context_capsule`
+4. `plan_edit`
+   Use when you want a patch plan with edit spans, affected callers and dependencies, docs guidance, and tests in one bundle.
+5. `get_context_capsule`
    Use for unfamiliar subsystems, broad architecture questions, or "how does X work?"
 
 Then use `expand_context` when one of those results returns a `context_handle` or `suggested_expand`.
@@ -122,6 +144,7 @@ Practical rule:
 
 - `diagnose_failure` decides where the failure is coming from
 - `prepare_change` decides what to edit
+- `plan_edit` decides how to patch it
 - `get_context_capsule` decides how the code works
 - `get_skeleton` decides whether a file is worth opening
 
@@ -174,6 +197,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
   Fast file map: symbols, kinds, and structure before loading source.
 - `get_context_capsule`
   Broad discovery tool for unfamiliar subsystems or architectural questions. Returns ranked pivots plus a reusable `context_handle` and `suggested_expand`.
+  When the graph node is known, `suggested_expand` uses stable `symbol_id:` or `file_id:` follow-up targets.
   For implementation-oriented queries, it favors source files over Markdown docs; use `get_docs_capsule` for doc-first questions.
 - `summarize_subsystem`
   Summary-first subsystem map: key files, key symbols, tests, and memories in a compact bundle.
@@ -181,20 +205,25 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 - `get_repo_playbook`
   Repo-wide architecture and convention summary for fast session startup.
 - `prepare_change`
-  Change-oriented bundle: likely edit files, symbols, tests, memory, and risks.
+  Change-oriented bundle: likely edit files, symbols, tests, memory, and risks. Bundled memory items keep the same legacy-plus-structured payload shape described below. Compact responses prefer stable follow-up handles when symbol identity is available.
+- `plan_edit`
+  Patch-oriented planning bundle: likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests. Compact responses prefer the top candidate edit span handle when one is available.
+- `trace_scenario`
+  Scenario-focused debugging bundle: given a behavior description, it surfaces likely entrypoints, plausible alternatives, execution-path segments, guards, side effects, failure branches, relevant docs/tests, and confidence-separated signals. Compact responses seed a `context_handle` and `suggested_expand` toward the most likely path focus.
 - `impact_from_diff`
-  Diff review bundle: changed symbols, affected code, review checklist, and tests.
+  Diff review bundle: changed symbols, affected code, review checklist, and tests. Compact responses prefer stable follow-up handles when symbol identity is available.
 - `diagnose_failure`
-  Failure triage bundle: likely culprit symbols, tests, likely causes, and next steps.
+  Failure triage bundle: likely culprit symbols, tests, likely causes, and next steps. Compact responses prefer stable follow-up handles when symbol identity is available.
 - `expand_context`
   Focused delta expansion from a prior `context_handle`, including one returned by `get_context_capsule`.
+  Accepts `symbol_id:`, `file_id:`, `symbol:`, `file:`, `test:`, and `memory:` focuses, with stable handles taking precedence.
 
 ### Tests, Working Set, And Refactoring
 
 - `find_relevant_tests`
   Rank tests from files, symbols, or diff text.
 - `get_working_set_context`
-  Compress active files, nearby symbols, tests, and memory into one bundle.
+  Compress active files, nearby symbols, tests, and memory into one bundle. Returned memory items preserve the same additive structured fields when present.
 - `get_symbol`
   Full symbol details: source, signature, dependencies, and dependents.
 - `get_dependencies`
@@ -223,14 +252,23 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 
 ### Memory, Outcomes, And Long-Running Context
 
+Memory payloads now include additive structured assertion metadata alongside the legacy fields (`id`, `content`, `type`, `scope`, links, stale flags, and related fields). Workflow bundles and memory tools may expose:
+
+- `assertion_type`, `verification_status`, and `confidence_reason`
+- `supersedes_memory_id`, `superseded_by_memory_id`, `contradicts_memory_ids`, and `contradicted_by_memory_ids`
+- `freshness_policy` and `freshness_policy_detail`
+- `provenance` and `evidence`
+
+At a high level, assistants should trust verified workflow outcomes and stronger branch/repo-scoped memories ahead of weaker stale, superseded, or contradicted recall. The legacy fields still exist; these structured fields are additive and help explain why one memory is preferred over another.
+
 - `save_observation`
-  Store a decision, pattern, or note for later reuse.
+  Store a decision, pattern, or note for later reuse. Returned memory payloads may include structured assertion and freshness metadata.
 - `get_session_context`
-  Recall current-session plus relevant previous-session memory.
+  Recall current-session plus relevant previous-session memory, with workflow bundles preferring stronger verified durable memories when available.
 - `search_memory`
-  Search stored memory across sessions.
+  Search stored memory across sessions. Structured verification and freshness fields help explain why a hit is stronger or weaker.
 - `list_observations`
-  Review stored memories.
+  Review stored memories, including structured trust and freshness metadata when present.
 - `list_stale_memories`
   Find memories that likely need refresh.
 - `promote_observation`
@@ -242,7 +280,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 - `delete_observation`
   Remove obsolete or incorrect memory.
 - `record_workflow_outcome`
-  Persist successful workflow outcomes so future sessions can reuse real solutions.
+  Persist successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory.
 
 ### Observability And Workspace Understanding
 
@@ -371,6 +409,7 @@ If the task starts from a failing test, stack trace, or compiler error, start wi
 Use these tools when they're the best fit:
 
 - `prepare_change` — first choice for "fix/add/refactor X" once you know the area to change
+- `plan_edit` — first choice for patch-oriented planning when you want edit files, spans, callers, docs, and tests in one bundle
 - `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it can now hand off directly to `expand_context`
 - `get_docs_capsule` — first choice for "what docs or runbooks explain this?" questions
 - `get_skeleton` — use before opening a large file

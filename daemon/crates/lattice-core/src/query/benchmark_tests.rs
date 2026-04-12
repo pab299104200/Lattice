@@ -351,3 +351,108 @@ fn bench_precision_scorecard() {
         "One or more queries fell below the 90% precision threshold"
     );
 }
+
+#[test]
+#[ignore] // Requires /home/pete/rmm_server
+fn bench_precision_assistant_scorecard() {
+    let graph = match get_benchmark_graph() {
+        Some(g) => g,
+        None => {
+            eprintln!("Skipping: {} not found", BENCHMARK_DIR);
+            return;
+        }
+    };
+
+    struct BenchQuery {
+        name: &'static str,
+        query: &'static str,
+        keywords: &'static [&'static str],
+    }
+
+    let queries = [
+        BenchQuery {
+            name: "AuthNL",
+            query: "Why does login fail after a token refresh?",
+            keywords: &[
+                "auth",
+                "jwt",
+                "token",
+                "login",
+                "password",
+                "verify",
+                "session",
+                "credential",
+                "user",
+                "permission",
+                "role",
+                "group",
+            ],
+        },
+        BenchQuery {
+            name: "PatchNL",
+            query: "How do I trace a patch rollout when deployment fails?",
+            keywords: &[
+                "patch", "deploy", "update", "install", "package", "rollback", "agent",
+            ],
+        },
+        BenchQuery {
+            name: "HostID",
+            query: "host management and discovery",
+            keywords: &[
+                "host",
+                "discover",
+                "device",
+                "network",
+                "scan",
+                "manage",
+                "inventory",
+                "asset",
+            ],
+        },
+        BenchQuery {
+            name: "SNMPID",
+            query: "SNMP polling credential encryption",
+            keywords: &[
+                "snmp",
+                "poll",
+                "credential",
+                "encrypt",
+                "decrypt",
+                "cipher",
+                "secret",
+                "community",
+            ],
+        },
+    ];
+
+    eprintln!("\n┌──────────┬───────────┬─────────┬────────┐");
+    eprintln!("│ Query    │ Precision │ Rel/Tot │ Status │");
+    eprintln!("├──────────┼───────────┼─────────┼────────┤");
+
+    let mut all_pass = true;
+    for q in &queries {
+        let mut engine = QueryEngine::new(graph.clone(), None, None);
+        let capsule = engine.query(q.query, None, false);
+        let (precision, relevant, total) = measure_precision(&capsule, q.keywords);
+        let pass = precision >= 0.90;
+        if !pass {
+            all_pass = false;
+        }
+
+        eprintln!(
+            "│ {:<8} │ {:>8.1}% │ {:>3}/{:<3} │ {:<6} │",
+            q.name,
+            precision * 100.0,
+            relevant,
+            total,
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    eprintln!("└──────────┴───────────┴─────────┴────────┘\n");
+
+    assert!(
+        all_pass,
+        "One or more assistant-style queries fell below the 90% precision threshold"
+    );
+}

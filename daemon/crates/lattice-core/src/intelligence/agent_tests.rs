@@ -3,8 +3,8 @@ use serde_json::json;
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
-    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem, BundleMode,
-    ExpandContextSeed, RulesDetector,
+    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem, trace_scenario,
+    BundleMode, ExpandContextSeed, RulesDetector,
 };
 use crate::query::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
 use crate::symbols::{Language, SymbolId, SymbolKind};
@@ -105,6 +105,185 @@ fn build_agent_graph() -> CodeGraph {
     graph.add_edge(&service_id, &login_id, EdgeKind::Calls);
     graph.add_edge(&auth_test_id, &route_id, EdgeKind::Calls);
     graph.add_edge(&session_test_id, &session_id, EdgeKind::Calls);
+
+    graph
+}
+
+fn build_trace_scenario_regression_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+
+    let login_route_id = make_id("src/routes/auth.ts", "loginRoute", 0);
+    let refresh_session_id = make_id("src/auth.ts", "refreshSession", 1);
+    let verify_refresh_token_id = make_id("src/auth.ts", "verifyRefreshToken", 2);
+    let create_session_id = make_id("src/session.ts", "createSession", 3);
+    let fallback_login_id = make_id("src/auth.ts", "fallbackLogin", 4);
+    let reject_refresh_id = make_id("src/auth.ts", "rejectRefresh", 5);
+    let refresh_test_id = make_id(
+        "tests/auth_refresh.test.ts",
+        "test_refresh_session_rejects_expired_token",
+        0,
+    );
+    let login_test_id = make_id(
+        "tests/auth_login.test.ts",
+        "test_login_route_falls_back_to_password_login",
+        0,
+    );
+    let docs_refresh_id = make_id("docs/auth.md", "Refresh Flow", 1);
+    let docs_login_id = make_id("docs/auth.md", "Login Flow", 20);
+
+    graph.add_node(
+        login_route_id.clone(),
+        SymbolKind::Function,
+        "loginRoute".to_string(),
+        "function loginRoute(req: Request): Promise<Response>".to_string(),
+        "function loginRoute(req) { return refreshSession(req.body.user, req.body.refreshToken); }"
+            .to_string(),
+        "src/routes/auth.ts".to_string(),
+        4,
+        18,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        refresh_session_id.clone(),
+        SymbolKind::Function,
+        "refreshSession".to_string(),
+        "function refreshSession(user: User, token: Token): Promise<Session>".to_string(),
+        "function refreshSession(user, token) { if (!verifyRefreshToken(token)) { return rejectRefresh(); } return createSession(user); }".to_string(),
+        "src/auth.ts".to_string(),
+        12,
+        30,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        verify_refresh_token_id.clone(),
+        SymbolKind::Function,
+        "verifyRefreshToken".to_string(),
+        "function verifyRefreshToken(token: Token): bool".to_string(),
+        "function verifyRefreshToken(token) { return token !== ''; }".to_string(),
+        "src/auth.ts".to_string(),
+        32,
+        46,
+        false,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        create_session_id.clone(),
+        SymbolKind::Function,
+        "createSession".to_string(),
+        "function createSession(user: User): Session".to_string(),
+        "function createSession(user) { persistSession(user); return { user }; }".to_string(),
+        "src/session.ts".to_string(),
+        3,
+        14,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        fallback_login_id.clone(),
+        SymbolKind::Function,
+        "fallbackLogin".to_string(),
+        "function fallbackLogin(req: Request): Promise<Response>".to_string(),
+        "function fallbackLogin(req) { return createSession(req.body.user); }".to_string(),
+        "src/auth.ts".to_string(),
+        48,
+        62,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        reject_refresh_id.clone(),
+        SymbolKind::Function,
+        "rejectRefresh".to_string(),
+        "function rejectRefresh(): Response".to_string(),
+        "function rejectRefresh() { return new Response(401); }".to_string(),
+        "src/auth.ts".to_string(),
+        64,
+        72,
+        false,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        refresh_test_id.clone(),
+        SymbolKind::Function,
+        "test_refresh_session_rejects_expired_token".to_string(),
+        "test('refresh session rejects expired token', () => void)".to_string(),
+        "test('refresh session rejects expired token', () => { loginRoute(req); });".to_string(),
+        "tests/auth_refresh.test.ts".to_string(),
+        6,
+        18,
+        false,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        login_test_id.clone(),
+        SymbolKind::Function,
+        "test_login_route_falls_back_to_password_login".to_string(),
+        "test('login route falls back to password login', () => void)".to_string(),
+        "test('login route falls back to password login', () => { fallbackLogin(req); });"
+            .to_string(),
+        "tests/auth_login.test.ts".to_string(),
+        6,
+        18,
+        false,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        docs_refresh_id.clone(),
+        SymbolKind::Section,
+        "Refresh Flow".to_string(),
+        "section Refresh Flow loginRoute refreshSession verifyRefreshToken rejectRefresh"
+            .to_string(),
+        "Use refreshSession after loginRoute and verifyRefreshToken before creating a session."
+            .to_string(),
+        "docs/auth.md".to_string(),
+        1,
+        16,
+        false,
+        Language::Markdown,
+    );
+    graph.add_node(
+        docs_login_id.clone(),
+        SymbolKind::Section,
+        "Login Flow".to_string(),
+        "section Login Flow loginRoute fallbackLogin createSession".to_string(),
+        "Fallback login remains available when refresh fails.".to_string(),
+        "docs/auth.md".to_string(),
+        20,
+        34,
+        false,
+        Language::Markdown,
+    );
+
+    graph.add_edge(&login_route_id, &refresh_session_id, EdgeKind::Calls);
+    graph.add_edge(&login_route_id, &fallback_login_id, EdgeKind::Calls);
+    graph.add_edge(
+        &refresh_session_id,
+        &verify_refresh_token_id,
+        EdgeKind::Calls,
+    );
+    graph.add_edge(&refresh_session_id, &create_session_id, EdgeKind::Calls);
+    graph.add_edge(&refresh_session_id, &reject_refresh_id, EdgeKind::Calls);
+    graph.add_edge(
+        &verify_refresh_token_id,
+        &create_session_id,
+        EdgeKind::Calls,
+    );
+    graph.add_edge(&fallback_login_id, &create_session_id, EdgeKind::Calls);
+    graph.add_edge(&refresh_test_id, &login_route_id, EdgeKind::Calls);
+    graph.add_edge(&login_test_id, &fallback_login_id, EdgeKind::Calls);
+    graph.add_edge(&docs_refresh_id, &login_route_id, EdgeKind::Mentions);
+    graph.add_edge(&docs_refresh_id, &refresh_session_id, EdgeKind::Mentions);
+    graph.add_edge(
+        &docs_refresh_id,
+        &verify_refresh_token_id,
+        EdgeKind::Mentions,
+    );
+    graph.add_edge(&docs_refresh_id, &reject_refresh_id, EdgeKind::Mentions);
+    graph.add_edge(&docs_login_id, &login_route_id, EdgeKind::Mentions);
+    graph.add_edge(&docs_login_id, &fallback_login_id, EdgeKind::Mentions);
+    graph.add_edge(&docs_login_id, &create_session_id, EdgeKind::Mentions);
 
     graph
 }
@@ -341,6 +520,44 @@ fn build_duplicate_symbol_graph() -> CodeGraph {
     graph.add_edge(&renewal_test_id, &policy_id, EdgeKind::Calls);
 
     graph
+}
+
+fn build_duplicate_symbol_capsule() -> ContextCapsule {
+    ContextCapsule {
+        query: "Fix certificate access checks".to_string(),
+        intent: QueryIntent::FixBug,
+        pivots: vec![PivotNode {
+            symbol: "_verify_org_access".to_string(),
+            kind: "fn".to_string(),
+            file: "routers/certificates.py".to_string(),
+            line: 66,
+            source: "def _verify_org_access(...): raise HTTPException(status_code=403)".to_string(),
+            score: 0.91,
+            reason: "entry file match".to_string(),
+        }],
+        context: vec![ContextNode {
+            symbol: "_verify_org_access".to_string(),
+            kind: "fn".to_string(),
+            file: "routers/compliance_mgmt/_shared.py".to_string(),
+            line: 14,
+            skeleton: "def _verify_org_access(perms, org_id)".to_string(),
+            relationship: "same_name".to_string(),
+            score: 0.57,
+        }],
+        memories: vec![],
+        stats: CapsuleStats {
+            tokens_used: 80,
+            tokens_saved: 120,
+            nodes_evaluated: 2,
+            nodes_included: 2,
+            engine_version: "test".to_string(),
+            seed_count: 2,
+            seed_symbols: vec![
+                "routers/certificates.py:_verify_org_access".to_string(),
+                "routers/compliance_mgmt/_shared.py:_verify_org_access".to_string(),
+            ],
+        },
+    }
 }
 
 fn build_prepare_change_noise_graph() -> CodeGraph {
@@ -653,6 +870,141 @@ fn test_find_relevant_tests_prefers_supplied_file_for_duplicate_symbols() {
 }
 
 #[test]
+fn test_prepare_change_suggested_expand_uses_stable_handle_for_duplicate_symbols() {
+    let graph = build_duplicate_symbol_graph();
+    let files = vec![
+        "routers/certificates.py".to_string(),
+        "routers/compliance_mgmt/_shared.py".to_string(),
+        "tests/test_certificate_tenant_isolation.py".to_string(),
+        "tests/test_cert_renewal.py".to_string(),
+    ];
+    let rules = RulesDetector::new().detect_rules(&files);
+
+    let first_bundle = prepare_change(
+        &graph,
+        &build_duplicate_symbol_capsule(),
+        &["routers/certificates.py".to_string()],
+        &["_verify_org_access".to_string()],
+        &rules,
+        BundleMode::Compact,
+    );
+    let second_bundle = prepare_change(
+        &graph,
+        &build_duplicate_symbol_capsule(),
+        &["routers/certificates.py".to_string()],
+        &["_verify_org_access".to_string()],
+        &rules,
+        BundleMode::Compact,
+    );
+
+    let first_suggested = first_bundle
+        .suggested_expand
+        .as_ref()
+        .expect("expected prepare_change to suggest a follow-up target");
+    let second_suggested = second_bundle
+        .suggested_expand
+        .as_ref()
+        .expect("expected prepare_change to suggest a follow-up target");
+
+    assert_eq!(
+        first_suggested.focus, second_suggested.focus,
+        "expected stable follow-up target to be deterministic across repeated planning calls"
+    );
+    assert_ne!(
+        first_suggested.focus, "symbol:_verify_org_access",
+        "expected duplicate symbol follow-up target to be stable rather than bare-name ambiguous"
+    );
+
+    let seed = ExpandContextSeed {
+        query: Some(first_bundle.query.clone()),
+        files: first_bundle
+            .primary_files
+            .iter()
+            .chain(first_bundle.secondary_files.iter())
+            .map(|item| item.file.clone())
+            .collect(),
+        symbols: first_bundle
+            .symbols
+            .iter()
+            .map(|item| item.symbol.clone())
+            .collect(),
+        tests: first_bundle
+            .tests
+            .iter()
+            .map(|item| item.file.clone())
+            .collect(),
+        memories: first_bundle.memories.clone(),
+    };
+    let report = expand_context(&graph, &seed, &first_suggested.focus, 800);
+
+    assert_eq!(report.focus_type, "symbol");
+    assert_eq!(
+        report.symbols.first().map(|item| item.symbol.as_str()),
+        Some("_verify_org_access"),
+        "expected stable target to resolve to the intended duplicate symbol"
+    );
+    assert_eq!(
+        report.symbols.first().map(|item| item.file.as_str()),
+        Some("routers/certificates.py"),
+        "expected stable target to resolve to the certificate router symbol rather than the same-name helper"
+    );
+    assert!(
+        report
+            .files
+            .iter()
+            .any(|item| item.file == "routers/certificates.py"),
+        "expected expanded file context to include the intended file: {:?}",
+        report
+            .files
+            .iter()
+            .map(|item| item.file.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_expand_context_keeps_legacy_symbol_name_fallback_for_duplicate_symbols() {
+    let graph = build_duplicate_symbol_graph();
+    let seed = ExpandContextSeed {
+        query: Some("Fix certificate access checks".to_string()),
+        files: vec![
+            "routers/certificates.py".to_string(),
+            "routers/compliance_mgmt/_shared.py".to_string(),
+        ],
+        symbols: vec![
+            "_verify_org_access".to_string(),
+            "upsert_renewal_policy".to_string(),
+        ],
+        tests: vec![
+            "tests/test_certificate_tenant_isolation.py".to_string(),
+            "tests/test_cert_renewal.py".to_string(),
+        ],
+        memories: vec![],
+    };
+
+    let report = expand_context(&graph, &seed, "symbol:_verify_org_access", 800);
+
+    let expanded = report
+        .symbols
+        .first()
+        .expect("expected legacy bare-name expansion to still resolve a duplicate symbol");
+    assert_eq!(report.focus_type, "symbol");
+    assert_eq!(expanded.symbol, "_verify_org_access");
+    assert!(
+        matches!(
+            expanded.file.as_str(),
+            "routers/certificates.py" | "routers/compliance_mgmt/_shared.py"
+        ),
+        "expected fallback expansion to resolve to one of the duplicate files, got {:?}",
+        expanded.file
+    );
+    assert!(
+        report.files.iter().any(|item| item.file == expanded.file),
+        "expected file context to track the resolved duplicate symbol"
+    );
+}
+
+#[test]
 fn test_find_relevant_tests_filters_generic_symbol_overlap_noise() {
     let graph = build_find_relevant_test_noise_graph();
     let rules = RulesDetector::new().detect_rules(&[
@@ -797,6 +1149,152 @@ fn test_get_working_set_context_collects_symbols_tests_and_memories() {
         report.overview.contains("prior repo observation"),
         "expected compact overview to keep only a short memory reference: {}",
         report.overview
+    );
+}
+
+#[test]
+fn test_get_working_set_context_prefers_verified_structured_memories() {
+    let graph = build_agent_graph();
+    let rules = RulesDetector::new().detect_rules(&[
+        "src/auth.ts".to_string(),
+        "src/session.ts".to_string(),
+        "src/routes/auth.ts".to_string(),
+        "tests/auth.test.ts".to_string(),
+        "tests/session.test.ts".to_string(),
+    ]);
+    let memories = vec![
+        json!({
+            "id": "mem-contradicted",
+            "content": "Auth fixes should inspect fallbackLogin before touching loginUser.",
+            "type": "observation",
+            "scope": "repo",
+            "verification_status": "verified",
+            "contradicted_by_memory_ids": ["mem-verified"],
+            "confidence_reason": "Older route note before refresh flow changes",
+            "freshness_policy": "manual_review"
+        }),
+        json!({
+            "id": "mem-verified",
+            "content": "Auth fixes should inspect loginUser before createSession.",
+            "type": "pattern",
+            "assertion_type": "workflow_outcome",
+            "scope": "repo",
+            "verification_status": "verified",
+            "confidence_reason": "Validated by recent auth regression coverage",
+            "freshness_policy": "repo_scoped",
+            "freshness_policy_detail": "Refresh after auth flow changes",
+            "provenance": [{
+                "source": "test",
+                "reference": "tests/auth.test.ts"
+            }],
+            "evidence": [{
+                "kind": "test",
+                "reference": "tests/auth.test.ts",
+                "detail": "Covers login route and session path"
+            }]
+        }),
+        json!({
+            "id": "mem-superseded",
+            "content": "Old auth timeout workaround retried createSession from the route.",
+            "type": "pattern",
+            "scope": "repo",
+            "superseded_by_memory_id": "mem-verified",
+            "confidence_reason": "Superseded during auth refactor"
+        }),
+    ];
+
+    let report = get_working_set_context(
+        &graph,
+        &["src/auth.ts".to_string()],
+        &["loginUser".to_string()],
+        Some("login timeout auth"),
+        &memories,
+        &rules,
+        BundleMode::Full,
+    );
+
+    assert_eq!(
+        report
+            .memory_highlights
+            .first()
+            .and_then(|item| item.verification_status.as_deref()),
+        Some("verified")
+    );
+    assert_eq!(
+        report
+            .memory_highlights
+            .first()
+            .and_then(|item| item.assertion_type.as_deref()),
+        Some("workflow_outcome")
+    );
+    assert_eq!(
+        report
+            .memory_highlights
+            .first()
+            .and_then(|item| item.freshness_policy.as_deref()),
+        Some("repo_scoped")
+    );
+    assert!(
+        report
+            .memory_highlights
+            .first()
+            .map(|item| item.content.contains("loginUser before createSession"))
+            .unwrap_or(false),
+        "expected verified structured memory to lead highlights: {:?}",
+        report.memory_highlights
+    );
+    assert!(
+        report
+            .overview
+            .contains("reuse verified repo workflow outcome"),
+        "expected overview to reflect structured trust signal: {}",
+        report.overview
+    );
+    assert_eq!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("id"))
+            .and_then(|item| item.as_str()),
+        Some("mem-verified")
+    );
+    assert_eq!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("assertion_type"))
+            .and_then(|item| item.as_str()),
+        Some("workflow_outcome")
+    );
+    assert_eq!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("verification_status"))
+            .and_then(|item| item.as_str()),
+        Some("verified")
+    );
+    assert!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("provenance"))
+            .and_then(|item| item.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false),
+        "expected compact full-memory payload to retain provenance: {:?}",
+        report.memories
+    );
+    assert!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("evidence"))
+            .and_then(|item| item.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false),
+        "expected compact full-memory payload to retain evidence: {:?}",
+        report.memories
     );
 }
 
@@ -1465,6 +1963,46 @@ fn test_expand_context_returns_delta_for_cached_symbol_focus() {
 }
 
 #[test]
+fn test_expand_context_memory_focus_prefers_verified_match() {
+    let graph = build_agent_graph();
+    let seed = ExpandContextSeed {
+        query: Some("Fix auth timeout".to_string()),
+        files: vec!["src/auth.ts".to_string()],
+        symbols: vec!["loginUser".to_string()],
+        tests: vec!["tests/auth.test.ts".to_string()],
+        memories: vec![
+            json!({
+                "id": "mem-contradicted",
+                "content": "Auth timeout fixes should start with fallbackLogin.",
+                "type": "observation",
+                "scope": "repo",
+                "contradicted_by_memory_ids": ["mem-verified"]
+            }),
+            json!({
+                "id": "mem-verified",
+                "content": "Auth timeout fixes should start with loginUser and session coverage.",
+                "type": "pattern",
+                "assertion_type": "workflow_outcome",
+                "scope": "repo",
+                "verification_status": "verified"
+            }),
+        ],
+    };
+
+    let report = expand_context(&graph, &seed, "Auth timeout fixes", 800);
+
+    assert_eq!(report.focus_type, "memory");
+    assert_eq!(
+        report
+            .memories
+            .first()
+            .and_then(|item| item.get("id"))
+            .and_then(|item| item.as_str()),
+        Some("mem-verified")
+    );
+}
+
+#[test]
 fn test_impact_from_diff_maps_changed_symbols_and_dependents() {
     let graph = build_agent_graph();
     let rules = RulesDetector::new().detect_rules(&[
@@ -1543,5 +2081,296 @@ fn test_impact_from_diff_maps_changed_symbols_and_dependents() {
             .iter()
             .map(|item| item.message.as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_trace_scenario_separates_likely_and_plausible_entrypoints_and_paths() {
+    let graph = build_trace_scenario_regression_graph();
+    let rules = RulesDetector::new().detect_rules(&[
+        "src/routes/auth.ts".to_string(),
+        "src/auth.ts".to_string(),
+        "src/session.ts".to_string(),
+        "tests/auth_refresh.test.ts".to_string(),
+        "tests/auth_login.test.ts".to_string(),
+        "docs/auth.md".to_string(),
+    ]);
+
+    let bundle = trace_scenario(
+        &graph,
+        "Why does login fail after refresh token verification?",
+        &["src/routes/auth.ts".to_string()],
+        &["loginRoute".to_string()],
+        &rules,
+        BundleMode::Full,
+    );
+
+    assert!(
+        !bundle.likely_entrypoints.is_empty(),
+        "expected likely scenario entrypoints: {:?}",
+        bundle
+            .likely_entrypoints
+            .iter()
+            .map(|item| format!("{}:{}:{}", item.file, item.symbol, item.confidence_band))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !bundle.plausible_entrypoints.is_empty(),
+        "expected plausible scenario entrypoints for alternate branches: {:?}",
+        bundle
+            .likely_entrypoints
+            .iter()
+            .chain(bundle.plausible_entrypoints.iter())
+            .map(|item| format!("{}:{}:{}", item.file, item.symbol, item.confidence_band))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .likely_entrypoints
+            .iter()
+            .all(|item| item.confidence_band == "high" || item.confidence_band == "medium"),
+        "expected likely entrypoints to keep high/medium confidence: {:?}",
+        bundle
+            .likely_entrypoints
+            .iter()
+            .map(|item| format!("{}:{}", item.symbol, item.confidence_band))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .plausible_entrypoints
+            .iter()
+            .all(|item| item.confidence_band == "low"),
+        "expected plausible entrypoints to stay in low-confidence band: {:?}",
+        bundle
+            .plausible_entrypoints
+            .iter()
+            .map(|item| format!("{}:{}", item.symbol, item.confidence_band))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle.plausible_entrypoints.iter().all(|item| {
+            bundle
+                .likely_entrypoints
+                .iter()
+                .all(|likely| likely.file != item.file || likely.symbol != item.symbol)
+        }),
+        "expected plausible entrypoints to remain distinct from likely entrypoints: likely={:?} plausible={:?}",
+        bundle
+            .likely_entrypoints
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>(),
+        bundle
+            .plausible_entrypoints
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        !bundle.execution_path.is_empty(),
+        "expected traced execution path segments: {:?}",
+        bundle
+            .execution_path
+            .iter()
+            .map(|item| format!(
+                "{}->{} ({})",
+                item.from_symbol, item.to_symbol, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !bundle.plausible_paths.is_empty(),
+        "expected plausible alternate path segments: {:?}",
+        bundle
+            .execution_path
+            .iter()
+            .chain(bundle.plausible_paths.iter())
+            .map(|item| format!(
+                "{}->{} ({})",
+                item.from_symbol, item.to_symbol, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .execution_path
+            .iter()
+            .all(|item| item.confidence_band == "high" || item.confidence_band == "medium"),
+        "expected execution path confidence to be high/medium: {:?}",
+        bundle
+            .execution_path
+            .iter()
+            .map(|item| format!(
+                "{}->{}:{}",
+                item.from_symbol, item.to_symbol, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .plausible_paths
+            .iter()
+            .all(|item| item.confidence_band == "low"),
+        "expected plausible path confidence to stay low: {:?}",
+        bundle
+            .plausible_paths
+            .iter()
+            .map(|item| format!(
+                "{}->{}:{}",
+                item.from_symbol, item.to_symbol, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .execution_path
+            .iter()
+            .any(|item| item.from_symbol == "loginRoute" && item.to_symbol == "refreshSession"),
+        "expected refresh path in execution segments: {:?}",
+        bundle
+            .execution_path
+            .iter()
+            .map(|item| format!("{}->{}", item.from_symbol, item.to_symbol))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .plausible_paths
+            .iter()
+            .any(|item| item.from_symbol == "fallbackLogin" || item.to_symbol == "fallbackLogin"),
+        "expected fallback-related branch in plausible segments: {:?}",
+        bundle
+            .plausible_paths
+            .iter()
+            .map(|item| format!("{}->{}", item.from_symbol, item.to_symbol))
+            .collect::<Vec<_>>()
+    );
+    let top_execution_score = bundle
+        .execution_path
+        .iter()
+        .map(|item| item.score)
+        .fold(0.0, f64::max);
+    let top_plausible_score = bundle
+        .plausible_paths
+        .iter()
+        .map(|item| item.score)
+        .fold(0.0, f64::max);
+    assert!(
+        top_execution_score > top_plausible_score,
+        "expected higher-confidence execution path score than plausible alternatives: execution={} plausible={}",
+        top_execution_score,
+        top_plausible_score
+    );
+}
+
+#[test]
+fn test_trace_scenario_surfaces_guard_failure_and_relevant_tests_docs() {
+    let graph = build_trace_scenario_regression_graph();
+    let rules = RulesDetector::new().detect_rules(&[
+        "src/routes/auth.ts".to_string(),
+        "src/auth.ts".to_string(),
+        "src/session.ts".to_string(),
+        "tests/auth_refresh.test.ts".to_string(),
+        "tests/auth_login.test.ts".to_string(),
+        "docs/auth.md".to_string(),
+    ]);
+
+    let bundle = trace_scenario(
+        &graph,
+        "Debug login refresh timeout where token verification fails and unauthorized responses are returned.",
+        &["src/routes/auth.ts".to_string(), "src/auth.ts".to_string()],
+        &["loginRoute".to_string(), "refreshSession".to_string()],
+        &rules,
+        BundleMode::Full,
+    );
+
+    assert!(
+        bundle
+            .guards
+            .iter()
+            .any(|item| item.symbol == "verifyRefreshToken"),
+        "expected guard signal for token verification: {:?}",
+        bundle
+            .guards
+            .iter()
+            .map(|item| format!("{}:{}", item.symbol, item.summary))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .failure_branches
+            .iter()
+            .any(|item| item.symbol == "rejectRefresh"),
+        "expected failure-branch signal for reject path: {:?}",
+        bundle
+            .failure_branches
+            .iter()
+            .map(|item| format!("{}:{}", item.symbol, item.summary))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .relevant_docs
+            .iter()
+            .any(|item| item.file == "docs/auth.md"),
+        "expected docs/auth.md recommendation in scenario trace: {:?}",
+        bundle
+            .relevant_docs
+            .iter()
+            .map(|item| format!("{}:{}", item.file, item.line))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .tests
+            .iter()
+            .take(3)
+            .any(|item| item.file == "tests/auth_refresh.test.ts"),
+        "expected refresh test to be recommended near the top: {:?}",
+        bundle
+            .tests
+            .iter()
+            .map(|item| format!(
+                "{}:{:.2}:{}",
+                item.file, item.confidence, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .tests
+            .iter()
+            .take(4)
+            .any(|item| item.file == "tests/auth_login.test.ts"),
+        "expected fallback/login test to remain recommended: {:?}",
+        bundle
+            .tests
+            .iter()
+            .map(|item| format!(
+                "{}:{:.2}:{}",
+                item.file, item.confidence, item.confidence_band
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    let refresh_confidence = bundle
+        .tests
+        .iter()
+        .find(|item| item.file == "tests/auth_refresh.test.ts")
+        .map(|item| item.confidence)
+        .unwrap_or(0.0);
+    let login_confidence = bundle
+        .tests
+        .iter()
+        .find(|item| item.file == "tests/auth_login.test.ts")
+        .map(|item| item.confidence)
+        .unwrap_or(0.0);
+    assert!(
+        refresh_confidence > login_confidence,
+        "expected refresh failure test to outrank fallback login test for this scenario: refresh={} login={}",
+        refresh_confidence,
+        login_confidence
     );
 }

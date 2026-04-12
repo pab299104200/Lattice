@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
-use crate::storage::SharedVectorIndex;
+use crate::storage::{SharedVectorIndex, VectorScope, VectorSearchResult};
 use crate::symbols::{SymbolId, SymbolKind};
 
 use super::capsule::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
@@ -53,6 +53,9 @@ const DOCUMENT_RESULT_QUERY_KEYWORDS: &[&str] = &[
     "section",
     "sections",
 ];
+
+const FILE_SUMMARY_VECTOR_NAME: &str = "file_summary";
+const FILE_SUMMARY_VECTOR_OFFSET: usize = usize::MAX;
 
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
@@ -113,7 +116,7 @@ impl QueryEngine {
         let prefer_markdown_results = query_prefers_markdown_results(&clean_query);
 
         // Step 2: Semantic search or keyword fallback (use clean query for matching)
-        let mut seed_hits = self.find_seed_hits(&clean_query, embedding, &params);
+        let mut seed_hits = self.find_seed_hits(&clean_query, embedding, &params, intent);
 
         // Step 2b: File-path seeding for Explore intent.
         // For understanding queries, augment seeds with top-centrality functions from
@@ -1150,6 +1153,7 @@ impl QueryEngine {
         query_text: &str,
         embedding: Option<&[f32]>,
         params: &IntentParams,
+        intent: QueryIntent,
     ) -> Vec<(SymbolId, f64)> {
         let prefer_markdown_results = query_prefers_markdown_results(query_text);
         let keyword_hits = self.keyword_fallback(query_text, params.semantic_k);
@@ -1162,7 +1166,10 @@ impl QueryEngine {
 
         // Try semantic search first
         if let (Some(emb), Some(index)) = (embedding, &self.vector_index) {
-            if let Ok(results) = index.search(emb, params.semantic_k) {
+            let symbol_results = index.search_in_scope(emb, params.semantic_k, VectorScope::Symbol);
+            let file_summary_results =
+                index.search_in_scope(emb, params.semantic_k, VectorScope::FileSummary);
+            if let Ok(results) = symbol_results {
                 let mut semantic_hits = Vec::new();
                 for (name, file, byte_offset, similarity) in results {
                     let id = SymbolId {
@@ -1172,16 +1179,228 @@ impl QueryEngine {
                     };
                     semantic_hits.push((id, similarity as f64));
                 }
+                if let Ok(file_hits) = file_summary_results {
+                    let expanded = self.expand_file_summary_hits(
+                        query_text,
+                        intent,
+                        prefer_markdown_results,
+                        file_hits,
+                        params.semantic_k,
+                    );
+                    semantic_hits = merge_seed_hits(semantic_hits, expanded, params.semantic_k * 3);
+                }
+
                 if !semantic_hits.is_empty() {
+                    let reranked_semantic_hits = self.rerank_semantic_hits(
+                        query_text,
+                        intent,
+                        semantic_hits,
+                        &keyword_hits,
+                        prefer_markdown_results,
+                    );
                     if prefer_markdown_results {
-                        return semantic_hits;
+                        return reranked_semantic_hits;
                     }
-                    return merge_seed_hits(semantic_hits, keyword_hits, params.semantic_k * 2);
+                    return merge_seed_hits(
+                        reranked_semantic_hits,
+                        keyword_hits,
+                        params.semantic_k * 2,
+                    );
+                }
+            } else if let Ok(file_hits) = file_summary_results {
+                let semantic_hits = self.expand_file_summary_hits(
+                    query_text,
+                    intent,
+                    prefer_markdown_results,
+                    file_hits,
+                    params.semantic_k,
+                );
+                if !semantic_hits.is_empty() {
+                    let reranked_semantic_hits = self.rerank_semantic_hits(
+                        query_text,
+                        intent,
+                        semantic_hits,
+                        &keyword_hits,
+                        prefer_markdown_results,
+                    );
+                    if prefer_markdown_results {
+                        return reranked_semantic_hits;
+                    }
+                    return merge_seed_hits(
+                        reranked_semantic_hits,
+                        keyword_hits,
+                        params.semantic_k * 2,
+                    );
                 }
             }
         }
 
         keyword_hits
+    }
+
+    fn expand_file_summary_hits(
+        &self,
+        query_text: &str,
+        intent: QueryIntent,
+        prefer_markdown_results: bool,
+        file_summary_hits: Vec<VectorSearchResult>,
+        semantic_k: usize,
+    ) -> Vec<(SymbolId, f64)> {
+        if file_summary_hits.is_empty() {
+            return Vec::new();
+        }
+        let query_terms = extract_query_terms(query_text);
+        let all_nodes = self.graph.all_nodes();
+        let max_total = semantic_k.max(4);
+        let per_file_limit = 2usize;
+        let mut expanded = Vec::new();
+        let mut seen_files = HashSet::new();
+
+        for (name, file, byte_offset, similarity) in file_summary_hits {
+            if !is_file_summary_vector_hit(&name, byte_offset) {
+                continue;
+            }
+            if !seen_files.insert(file.clone()) {
+                continue;
+            }
+
+            let file_nodes: Vec<&GraphNode> = all_nodes
+                .iter()
+                .copied()
+                .filter(|node| node.file == file)
+                .filter(|node| {
+                    if prefer_markdown_results {
+                        true
+                    } else {
+                        !is_markdown_node(node)
+                    }
+                })
+                .filter(|node| !is_test_file(&node.file))
+                .collect();
+            if file_nodes.is_empty() {
+                continue;
+            }
+
+            let max_centrality = file_nodes
+                .iter()
+                .map(|node| self.graph.centrality(&node.id))
+                .fold(0.0f64, f64::max)
+                .max(1.0);
+            let base_similarity = (similarity as f64).clamp(0.0, 1.0);
+
+            let mut file_candidates: Vec<(SymbolId, f64)> = file_nodes
+                .iter()
+                .map(|node| {
+                    let query_signal = file_summary_query_signal(node, &query_terms);
+                    let intent_signal = intent_rerank_signal(intent, node, prefer_markdown_results);
+                    let centrality_signal =
+                        (self.graph.centrality(&node.id) / max_centrality).clamp(0.0, 1.0);
+                    let local_signal =
+                        (0.45 * query_signal + 0.35 * intent_signal + 0.20 * centrality_signal)
+                            .clamp(0.0, 1.0);
+                    let seed_score = (0.62 * base_similarity + 0.38 * local_signal).clamp(0.0, 1.0);
+                    (node.id.clone(), seed_score)
+                })
+                .collect();
+
+            file_candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.file.cmp(&b.0.file))
+                    .then_with(|| a.0.byte_offset.cmp(&b.0.byte_offset))
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            });
+
+            for candidate in file_candidates.into_iter().take(per_file_limit) {
+                expanded.push(candidate);
+                if expanded.len() >= max_total {
+                    break;
+                }
+            }
+            if expanded.len() >= max_total {
+                break;
+            }
+        }
+
+        expanded.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.file.cmp(&b.0.file))
+                .then_with(|| a.0.name.cmp(&b.0.name))
+                .then_with(|| a.0.byte_offset.cmp(&b.0.byte_offset))
+        });
+        expanded.truncate(max_total);
+        expanded
+    }
+
+    /// Re-rank semantic hits using deterministic graph, identifier, and intent signals.
+    /// This complements ANN similarity so assistant-style coding prompts prefer actionable code.
+    fn rerank_semantic_hits(
+        &self,
+        query_text: &str,
+        intent: QueryIntent,
+        semantic_hits: Vec<(SymbolId, f64)>,
+        keyword_hits: &[(SymbolId, f64)],
+        prefer_markdown_results: bool,
+    ) -> Vec<(SymbolId, f64)> {
+        if semantic_hits.is_empty() {
+            return semantic_hits;
+        }
+
+        let query_terms = extract_query_terms(query_text);
+        let identifier_fragments = extract_identifier_fragments(query_text);
+        let has_identifier_query = query_has_identifier_terms(query_text);
+        let keyword_anchor_ids: HashSet<SymbolId> =
+            keyword_hits.iter().map(|(id, _)| id.clone()).collect();
+
+        let all_node_ids = self.graph.all_node_ids();
+        let max_centrality = all_node_ids
+            .iter()
+            .map(|id| self.graph.centrality(id))
+            .fold(0.0f64, f64::max)
+            .max(1.0);
+
+        let (semantic_weight, graph_weight, identifier_weight, intent_weight) =
+            if has_identifier_query {
+                (0.55, 0.18, 0.22, 0.05)
+            } else {
+                (0.68, 0.17, 0.10, 0.05)
+            };
+
+        let mut reranked: Vec<(SymbolId, f64)> = semantic_hits
+            .into_iter()
+            .map(|(id, semantic_sim)| {
+                let base = semantic_sim.clamp(0.0, 1.0);
+                let Some(node) = self.graph.get_node(&id) else {
+                    return (id, base);
+                };
+
+                let graph_signal =
+                    graph_rerank_signal(&self.graph, node, &keyword_anchor_ids, max_centrality);
+                let identifier_signal =
+                    identifier_rerank_signal(node, &query_terms, &identifier_fragments);
+                let intent_signal = intent_rerank_signal(intent, node, prefer_markdown_results);
+
+                let mut reranked_score = base * semantic_weight
+                    + graph_signal * graph_weight
+                    + identifier_signal * identifier_weight
+                    + intent_signal * intent_weight;
+
+                if keyword_anchor_ids.contains(&id) {
+                    reranked_score = reranked_score.max((base + 0.06).min(1.0));
+                }
+
+                (id, reranked_score.clamp(0.0, 1.0))
+            })
+            .collect();
+
+        reranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.file.cmp(&b.0.file))
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+        reranked
     }
 
     /// Keyword-based fallback when no vector store or embedding is available.
@@ -1786,11 +2005,16 @@ fn is_markdown_node(node: &GraphNode) -> bool {
         || node.language == crate::symbols::Language::Markdown
 }
 
-fn query_prefers_markdown_results(query: &str) -> bool {
-    let lower = query.to_ascii_lowercase();
-    DOCUMENT_RESULT_QUERY_KEYWORDS
-        .iter()
-        .any(|keyword| lower.contains(keyword))
+pub(super) fn query_prefers_markdown_results(query: &str) -> bool {
+    query
+        .split_whitespace()
+        .map(normalize_query_token)
+        .any(|token| {
+            DOCUMENT_RESULT_QUERY_KEYWORDS.contains(&token.as_str())
+                || token == "readme"
+                || token.starts_with("docs/")
+                || token.ends_with(".md")
+        })
 }
 
 fn extract_query_terms(query: &str) -> Vec<String> {
@@ -1827,6 +2051,51 @@ fn extract_query_terms(query: &str) -> Vec<String> {
     }
 
     terms
+}
+
+fn normalize_query_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '_' | '.' | '/' | '-'))
+        .to_ascii_lowercase()
+}
+
+fn extract_identifier_fragments(query: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut seen = HashSet::new();
+
+    for token in query.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| {
+            !c.is_alphanumeric() && !matches!(c, '_' | ':' | '.' | '/' | '-')
+        });
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let looks_like_identifier = cleaned.contains('_')
+            || cleaned.contains("::")
+            || cleaned.contains('/')
+            || cleaned.contains('.')
+            || cleaned.chars().any(|ch| ch.is_uppercase());
+        if !looks_like_identifier {
+            continue;
+        }
+
+        for segment in cleaned.split(|c: char| matches!(c, '_' | ':' | '/' | '.' | '-')) {
+            if segment.len() < 3 {
+                continue;
+            }
+            for part in split_identifier(segment) {
+                if part.len() >= 3
+                    && !STOP_WORDS.contains(&part.as_str())
+                    && seen.insert(part.clone())
+                {
+                    fragments.push(part);
+                }
+            }
+        }
+    }
+
+    fragments
 }
 
 fn query_has_identifier_terms(query: &str) -> bool {
@@ -1866,6 +2135,197 @@ pub(super) fn merge_seed_hits(
     });
     hits.truncate(limit.max(1));
     hits
+}
+
+fn graph_rerank_signal(
+    graph: &CodeGraph,
+    node: &GraphNode,
+    keyword_anchor_ids: &HashSet<SymbolId>,
+    max_centrality: f64,
+) -> f64 {
+    let centrality = graph.centrality(&node.id) / max_centrality.max(1.0);
+    if keyword_anchor_ids.is_empty() {
+        return centrality.clamp(0.0, 1.0);
+    }
+
+    let same_file_anchor = keyword_anchor_ids
+        .iter()
+        .any(|anchor| anchor.file == node.file);
+    let adjacent_anchor = graph
+        .get_dependencies(&node.id)
+        .iter()
+        .chain(graph.get_dependents(&node.id).iter())
+        .any(|(related, _)| keyword_anchor_ids.contains(&related.id));
+
+    let mut score = 0.20 * centrality;
+    if same_file_anchor {
+        score += 0.35;
+    }
+    if adjacent_anchor {
+        score += 0.45;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn identifier_rerank_signal(
+    node: &GraphNode,
+    query_terms: &[String],
+    identifier_fragments: &[String],
+) -> f64 {
+    let name_parts = split_identifier(&node.name);
+    let file_segments: Vec<String> = node
+        .file
+        .to_lowercase()
+        .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+        .filter(|part| part.len() >= 3)
+        .map(|part| part.to_string())
+        .collect();
+
+    let node_name_lower = node.name.to_lowercase();
+
+    let query_overlap = overlap_ratio(query_terms, &name_parts, &file_segments);
+    if identifier_fragments.is_empty() {
+        return query_overlap;
+    }
+
+    let exact_identifier_match: f64 = if identifier_fragments
+        .iter()
+        .any(|part| part == &node_name_lower)
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let identifier_overlap = overlap_ratio(identifier_fragments, &name_parts, &file_segments);
+    (exact_identifier_match.max(0.75 * identifier_overlap + 0.25 * query_overlap)).clamp(0.0, 1.0)
+}
+
+fn intent_rerank_signal(
+    intent: QueryIntent,
+    node: &GraphNode,
+    prefer_markdown_results: bool,
+) -> f64 {
+    if prefer_markdown_results {
+        return if is_markdown_node(node) { 1.0 } else { 0.2 };
+    }
+
+    let node_lower = format!(
+        "{} {} {}",
+        node.name.to_lowercase(),
+        node.signature.to_lowercase(),
+        node.body.to_lowercase()
+    );
+    let bug_hint = [
+        "error",
+        "invalid",
+        "timeout",
+        "denied",
+        "forbidden",
+        "exception",
+        "fail",
+        "panic",
+    ]
+    .iter()
+    .any(|needle| node_lower.contains(needle));
+
+    let mut score: f64 = match intent {
+        QueryIntent::Explore => match node.kind {
+            SymbolKind::Function | SymbolKind::Method => 0.85,
+            SymbolKind::Class | SymbolKind::Struct => 0.55,
+            SymbolKind::Interface | SymbolKind::TypeAlias => 0.40,
+            SymbolKind::Variable | SymbolKind::Constant => 0.15,
+            _ => 0.35,
+        },
+        QueryIntent::FixBug => {
+            let mut score = match node.kind {
+                SymbolKind::Function | SymbolKind::Method => 0.75,
+                SymbolKind::Class | SymbolKind::Struct => 0.50,
+                _ => 0.35,
+            };
+            if bug_hint {
+                score += 0.20;
+            }
+            score
+        }
+        QueryIntent::Refactor => match node.kind {
+            SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias => 0.75,
+            _ => 0.35,
+        },
+        QueryIntent::AddFeature => match node.kind {
+            SymbolKind::Function | SymbolKind::Method => 0.75,
+            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface => 0.65,
+            _ => 0.35,
+        },
+        QueryIntent::Unknown => match node.kind {
+            SymbolKind::Function | SymbolKind::Method => 0.70,
+            SymbolKind::Class | SymbolKind::Struct => 0.50,
+            _ => 0.35,
+        },
+    };
+
+    if node.is_exported {
+        score += 0.10;
+    }
+    if is_test_file(&node.file) {
+        score *= 0.35;
+    }
+    if is_markdown_node(node) {
+        score *= 0.20;
+    }
+    score.clamp(0.0, 1.0)
+}
+
+fn overlap_ratio(terms: &[String], name_parts: &[String], file_segments: &[String]) -> f64 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let matched = terms
+        .iter()
+        .filter(|term| {
+            let t = term.as_str();
+            name_parts.iter().any(|part| {
+                (part.len() >= 3 && part == t)
+                    || (part.len() >= 4 && t.starts_with(part))
+                    || (part.len() >= 3 && part.starts_with(t))
+            }) || file_segments.iter().any(|segment| {
+                (segment.len() >= 3 && segment == t)
+                    || (segment.len() >= 4 && t.starts_with(segment))
+            })
+        })
+        .count();
+    (matched as f64 / terms.len() as f64).clamp(0.0, 1.0)
+}
+
+fn is_file_summary_vector_hit(name: &str, byte_offset: usize) -> bool {
+    name == FILE_SUMMARY_VECTOR_NAME || byte_offset == FILE_SUMMARY_VECTOR_OFFSET
+}
+
+fn file_summary_query_signal(node: &GraphNode, query_terms: &[String]) -> f64 {
+    if query_terms.is_empty() {
+        return 0.25;
+    }
+
+    let query_words: Vec<&str> = query_terms.iter().map(|item| item.as_str()).collect();
+    let coherent = has_keyword_coherence(&node.name, &node.signature, &node.file, &query_words);
+    if !coherent {
+        return 0.20;
+    }
+
+    let name_parts = split_identifier(&node.name);
+    let file_segments: Vec<String> = node
+        .file
+        .to_lowercase()
+        .split(|c: char| c == '/' || c == '_' || c == '-' || c == '.')
+        .filter(|part| part.len() >= 3)
+        .map(|part| part.to_string())
+        .collect();
+    let overlap = overlap_ratio(query_terms, &name_parts, &file_segments);
+    (0.35 + 0.65 * overlap).clamp(0.0, 1.0)
 }
 
 /// Detect if a file path is a test file based on common naming conventions.

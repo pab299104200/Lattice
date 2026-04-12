@@ -6,6 +6,17 @@ use super::protocol::{format_response, parse_request, JsonRpcResponse};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
+struct ActiveRequest {
+    generation: u64,
+    handle: JoinHandle<()>,
+}
+
+struct PendingResponse {
+    request_key: String,
+    generation: u64,
+    response: JsonRpcResponse,
+}
+
 /// Trait for handling JSON-RPC requests.
 #[async_trait::async_trait]
 pub trait RequestHandler: Send + Sync {
@@ -41,7 +52,7 @@ impl StdioServer {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (response_tx, mut response_rx) =
-            tokio::sync::mpsc::unbounded_channel::<JsonRpcResponse>();
+            tokio::sync::mpsc::unbounded_channel::<PendingResponse>();
 
         // Stdin reader in a dedicated blocking thread.
         std::thread::spawn(move || {
@@ -61,9 +72,10 @@ impl StdioServer {
         });
 
         // Process messages from the channel.
-        let mut active_requests: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let mut active_requests: HashMap<String, ActiveRequest> = HashMap::new();
         let mut cancelled_requests = HashSet::new();
         let mut shutting_down = false;
+        let mut next_generation = 0u64;
 
         loop {
             tokio::select! {
@@ -142,6 +154,9 @@ impl StdioServer {
                         cancelled_requests.remove(&key);
 
                         let response_tx = response_tx.clone();
+                        let response_key = key.clone();
+                        let generation = next_generation;
+                        next_generation = next_generation.wrapping_add(1);
                         let method = request.method;
                         let params = request.params;
                         let id = request.id;
@@ -150,13 +165,22 @@ impl StdioServer {
                                 Ok(result) => JsonRpcResponse::success(id, result),
                                 Err((code, message)) => JsonRpcResponse::error(id, code, message),
                             };
-                            let _ = response_tx.send(response);
+                            let _ = response_tx.send(PendingResponse {
+                                request_key: response_key,
+                                generation,
+                                response,
+                            });
                         });
 
-                        if let Some(previous) = active_requests.insert(key.clone(), task) {
+                        if let Some(previous) = active_requests.insert(
+                            key.clone(),
+                            ActiveRequest {
+                                generation,
+                                handle: task,
+                            },
+                        ) {
                             tracing::warn!("Replacing duplicate in-flight request id {}", key);
-                            cancelled_requests.insert(key);
-                            previous.abort();
+                            previous.handle.abort();
                         }
                     } else {
                         tokio::spawn(async move {
@@ -167,14 +191,13 @@ impl StdioServer {
                 response = response_rx.recv() => {
                     let Some(response) = response else { continue };
 
-                    if let Some(key) = request_id_key(&response.id) {
-                        active_requests.remove(&key);
-                        if cancelled_requests.remove(&key) {
-                            tracing::debug!("Dropping response for cancelled request {}", key);
-                            continue;
-                        }
+                    if should_write_tracked_response(
+                        &mut active_requests,
+                        &mut cancelled_requests,
+                        &response,
+                    ) {
+                        write_response_sync(&response.response);
                     }
-                    write_response_sync(&response);
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!(
@@ -276,7 +299,7 @@ fn cancelled_request_key(params: &Value) -> Option<String> {
 }
 
 fn cancel_active_request(
-    active_requests: &mut HashMap<String, JoinHandle<()>>,
+    active_requests: &mut HashMap<String, ActiveRequest>,
     cancelled_requests: &mut HashSet<String>,
     params: &Value,
 ) -> bool {
@@ -286,22 +309,70 @@ fn cancel_active_request(
 
     cancelled_requests.insert(key.clone());
     if let Some(handle) = active_requests.remove(&key) {
-        handle.abort();
+        handle.handle.abort();
         return true;
     }
 
     false
 }
 
-fn abort_all_requests(active_requests: &mut HashMap<String, JoinHandle<()>>) {
+fn should_write_tracked_response(
+    active_requests: &mut HashMap<String, ActiveRequest>,
+    cancelled_requests: &mut HashSet<String>,
+    pending: &PendingResponse,
+) -> bool {
+    match active_requests.get(&pending.request_key) {
+        Some(active) if active.generation == pending.generation => {
+            active_requests.remove(&pending.request_key);
+            if cancelled_requests.remove(&pending.request_key) {
+                tracing::debug!(
+                    "Dropping response for cancelled request {}",
+                    pending.request_key
+                );
+                false
+            } else {
+                true
+            }
+        }
+        Some(active) => {
+            tracing::debug!(
+                "Dropping stale response for replaced request {} (got generation {}, active generation {})",
+                pending.request_key,
+                pending.generation,
+                active.generation
+            );
+            false
+        }
+        None => {
+            if cancelled_requests.remove(&pending.request_key) {
+                tracing::debug!(
+                    "Dropping response for cancelled request {}",
+                    pending.request_key
+                );
+            } else {
+                tracing::debug!(
+                    "Dropping orphaned response for inactive request {}",
+                    pending.request_key
+                );
+            }
+            false
+        }
+    }
+}
+
+fn abort_all_requests(active_requests: &mut HashMap<String, ActiveRequest>) {
     for (_, handle) in active_requests.drain() {
-        handle.abort();
+        handle.handle.abort();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_all_requests, cancel_active_request, cancelled_request_key, request_id_key};
+    use super::{
+        abort_all_requests, cancel_active_request, cancelled_request_key, request_id_key,
+        should_write_tracked_response, ActiveRequest, PendingResponse,
+    };
+    use crate::rpc::protocol::JsonRpcResponse;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -358,7 +429,13 @@ mod tests {
     async fn test_cancel_active_request_aborts_matching_task() {
         let (handle, dropped) = pending_task();
         let key = request_id_key(&json!(42)).expect("request key");
-        let mut active_requests = HashMap::from([(key.clone(), handle)]);
+        let mut active_requests = HashMap::from([(
+            key.clone(),
+            ActiveRequest {
+                generation: 0,
+                handle,
+            },
+        )]);
         let mut cancelled_requests = HashSet::new();
 
         assert!(cancel_active_request(
@@ -382,11 +459,17 @@ mod tests {
         let mut active_requests = HashMap::from([
             (
                 request_id_key(&json!(1)).expect("first request key"),
-                first_handle,
+                ActiveRequest {
+                    generation: 0,
+                    handle: first_handle,
+                },
             ),
             (
                 request_id_key(&json!("second")).expect("second request key"),
-                second_handle,
+                ActiveRequest {
+                    generation: 1,
+                    handle: second_handle,
+                },
             ),
         ]);
 
@@ -401,5 +484,65 @@ mod tests {
             .await
             .expect("second task should abort promptly")
             .expect("second drop signal should arrive");
+    }
+
+    #[tokio::test]
+    async fn test_should_write_tracked_response_drops_stale_duplicate_generation() {
+        let (handle, dropped) = pending_task();
+        let key = request_id_key(&json!(7)).expect("request key");
+        let mut active_requests = HashMap::from([(
+            key.clone(),
+            ActiveRequest {
+                generation: 2,
+                handle,
+            },
+        )]);
+        let mut cancelled_requests = HashSet::new();
+        let stale = PendingResponse {
+            request_key: key.clone(),
+            generation: 1,
+            response: JsonRpcResponse::success(json!(7), json!({"status": "stale"})),
+        };
+
+        assert!(!should_write_tracked_response(
+            &mut active_requests,
+            &mut cancelled_requests,
+            &stale,
+        ));
+        assert_eq!(
+            active_requests.get(&key).map(|request| request.generation),
+            Some(2)
+        );
+
+        abort_all_requests(&mut active_requests);
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("replacement task should abort promptly")
+            .expect("replacement drop signal should arrive");
+    }
+
+    #[tokio::test]
+    async fn test_should_write_tracked_response_accepts_current_generation() {
+        let key = request_id_key(&json!(9)).expect("request key");
+        let mut active_requests = HashMap::from([(
+            key.clone(),
+            ActiveRequest {
+                generation: 3,
+                handle: tokio::spawn(async {}),
+            },
+        )]);
+        let mut cancelled_requests = HashSet::new();
+        let current = PendingResponse {
+            request_key: key.clone(),
+            generation: 3,
+            response: JsonRpcResponse::success(json!(9), json!({"status": "ok"})),
+        };
+
+        assert!(should_write_tracked_response(
+            &mut active_requests,
+            &mut cancelled_requests,
+            &current,
+        ));
+        assert!(!active_requests.contains_key(&key));
     }
 }

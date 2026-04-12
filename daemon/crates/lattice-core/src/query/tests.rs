@@ -1,10 +1,12 @@
 use crate::graph::model::{CodeGraph, EdgeKind};
-use crate::storage::{SharedVectorIndex, VectorIndex, VectorSearchResult};
+use crate::storage::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use std::sync::Arc;
 
 use super::capsule::QueryIntent;
-use super::engine::{merge_seed_hits, parse_query_filters, QueryEngine};
+use super::engine::{
+    merge_seed_hits, parse_query_filters, query_prefers_markdown_results, QueryEngine,
+};
 use super::intent::detect_intent;
 
 // ─── Intent detection tests ─────────────────────────────────────────
@@ -215,8 +217,194 @@ fn build_lattice_workflow_graph() -> CodeGraph {
     graph
 }
 
+fn build_semantic_identifier_rerank_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+
+    let target = make_id("src/auth/session_manager.ts", "rotateSessionToken", 10);
+    let target_helper = make_id("src/auth/session_manager.ts", "authorizeSessionContext", 60);
+    let decoy = make_id("src/cache/reconcile.ts", "reconcileCacheEntries", 20);
+    let decoy_helper = make_id("src/cache/reconcile.ts", "pruneCacheShard", 70);
+
+    graph.add_node(
+        target.clone(),
+        SymbolKind::Function,
+        "rotateSessionToken".to_string(),
+        "fn rotateSessionToken(ctx: AuthCtx) -> SessionToken".to_string(),
+        "fn rotateSessionToken(ctx) { return issue_token(ctx.user_id); }".to_string(),
+        "src/auth/session_manager.ts".to_string(),
+        10,
+        28,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        target_helper.clone(),
+        SymbolKind::Function,
+        "authorizeSessionContext".to_string(),
+        "fn authorizeSessionContext(ctx: AuthCtx) -> bool".to_string(),
+        "fn authorizeSessionContext(ctx) { return ctx.org_id > 0; }".to_string(),
+        "src/auth/session_manager.ts".to_string(),
+        60,
+        76,
+        false,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        decoy.clone(),
+        SymbolKind::Function,
+        "reconcileCacheEntries".to_string(),
+        "fn reconcileCacheEntries(cache: Cache) -> usize".to_string(),
+        "fn reconcileCacheEntries(cache) { return cache.compact(); }".to_string(),
+        "src/cache/reconcile.ts".to_string(),
+        20,
+        42,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_node(
+        decoy_helper.clone(),
+        SymbolKind::Function,
+        "pruneCacheShard".to_string(),
+        "fn pruneCacheShard(shard: usize) -> usize".to_string(),
+        "fn pruneCacheShard(shard) { return shard + 1; }".to_string(),
+        "src/cache/reconcile.ts".to_string(),
+        70,
+        83,
+        false,
+        Language::TypeScript,
+    );
+
+    graph.add_edge(&target, &target_helper, EdgeKind::Calls);
+    graph.add_edge(&decoy, &decoy_helper, EdgeKind::Calls);
+
+    graph
+}
+
+fn build_semantic_graph_rerank_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+
+    let anchor = make_id("routers/certificates.py", "validateTenantAccess", 10);
+    let candidate = make_id("routers/certificates.py", "enforceOrgBoundary", 70);
+    let decoy = make_id("services/inventory.py", "syncInventoryCache", 20);
+    let decoy_helper = make_id("services/inventory.py", "flushInventoryShard", 60);
+
+    graph.add_node(
+        anchor.clone(),
+        SymbolKind::Function,
+        "validateTenantAccess".to_string(),
+        "def validateTenantAccess(org_id):".to_string(),
+        "def validateTenantAccess(org_id):\n    return org_id > 0".to_string(),
+        "routers/certificates.py".to_string(),
+        10,
+        28,
+        true,
+        Language::Python,
+    );
+    graph.add_node(
+        candidate.clone(),
+        SymbolKind::Function,
+        "enforceOrgBoundary".to_string(),
+        "def enforceOrgBoundary(ctx):".to_string(),
+        "def enforceOrgBoundary(ctx):\n    raise HTTPException(status_code=403)".to_string(),
+        "routers/certificates.py".to_string(),
+        70,
+        92,
+        true,
+        Language::Python,
+    );
+    graph.add_node(
+        decoy.clone(),
+        SymbolKind::Function,
+        "syncInventoryCache".to_string(),
+        "def syncInventoryCache():".to_string(),
+        "def syncInventoryCache():\n    return 1".to_string(),
+        "services/inventory.py".to_string(),
+        20,
+        35,
+        true,
+        Language::Python,
+    );
+    graph.add_node(
+        decoy_helper.clone(),
+        SymbolKind::Function,
+        "flushInventoryShard".to_string(),
+        "def flushInventoryShard(shard):".to_string(),
+        "def flushInventoryShard(shard):\n    return shard".to_string(),
+        "services/inventory.py".to_string(),
+        60,
+        72,
+        false,
+        Language::Python,
+    );
+
+    graph.add_edge(&anchor, &candidate, EdgeKind::Calls);
+    graph.add_edge(&decoy, &decoy_helper, EdgeKind::Calls);
+
+    graph
+}
+
+fn build_file_summary_influence_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+
+    let guard = make_id("src/policy/guardrails.rs", "enforce_org_boundary", 10);
+    let scope = make_id("src/policy/guardrails.rs", "check_access_scope", 60);
+    let decoy = make_id("src/cache/reconcile.rs", "reconcile_cache_entries", 20);
+
+    graph.add_node(
+        guard.clone(),
+        SymbolKind::Function,
+        "enforce_org_boundary".to_string(),
+        "fn enforce_org_boundary(actor: &Actor, target: OrgId) -> Result<()>".to_string(),
+        "fn enforce_org_boundary(actor, target) { if actor.org_id != target { return Err(anyhow!(\"org boundary\")); } Ok(()) }".to_string(),
+        "src/policy/guardrails.rs".to_string(),
+        10,
+        34,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        scope.clone(),
+        SymbolKind::Function,
+        "check_access_scope".to_string(),
+        "fn check_access_scope(actor: &Actor, scope: Scope) -> bool".to_string(),
+        "fn check_access_scope(actor, scope) { actor.scope.contains(scope) }".to_string(),
+        "src/policy/guardrails.rs".to_string(),
+        60,
+        82,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        decoy.clone(),
+        SymbolKind::Function,
+        "reconcile_cache_entries".to_string(),
+        "fn reconcile_cache_entries(cache: &mut Cache) -> usize".to_string(),
+        "fn reconcile_cache_entries(cache) { cache.compact() }".to_string(),
+        "src/cache/reconcile.rs".to_string(),
+        20,
+        47,
+        true,
+        Language::Rust,
+    );
+
+    graph.add_edge(&guard, &scope, EdgeKind::Calls);
+    graph.add_edge(&decoy, &guard, EdgeKind::Calls);
+
+    graph
+}
+
 struct StubVectorIndex {
-    hits: Vec<VectorSearchResult>,
+    symbol_hits: Vec<VectorSearchResult>,
+    file_summary_hits: Vec<VectorSearchResult>,
+}
+
+impl StubVectorIndex {
+    fn with_symbol_hits(symbol_hits: Vec<VectorSearchResult>) -> Self {
+        Self {
+            symbol_hits,
+            file_summary_hits: Vec::new(),
+        }
+    }
 }
 
 impl VectorIndex for StubVectorIndex {
@@ -247,7 +435,27 @@ impl VectorIndex for StubVectorIndex {
         _query: &[f32],
         _top_k: usize,
     ) -> Result<Vec<VectorSearchResult>, crate::error::LatticeError> {
-        Ok(self.hits.clone())
+        Ok(self.symbol_hits.clone())
+    }
+
+    fn search_in_scope(
+        &self,
+        _query: &[f32],
+        top_k: usize,
+        scope: VectorScope,
+    ) -> Result<Vec<VectorSearchResult>, crate::error::LatticeError> {
+        let mut results = match scope {
+            VectorScope::Symbol => self.symbol_hits.clone(),
+            VectorScope::FileSummary => self.file_summary_hits.clone(),
+            VectorScope::All => {
+                let mut combined = self.symbol_hits.clone();
+                combined.extend(self.file_summary_hits.clone());
+                combined
+            }
+        };
+        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+        Ok(results)
     }
 
     fn implementation_name(&self) -> &'static str {
@@ -291,20 +499,187 @@ fn test_query_engine_produces_capsule() {
 #[test]
 fn test_query_engine_uses_vector_index_abstraction_for_semantic_hits() {
     let graph = build_test_graph();
-    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex {
-        hits: vec![(
-            "hashPassword".to_string(),
-            "src/crypto.ts".to_string(),
-            0,
-            0.91,
-        )],
-    });
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex::with_symbol_hits(vec![(
+        "hashPassword".to_string(),
+        "src/crypto.ts".to_string(),
+        0,
+        0.91,
+    )]));
     let mut engine = QueryEngine::new(graph, Some(vector_index), None);
 
     let capsule = engine.query("credential hashing", Some(&[0.1, 0.2, 0.3]), false);
 
     assert!(!capsule.pivots.is_empty());
     assert_eq!(capsule.pivots[0].symbol, "hashPassword");
+}
+
+#[test]
+fn test_query_engine_reranks_semantic_hits_using_identifier_and_intent_signals() {
+    let graph = build_semantic_identifier_rerank_graph();
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex::with_symbol_hits(vec![
+        (
+            "reconcileCacheEntries".to_string(),
+            "src/cache/reconcile.ts".to_string(),
+            20,
+            0.93,
+        ),
+        (
+            "rotateSessionToken".to_string(),
+            "src/auth/session_manager.ts".to_string(),
+            10,
+            0.79,
+        ),
+    ]));
+    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+
+    let capsule = engine.query(
+        "Fix AuthService::RefreshSession bug",
+        Some(&[0.1, 0.2, 0.3]),
+        false,
+    );
+    let target_seed = "session_manager.ts:rotateSessionToken".to_string();
+    let decoy_seed = "reconcile.ts:reconcileCacheEntries".to_string();
+    let target_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &target_seed);
+    let decoy_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &decoy_seed);
+
+    assert!(
+        matches!((target_idx, decoy_idx), (Some(a), Some(b)) if a < b),
+        "expected identifier + intent rerank to promote rotateSessionToken over higher raw semantic cache symbol, got seeds: {:?}",
+        capsule.stats.seed_symbols
+    );
+}
+
+#[test]
+fn test_query_engine_reranks_semantic_hits_using_graph_proximity() {
+    let graph = build_semantic_graph_rerank_graph();
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex::with_symbol_hits(vec![
+        (
+            "syncInventoryCache".to_string(),
+            "services/inventory.py".to_string(),
+            20,
+            0.92,
+        ),
+        (
+            "enforceOrgBoundary".to_string(),
+            "routers/certificates.py".to_string(),
+            70,
+            0.84,
+        ),
+    ]));
+    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+
+    let capsule = engine.query("tenant access flow analysis", Some(&[0.2, 0.1, 0.4]), false);
+    let enforce_seed = "certificates.py:enforceOrgBoundary".to_string();
+    let decoy_seed = "inventory.py:syncInventoryCache".to_string();
+    let enforce_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &enforce_seed);
+    let decoy_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &decoy_seed);
+
+    assert!(
+        matches!((enforce_idx, decoy_idx), (Some(a), Some(b)) if a < b),
+        "expected graph-aware rerank to place enforceOrgBoundary ahead of unrelated cache symbol, got seeds: {:?}",
+        capsule.stats.seed_symbols
+    );
+}
+
+#[test]
+fn test_query_engine_uses_file_summary_vectors_to_seed_file_symbols() {
+    let graph = build_file_summary_influence_graph();
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex {
+        symbol_hits: vec![(
+            "reconcile_cache_entries".to_string(),
+            "src/cache/reconcile.rs".to_string(),
+            20,
+            0.91,
+        )],
+        file_summary_hits: vec![(
+            "file_summary".to_string(),
+            "src/policy/guardrails.rs".to_string(),
+            usize::MAX,
+            0.86,
+        )],
+    });
+    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+
+    let capsule = engine.query(
+        "cross-org certificate renewal returned 403",
+        Some(&[0.3, 0.2]),
+        false,
+    );
+
+    assert!(
+        capsule
+            .stats
+            .seed_symbols
+            .iter()
+            .any(|item| item.ends_with(":enforce_org_boundary")),
+        "expected file-summary semantic hit to seed at least one guardrails symbol, got seeds: {:?}",
+        capsule.stats.seed_symbols
+    );
+    let target_seed = "guardrails.rs:enforce_org_boundary".to_string();
+    let decoy_seed = "reconcile.rs:reconcile_cache_entries".to_string();
+    let target_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &target_seed);
+    let decoy_idx = capsule
+        .stats
+        .seed_symbols
+        .iter()
+        .position(|item| item == &decoy_seed);
+    assert!(
+        matches!((target_idx, decoy_idx), (Some(a), Some(b)) if a < b),
+        "expected file-summary seeded guardrails symbol to outrank decoy symbol seed, got seeds: {:?}",
+        capsule.stats.seed_symbols
+    );
+}
+
+#[test]
+fn test_query_engine_identifier_queries_still_prefer_keyword_hits_over_scoped_semantic() {
+    let graph = build_test_graph();
+    let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex {
+        symbol_hits: vec![(
+            "hashPassword".to_string(),
+            "src/crypto.ts".to_string(),
+            0,
+            0.99,
+        )],
+        file_summary_hits: vec![(
+            "file_summary".to_string(),
+            "src/crypto.ts".to_string(),
+            usize::MAX,
+            0.97,
+        )],
+    });
+    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+
+    let capsule = engine.query("fix login_user timeout", Some(&[0.5, 0.4, 0.3]), false);
+    let lead = capsule
+        .pivots
+        .first()
+        .map(|item| item.symbol.as_str())
+        .or_else(|| capsule.context.first().map(|item| item.symbol.as_str()));
+    assert_eq!(
+        lead,
+        Some("loginUser"),
+        "identifier query should still anchor on keyword-derived loginUser even when scoped semantic hits point elsewhere"
+    );
 }
 
 #[test]
@@ -430,6 +805,78 @@ fn test_query_engine_prefers_source_over_markdown_for_workflow_queries() {
                 | Some("daemon/crates/lattice-core/src/intelligence/agent.rs")
         ),
         "expected source-first lead file for workflow query, got pivots={:?} context={:?}",
+        capsule
+            .pivots
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>(),
+        capsule
+            .context
+            .iter()
+            .map(|item| format!("{}::{}", item.file, item.symbol))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_query_prefers_markdown_results_only_for_explicit_doc_terms() {
+    assert!(query_prefers_markdown_results("docs for auth flow"));
+    assert!(query_prefers_markdown_results("README.md render notes"));
+    assert!(!query_prefers_markdown_results(
+        "get_docs_capsule render modes"
+    ));
+    assert!(!query_prefers_markdown_results(
+        "intersection observer state"
+    ));
+}
+
+#[test]
+fn test_query_engine_keeps_tool_identifiers_source_first_when_name_contains_docs() {
+    let mut graph = build_lattice_workflow_graph();
+    let code_id = make_id(
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs",
+        "get_docs_capsule",
+        2,
+    );
+    let doc_id = make_id("README.md", "Docs Tools", 2);
+
+    graph.add_node(
+        code_id,
+        SymbolKind::Function,
+        "get_docs_capsule".to_string(),
+        "fn get_docs_capsule(render: RenderMode, query: &str)".to_string(),
+        "fn get_docs_capsule(...) { /* source implementation for tool lookup */ }".to_string(),
+        "daemon/crates/lattice-daemon/src/rpc/mcp.rs".to_string(),
+        96,
+        140,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        doc_id,
+        SymbolKind::Section,
+        "Docs Tools".to_string(),
+        "section Docs Tools get_docs_capsule render modes".to_string(),
+        "Docs Tools: get_docs_capsule render modes".to_string(),
+        "README.md".to_string(),
+        49,
+        65,
+        false,
+        Language::Markdown,
+    );
+
+    let mut engine = QueryEngine::new(graph, None, None);
+    let capsule = engine.query("get_docs_capsule render modes", None, false);
+    let lead_file = capsule
+        .pivots
+        .first()
+        .map(|item| item.file.as_str())
+        .or_else(|| capsule.context.first().map(|item| item.file.as_str()));
+
+    assert_eq!(
+        lead_file,
+        Some("daemon/crates/lattice-daemon/src/rpc/mcp.rs"),
+        "expected tool identifier query to stay source-first, got pivots={:?} context={:?}",
         capsule
             .pivots
             .iter()

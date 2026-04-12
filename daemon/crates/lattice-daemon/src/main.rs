@@ -257,11 +257,20 @@ async fn main() -> Result<()> {
                                 emb.as_ref(),
                                 index.as_ref(),
                             ) {
-                                Ok(embedded) => {
+                                Ok(stats) => {
                                     tracing::info!(
-                                        "Embedded {} nodes into {}",
-                                        embedded,
-                                        index.implementation_name()
+                                        mode = stats.mode,
+                                        implementation = stats.implementation,
+                                        graph_nodes = stats.graph_nodes,
+                                        nodes_considered = stats.nodes_considered,
+                                        embedded_nodes = stats.embedded_nodes,
+                                        failed_nodes = stats.failed_nodes,
+                                        payload_chars_total = stats.payload_chars_total,
+                                        payload_chars_avg = stats.payload_chars_avg,
+                                        payload_chars_max = stats.payload_chars_max,
+                                        elapsed_ms = stats.elapsed_ms as u64,
+                                        throughput_nodes_per_sec = stats.throughput_nodes_per_sec(),
+                                        "Background semantic sync complete"
                                     );
                                 }
                                 Err(e) => {

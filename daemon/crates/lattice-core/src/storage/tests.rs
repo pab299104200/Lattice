@@ -1,7 +1,7 @@
 use super::graph_store::GraphStore;
 use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::storage::VectorStore;
-use crate::storage::{UsearchVectorIndex, VectorIndex};
+use crate::storage::{UsearchVectorIndex, VectorIndex, VectorScope};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -173,6 +173,49 @@ fn test_vector_store_and_search() {
 }
 
 #[test]
+fn test_vector_store_scope_search_supports_file_summary_vectors() {
+    let store = VectorStore::open_in_memory().unwrap();
+    store.initialize(384).unwrap();
+
+    let vec_symbol = vec![1.0f32; 384];
+    let vec_summary = vec![0.95f32; 384];
+    store
+        .upsert_vector_in_scope(
+            "src/auth.ts",
+            "loginUser",
+            0,
+            VectorScope::Symbol,
+            &vec_symbol,
+        )
+        .unwrap();
+    store
+        .upsert_vector_in_scope(
+            "src/auth.ts",
+            "file_summary",
+            usize::MAX,
+            VectorScope::FileSummary,
+            &vec_summary,
+        )
+        .unwrap();
+
+    let symbol_results = store.search(&vec_symbol, 10).unwrap();
+    assert_eq!(symbol_results.len(), 1);
+    assert_eq!(symbol_results[0].0, "loginUser");
+
+    let summary_results = store
+        .search_in_scope(&vec_summary, 10, VectorScope::FileSummary)
+        .unwrap();
+    assert_eq!(summary_results.len(), 1);
+    assert_eq!(summary_results[0].0, "file_summary");
+    assert_eq!(summary_results[0].1, "src/auth.ts");
+
+    let all_results = store
+        .search_in_scope(&vec_symbol, 10, VectorScope::All)
+        .unwrap();
+    assert_eq!(all_results.len(), 2);
+}
+
+#[test]
 fn test_vector_delete_by_file() {
     let store = VectorStore::open_in_memory().unwrap();
     store.initialize(384).unwrap();
@@ -316,6 +359,56 @@ fn test_usearch_delete_by_file_updates_persisted_index() {
         let results = index.search(&query, 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "helper");
+    }
+
+    cleanup_vector_backend(&dir);
+}
+
+#[test]
+fn test_usearch_scope_search_supports_file_summary_vectors() {
+    let dir = unique_temp_dir("usearch-scope");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sqlite_path = dir.join("vectors.db");
+    let ann_path = dir.join("vectors.usearch");
+
+    {
+        let index =
+            UsearchVectorIndex::open(sqlite_path.to_string_lossy().as_ref(), ann_path).unwrap();
+        index.initialize(384).unwrap();
+        index.warm().unwrap();
+
+        let vec_symbol = vec![1.0f32; 384];
+        let vec_summary = vec![0.95f32; 384];
+        index
+            .upsert_vector_in_scope(
+                "src/auth.ts",
+                "loginUser",
+                0,
+                VectorScope::Symbol,
+                &vec_symbol,
+            )
+            .unwrap();
+        index
+            .upsert_vector_in_scope(
+                "src/auth.ts",
+                "file_summary",
+                usize::MAX,
+                VectorScope::FileSummary,
+                &vec_summary,
+            )
+            .unwrap();
+        index.flush().unwrap();
+
+        let symbol_results = index.search(&vec_symbol, 10).unwrap();
+        assert_eq!(symbol_results.len(), 1);
+        assert_eq!(symbol_results[0].0, "loginUser");
+
+        let summary_results = index
+            .search_in_scope(&vec_summary, 10, VectorScope::FileSummary)
+            .unwrap();
+        assert_eq!(summary_results.len(), 1);
+        assert_eq!(summary_results[0].0, "file_summary");
+        assert_eq!(summary_results[0].1, "src/auth.ts");
     }
 
     cleanup_vector_backend(&dir);

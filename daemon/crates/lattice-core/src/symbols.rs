@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub const SYMBOL_HANDLE_PREFIX: &str = "symbol_id:";
+pub const FILE_HANDLE_PREFIX: &str = "file_id:";
+
 /// Unique identifier for a symbol in the graph.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SymbolId {
@@ -9,6 +12,38 @@ pub struct SymbolId {
     pub name: String,
     /// Byte offset in the source file (for disambiguation).
     pub byte_offset: usize,
+}
+
+impl SymbolId {
+    /// Stable handle used in follow-up expansion targets.
+    pub fn stable_handle(&self) -> String {
+        let payload = serde_json::json!({
+            "file": self.file,
+            "name": self.name,
+            "byte_offset": self.byte_offset
+        });
+        format!("{SYMBOL_HANDLE_PREFIX}{payload}")
+    }
+
+    /// Parse a stable handle into a SymbolId.
+    pub fn from_stable_handle(value: &str) -> Option<Self> {
+        let payload = value.strip_prefix(SYMBOL_HANDLE_PREFIX)?;
+        serde_json::from_str::<SymbolId>(payload).ok()
+    }
+}
+
+/// Stable file handle used in follow-up expansion targets.
+pub fn stable_file_handle(file: &str) -> String {
+    format!("{FILE_HANDLE_PREFIX}{file}")
+}
+
+/// Parse a stable file handle into a file path.
+pub fn parse_stable_file_handle(value: &str) -> Option<String> {
+    let file = value.strip_prefix(FILE_HANDLE_PREFIX)?.trim();
+    if file.is_empty() {
+        return None;
+    }
+    Some(file.to_string())
 }
 
 /// The kind of symbol extracted from source code.

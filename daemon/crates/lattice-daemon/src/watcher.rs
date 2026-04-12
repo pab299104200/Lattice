@@ -210,18 +210,32 @@ impl FileWatcher {
             return;
         };
 
+        let sync_started = std::time::Instant::now();
         match crate::vector_sync::sync_changed_files_embeddings(
             &new_graph,
             &changed_graph_files,
             embedding_engine.as_ref(),
             vector_index.as_ref(),
         ) {
-            Ok(updated) => {
+            Ok(stats) => {
+                let watcher_sync_elapsed_ms = sync_started.elapsed().as_millis();
                 if !changed_graph_files.is_empty() {
                     info!(
-                        "Updated {} semantic vectors across {} changed files",
-                        updated,
-                        changed_graph_files.len()
+                        mode = stats.mode,
+                        implementation = stats.implementation,
+                        changed_files = changed_graph_files.len(),
+                        graph_nodes = stats.graph_nodes,
+                        files_deleted = stats.files_deleted,
+                        nodes_considered = stats.nodes_considered,
+                        embedded_nodes = stats.embedded_nodes,
+                        failed_nodes = stats.failed_nodes,
+                        payload_chars_total = stats.payload_chars_total,
+                        payload_chars_avg = stats.payload_chars_avg,
+                        payload_chars_max = stats.payload_chars_max,
+                        vector_sync_elapsed_ms = stats.elapsed_ms as u64,
+                        watcher_sync_elapsed_ms = watcher_sync_elapsed_ms as u64,
+                        throughput_nodes_per_sec = stats.throughput_nodes_per_sec(),
+                        "Watcher semantic sync complete"
                     );
                 }
             }

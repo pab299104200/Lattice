@@ -1,4 +1,7 @@
-use super::model::{Memory, MemoryScope, MemoryType};
+use super::model::{
+    Memory, MemoryAssertionType, MemoryEvidence, MemoryFreshnessPolicy, MemoryProvenance,
+    MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
+};
 use crate::error::LatticeError;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -58,6 +61,17 @@ impl MemoryStore {
                     branch          TEXT,
                     refresh_key     TEXT,
                     source_query    TEXT,
+                    assertion_type  TEXT NOT NULL DEFAULT 'observation',
+                    verification_status TEXT NOT NULL DEFAULT 'unverified',
+                    confidence_reason TEXT,
+                    supersedes_memory_id TEXT,
+                    superseded_by_memory_id TEXT,
+                    contradicts_memory_ids TEXT NOT NULL DEFAULT '[]',
+                    contradicted_by_memory_ids TEXT NOT NULL DEFAULT '[]',
+                    freshness_policy TEXT NOT NULL DEFAULT 'session_scoped',
+                    freshness_policy_detail TEXT,
+                    provenance_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_json   TEXT NOT NULL DEFAULT '[]',
                     created_at      INTEGER NOT NULL,
                     last_accessed   INTEGER NOT NULL,
                     access_count    INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +111,49 @@ impl MemoryStore {
         let _ = self
             .conn
             .execute("ALTER TABLE memories ADD COLUMN refresh_key TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN assertion_type TEXT NOT NULL DEFAULT 'observation'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE memories ADD COLUMN confidence_reason TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN supersedes_memory_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN superseded_by_memory_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN contradicts_memory_ids TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN contradicted_by_memory_ids TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN freshness_policy TEXT NOT NULL DEFAULT 'session_scoped'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN freshness_policy_detail TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
 
         self.conn
             .execute_batch(
@@ -105,7 +162,11 @@ impl MemoryStore {
                  CREATE INDEX IF NOT EXISTS idx_memories_type
                     ON memories(memory_type);
                  CREATE INDEX IF NOT EXISTS idx_memories_session
-                    ON memories(session_id);",
+                    ON memories(session_id);
+                 CREATE INDEX IF NOT EXISTS idx_memories_verification_status
+                    ON memories(verification_status);
+                 CREATE INDEX IF NOT EXISTS idx_memories_superseded_by
+                    ON memories(superseded_by_memory_id);",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory indexes: {}", e))
@@ -152,14 +213,39 @@ impl MemoryStore {
         let linked_files_json = serde_json::to_string(&memory.linked_files).map_err(|e| {
             LatticeError::Storage(format!("Failed to serialize linked_files: {}", e))
         })?;
+        let structured_fields = self.resolve_structured_fields_for_store(&memory)?;
+        let contradicts_json = serde_json::to_string(&structured_fields.contradicts_memory_ids)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize contradicts_memory_ids: {}", e))
+            })?;
+        let contradicted_by_json =
+            serde_json::to_string(&structured_fields.contradicted_by_memory_ids).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize contradicted_by_memory_ids: {}",
+                    e
+                ))
+            })?;
+        let provenance_json =
+            serde_json::to_string(&structured_fields.provenance).map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize provenance_json: {}", e))
+            })?;
+        let evidence_json = serde_json::to_string(&structured_fields.evidence).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize evidence_json: {}", e))
+        })?;
 
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO memories
                     (id, session_id, content, memory_type, scope, confidence, linked_symbols, linked_files,
-                     workspace_id, branch, refresh_key, source_query, created_at, last_accessed,
-                     access_count, is_stale, stale_reason, is_invalidated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)",
+                     workspace_id, branch, refresh_key, source_query,
+                     assertion_type, verification_status, confidence_reason, supersedes_memory_id,
+                     superseded_by_memory_id, contradicts_memory_ids, contradicted_by_memory_ids,
+                     freshness_policy, freshness_policy_detail, provenance_json, evidence_json,
+                     created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated)
+                 VALUES
+                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                      ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                      ?25, ?26, ?27, ?28, 0)",
                 params![
                     memory.id,
                     memory.session_id,
@@ -173,6 +259,17 @@ impl MemoryStore {
                     memory.branch,
                     memory.refresh_key,
                     memory.source_query,
+                    structured_fields.assertion_type.as_str(),
+                    structured_fields.verification_status.as_str(),
+                    structured_fields.confidence_reason,
+                    structured_fields.supersedes_memory_id,
+                    structured_fields.superseded_by_memory_id,
+                    contradicts_json,
+                    contradicted_by_json,
+                    structured_fields.freshness_policy.as_str(),
+                    structured_fields.freshness_policy_detail,
+                    provenance_json,
+                    evidence_json,
                     memory.created_at as i64,
                     memory.last_accessed as i64,
                     memory.access_count as i64,
@@ -298,7 +395,35 @@ impl MemoryStore {
                    AND refresh_key = ?1
                    AND (?2 IS NULL OR workspace_id = ?2)
                    AND (?3 IS NULL OR branch = ?3)
-                 ORDER BY created_at DESC
+                 ORDER BY
+                    CASE verification_status
+                        WHEN 'verified' THEN 60
+                        WHEN 'in_review' THEN 50
+                        WHEN 'unverified' THEN 40
+                        WHEN 'superseded' THEN 20
+                        WHEN 'stale' THEN 10
+                        WHEN 'contradicted' THEN 0
+                        ELSE 30
+                    END DESC,
+                    CASE WHEN superseded_by_memory_id IS NULL THEN 1 ELSE 0 END DESC,
+                    CASE WHEN is_stale = 0 THEN 1 ELSE 0 END DESC,
+                    CASE scope
+                        WHEN 'repo' THEN 2
+                        WHEN 'branch' THEN 1
+                        ELSE 0
+                    END DESC,
+                    CASE assertion_type
+                        WHEN 'workflow_outcome' THEN 6
+                        WHEN 'constraint' THEN 5
+                        WHEN 'pattern' THEN 4
+                        WHEN 'decision' THEN 4
+                        WHEN 'anti_pattern' THEN 3
+                        WHEN 'observation' THEN 2
+                        WHEN 'exploration' THEN 1
+                        ELSE 2
+                    END DESC,
+                    confidence DESC,
+                    created_at DESC
                  LIMIT 1",
             )
             .map_err(|e| {
@@ -336,6 +461,91 @@ impl MemoryStore {
             })?;
 
         Ok(row.map(MemoryRow::into_memory))
+    }
+
+    /// Return structured assertion metadata for a single non-invalidated memory.
+    pub fn get_structured_fields(
+        &self,
+        id: &str,
+    ) -> Result<Option<MemoryStructuredFields>, LatticeError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT assertion_type, verification_status, confidence_reason,
+                        supersedes_memory_id, superseded_by_memory_id,
+                        contradicts_memory_ids, contradicted_by_memory_ids,
+                        freshness_policy, freshness_policy_detail,
+                        provenance_json, evidence_json
+                 FROM memories
+                 WHERE id = ?1 AND is_invalidated = 0
+                 LIMIT 1",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare structured-fields query: {}", e))
+            })?;
+
+        let row = stmt
+            .query_row(params![id], structured_row_from_row)
+            .optional()
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to load structured memory fields: {}", e))
+            })?;
+
+        Ok(row.map(StructuredMemoryRow::into_structured_fields))
+    }
+
+    /// Replace structured assertion metadata for an existing, non-invalidated memory.
+    pub fn update_structured_fields(
+        &self,
+        id: &str,
+        fields: &MemoryStructuredFields,
+    ) -> Result<(), LatticeError> {
+        self.persist_structured_fields(id, fields)
+    }
+
+    /// Mark a memory as superseded by another memory id and downgrade verification state.
+    pub fn mark_memory_superseded(
+        &self,
+        id: &str,
+        superseded_by_memory_id: &str,
+    ) -> Result<(), LatticeError> {
+        let mut fields = self.get_structured_fields(id)?.ok_or_else(|| {
+            LatticeError::Storage(format!("Memory '{}' not found or invalidated", id))
+        })?;
+        fields.superseded_by_memory_id = Some(superseded_by_memory_id.to_string());
+        fields.verification_status = MemoryVerificationStatus::Superseded;
+        self.persist_structured_fields(id, &fields)
+    }
+
+    /// Mark a contradiction edge between two memory rows.
+    pub fn mark_memory_contradicted(
+        &self,
+        id: &str,
+        contradicted_by_memory_id: &str,
+    ) -> Result<(), LatticeError> {
+        let mut fields = self.get_structured_fields(id)?.ok_or_else(|| {
+            LatticeError::Storage(format!("Memory '{}' not found or invalidated", id))
+        })?;
+        if !fields
+            .contradicted_by_memory_ids
+            .iter()
+            .any(|v| v == contradicted_by_memory_id)
+        {
+            fields
+                .contradicted_by_memory_ids
+                .push(contradicted_by_memory_id.to_string());
+        }
+        fields.verification_status = MemoryVerificationStatus::Contradicted;
+        self.persist_structured_fields(id, &fields)?;
+
+        if let Some(mut contradictor) = self.get_structured_fields(contradicted_by_memory_id)? {
+            if !contradictor.contradicts_memory_ids.iter().any(|v| v == id) {
+                contradictor.contradicts_memory_ids.push(id.to_string());
+            }
+            self.persist_structured_fields(contradicted_by_memory_id, &contradictor)?;
+        }
+
+        Ok(())
     }
 
     /// Search memories by keyword (per-word AND match on content + linked_symbols). Excludes invalidated.
@@ -393,7 +603,10 @@ impl MemoryStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE memories SET is_stale = 1, stale_reason = ?1
+                "UPDATE memories
+                    SET is_stale = 1,
+                        stale_reason = ?1,
+                        verification_status = 'stale'
                  WHERE is_invalidated = 0 AND linked_symbols LIKE ?2 ESCAPE '\\'",
                 params![reason, pattern],
             )
@@ -411,7 +624,10 @@ impl MemoryStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE memories SET is_stale = 1, stale_reason = ?1
+                "UPDATE memories
+                    SET is_stale = 1,
+                        stale_reason = ?1,
+                        verification_status = 'stale'
                  WHERE is_invalidated = 0 AND linked_files LIKE ?2 ESCAPE '\\'",
                 params![reason, pattern],
             )
@@ -451,7 +667,14 @@ impl MemoryStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE memories SET content = ?1, is_stale = 0, stale_reason = NULL
+                "UPDATE memories
+                    SET content = ?1,
+                        is_stale = 0,
+                        stale_reason = NULL,
+                        verification_status = CASE
+                            WHEN verification_status = 'stale' THEN 'unverified'
+                            ELSE verification_status
+                        END
                  WHERE id = ?2 AND is_invalidated = 0",
                 params![new_content, id],
             )
@@ -535,6 +758,7 @@ impl MemoryStore {
         branch: Option<&str>,
         refresh_key: Option<&str>,
     ) -> Result<(), LatticeError> {
+        let freshness_policy = MemoryFreshnessPolicy::from_scope(&scope);
         let updated = if let Some(linked_files) = linked_files {
             let linked_files_json = serde_json::to_string(linked_files).map_err(|e| {
                 LatticeError::Storage(format!("Failed to serialize linked_files: {}", e))
@@ -547,15 +771,25 @@ impl MemoryStore {
                          workspace_id = COALESCE(?3, workspace_id),
                          branch = COALESCE(?4, branch),
                          refresh_key = COALESCE(?5, refresh_key),
+                         freshness_policy = CASE
+                            WHEN freshness_policy IN ('session_scoped', 'branch_scoped', 'repo_scoped')
+                            THEN ?6
+                            ELSE freshness_policy
+                         END,
                          is_stale = 0,
-                         stale_reason = NULL
-                     WHERE id = ?6 AND is_invalidated = 0",
+                         stale_reason = NULL,
+                         verification_status = CASE
+                            WHEN verification_status = 'stale' THEN 'unverified'
+                            ELSE verification_status
+                         END
+                     WHERE id = ?7 AND is_invalidated = 0",
                 params![
                     scope.as_str(),
                     linked_files_json,
                     workspace_id,
                     branch,
                     refresh_key,
+                    freshness_policy.as_str(),
                     id,
                 ],
             )
@@ -566,10 +800,26 @@ impl MemoryStore {
                          workspace_id = COALESCE(?2, workspace_id),
                          branch = COALESCE(?3, branch),
                          refresh_key = COALESCE(?4, refresh_key),
+                         freshness_policy = CASE
+                            WHEN freshness_policy IN ('session_scoped', 'branch_scoped', 'repo_scoped')
+                            THEN ?5
+                            ELSE freshness_policy
+                         END,
                          is_stale = 0,
-                         stale_reason = NULL
-                     WHERE id = ?5 AND is_invalidated = 0",
-                params![scope.as_str(), workspace_id, branch, refresh_key, id],
+                         stale_reason = NULL,
+                         verification_status = CASE
+                            WHEN verification_status = 'stale' THEN 'unverified'
+                            ELSE verification_status
+                         END
+                     WHERE id = ?6 AND is_invalidated = 0",
+                params![
+                    scope.as_str(),
+                    workspace_id,
+                    branch,
+                    refresh_key,
+                    freshness_policy.as_str(),
+                    id
+                ],
             )
         }
         .map_err(|e| LatticeError::Storage(format!("Failed to promote memory: {}", e)))?;
@@ -837,6 +1087,135 @@ impl MemoryStore {
         )
     }
 
+    fn resolve_structured_fields_for_store(
+        &self,
+        memory: &Memory,
+    ) -> Result<MemoryStructuredFields, LatticeError> {
+        let mut fields = self
+            .get_structured_fields(&memory.id)?
+            .unwrap_or_else(|| self.derive_default_structured_fields(memory));
+
+        if !has_extended_assertion_type(&fields) {
+            fields.assertion_type = MemoryAssertionType::from_memory_type(&memory.memory_type);
+        }
+        if fields.freshness_policy.is_scope_derived() {
+            fields.freshness_policy = MemoryFreshnessPolicy::from_scope(&memory.scope);
+        }
+        if memory.is_stale {
+            fields.verification_status = MemoryVerificationStatus::Stale;
+        } else if fields.verification_status == MemoryVerificationStatus::Stale {
+            fields.verification_status = infer_verification_status(memory);
+        }
+        if fields.confidence_reason.is_none() && memory.confidence < 0.5 {
+            fields.confidence_reason = Some(format!(
+                "Low-confidence memory (confidence={:.2})",
+                memory.confidence
+            ));
+        }
+        if fields.provenance.is_empty() {
+            fields.provenance = build_default_provenance(memory);
+        }
+        if fields.evidence.is_empty() {
+            fields.evidence = build_default_evidence(memory);
+        }
+
+        Ok(fields)
+    }
+
+    fn derive_default_structured_fields(&self, memory: &Memory) -> MemoryStructuredFields {
+        let mut fields = MemoryStructuredFields {
+            assertion_type: MemoryAssertionType::from_memory_type(&memory.memory_type),
+            verification_status: infer_verification_status(memory),
+            confidence_reason: memory
+                .source_query
+                .as_ref()
+                .filter(|query| query_is_verification_signal(query))
+                .map(|query| format!("Verification signal from source query: '{}'", query)),
+            freshness_policy: MemoryFreshnessPolicy::from_scope(&memory.scope),
+            freshness_policy_detail: None,
+            provenance: build_default_provenance(memory),
+            evidence: build_default_evidence(memory),
+            ..MemoryStructuredFields::default()
+        };
+
+        if fields.confidence_reason.is_none() && memory.confidence < 0.5 {
+            fields.confidence_reason = Some(format!(
+                "Low-confidence memory (confidence={:.2})",
+                memory.confidence
+            ));
+        }
+
+        fields
+    }
+
+    fn persist_structured_fields(
+        &self,
+        id: &str,
+        fields: &MemoryStructuredFields,
+    ) -> Result<(), LatticeError> {
+        let contradicts_json =
+            serde_json::to_string(&fields.contradicts_memory_ids).map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize contradicts memory ids: {}", e))
+            })?;
+        let contradicted_by_json = serde_json::to_string(&fields.contradicted_by_memory_ids)
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize contradicted-by memory ids: {}",
+                    e
+                ))
+            })?;
+        let provenance_json = serde_json::to_string(&fields.provenance).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize provenance metadata: {}", e))
+        })?;
+        let evidence_json = serde_json::to_string(&fields.evidence).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize evidence metadata: {}", e))
+        })?;
+
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET assertion_type = ?1,
+                     verification_status = ?2,
+                     confidence_reason = ?3,
+                     supersedes_memory_id = ?4,
+                     superseded_by_memory_id = ?5,
+                     contradicts_memory_ids = ?6,
+                     contradicted_by_memory_ids = ?7,
+                     freshness_policy = ?8,
+                     freshness_policy_detail = ?9,
+                     provenance_json = ?10,
+                     evidence_json = ?11
+                 WHERE id = ?12 AND is_invalidated = 0",
+                params![
+                    fields.assertion_type.as_str(),
+                    fields.verification_status.as_str(),
+                    fields.confidence_reason,
+                    fields.supersedes_memory_id,
+                    fields.superseded_by_memory_id,
+                    contradicts_json,
+                    contradicted_by_json,
+                    fields.freshness_policy.as_str(),
+                    fields.freshness_policy_detail,
+                    provenance_json,
+                    evidence_json,
+                    id,
+                ],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to update structured memory fields: {}", e))
+            })?;
+
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+
+        Ok(())
+    }
+
     fn rebuild_fts(&self) -> Result<(), LatticeError> {
         self.conn
             .execute(&format!("DELETE FROM {}", MEMORIES_FTS_TABLE), [])
@@ -950,6 +1329,56 @@ struct MemoryRow {
     stale_reason: Option<String>,
 }
 
+struct StructuredMemoryRow {
+    assertion_type_str: String,
+    verification_status_str: String,
+    confidence_reason: Option<String>,
+    supersedes_memory_id: Option<String>,
+    superseded_by_memory_id: Option<String>,
+    contradicts_memory_ids_json: String,
+    contradicted_by_memory_ids_json: String,
+    freshness_policy_str: String,
+    freshness_policy_detail: Option<String>,
+    provenance_json: String,
+    evidence_json: String,
+}
+
+fn structured_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StructuredMemoryRow> {
+    Ok(StructuredMemoryRow {
+        assertion_type_str: row.get(0)?,
+        verification_status_str: row.get(1)?,
+        confidence_reason: row.get(2)?,
+        supersedes_memory_id: row.get(3)?,
+        superseded_by_memory_id: row.get(4)?,
+        contradicts_memory_ids_json: row.get(5)?,
+        contradicted_by_memory_ids_json: row.get(6)?,
+        freshness_policy_str: row.get(7)?,
+        freshness_policy_detail: row.get(8)?,
+        provenance_json: row.get(9)?,
+        evidence_json: row.get(10)?,
+    })
+}
+
+impl StructuredMemoryRow {
+    fn into_structured_fields(self) -> MemoryStructuredFields {
+        MemoryStructuredFields {
+            assertion_type: MemoryAssertionType::from_str(&self.assertion_type_str),
+            verification_status: MemoryVerificationStatus::from_str(&self.verification_status_str),
+            confidence_reason: self.confidence_reason,
+            supersedes_memory_id: self.supersedes_memory_id,
+            superseded_by_memory_id: self.superseded_by_memory_id,
+            contradicts_memory_ids: serde_json::from_str(&self.contradicts_memory_ids_json)
+                .unwrap_or_default(),
+            contradicted_by_memory_ids: serde_json::from_str(&self.contradicted_by_memory_ids_json)
+                .unwrap_or_default(),
+            freshness_policy: MemoryFreshnessPolicy::from_str(&self.freshness_policy_str),
+            freshness_policy_detail: self.freshness_policy_detail,
+            provenance: serde_json::from_str(&self.provenance_json).unwrap_or_default(),
+            evidence: serde_json::from_str(&self.evidence_json).unwrap_or_default(),
+        }
+    }
+}
+
 fn memory_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
     Ok(MemoryRow {
         id: row.get(0)?,
@@ -1027,23 +1456,7 @@ fn build_memory_search_document(memory: &Memory) -> MemorySearchDocument {
 fn build_fts_query(keyword: &str) -> Option<String> {
     let groups: Vec<String> = keyword
         .split_whitespace()
-        .filter_map(|raw| {
-            let variants = expand_search_terms(raw);
-            if variants.is_empty() {
-                None
-            } else if variants.len() == 1 {
-                Some(format!("{}*", variants[0]))
-            } else {
-                Some(format!(
-                    "({})",
-                    variants
-                        .into_iter()
-                        .map(|term| format!("{}*", term))
-                        .collect::<Vec<_>>()
-                        .join(" OR ")
-                ))
-            }
-        })
+        .filter_map(build_fts_group)
         .collect();
 
     if groups.is_empty() {
@@ -1051,6 +1464,26 @@ fn build_fts_query(keyword: &str) -> Option<String> {
     } else {
         Some(groups.join(" AND "))
     }
+}
+
+fn build_fts_group(raw: &str) -> Option<String> {
+    let variants = expand_search_terms(raw);
+    if variants.is_empty() {
+        return None;
+    }
+
+    if variants.len() == 1 || is_identifier_search_token(raw) {
+        return Some(format!("{}*", variants[0]));
+    }
+
+    Some(format!(
+        "({})",
+        variants
+            .into_iter()
+            .map(|term| format!("{}*", term))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    ))
 }
 
 fn augment_search_text(text: &str) -> String {
@@ -1095,6 +1528,15 @@ fn expand_search_terms(text: &str) -> Vec<String> {
     terms
 }
 
+fn is_identifier_search_token(raw: &str) -> bool {
+    raw.contains('_')
+        || raw.contains("::")
+        || raw.contains('/')
+        || raw.contains('\\')
+        || raw.contains('.')
+        || raw.chars().any(|ch| ch.is_ascii_uppercase())
+}
+
 fn push_term(seen: &mut HashSet<String>, terms: &mut Vec<String>, term: String) {
     if term.len() < 2 {
         return;
@@ -1102,6 +1544,97 @@ fn push_term(seen: &mut HashSet<String>, terms: &mut Vec<String>, term: String) 
     if seen.insert(term.clone()) {
         terms.push(term);
     }
+}
+
+fn infer_verification_status(memory: &Memory) -> MemoryVerificationStatus {
+    if memory.is_stale {
+        return MemoryVerificationStatus::Stale;
+    }
+
+    if let Some(query) = memory.source_query.as_deref() {
+        if query_is_verification_signal(query) {
+            return MemoryVerificationStatus::Verified;
+        }
+    }
+
+    if memory.confidence >= 0.95 {
+        MemoryVerificationStatus::InReview
+    } else {
+        MemoryVerificationStatus::Unverified
+    }
+}
+
+fn has_extended_assertion_type(fields: &MemoryStructuredFields) -> bool {
+    matches!(
+        fields.assertion_type,
+        MemoryAssertionType::WorkflowOutcome | MemoryAssertionType::Constraint
+    )
+}
+
+fn query_is_verification_signal(source_query: &str) -> bool {
+    let query = source_query.to_ascii_lowercase();
+    query.contains("verified")
+        || query.contains("validated")
+        || query.contains("code and tests")
+        || query.contains("from tests")
+        || query.contains("from code")
+}
+
+fn build_default_provenance(memory: &Memory) -> Vec<MemoryProvenance> {
+    let mut provenance = Vec::new();
+
+    if let Some(source_query) = memory.source_query.as_ref() {
+        provenance.push(MemoryProvenance {
+            source: "source_query".to_string(),
+            reference: Some(source_query.clone()),
+            captured_at: Some(memory.created_at),
+            note: None,
+        });
+    }
+
+    if let Some(refresh_key) = memory.refresh_key.as_ref() {
+        provenance.push(MemoryProvenance {
+            source: "refresh_key".to_string(),
+            reference: Some(refresh_key.clone()),
+            captured_at: Some(memory.created_at),
+            note: None,
+        });
+    }
+
+    if provenance.is_empty() {
+        provenance.push(MemoryProvenance {
+            source: "assistant_observation".to_string(),
+            reference: None,
+            captured_at: Some(memory.created_at),
+            note: None,
+        });
+    }
+
+    provenance
+}
+
+fn build_default_evidence(memory: &Memory) -> Vec<MemoryEvidence> {
+    let mut evidence = Vec::new();
+
+    for symbol in &memory.linked_symbols {
+        evidence.push(MemoryEvidence {
+            kind: "symbol".to_string(),
+            reference: Some(symbol.clone()),
+            detail: None,
+            captured_at: Some(memory.created_at),
+        });
+    }
+
+    for file in &memory.linked_files {
+        evidence.push(MemoryEvidence {
+            kind: "file".to_string(),
+            reference: Some(file.clone()),
+            detail: None,
+            captured_at: Some(memory.created_at),
+        });
+    }
+
+    evidence
 }
 
 /// Generate a unique identifier using timestamp, thread ID, and an atomic counter

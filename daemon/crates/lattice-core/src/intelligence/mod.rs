@@ -15,15 +15,17 @@ use std::collections::HashMap;
 
 pub use agent::{
     diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
-    get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem,
-    AffectedSymbolImpact, BundleMode, ChangedFileImpact, ChangedSymbolImpact, CompactFileSummary,
-    CompactSymbolSummary, DiffImpactReport, DiffImpactStats, ExpandContextSeed, ExpandedContext,
-    ExpandedContextStats, ExpandedFileContext, ExpandedFileSymbolContext,
-    ExpandedRelationshipContext, ExpandedSymbolContext, ExpandedTestContext, FailureDiagnosis,
-    FailureDiagnosisStats, FileRecommendation, MemoryHighlight, RepoPlaybook, RepoPlaybookStats,
-    ReviewChecklistItem, RiskRecommendation, SubsystemSummary, SubsystemSummaryStats,
-    SymbolRecommendation, TaskBundle, TaskBundleStats, TestRecommendation, TestSelectionReport,
-    WorkingSetContext, WorkingSetStats,
+    get_working_set_context, impact_from_diff, plan_edit, prepare_change, summarize_subsystem,
+    trace_scenario, AffectedSymbolImpact, BundleMode, ChangedFileImpact, ChangedSymbolImpact,
+    CompactFileSummary, CompactSymbolSummary, DiffImpactReport, DiffImpactStats,
+    EditSpanRecommendation, ExpandContextSeed, ExpandedContext, ExpandedContextStats,
+    ExpandedFileContext, ExpandedFileSymbolContext, ExpandedRelationshipContext,
+    ExpandedSymbolContext, ExpandedTestContext, FailureDiagnosis, FailureDiagnosisStats,
+    FileRecommendation, MemoryHighlight, PlanEditBundle, PlanEditDocRecommendation, PlanEditImpact,
+    PlanEditStats, RepoPlaybook, RepoPlaybookStats, ReviewChecklistItem, RiskRecommendation,
+    ScenarioPathSegment, ScenarioSignal, ScenarioTraceBundle, ScenarioTraceStats, SubsystemSummary,
+    SubsystemSummaryStats, SymbolRecommendation, TaskBundle, TaskBundleStats, TestRecommendation,
+    TestSelectionReport, WorkingSetContext, WorkingSetStats,
 };
 pub use docs::{
     find_stale_docs, get_backlinks, get_docs_capsule, get_outgoing_links, BacklinksReport, DocHit,
