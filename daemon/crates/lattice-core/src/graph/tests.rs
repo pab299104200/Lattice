@@ -315,6 +315,50 @@ Run `prepare_change` first.
 }
 
 #[test]
+fn test_build_graph_from_markdown_links_with_nested_delimiters() {
+    use crate::graph::builder::GraphBuilder;
+    use crate::parser::parse_file;
+
+    let overview_source = r#"
+# Overview
+
+See [runbook [ops]](./runbook(v2).md#Checklist (Prod)).
+"#;
+    let runbook_source = r#"
+# Runbook (v2)
+
+## Checklist (Prod)
+
+Run `prepare_change` first.
+"#;
+
+    let overview = parse_file("docs/overview.md", overview_source).unwrap();
+    let runbook = parse_file("docs/runbook(v2).md", runbook_source).unwrap();
+
+    let mut builder = GraphBuilder::new();
+    builder.add_file(overview);
+    builder.add_file(runbook);
+    let graph = builder.build();
+
+    let overview_section_id = graph
+        .all_nodes()
+        .iter()
+        .find(|node| node.file == "docs/overview.md" && node.kind == SymbolKind::Section)
+        .map(|node| node.id.clone())
+        .expect("overview section should exist");
+
+    let deps = graph.get_dependencies(&overview_section_id);
+    assert!(
+        deps.iter().any(|(node, edge)| {
+            node.file == "docs/runbook(v2).md"
+                && node.name == "Checklist (Prod)"
+                && *edge == EdgeKind::LinksTo
+        }),
+        "overview section should link to the Checklist (Prod) section"
+    );
+}
+
+#[test]
 fn test_markdown_sections_mention_code_symbols() {
     use crate::graph::builder::GraphBuilder;
     use crate::parser::parse_file;

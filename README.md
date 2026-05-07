@@ -24,6 +24,7 @@ Current guidance from internal evaluation:
 - Deep discovery tasks: about `35-55%` fewer tokens
 - Mixed coding workloads: about `40%` fewer tokens
 - Current synthetic workflow benchmark: about `1305B` average payload, about `327` estimated tokens, `100%` top-3 hit, `100%` target hit, about `2.6` calls saved, and `100%` stale-memory precision
+- Current product working-set eval across Portal, Meridian, Keystone, and RMM: raw capsule top-5 hit `8/8`, prepared working-set top-5 hit `8/8`, and `rg` top-5 baseline hit `3/8` on the same cases
 
 That synthetic workflow benchmark reflects the current compact workflow stack, including:
 
@@ -103,10 +104,14 @@ daemon/target/release/lattice
 
 At runtime Lattice keeps assistant state under the workspace-local `.lattice/` directory:
 
-- `graph.db` stores the persisted graph snapshot
+- `graph.db` stores the persisted graph snapshot, file fingerprint manifest, and cached parsed files used for incremental startup indexing
 - `memories.db` stores memory rows, plus an FTS5 keyword index that is rebuilt automatically on open
 - `vectors.db` stores semantic vectors as the durable source of truth and exact-search fallback
 - `vectors.usearch` stores the persisted ANN index used on the semantic-search hot path
+
+On startup, Lattice warm-loads the persisted graph immediately, computes current file fingerprints in the background, and reparses only new, changed, deleted, or parser/schema-version-stale files. The first run after this cache format is introduced populates cached parsed files; later restarts reuse unchanged parsed files and update the loaded graph from deltas.
+
+If `memories.db` cannot be opened cleanly, the daemon first quarantines `memories.db`, `memories.db-wal`, and `memories.db-shm` under `.lattice/recovered-memory/`, rebuilds a fresh persistent store, and only falls back to in-memory session memory if that recovery path also fails.
 
 If the USearch index cannot be opened or synchronized, the daemon falls back to exact SQLite vector search without changing MCP response shapes.
 
@@ -123,7 +128,7 @@ If you are not sure which tool to call, choose one of these five first-call tool
 4. `plan_edit`
    Use when you want a patch plan with edit spans, affected callers and dependencies, docs guidance, and tests in one bundle.
 5. `get_context_capsule`
-   Use for unfamiliar subsystems, broad architecture questions, or "how does X work?"
+   Use for unfamiliar subsystems, broad architecture questions, or "how does X work?" It is a bounded first-pass working-set finder, not a source dump.
 
 Then use `expand_context` when one of those results returns a `context_handle` or `suggested_expand`.
 
@@ -196,7 +201,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 - `get_skeleton`
   Fast file map: symbols, kinds, and structure before loading source.
 - `get_context_capsule`
-  Broad discovery tool for unfamiliar subsystems or architectural questions. Returns ranked pivots plus a reusable `context_handle` and `suggested_expand`.
+  Broad discovery tool for unfamiliar subsystems or architectural questions. Returns bounded ranked pivots plus a reusable `context_handle` and `suggested_expand`; compact first-pass responses strip pivot source bodies and expect `expand_context` for the next delta.
   When the graph node is known, `suggested_expand` uses stable `symbol_id:` or `file_id:` follow-up targets.
   For implementation-oriented queries, it favors source files over Markdown docs; use `get_docs_capsule` for doc-first questions.
 - `summarize_subsystem`
@@ -311,8 +316,12 @@ Workflow tools, plus `get_context_capsule`, support assistant-oriented response 
 What this means in practice:
 
 - Lattice can auto-select `tiny`, `compact`, or `full` depending on confidence and signal quality
+- first-pass discovery and planning use indexed graph, lexical, path, and memory signals before any semantic fallback
+- workflow responses include an `agent_retrieval_contract` that states what the result is best for, why it is useful instead of `rg`, when to use `rg`, and the next recommended action
+- workflow responses include budget metadata (`budget`, `budget_max_tokens`, `approx_tokens`, `truncated`) and apply default caps for `tiny`, `compact`, and `full`
 - high-confidence results may collapse to a single anchor plus `suggested_expand`
 - `get_context_capsule` and workflow responses can include a `context_handle` and a `suggested_expand` target
+- compact `prepare_change` results keep bounded ranking evidence and state when the bundle is useful as a working-set finder versus when `rg` is the better literal-search tool
 - `expand_context` handles persist across daemon restarts
 - `get_session_metrics` exposes how often tiny/dense/single-anchor paths are actually being used
 
@@ -381,6 +390,7 @@ Latest verification:
 cd daemon
 cargo test --workspace
 cargo test workflow_bench_scorecard -- --ignored --nocapture
+cargo test bench_product_working_set_vs_rg -- --ignored --nocapture
 cd ../extension
 ./node_modules/.bin/tsc --noEmit -p ./
 ```
@@ -410,7 +420,7 @@ Use these tools when they're the best fit:
 
 - `prepare_change` — first choice for "fix/add/refactor X" once you know the area to change
 - `plan_edit` — first choice for patch-oriented planning when you want edit files, spans, callers, docs, and tests in one bundle
-- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it can now hand off directly to `expand_context`
+- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it returns a bounded first-pass working set and can hand off directly to `expand_context`
 - `get_docs_capsule` — first choice for "what docs or runbooks explain this?" questions
 - `get_skeleton` — use before opening a large file
 - `summarize_subsystem` — use for a summary-first subsystem map
@@ -430,7 +440,7 @@ Use these tools when they're the best fit:
 - `update_observation` / `delete_observation` — maintain existing memories
 - `record_workflow_outcome` — store successful outcomes so later sessions can reuse them
 
-For targeted edits to known files, direct Read/Grep/Edit are still fine.
+For targeted edits to known files, direct Read/Grep/Edit are still fine. If the question is exact literal search, use `rg`; Lattice is intended to find the working set.
 Lattice adds the most value when you do not already know where to look.
 ```
 

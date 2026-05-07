@@ -2,9 +2,24 @@ use super::schema::CREATE_TABLES;
 use crate::error::LatticeError;
 use crate::graph::model::CodeGraph;
 use crate::graph::model::EdgeKind;
-use crate::symbols::{Language, SymbolId, SymbolKind};
+use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
+
+pub const FILE_INDEX_PARSER_VERSION: i64 = 1;
+pub const FILE_INDEX_SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIndexEntry {
+    pub file: String,
+    pub content_hash: String,
+    pub mtime_ns: i64,
+    pub size_bytes: i64,
+    pub parser_version: i64,
+    pub schema_version: i64,
+    pub last_indexed_at: i64,
+}
 
 /// Persistent storage for the code dependency graph backed by SQLite.
 pub struct GraphStore {
@@ -113,6 +128,131 @@ impl GraphStore {
         tx.commit()
             .map_err(|e| LatticeError::Storage(format!("Failed to commit transaction: {}", e)))?;
 
+        Ok(())
+    }
+
+    pub fn load_file_index(&self) -> Result<HashMap<String, FileIndexEntry>, LatticeError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file, content_hash, mtime_ns, size_bytes, parser_version, schema_version, last_indexed_at FROM file_index",
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to prepare file index query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(FileIndexEntry {
+                    file: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    mtime_ns: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    parser_version: row.get(4)?,
+                    schema_version: row.get(5)?,
+                    last_indexed_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| LatticeError::Storage(format!("Failed to query file index: {}", e)))?;
+
+        let mut entries = HashMap::new();
+        for row in rows {
+            let entry = row.map_err(|e| {
+                LatticeError::Storage(format!("Failed to read file index row: {}", e))
+            })?;
+            entries.insert(entry.file.clone(), entry);
+        }
+        Ok(entries)
+    }
+
+    pub fn save_file_index(&self, entries: &[FileIndexEntry]) -> Result<(), LatticeError> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to begin file index transaction: {}", e))
+        })?;
+        tx.execute("DELETE FROM file_index", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear file index: {}", e)))?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO file_index (file, content_hash, mtime_ns, size_bytes, parser_version, schema_version, last_indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| LatticeError::Storage(format!("Failed to prepare file index insert: {}", e)))?;
+            for entry in entries {
+                insert
+                    .execute(params![
+                        &entry.file,
+                        &entry.content_hash,
+                        entry.mtime_ns,
+                        entry.size_bytes,
+                        entry.parser_version,
+                        entry.schema_version,
+                        entry.last_indexed_at,
+                    ])
+                    .map_err(|e| {
+                        LatticeError::Storage(format!("Failed to insert file index row: {}", e))
+                    })?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit file index: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn load_parsed_files(&self) -> Result<HashMap<String, ParsedFile>, LatticeError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file, payload FROM parsed_files")
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare parsed files query: {}", e))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let file: String = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Ok((file, payload))
+            })
+            .map_err(|e| LatticeError::Storage(format!("Failed to query parsed files: {}", e)))?;
+
+        let mut files = HashMap::new();
+        for row in rows {
+            let (file, payload) = row.map_err(|e| {
+                LatticeError::Storage(format!("Failed to read parsed file row: {}", e))
+            })?;
+            let parsed: ParsedFile = serde_json::from_str(&payload).map_err(|e| {
+                LatticeError::Storage(format!("Failed to deserialize parsed file {}: {}", file, e))
+            })?;
+            files.insert(file, parsed);
+        }
+        Ok(files)
+    }
+
+    pub fn save_parsed_files(
+        &self,
+        parsed_files: &HashMap<String, ParsedFile>,
+    ) -> Result<(), LatticeError> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to begin parsed files transaction: {}", e))
+        })?;
+        tx.execute("DELETE FROM parsed_files", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear parsed files: {}", e)))?;
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO parsed_files (file, payload) VALUES (?1, ?2)")
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to prepare parsed file insert: {}", e))
+                })?;
+            for (file, parsed) in parsed_files {
+                let payload = serde_json::to_string(parsed).map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to serialize parsed file {}: {}",
+                        file, e
+                    ))
+                })?;
+                insert.execute(params![file, payload]).map_err(|e| {
+                    LatticeError::Storage(format!("Failed to insert parsed file {}: {}", file, e))
+                })?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit parsed files: {}", e)))?;
         Ok(())
     }
 

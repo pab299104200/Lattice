@@ -4,8 +4,8 @@ import { DaemonManager } from './daemon';
 interface SymbolInfo {
     name: string;
     dependentCount: number;
-    topCallers: Array<{ name: string; file: string; count: number }>;
-    isHotspot: boolean;
+    topCallers?: string[];
+    hotspot?: number;
     lastModified: string | null;
 }
 
@@ -69,7 +69,7 @@ export class LatticeHoverProvider implements vscode.HoverProvider {
         if (info.topCallers && info.topCallers.length > 0) {
             const callerList = info.topCallers
                 .slice(0, 3)
-                .map((c) => `\`${c.name}\` (${c.count})`)
+                .map((caller) => `\`${caller}\``)
                 .join(', ');
             md.appendMarkdown(`| Top callers | ${callerList} |\n`);
         } else {
@@ -77,7 +77,7 @@ export class LatticeHoverProvider implements vscode.HoverProvider {
         }
 
         // Hotspot indicator
-        const hotspotIcon = info.isHotspot ? '$(circle-filled)' : '$(circle-outline)';
+        const hotspotIcon = (info.hotspot ?? 0) > 0 ? '$(circle-filled)' : '$(circle-outline)';
         md.appendMarkdown(`| Hotspot | ${hotspotIcon} |\n`);
 
         // Last modified

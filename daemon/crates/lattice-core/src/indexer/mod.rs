@@ -43,6 +43,15 @@ impl Indexer {
         &mut self.graph
     }
 
+    pub fn parsed_files(&self) -> &HashMap<String, ParsedFile> {
+        &self.parsed_files
+    }
+
+    pub fn replace_parsed_files(&mut self, parsed_files: HashMap<String, ParsedFile>) {
+        self.parsed_files = parsed_files;
+        self.rebuild_graph();
+    }
+
     /// Parse and index a single file by its relative path and content.
     ///
     /// If the file was previously indexed, its old symbols are replaced.

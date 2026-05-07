@@ -252,6 +252,28 @@ See [[runbook#Checklist]] and [Overview](./overview.md).
     );
 }
 
+#[test]
+fn test_parse_markdown_links_with_nested_delimiters() {
+    let source = r#"
+# Guide
+
+See [runbook [ops]](./runbook(v2).md#Checklist (Prod)).
+"#;
+
+    let result = parse_file("docs/guide.md", source).expect("Failed to parse");
+    assert_eq!(
+        result.links.len(),
+        1,
+        "Should extract the full Markdown link"
+    );
+
+    let link = &result.links[0];
+    assert_eq!(link.target, "./runbook(v2).md");
+    assert_eq!(link.heading.as_deref(), Some("Checklist (Prod)"));
+    assert_eq!(link.text.as_deref(), Some("runbook [ops]"));
+    assert!(!link.is_wiki, "Expected a normal Markdown link");
+}
+
 // ==================== Python Tests ====================
 
 #[test]

@@ -168,7 +168,7 @@ pub struct LinkInfo {
 }
 
 /// Result of parsing a single file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedFile {
     pub file: String,
     pub language: Language,

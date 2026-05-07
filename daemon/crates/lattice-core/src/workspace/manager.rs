@@ -2,6 +2,7 @@ use crate::graph::CodeGraph;
 use crate::indexer::Indexer;
 use crate::query::capsule::ContextCapsule;
 use crate::query::QueryEngine;
+use crate::symbols::ParsedFile;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,6 +50,16 @@ impl WorkspaceManager {
             repo.indexer.index_file_content(&namespaced, content)?;
         }
         Ok(())
+    }
+
+    pub fn replace_repo_parsed_files(
+        &mut self,
+        repo_name: &str,
+        parsed_files: HashMap<String, ParsedFile>,
+    ) {
+        if let Some(repo) = self.repos.get_mut(repo_name) {
+            repo.indexer.replace_parsed_files(parsed_files);
+        }
     }
 
     pub fn remove_file(&mut self, repo_name: &str, rel_path: &str) {

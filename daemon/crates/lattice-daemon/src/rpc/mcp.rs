@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
 
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::graph::model::{CodeGraph, GraphNode};
@@ -63,6 +64,21 @@ enum WorkflowBudget {
     Full,
 }
 
+impl WorkflowBudget {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkflowBudget::Auto => "auto",
+            WorkflowBudget::Tiny => "tiny",
+            WorkflowBudget::Compact => "compact",
+            WorkflowBudget::Full => "full",
+        }
+    }
+}
+
+const TINY_WORKFLOW_TOKEN_CAP: usize = 260;
+const COMPACT_WORKFLOW_TOKEN_CAP: usize = 850;
+const FULL_WORKFLOW_TOKEN_CAP: usize = 2600;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowWireFormat {
     Auto,
@@ -102,6 +118,11 @@ struct SessionPruningProfile {
     prefer_dense: bool,
 }
 
+struct StatusSnapshot {
+    stats: lattice_core::graph::GraphStats,
+    languages: Option<std::collections::HashMap<String, usize>>,
+}
+
 impl McpHandler {
     /// Create a new McpHandler with all shared state.
     pub fn new(
@@ -137,6 +158,49 @@ impl McpHandler {
         }
     }
 
+    fn embed_query_for_fallback(&self, query: &str) -> Option<Vec<f32>> {
+        self.embedding_engine
+            .get()
+            .and_then(|eng| eng.embed(query).ok())
+    }
+
+    async fn lock_query_engine_for_workflow(&self) -> Result<MutexGuard<'_, QueryEngine>, ()> {
+        if self.indexing.load(Ordering::Relaxed) {
+            self.engine.try_lock().map_err(|_| ())
+        } else {
+            Ok(self.engine.lock().await)
+        }
+    }
+
+    fn promote_live_graph_for_workflow(&self, engine: &mut QueryEngine) -> bool {
+        if engine.graph().stats().node_count > 0 {
+            return true;
+        }
+        if !self.indexing.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        if let Some(wm) = &self.workspace_manager {
+            if let Ok(wm) = wm.try_lock() {
+                let graph = wm.unified_graph();
+                if graph.stats().node_count > 0 {
+                    engine.update_graph(graph);
+                    return true;
+                }
+            }
+        }
+
+        if let Ok(indexer) = self.indexer.try_lock() {
+            let graph = indexer.graph().clone();
+            if graph.stats().node_count > 0 {
+                engine.update_graph(graph);
+                return true;
+            }
+        }
+
+        false
+    }
+
     // ── MCP Protocol Methods ──────────────────────────────────────────
 
     fn handle_initialize(&self) -> Value {
@@ -152,6 +216,48 @@ impl McpHandler {
                 "version": env!("CARGO_PKG_VERSION")
             }
         })
+    }
+
+    fn try_live_status_snapshot(&self, include_languages: bool) -> Option<StatusSnapshot> {
+        if let Some(wm) = &self.workspace_manager {
+            if let Ok(wm) = wm.try_lock() {
+                let repo_stats = wm.repo_stats();
+                return Some(StatusSnapshot {
+                    stats: lattice_core::graph::GraphStats {
+                        node_count: repo_stats.iter().map(|s| s.node_count).sum(),
+                        edge_count: repo_stats.iter().map(|s| s.edge_count).sum(),
+                        file_count: repo_stats.iter().map(|s| s.file_count).sum(),
+                    },
+                    // Avoid building a merged graph while indexing. Multi-repo status must
+                    // stay cheap even when one repo has a large transient graph.
+                    languages: None,
+                });
+            }
+        }
+
+        if let Ok(indexer) = self.indexer.try_lock() {
+            return Some(status_snapshot_from_graph(
+                indexer.graph(),
+                include_languages,
+            ));
+        }
+
+        None
+    }
+
+    async fn current_status_snapshot(&self, include_languages: bool) -> StatusSnapshot {
+        if self.indexing.load(Ordering::Relaxed) {
+            if let Some(snapshot) = self.try_live_status_snapshot(include_languages) {
+                return snapshot;
+            }
+        }
+
+        if let Ok(engine) = self.engine.try_lock() {
+            return status_snapshot_from_graph(engine.graph(), include_languages);
+        }
+
+        let engine = self.engine.lock().await;
+        status_snapshot_from_graph(engine.graph(), include_languages)
     }
 
     fn handle_tools_list(&self) -> Value {
@@ -1303,16 +1409,27 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let focused = args["mode"].as_str().unwrap_or("full") == "focused";
-        let render = parse_workflow_response_options(args).render;
+        let response_options = parse_workflow_response_options(args);
 
-        // Embed query text if embedding engine is available (graceful fallback to keyword)
-        let embedding = self
-            .embedding_engine
-            .get()
-            .and_then(|eng| eng.embed(query).ok());
-
-        let mut engine = self.engine.lock().await;
-        let capsule = engine.query(query, embedding.as_deref(), focused);
+        let mut engine = match self.lock_query_engine_for_workflow().await {
+            Ok(engine) => engine,
+            Err(()) => {
+                return Ok(wrap_workflow_tool_result(
+                    indexing_workflow_response("get_context_capsule", query),
+                    response_options.render,
+                ))
+            }
+        };
+        if self.indexing.load(Ordering::Relaxed)
+            && workflow_graph_is_empty(engine.graph())
+            && !self.promote_live_graph_for_workflow(&mut engine)
+        {
+            return Ok(wrap_workflow_tool_result(
+                indexing_workflow_response("get_context_capsule", query),
+                response_options.render,
+            ));
+        }
+        let capsule = engine.query(query, None, focused);
         let seed = seed_from_context_capsule(engine.graph(), &capsule);
         let suggested_expand = context_capsule_suggested_expand(&capsule, engine.graph());
         drop(engine);
@@ -1323,7 +1440,21 @@ impl McpHandler {
         attach_context_handle(&mut value, &handle, "get_context_capsule");
         attach_context_capsule_suggested_expand(&mut value, suggested_expand);
 
-        Ok(wrap_workflow_tool_result(value, render))
+        let metadata = WorkflowRunMetadata {
+            delivery_mode: if focused {
+                "tiny".to_string()
+            } else {
+                "compact".to_string()
+            },
+            wire_format: "standard".to_string(),
+            single_anchor_used: false,
+            _mode_reason: "context capsule defaults to bounded first-pass retrieval".to_string(),
+            semantic_fallback_used: false,
+            outcome_memory_reuse_count: 0,
+        };
+
+        self.finalize_workflow_value("get_context_capsule", value, &metadata, &response_options)
+            .await
     }
 
     async fn tool_prepare_change(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -1335,23 +1466,37 @@ impl McpHandler {
         let entry_files = parse_string_array(args, "entry_files");
         let entry_symbols = parse_string_array(args, "entry_symbols");
 
-        let embedding = self
-            .embedding_engine
-            .get()
-            .and_then(|eng| eng.embed(query).ok());
-
         let (mut capsule, project_rules, semantic_fallback_used) = {
-            let mut engine = self.engine.lock().await;
+            let mut engine = match self.lock_query_engine_for_workflow().await {
+                Ok(engine) => engine,
+                Err(()) => {
+                    return Ok(wrap_workflow_tool_result(
+                        indexing_workflow_response("prepare_change", query),
+                        response_options.render,
+                    ))
+                }
+            };
+            if self.indexing.load(Ordering::Relaxed)
+                && workflow_graph_is_empty(engine.graph())
+                && !self.promote_live_graph_for_workflow(&mut engine)
+            {
+                return Ok(wrap_workflow_tool_result(
+                    indexing_workflow_response("prepare_change", query),
+                    response_options.render,
+                ));
+            }
             let project_rules = detect_project_rules(engine.graph());
             let mut keyword_capsule = engine.query(query, None, false);
             let mut semantic_fallback_used = false;
 
-            if should_try_prepare_change_semantic_fallback(
-                &keyword_capsule,
-                &entry_files,
-                &entry_symbols,
-            ) {
-                if let Some(ref embedding) = embedding {
+            if !self.indexing.load(Ordering::Relaxed)
+                && should_try_prepare_change_semantic_fallback(
+                    &keyword_capsule,
+                    &entry_files,
+                    &entry_symbols,
+                )
+            {
+                if let Some(embedding) = self.embed_query_for_fallback(query) {
                     let semantic_capsule = engine.query(query, Some(embedding.as_slice()), false);
                     if prepare_change_capsule_quality(
                         &semantic_capsule,
@@ -1442,23 +1587,37 @@ impl McpHandler {
         let entry_files = parse_string_array(args, "entry_files");
         let entry_symbols = parse_string_array(args, "entry_symbols");
 
-        let embedding = self
-            .embedding_engine
-            .get()
-            .and_then(|eng| eng.embed(query).ok());
-
         let (mut capsule, project_rules, semantic_fallback_used) = {
-            let mut engine = self.engine.lock().await;
+            let mut engine = match self.lock_query_engine_for_workflow().await {
+                Ok(engine) => engine,
+                Err(()) => {
+                    return Ok(wrap_workflow_tool_result(
+                        indexing_workflow_response("plan_edit", query),
+                        response_options.render,
+                    ))
+                }
+            };
+            if self.indexing.load(Ordering::Relaxed)
+                && workflow_graph_is_empty(engine.graph())
+                && !self.promote_live_graph_for_workflow(&mut engine)
+            {
+                return Ok(wrap_workflow_tool_result(
+                    indexing_workflow_response("plan_edit", query),
+                    response_options.render,
+                ));
+            }
             let project_rules = detect_project_rules(engine.graph());
             let mut keyword_capsule = engine.query(query, None, false);
             let mut semantic_fallback_used = false;
 
-            if should_try_prepare_change_semantic_fallback(
-                &keyword_capsule,
-                &entry_files,
-                &entry_symbols,
-            ) {
-                if let Some(ref embedding) = embedding {
+            if !self.indexing.load(Ordering::Relaxed)
+                && should_try_prepare_change_semantic_fallback(
+                    &keyword_capsule,
+                    &entry_files,
+                    &entry_symbols,
+                )
+            {
+                if let Some(embedding) = self.embed_query_for_fallback(query) {
                     let semantic_capsule = engine.query(query, Some(embedding.as_slice()), false);
                     if prepare_change_capsule_quality(
                         &semantic_capsule,
@@ -1787,10 +1946,6 @@ impl McpHandler {
         } else {
             4
         };
-        let embedding = self
-            .embedding_engine
-            .get()
-            .and_then(|eng| eng.embed(query).ok());
         let mut memories = self
             .augment_memory_values_with_playbooks(
                 query,
@@ -1803,7 +1958,24 @@ impl McpHandler {
             .await?;
 
         let (mut compact_report, mut semantic_fallback_used) = {
-            let engine = self.engine.lock().await;
+            let mut engine = match self.lock_query_engine_for_workflow().await {
+                Ok(engine) => engine,
+                Err(()) => {
+                    return Ok(wrap_workflow_tool_result(
+                        indexing_workflow_response("summarize_subsystem", query),
+                        response_options.render,
+                    ))
+                }
+            };
+            if self.indexing.load(Ordering::Relaxed)
+                && workflow_graph_is_empty(engine.graph())
+                && !self.promote_live_graph_for_workflow(&mut engine)
+            {
+                return Ok(wrap_workflow_tool_result(
+                    indexing_workflow_response("summarize_subsystem", query),
+                    response_options.render,
+                ));
+            }
             let project_rules = detect_project_rules(engine.graph());
             (
                 summarize_subsystem(
@@ -1819,8 +1991,10 @@ impl McpHandler {
             )
         };
 
-        if should_try_subsystem_semantic_fallback(&compact_report, &files, &symbols) {
-            if let Some(ref embedding) = embedding {
+        if !self.indexing.load(Ordering::Relaxed)
+            && should_try_subsystem_semantic_fallback(&compact_report, &files, &symbols)
+        {
+            if let Some(embedding) = self.embed_query_for_fallback(query) {
                 let semantic_capsule = {
                     let mut engine = self.engine.lock().await;
                     engine.query(query, Some(embedding.as_slice()), false)
@@ -1874,7 +2048,15 @@ impl McpHandler {
 
         let outcome_memory_reuse_count = count_outcome_memory_reuse(&memories);
         let (report, metadata) = {
-            let engine = self.engine.lock().await;
+            let engine = match self.lock_query_engine_for_workflow().await {
+                Ok(engine) => engine,
+                Err(()) => {
+                    return Ok(wrap_workflow_tool_result(
+                        indexing_workflow_response("summarize_subsystem", query),
+                        response_options.render,
+                    ))
+                }
+            };
             let project_rules = detect_project_rules(engine.graph());
             let (delivery_mode, mode_reason) =
                 select_subsystem_summary_mode(requested_mode, &compact_report);
@@ -2353,9 +2535,14 @@ impl McpHandler {
             pruning_profile,
             &mut metadata,
         );
+        attach_agent_retrieval_guidance(tool_name, &mut value);
 
-        if let Some(max_tokens) = response_options.max_tokens {
-            if approx_value_tokens(&value) > max_tokens {
+        let effective_token_cap = response_options
+            .max_tokens
+            .unwrap_or_else(|| default_workflow_token_cap(budget));
+        let mut truncated = approx_value_tokens(&value) > effective_token_cap;
+        if truncated {
+            if !matches!(budget, WorkflowBudget::Tiny) {
                 budget = WorkflowBudget::Tiny;
                 apply_workflow_budget(
                     tool_name,
@@ -2364,8 +2551,9 @@ impl McpHandler {
                     pruning_profile,
                     &mut metadata,
                 );
-                trim_value_for_token_budget(&mut value, max_tokens);
+                attach_agent_retrieval_guidance(tool_name, &mut value);
             }
+            trim_value_for_token_budget(&mut value, effective_token_cap);
         }
 
         let mut wire_format = select_workflow_wire_format(
@@ -2374,10 +2562,20 @@ impl McpHandler {
             budget,
             approx_value_tokens(&value),
         );
-        if let Some(limit) = response_options.max_tokens {
-            if approx_value_tokens(&value) > limit {
-                wire_format = WorkflowWireFormat::Dense;
+        if approx_value_tokens(&value) > effective_token_cap {
+            wire_format = WorkflowWireFormat::Dense;
+        }
+
+        if matches!(wire_format, WorkflowWireFormat::Dense) {
+            let dense_preview = densify_workflow_value(value.clone());
+            if approx_value_tokens(&dense_preview) <= effective_token_cap {
+                value = dense_preview;
             }
+        }
+
+        if approx_value_tokens(&value) > effective_token_cap {
+            trim_value_for_token_budget(&mut value, effective_token_cap);
+            truncated = true;
         }
 
         metadata.wire_format = match wire_format {
@@ -2385,6 +2583,7 @@ impl McpHandler {
             _ => "standard".to_string(),
         };
         attach_workflow_metadata(&mut value, &metadata);
+        attach_workflow_budget_metadata(&mut value, budget, effective_token_cap, truncated);
 
         if matches!(wire_format, WorkflowWireFormat::Dense) {
             value = densify_workflow_value(value);
@@ -3409,27 +3608,16 @@ impl McpHandler {
 
     async fn tool_index_status(&self, _args: &Value) -> Result<Value, (i32, String)> {
         let is_indexing = self.indexing.load(Ordering::Relaxed);
-
-        let engine = self.engine.lock().await;
-        let stats = engine.graph().stats();
-        let all_nodes = engine.graph().all_nodes();
-
-        let mut lang_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for node in &all_nodes {
-            *lang_counts
-                .entry(format!("{:?}", node.language))
-                .or_insert(0) += 1;
-        }
+        let snapshot = self.current_status_snapshot(true).await;
 
         let mut result = json!({
             "status": if is_indexing { "indexing" } else { "ready" },
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.workspace_root.to_string_lossy(),
-            "nodes": stats.node_count,
-            "edges": stats.edge_count,
-            "files": stats.file_count,
-            "languages": lang_counts
+            "nodes": snapshot.stats.node_count,
+            "edges": snapshot.stats.edge_count,
+            "files": snapshot.stats.file_count,
+            "languages": snapshot.languages.unwrap_or_default()
         });
 
         // Add multi-repo info if applicable
@@ -3447,20 +3635,23 @@ impl McpHandler {
             obj.insert("multi_repo".to_string(), json!(true));
 
             if let Some(wm) = &self.workspace_manager {
-                let wm = wm.lock().await;
-                let repo_stats: Vec<Value> = wm
-                    .repo_stats()
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "name": s.name,
-                            "files": s.file_count,
-                            "nodes": s.node_count,
-                            "edges": s.edge_count
+                if let Ok(wm) = wm.try_lock() {
+                    let repo_stats: Vec<Value> = wm
+                        .repo_stats()
+                        .iter()
+                        .map(|s| {
+                            json!({
+                                "name": s.name,
+                                "files": s.file_count,
+                                "nodes": s.node_count,
+                                "edges": s.edge_count
+                            })
                         })
-                    })
-                    .collect();
-                obj.insert("repos".to_string(), json!(repo_stats));
+                        .collect();
+                    obj.insert("repos".to_string(), json!(repo_stats));
+                } else {
+                    obj.insert("repos_pending".to_string(), json!(true));
+                }
             }
         }
 
@@ -3579,7 +3770,12 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
 
         let engine = self.engine.lock().await;
-        let file_nodes = engine.file_symbols(file);
+        let mut file_nodes = engine.file_symbols(file);
+        file_nodes.sort_by(|left, right| {
+            left.line
+                .cmp(&right.line)
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
         let symbols: Vec<Value> = file_nodes
             .iter()
@@ -3587,12 +3783,16 @@ impl McpHandler {
                 let dependents = engine.graph().get_dependents(&n.id);
                 let dependent_files: HashSet<&str> =
                     dependents.iter().map(|(d, _)| d.file.as_str()).collect();
+                let dependent_file_count = dependent_files.len();
 
                 json!({
                     "name": n.name,
                     "line": n.line,
+                    "character": 0,
+                    "kind": n.kind.short_code(),
                     "dependentCount": dependents.len(),
-                    "fileCount": dependent_files.len()
+                    "dependentFileCount": dependent_file_count,
+                    "fileCount": dependent_file_count
                 })
             })
             .collect();
@@ -3864,6 +4064,43 @@ impl McpHandler {
     }
 }
 
+fn status_snapshot_from_graph(graph: &CodeGraph, include_languages: bool) -> StatusSnapshot {
+    let languages = include_languages.then(|| {
+        let mut counts = std::collections::HashMap::new();
+        for node in graph.all_nodes() {
+            *counts.entry(format!("{:?}", node.language)).or_insert(0) += 1;
+        }
+        counts
+    });
+
+    StatusSnapshot {
+        stats: graph.stats(),
+        languages,
+    }
+}
+
+fn indexing_workflow_response(tool_name: &str, query: &str) -> Value {
+    json!({
+        "query": query,
+        "overview": "Indexing is still in progress and the graph is temporarily busy; retry shortly or use rg for exact literal lookup.",
+        "indexing": true,
+        "primary_files": [],
+        "symbols": [],
+        "tests": [],
+        "rationale": [
+            format!("{tool_name} returned a bounded indexing response instead of waiting on the graph lock.")
+        ],
+        "suggested_expand": {
+            "focus": "index_status",
+            "reason": "Check index_status, then retry the workflow once the graph is ready."
+        }
+    })
+}
+
+fn workflow_graph_is_empty(graph: &CodeGraph) -> bool {
+    graph.stats().node_count == 0
+}
+
 fn apply_lsp_edge_to_graph(
     graph: &mut lattice_core::graph::CodeGraph,
     edge: &Value,
@@ -3940,36 +4177,14 @@ impl RequestHandler for McpHandler {
             "ping" => Ok(json!({})),
             "lattice/status" => {
                 let is_indexing = self.indexing.load(Ordering::Relaxed);
-                let engine = self.engine.lock().await;
-                let stats = if engine.graph().stats().node_count == 0 && is_indexing {
-                    if let Some(wm) = &self.workspace_manager {
-                        if let Ok(wm) = wm.try_lock() {
-                            let repo_stats = wm.repo_stats();
-                            lattice_core::graph::GraphStats {
-                                node_count: repo_stats.iter().map(|s| s.node_count).sum(),
-                                edge_count: repo_stats.iter().map(|s| s.edge_count).sum(),
-                                file_count: repo_stats.iter().map(|s| s.file_count).sum(),
-                            }
-                        } else if let Ok(idx) = self.indexer.try_lock() {
-                            idx.graph().stats()
-                        } else {
-                            engine.graph().stats()
-                        }
-                    } else if let Ok(idx) = self.indexer.try_lock() {
-                        idx.graph().stats()
-                    } else {
-                        engine.graph().stats()
-                    }
-                } else {
-                    engine.graph().stats()
-                };
+                let snapshot = self.current_status_snapshot(false).await;
                 Ok(json!({
                     "status": if is_indexing { "indexing" } else { "ready" },
                     "version": env!("CARGO_PKG_VERSION"),
                     "workspace": self.workspace_root.to_string_lossy(),
-                    "nodes": stats.node_count,
-                    "edges": stats.edge_count,
-                    "files": stats.file_count
+                    "nodes": snapshot.stats.node_count,
+                    "edges": snapshot.stats.edge_count,
+                    "files": snapshot.stats.file_count
                 }))
             }
             "lattice/reindex" => self.handle_reindex().await,
@@ -4653,6 +4868,14 @@ fn select_workflow_wire_format(
     }
 }
 
+fn default_workflow_token_cap(budget: WorkflowBudget) -> usize {
+    match budget {
+        WorkflowBudget::Tiny => TINY_WORKFLOW_TOKEN_CAP,
+        WorkflowBudget::Auto | WorkflowBudget::Compact => COMPACT_WORKFLOW_TOKEN_CAP,
+        WorkflowBudget::Full => FULL_WORKFLOW_TOKEN_CAP,
+    }
+}
+
 fn apply_workflow_budget(
     tool_name: &str,
     value: &mut Value,
@@ -4709,6 +4932,12 @@ fn apply_compact_workflow_pruning(value: &mut Value, pruning_profile: SessionPru
     truncate_array_strings_field(object, "next_steps", 2, 72);
     truncate_array_strings_field(object, "architecture", 2, 72);
     truncate_array_strings_field(object, "conventions", 2, 72);
+
+    truncate_array_field(object, "pivots", 5);
+    truncate_array_field(object, "context", 5);
+    strip_array_object_field(object, "pivots", "source");
+    shorten_array_object_string_field(object, "pivots", "reason", 96);
+    shorten_array_object_string_field(object, "context", "relationship", 96);
 }
 
 fn apply_tiny_workflow_pruning(
@@ -4800,6 +5029,12 @@ fn apply_tiny_workflow_pruning(
             truncate_array_field(object, "likely_causes", 1);
             truncate_array_field(object, "next_steps", 1);
         }
+        "get_context_capsule" => {
+            truncate_array_field(object, "pivots", 3);
+            truncate_array_field(object, "context", 3);
+            strip_array_object_field(object, "pivots", "source");
+            truncate_array_field(object, "memories", 0);
+        }
         _ => {}
     }
 
@@ -4881,6 +5116,12 @@ fn apply_single_anchor_mode(
             truncate_array_field(object, "next_steps", 1);
             truncate_array_field(object, "related_symbols", 0);
             truncate_array_field(object, "memory_highlights", 0);
+        }
+        "get_context_capsule" => {
+            truncate_array_field(object, "pivots", 1);
+            truncate_array_field(object, "context", 2);
+            strip_array_object_field(object, "pivots", "source");
+            truncate_array_field(object, "memories", 0);
         }
         _ => return false,
     }
@@ -5065,6 +5306,82 @@ fn stable_file_focus_value(file: &str) -> String {
     stable_file_handle(normalized)
 }
 
+fn attach_agent_retrieval_guidance(tool_name: &str, value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("agent_retrieval_contract") {
+        return;
+    }
+
+    let (best_for, why_not_rg, use_rg_if, next_action) = match tool_name {
+        "get_context_capsule" | "prepare_change" | "plan_edit" | "summarize_subsystem" => (
+            "working_set_discovery",
+            "Ranks files and symbols with graph relationships, symbol names, path conventions, tests, docs links, and memory signals; rg only finds literal text.",
+            "Use rg when you need an exact string, identifier spelling, config key, error text, or exhaustive textual occurrences.",
+            "Expand the suggested handle before opening multiple unfamiliar files.",
+        ),
+        "diagnose_failure" => (
+            "failure_triage",
+            "Maps raw failure text to likely files, symbols, related code, and tests; rg only finds the literal stack-trace terms.",
+            "Use rg when the failure contains a unique literal error string or file path you need to inspect directly.",
+            "Expand the top suspect or run the returned focused test.",
+        ),
+        "find_relevant_tests" => (
+            "test_ownership",
+            "Uses graph links, path conventions, changed files, and symbol overlap to pick tests; rg only finds textual references.",
+            "Use rg when you need every textual reference to a test name or symbol.",
+            "Run the highest-confidence tests first.",
+        ),
+        "impact_from_diff" => (
+            "change_impact",
+            "Uses changed symbols and dependents to find blast radius and tests; rg only finds text in the diff.",
+            "Use rg when reviewing exact changed strings or migration markers.",
+            "Review affected symbols and run the returned tests.",
+        ),
+        "trace_scenario" => (
+            "scenario_path_discovery",
+            "Uses likely entrypoints, call paths, guards, side effects, and failure branches; rg only finds scenario words.",
+            "Use rg when the scenario includes a unique route, error string, flag, or config key.",
+            "Expand the top execution-path or entrypoint handle.",
+        ),
+        _ => (
+            "indexed_context",
+            "Uses indexed code graph and metadata to find a working set; rg is better for exact literal search.",
+            "Use rg for exact string search or exhaustive occurrences.",
+            "Use suggested_expand when present.",
+        ),
+    };
+
+    object.insert(
+        "agent_retrieval_contract".to_string(),
+        json!({
+            "best_for": best_for,
+            "why_not_rg": why_not_rg,
+            "use_rg_if": use_rg_if,
+            "next_action": next_action,
+        }),
+    );
+}
+
+fn attach_workflow_budget_metadata(
+    value: &mut Value,
+    budget: WorkflowBudget,
+    max_tokens: usize,
+    truncated: bool,
+) {
+    let approx_tokens = approx_value_tokens(value);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("budget".to_string(), json!(budget.as_str()));
+        object.insert("budget_max_tokens".to_string(), json!(max_tokens));
+        object.insert("approx_tokens".to_string(), json!(approx_tokens));
+        object.insert(
+            "truncated".to_string(),
+            json!(truncated || approx_tokens > max_tokens),
+        );
+    }
+}
+
 fn trim_value_for_token_budget(value: &mut Value, max_tokens: usize) {
     if approx_value_tokens(value) <= max_tokens {
         return;
@@ -5105,6 +5422,9 @@ fn trim_value_for_token_budget(value: &mut Value, max_tokens: usize) {
     truncate_array_strings_field(object, "stale_doc_signals", 0, 72);
     truncate_array_field(object, "changed_files", 1);
     truncate_array_field(object, "changed_symbols", 1);
+    truncate_array_field(object, "pivots", 1);
+    truncate_array_field(object, "context", 2);
+    strip_array_object_field(object, "pivots", "source");
     truncate_array_field(object, "files", 1);
     truncate_array_field(object, "key_files", 1);
     truncate_array_field(object, "key_symbols", 1);
@@ -5187,6 +5507,15 @@ fn dense_key(key: &str) -> &str {
         "single_anchor_used" => "sa",
         "semantic_fallback_used" => "se",
         "outcome_memory_reuse_count" => "or",
+        "agent_retrieval_contract" => "arc",
+        "best_for" => "bf",
+        "why_not_rg" => "wnr",
+        "use_rg_if" => "uri",
+        "next_action" => "na",
+        "budget" => "bg",
+        "budget_max_tokens" => "bmt",
+        "approx_tokens" => "apt",
+        "truncated" => "tr",
         "playbook_memory" => "pm",
         "focus" => "fo",
         "reason" => "r",
@@ -5300,6 +5629,36 @@ fn truncate_array_strings_field(
 
     if remove {
         object.remove(key);
+    }
+}
+
+fn strip_array_object_field(object: &mut serde_json::Map<String, Value>, key: &str, field: &str) {
+    if let Some(Value::Array(items)) = object.get_mut(key) {
+        for item in items {
+            if let Some(entry) = item.as_object_mut() {
+                entry.remove(field);
+            }
+        }
+    }
+}
+
+fn shorten_array_object_string_field(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+    limit: usize,
+) {
+    if let Some(Value::Array(items)) = object.get_mut(key) {
+        for item in items {
+            if let Some(entry) = item.as_object_mut() {
+                if let Some(text) = entry.get(field).and_then(|value| value.as_str()) {
+                    entry.insert(
+                        field.to_string(),
+                        Value::String(truncate_text_value(text, limit)),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -6503,6 +6862,7 @@ mod tests {
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, wrap_tool_result,
         wrap_workflow_tool_result, McpHandler, RequestHandler, WorkflowRenderMode,
+        COMPACT_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -6523,7 +6883,7 @@ mod tests {
     use lattice_core::symbols::{Language, SymbolKind};
     use serde_json::{json, Value};
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Mutex;
@@ -7214,6 +7574,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_status_uses_live_indexer_snapshot_while_indexing() {
+        let (handler, _memory_store, workspace_root) =
+            build_memory_test_handler("session-index-status-live-indexer");
+
+        {
+            let mut indexer = handler.indexer.lock().await;
+            indexer
+                .index_file_content(
+                    "src/status.ts",
+                    r#"
+export function greet(name: string): string {
+    return `hello ${name}`;
+}
+"#,
+                )
+                .expect("index test file");
+        }
+        handler.indexing.store(true, Ordering::Relaxed);
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "index_status",
+                "arguments": {}
+            }),
+        )
+        .await
+        .expect("index_status tools/call should succeed");
+
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("expected wrapped index_status response text");
+        let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
+
+        assert_eq!(payload["status"].as_str(), Some("indexing"));
+        assert_eq!(payload["files"].as_u64(), Some(1));
+        assert!(payload["nodes"].as_u64().unwrap_or_default() >= 1);
+        assert!(payload["edges"].as_u64().is_some());
+        assert_eq!(
+            payload["languages"]["TypeScript"].as_u64(),
+            Some(1),
+            "expected language counts to come from live indexer snapshot: {payload:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn test_file_symbols_returns_extension_compatible_fields() {
+        use lattice_core::graph::builder::GraphBuilder;
+        use lattice_core::parser::parse_file;
+
+        let (handler, _memory_store, workspace_root) =
+            build_memory_test_handler("session-file-symbols-contract");
+
+        let source = r#"export function greet(name: string): string {
+    return `hello ${name}`;
+}"#;
+        let caller = r#"import { greet } from "./status";
+
+export function sendGreeting(): string {
+    return greet("team");
+}"#;
+
+        let mut builder = GraphBuilder::new();
+        builder.add_file(parse_file("src/status.ts", source).expect("parse source"));
+        builder.add_file(parse_file("src/caller.ts", caller).expect("parse caller"));
+
+        {
+            let mut engine = handler.engine.lock().await;
+            engine.update_graph(builder.build());
+        }
+
+        let payload = RequestHandler::handle(
+            &handler,
+            "lattice/file_symbols",
+            json!({
+                "file": "src/status.ts"
+            }),
+        )
+        .await
+        .expect("file_symbols should succeed");
+
+        let symbols = payload["symbols"]
+            .as_array()
+            .expect("expected symbols array");
+        let greet = symbols
+            .iter()
+            .find(|value| value["name"].as_str() == Some("greet"))
+            .expect("expected greet symbol");
+
+        assert_eq!(greet["line"].as_u64(), Some(1));
+        assert_eq!(greet["character"].as_u64(), Some(0));
+        assert_eq!(greet["kind"].as_str(), Some("fn"));
+        assert_eq!(greet["dependentCount"].as_u64(), Some(1));
+        assert_eq!(greet["dependentFileCount"].as_u64(), Some(1));
+        assert_eq!(greet["fileCount"].as_u64(), Some(1));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn test_augment_memory_values_with_playbooks_prefers_verified_workflow_outcome() {
         let (handler, memory_store, workspace_root) =
             build_memory_test_handler("session-memory-preference");
@@ -7733,6 +8196,273 @@ mod tests {
                 .is_some_and(|value| !value.is_empty()),
             "expected non-empty context_handle in plan_edit payload: {payload:?}"
         );
+        let contract = payload
+            .get("agent_retrieval_contract")
+            .or_else(|| payload.get("arc"))
+            .expect("expected retrieval contract");
+        assert_eq!(
+            contract
+                .get("best_for")
+                .or_else(|| contract.get("bf"))
+                .and_then(|value| value.as_str()),
+            Some("working_set_discovery")
+        );
+        assert_eq!(
+            payload
+                .get("budget")
+                .or_else(|| payload.get("bg"))
+                .and_then(|value| value.as_str()),
+            Some("tiny")
+        );
+        assert!(payload
+            .get("budget_max_tokens")
+            .or_else(|| payload.get("bmt"))
+            .and_then(|value| value.as_u64())
+            .is_some());
+
+        let _ = std::fs::remove_file(context_cache_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn test_context_capsule_tool_path_is_bounded_and_strips_source() {
+        let mut graph = CodeGraph::new();
+        graph.add_node(
+            SymbolId {
+                file: "src/auth.ts".to_string(),
+                name: "loginUser".to_string(),
+                byte_offset: 41,
+            },
+            SymbolKind::Function,
+            "loginUser".to_string(),
+            "function loginUser(credentials) {}".to_string(),
+            "function loginUser(credentials) {\n  const secret = credentials.password;\n  return authenticate(secret);\n}".repeat(20),
+            "src/auth.ts".to_string(),
+            12,
+            30,
+            true,
+            Language::TypeScript,
+        );
+
+        let workspace_root = unique_test_path("lattice-mcp-context-capsule");
+        std::fs::create_dir_all(&workspace_root).expect("failed to create temp workspace");
+        let context_cache_path = workspace_root.join("context_handles.json");
+
+        let handler = McpHandler::new(
+            Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+            Arc::new(Mutex::new(
+                MemoryStore::open_in_memory().expect("memory store"),
+            )),
+            Arc::new(Mutex::new(
+                GraphStore::open_in_memory().expect("graph store"),
+            )),
+            Arc::new(OnceLock::new()),
+            None,
+            workspace_root.clone(),
+            context_cache_path.clone(),
+            "session-test-context-capsule".to_string(),
+            None,
+            vec![workspace_root.clone()],
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "get_context_capsule",
+                "arguments": {
+                    "query": "how does loginUser authenticate credentials",
+                    "render": "json"
+                }
+            }),
+        )
+        .await
+        .expect("get_context_capsule tools/call should succeed");
+
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("expected wrapped get_context_capsule response text");
+        let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
+        assert_eq!(
+            payload["context_origin"].as_str(),
+            Some("get_context_capsule")
+        );
+        assert_eq!(
+            payload["agent_retrieval_contract"]["best_for"].as_str(),
+            Some("working_set_discovery")
+        );
+        assert_eq!(
+            payload["agent_retrieval_contract"]["use_rg_if"].as_str(),
+            Some("Use rg when you need an exact string, identifier spelling, config key, error text, or exhaustive textual occurrences.")
+        );
+        assert!(
+            payload["pivots"]
+                .as_array()
+                .is_some_and(|items| items.len() <= 3
+                    && items.iter().all(|item| item.get("source").is_none())),
+            "expected bounded pivots without full source: {payload:?}"
+        );
+        assert!(
+            payload["budget_max_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens <= COMPACT_WORKFLOW_TOKEN_CAP as u64),
+            "expected compact hard cap metadata: {payload:?}"
+        );
+        assert!(
+            payload
+                .get("context_handle")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty()),
+            "expected context handle: {payload:?}"
+        );
+        assert!(
+            payload
+                .get("suggested_expand")
+                .and_then(|value| value.get("focus"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty()),
+            "expected suggested expand: {payload:?}"
+        );
+
+        let _ = std::fs::remove_file(context_cache_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_change_reports_indexing_when_no_warm_graph_is_available() {
+        let workspace_root = unique_test_path("lattice-mcp-prepare-change-indexing-empty-graph");
+        std::fs::create_dir_all(&workspace_root).expect("failed to create temp workspace");
+        let context_cache_path = workspace_root.join("context_handles.json");
+
+        let handler = McpHandler::new(
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+            Arc::new(Mutex::new(
+                MemoryStore::open_in_memory().expect("memory store"),
+            )),
+            Arc::new(Mutex::new(
+                GraphStore::open_in_memory().expect("graph store"),
+            )),
+            Arc::new(OnceLock::new()),
+            None,
+            workspace_root.clone(),
+            context_cache_path.clone(),
+            "session-test-prepare-change-indexing".to_string(),
+            None,
+            vec![workspace_root.clone()],
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "prepare_change",
+                "arguments": {
+                    "query": "fix product agent drift",
+                    "render": "json"
+                }
+            }),
+        )
+        .await
+        .expect("prepare_change tools/call should succeed");
+
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("expected wrapped prepare_change response text");
+        let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
+        assert_eq!(payload["indexing"].as_bool(), Some(true));
+        assert_eq!(
+            payload["primary_files"].as_array().map(Vec::len),
+            Some(0),
+            "indexing response should stay bounded and avoid misleading empty rankings"
+        );
+        assert!(
+            payload["overview"]
+                .as_str()
+                .is_some_and(|overview| overview.contains("Indexing is still in progress")),
+            "expected explicit indexing overview: {payload:?}"
+        );
+
+        let _ = std::fs::remove_file(context_cache_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_change_promotes_live_indexer_graph_while_indexing() {
+        let workspace_root = unique_test_path("lattice-mcp-prepare-change-live-indexer-graph");
+        std::fs::create_dir_all(&workspace_root).expect("failed to create temp workspace");
+        let context_cache_path = workspace_root.join("context_handles.json");
+
+        let mut indexer = Indexer::new(workspace_root.clone());
+        indexer
+            .index_file_content(
+                "backend/core/agent_version_drift.py",
+                r#"
+def detect_agent_version_drift(agent, rollout):
+    return agent.version != rollout.target_version
+"#,
+            )
+            .expect("index test file");
+
+        let handler = McpHandler::new(
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(indexer)),
+            Arc::new(Mutex::new(
+                MemoryStore::open_in_memory().expect("memory store"),
+            )),
+            Arc::new(Mutex::new(
+                GraphStore::open_in_memory().expect("graph store"),
+            )),
+            Arc::new(OnceLock::new()),
+            None,
+            workspace_root.clone(),
+            context_cache_path.clone(),
+            "session-test-prepare-change-live-indexer".to_string(),
+            None,
+            vec![workspace_root.clone()],
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "prepare_change",
+                "arguments": {
+                    "query": "fix agent version drift",
+                    "render": "json"
+                }
+            }),
+        )
+        .await
+        .expect("prepare_change tools/call should succeed");
+
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("expected wrapped prepare_change response text");
+        let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
+        assert_ne!(
+            payload["indexing"].as_bool(),
+            Some(true),
+            "live indexer graph should be promoted instead of returning an indexing placeholder: {payload:?}"
+        );
+        assert!(
+            payload["primary_files"]
+                .as_array()
+                .is_some_and(|files| files.iter().any(
+                    |file| file["file"].as_str() == Some("backend/core/agent_version_drift.py")
+                )),
+            "expected promoted live graph to produce a working set: {payload:?}"
+        );
+        assert!(
+            payload["context_handle"]
+                .as_str()
+                .is_some_and(|handle| !handle.is_empty()),
+            "expected context handle from promoted live graph response: {payload:?}"
+        );
 
         let _ = std::fs::remove_file(context_cache_path);
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -8111,6 +8841,20 @@ fn build_workflow_metrics_payload(value: &Value) -> Option<Value> {
         "outcome_memory_reuse_count",
         &["outcome_memory_reuse_count", "or"],
     );
+    copy_object_alias_value(object, &mut metadata, "budget", &["budget", "bg"]);
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "budget_max_tokens",
+        &["budget_max_tokens", "bmt"],
+    );
+    copy_object_alias_value(
+        object,
+        &mut metadata,
+        "approx_tokens",
+        &["approx_tokens", "apt"],
+    );
+    copy_object_alias_value(object, &mut metadata, "truncated", &["truncated", "tr"]);
 
     if let Some(suggested_expand) =
         object_get(object, &["suggested_expand", "x"]).and_then(|item| item.as_object())
@@ -8120,6 +8864,32 @@ fn build_workflow_metrics_payload(value: &Value) -> Option<Value> {
         copy_object_alias_value(suggested_expand, &mut suggested, "reason", &["reason", "r"]);
         if !suggested.is_empty() {
             metadata.insert("suggested_expand".to_string(), Value::Object(suggested));
+        }
+    }
+
+    if let Some(contract) =
+        object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
+    {
+        let mut retrieval = serde_json::Map::new();
+        copy_object_alias_value(contract, &mut retrieval, "best_for", &["best_for", "bf"]);
+        copy_object_alias_value(
+            contract,
+            &mut retrieval,
+            "why_not_rg",
+            &["why_not_rg", "wnr"],
+        );
+        copy_object_alias_value(contract, &mut retrieval, "use_rg_if", &["use_rg_if", "uri"]);
+        copy_object_alias_value(
+            contract,
+            &mut retrieval,
+            "next_action",
+            &["next_action", "na"],
+        );
+        if !retrieval.is_empty() {
+            metadata.insert(
+                "agent_retrieval_contract".to_string(),
+                Value::Object(retrieval),
+            );
         }
     }
 
@@ -8212,6 +8982,28 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
                 Some(reason) => lines.push(format!("- Suggested expand: `{}` ({})", focus, reason)),
                 None => lines.push(format!("- Suggested expand: `{}`", focus)),
             }
+        }
+    }
+
+    if let Some(contract) =
+        object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
+    {
+        if let Some(best_for) = object_get(contract, &["best_for", "bf"])
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            lines.push(format!("- Best for: {}", best_for));
+        }
+        if let Some(next_action) = object_get(contract, &["next_action", "na"])
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            lines.push(format!(
+                "- Next action: {}",
+                truncate_text_value(next_action, 96)
+            ));
         }
     }
 

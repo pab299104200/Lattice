@@ -3,11 +3,11 @@ import { DaemonManager } from './daemon';
 
 interface FileSymbol {
     name: string;
-    kind: string;
     line: number;
-    character: number;
+    character?: number;
     dependentCount: number;
-    dependentFileCount: number;
+    dependentFileCount?: number;
+    fileCount?: number;
 }
 
 interface FileSymbolsResponse {
@@ -57,20 +57,23 @@ export class LatticeCodeLensProvider implements vscode.CodeLensProvider {
                     continue;
                 }
 
+                const line = Math.max((symbol.line ?? 1) - 1, 0);
+                const character = Math.max(symbol.character ?? 0, 0);
+                const dependentFileCount = symbol.dependentFileCount ?? symbol.fileCount ?? 0;
                 const range = new vscode.Range(
-                    symbol.line,
-                    symbol.character,
-                    symbol.line,
-                    symbol.character + symbol.name.length
+                    line,
+                    character,
+                    line,
+                    character + symbol.name.length
                 );
 
-                const fileLabel = symbol.dependentFileCount === 1 ? 'file' : 'files';
+                const fileLabel = dependentFileCount === 1 ? 'file' : 'files';
                 const depLabel = symbol.dependentCount === 1 ? 'dependent' : 'dependents';
 
                 const lens = new vscode.CodeLens(range, {
-                    title: `Lattice: ${symbol.dependentCount} ${depLabel} across ${symbol.dependentFileCount} ${fileLabel}`,
+                    title: `Lattice: ${symbol.dependentCount} ${depLabel} across ${dependentFileCount} ${fileLabel}`,
                     command: 'lattice.showDependents',
-                    arguments: [document.uri.fsPath, symbol.name],
+                    arguments: [relPath, symbol.name],
                     tooltip: `Show dependents of ${symbol.name}`,
                 });
 

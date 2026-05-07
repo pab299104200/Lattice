@@ -704,6 +704,246 @@ fn test_prepare_change_prioritizes_primary_files_and_tests() {
         "expected compact overview to keep only a short memory reference: {}",
         bundle.overview
     );
+    assert!(
+        bundle
+            .primary_files
+            .iter()
+            .all(|item| !item.reasons.is_empty() && !item.evidence.is_empty()),
+        "expected compact primary files to keep bounded ranking evidence: {:?}",
+        bundle.primary_files
+    );
+    assert!(
+        bundle
+            .rationale
+            .iter()
+            .any(|item| item.contains("Use this instead of rg")),
+        "expected compact prepare_change to explain when it beats rg: {:?}",
+        bundle.rationale
+    );
+}
+
+#[test]
+fn test_prepare_change_uses_repo_name_query_as_scope_hint() {
+    let mut graph = CodeGraph::new();
+    graph.add_node(
+        make_id("lattice/AGENTS.md", "Lattice Context Engine", 0),
+        SymbolKind::Section,
+        "Lattice Context Engine".to_string(),
+        "section Lattice Context Engine".to_string(),
+        "Lattice workflow tool guidance".to_string(),
+        "lattice/AGENTS.md".to_string(),
+        1,
+        5,
+        false,
+        Language::Markdown,
+    );
+    graph.add_node(
+        make_id(
+            "lattice/daemon/crates/lattice-core/src/workflow/tools.rs",
+            "prepare_change_workflow_tools",
+            1,
+        ),
+        SymbolKind::Function,
+        "prepare_change_workflow_tools".to_string(),
+        "fn prepare_change_workflow_tools()".to_string(),
+        "fn prepare_change_workflow_tools() {}".to_string(),
+        "lattice/daemon/crates/lattice-core/src/workflow/tools.rs".to_string(),
+        10,
+        20,
+        true,
+        Language::Rust,
+    );
+    graph.add_node(
+        make_id("keystone/AGENTS.md", "Keystone Context Engine", 0),
+        SymbolKind::Section,
+        "Keystone Context Engine".to_string(),
+        "section Keystone Context Engine".to_string(),
+        "Keystone workflow guidance".to_string(),
+        "keystone/AGENTS.md".to_string(),
+        1,
+        5,
+        false,
+        Language::Markdown,
+    );
+    graph.add_node(
+        make_id(
+            "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js",
+            "workflowLabel",
+            1,
+        ),
+        SymbolKind::Function,
+        "workflowLabel".to_string(),
+        "function workflowLabel()".to_string(),
+        "function workflowLabel() {}".to_string(),
+        "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js".to_string(),
+        10,
+        20,
+        true,
+        Language::JavaScript,
+    );
+
+    let capsule = ContextCapsule {
+        query: "Improve Lattice workflow tools".to_string(),
+        intent: QueryIntent::Explore,
+        pivots: vec![PivotNode {
+            symbol: "workflowLabel".to_string(),
+            kind: "fn".to_string(),
+            file: "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js"
+                .to_string(),
+            line: 10,
+            source: "function workflowLabel() {}".to_string(),
+            score: 1.0,
+            reason: "keyword match".to_string(),
+        }],
+        context: vec![],
+        memories: vec![],
+        stats: CapsuleStats {
+            tokens_used: 10,
+            tokens_saved: 10,
+            nodes_evaluated: 0,
+            nodes_included: 0,
+            engine_version: "test".to_string(),
+            seed_count: 1,
+            seed_symbols: vec![],
+        },
+    };
+    let rules = RulesDetector::new().detect_rules(&[
+        "lattice/daemon/crates/lattice-core/src/workflow/tools.rs".to_string(),
+        "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js".to_string(),
+    ]);
+
+    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact);
+
+    assert_eq!(
+        bundle.primary_files.first().map(|item| item.file.as_str()),
+        Some("lattice/daemon/crates/lattice-core/src/workflow/tools.rs"),
+        "expected repo name in query to scope workflow matches to lattice before sibling repos: {:?}",
+        bundle
+            .primary_files
+            .iter()
+            .map(|item| format!("{}:{:?}", item.file, item.reasons))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_prepare_change_promotes_specific_file_stem_over_broad_path_match() {
+    let mut graph = CodeGraph::new();
+    graph.add_node(
+        make_id("agent/pkg/agent/loops.go", "runAgentLoop", 0),
+        SymbolKind::Function,
+        "runAgentLoop".to_string(),
+        "func runAgentLoop()".to_string(),
+        "func runAgentLoop() { pollJobs() }".to_string(),
+        "agent/pkg/agent/loops.go".to_string(),
+        12,
+        30,
+        true,
+        Language::Go,
+    );
+    graph.add_node(
+        make_id(
+            "backend/core/agent_version_drift.py",
+            "check_agent_version_drift",
+            0,
+        ),
+        SymbolKind::Function,
+        "check_agent_version_drift".to_string(),
+        "def check_agent_version_drift(db):".to_string(),
+        "def check_agent_version_drift(db):\n    return compare_hosts_to_latest_publication(db)"
+            .to_string(),
+        "backend/core/agent_version_drift.py".to_string(),
+        20,
+        80,
+        true,
+        Language::Python,
+    );
+    graph.add_node(
+        make_id(
+            "backend/core/agent_rollout_engine.py",
+            "active_rollout_for_version",
+            0,
+        ),
+        SymbolKind::Function,
+        "active_rollout_for_version".to_string(),
+        "def active_rollout_for_version(db, version):".to_string(),
+        "def active_rollout_for_version(db, version):\n    return db.query(Rollout).first()"
+            .to_string(),
+        "backend/core/agent_rollout_engine.py".to_string(),
+        15,
+        40,
+        true,
+        Language::Python,
+    );
+    graph.add_node(
+        make_id(
+            "backend/tests/test_agent_version_drift.py",
+            "test_drift_suppressed_during_active_rollout",
+            0,
+        ),
+        SymbolKind::Function,
+        "test_drift_suppressed_during_active_rollout".to_string(),
+        "def test_drift_suppressed_during_active_rollout(db):".to_string(),
+        "def test_drift_suppressed_during_active_rollout(db):\n    check_agent_version_drift(db)"
+            .to_string(),
+        "backend/tests/test_agent_version_drift.py".to_string(),
+        100,
+        125,
+        false,
+        Language::Python,
+    );
+
+    let capsule = ContextCapsule {
+        query: "agent version drift alerting should ignore active rollouts".to_string(),
+        intent: QueryIntent::FixBug,
+        pivots: vec![PivotNode {
+            symbol: "runAgentLoop".to_string(),
+            kind: "fn".to_string(),
+            file: "agent/pkg/agent/loops.go".to_string(),
+            line: 12,
+            source: "func runAgentLoop() { pollJobs() }".to_string(),
+            score: 9.0,
+            reason: "broad path match".to_string(),
+        }],
+        context: vec![],
+        memories: vec![],
+        stats: CapsuleStats {
+            tokens_used: 10,
+            tokens_saved: 10,
+            nodes_evaluated: 4,
+            nodes_included: 1,
+            engine_version: "test".to_string(),
+            seed_count: 1,
+            seed_symbols: vec!["runAgentLoop".to_string()],
+        },
+    };
+    let rules = RulesDetector::new().detect_rules(&[
+        "agent/pkg/agent/loops.go".to_string(),
+        "backend/core/agent_version_drift.py".to_string(),
+        "backend/core/agent_rollout_engine.py".to_string(),
+        "backend/tests/test_agent_version_drift.py".to_string(),
+    ]);
+
+    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact);
+
+    assert_eq!(
+        bundle.primary_files.first().map(|item| item.file.as_str()),
+        Some("backend/core/agent_version_drift.py"),
+        "expected exact file-stem/test-owner match to outrank broad agent runtime path: {:?}",
+        bundle
+            .primary_files
+            .iter()
+            .map(|item| format!("{}:{:?}", item.file, item.reasons))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        bundle
+            .primary_files
+            .first()
+            .is_some_and(|item| item.evidence.iter().any(|tag| tag == "stem")),
+        "expected stem evidence on promoted file: {:?}",
+        bundle.primary_files
+    );
 }
 
 #[test]

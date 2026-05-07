@@ -15,11 +15,12 @@ If you would otherwise open 3 or more unfamiliar files, call `get_context_capsul
 If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
 If the task starts from a failing test, stack trace, compiler error, or runtime failure, start with `diagnose_failure` and use `prepare_change` after it narrows the likely culprit.
 If you're unsure which tool to use, default to `prepare_change` for implementation tasks and `get_context_capsule` for understanding tasks.
+If a Lattice response says the task is better handled by `rg`, use `rg`; Lattice is for working-set discovery, not exact literal search.
 
 Use these tools when they're the best fit:
 
 - `prepare_change` — first choice for fix, add, or refactor tasks once you know the change area and want likely edit files, tests, risks, and nearby memory in one result
-- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; use `mode: "focused"` for targeted lookups, and use its returned handle with `expand_context`
+- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it returns a bounded first-pass working set, strips full source bodies by default, and should be followed with `expand_context`
 - `summarize_subsystem` — use for a summary-first subsystem map before loading full source
 - `get_skeleton` — use before opening a large file when you want structure without full source
 - `impact_from_diff` — use when reviewing a diff or local change and you want downstream impact plus tests
@@ -35,7 +36,7 @@ Use these tools when they're the best fit:
 - `record_workflow_outcome` — use to store successful outcomes so later sessions can reuse them
 
 For targeted edits to known files, direct read, grep, and edit operations are fine.
-Lattice adds the most value when you do not already know where to look.
+Lattice adds the most value when you do not already know where to look. `rg` remains the right first tool for exact strings, config keys, error text, and exhaustive textual occurrences.
 
 ## Core Rules
 

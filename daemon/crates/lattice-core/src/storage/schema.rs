@@ -25,6 +25,21 @@ CREATE TABLE IF NOT EXISTS edges (
     kind TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS file_index (
+    file TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    parser_version INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    last_indexed_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS parsed_files (
+    file TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file);
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file, from_name, from_offset);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file, to_name, to_offset);

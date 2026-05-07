@@ -936,6 +936,7 @@ pub fn prepare_change(
     let query_tokens: HashSet<String> = tokenize_path(&capsule.query).into_iter().collect();
     let entry_file_set: HashSet<String> = entry_files.iter().cloned().collect();
     let entry_symbol_set: HashSet<String> = entry_symbols.iter().cloned().collect();
+    let repo_scope_hints = repo_scope_hints_for_query(graph, &query_tokens);
 
     for file in entry_files {
         if !is_queryable_graph_file(file) {
@@ -1026,6 +1027,19 @@ pub fn prepare_change(
             push_seed_node(&mut seed_nodes, &mut seed_seen, node);
         }
     }
+
+    if !repo_scope_hints.is_empty() {
+        add_repo_scoped_query_scores(
+            graph,
+            &repo_scope_hints,
+            &query_tokens,
+            &entry_file_set,
+            &entry_symbol_set,
+            &mut file_scores,
+            &mut symbol_scores,
+        );
+    }
+    add_specific_query_match_scores(graph, &query_tokens, &mut file_scores, &mut symbol_scores);
 
     for node in &seed_nodes {
         let dependencies = rank_related_nodes(graph.get_dependencies(&node.id));
@@ -1142,6 +1156,7 @@ pub fn prepare_change(
             capsule.memories.len()
         ));
     }
+    rationale.push(task_bundle_search_guidance(&primary_files, &symbols));
 
     dedupe_strings(&mut rationale);
     let selected_files: HashSet<String> = primary_files
@@ -5231,6 +5246,40 @@ fn rank_file_focus_nodes<'a>(
     nodes
 }
 
+fn repo_scope_hints_for_query(
+    graph: &CodeGraph,
+    query_tokens: &HashSet<String>,
+) -> HashSet<String> {
+    let repo_prefixes = graph_repo_prefixes(graph);
+    query_tokens
+        .iter()
+        .filter(|token| repo_prefixes.contains(*token))
+        .cloned()
+        .collect()
+}
+
+fn graph_repo_prefixes(graph: &CodeGraph) -> HashSet<String> {
+    let mut prefixes = HashSet::new();
+    for node in graph.all_nodes() {
+        let Some((prefix, rest)) = node.file.split_once('/') else {
+            continue;
+        };
+        if matches!(
+            rest,
+            "README.md" | "AGENTS.md" | "CLAUDE.md" | "CONTRIBUTING.md"
+        ) {
+            prefixes.insert(prefix.to_ascii_lowercase());
+        }
+    }
+    prefixes
+}
+
+fn file_matches_repo_scope(file: &str, repo_scope_hints: &HashSet<String>) -> bool {
+    file.split_once('/')
+        .map(|(prefix, _)| repo_scope_hints.contains(&prefix.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
 fn find_symbol_matches<'a>(
     graph: &'a CodeGraph,
     symbol: &str,
@@ -5311,6 +5360,148 @@ fn add_symbol_score(
         entry.role = role;
     }
     entry.score += delta;
+}
+
+fn add_repo_scoped_query_scores(
+    graph: &CodeGraph,
+    repo_scope_hints: &HashSet<String>,
+    query_tokens: &HashSet<String>,
+    entry_file_set: &HashSet<String>,
+    entry_symbol_set: &HashSet<String>,
+    file_scores: &mut HashMap<String, FileAccumulator>,
+    symbol_scores: &mut HashMap<(String, String), SymbolAccumulator>,
+) {
+    for node in graph.all_nodes() {
+        if !is_queryable_graph_file(&node.file)
+            || !file_matches_repo_scope(&node.file, repo_scope_hints)
+        {
+            continue;
+        }
+
+        let hits = task_relevance_hits(
+            &node.file,
+            &node.name,
+            query_tokens,
+            entry_file_set,
+            entry_symbol_set,
+        );
+        if hits == 0 {
+            continue;
+        }
+
+        let repo_name = node.file.split('/').next().unwrap_or_default();
+        let delta = 2.5 + hits as f64;
+        add_file_score(
+            file_scores,
+            &node.file,
+            delta,
+            format!("repo scope {} matched query", repo_name),
+        );
+        add_symbol_score(
+            symbol_scores,
+            &node.file,
+            &node.name,
+            Some(&node.id),
+            node.kind.short_code().to_string(),
+            node.line,
+            "repo_scope".to_string(),
+            delta,
+        );
+    }
+}
+
+fn add_specific_query_match_scores(
+    graph: &CodeGraph,
+    query_tokens: &HashSet<String>,
+    file_scores: &mut HashMap<String, FileAccumulator>,
+    symbol_scores: &mut HashMap<(String, String), SymbolAccumulator>,
+) {
+    if query_tokens.is_empty() {
+        return;
+    }
+
+    let all_nodes = graph.all_nodes();
+    let mut source_stems: HashMap<Vec<String>, Vec<&GraphNode>> = HashMap::new();
+    for node in &all_nodes {
+        if is_queryable_graph_file(&node.file) && !is_test_file(&node.file) {
+            let stem_tokens = normalized_file_stem_tokens(&node.file);
+            if stem_tokens.len() >= 2 {
+                source_stems.entry(stem_tokens).or_default().push(node);
+            }
+        }
+    }
+
+    let mut boosted_files = HashSet::new();
+    for node in all_nodes {
+        if !is_queryable_graph_file(&node.file) {
+            continue;
+        }
+
+        let stem_tokens = normalized_file_stem_tokens(&node.file);
+        if stem_tokens.len() >= 2 && tokens_are_subset(&stem_tokens, query_tokens) {
+            let delta = 6.0 + stem_tokens.len() as f64;
+            add_file_score(
+                file_scores,
+                &node.file,
+                delta,
+                format!("matches exact file stem {}", stem_tokens.join("_")),
+            );
+            boosted_files.insert(node.file.clone());
+        }
+
+        let symbol_tokens = tokenize_path(&node.name);
+        if symbol_tokens.len() >= 2 && tokens_are_subset(&symbol_tokens, query_tokens) {
+            let delta = 4.5 + symbol_tokens.len() as f64 * 0.75;
+            add_file_score(
+                file_scores,
+                &node.file,
+                delta,
+                format!("matches exact symbol phrase {}", node.name),
+            );
+            add_symbol_score(
+                symbol_scores,
+                &node.file,
+                &node.name,
+                Some(&node.id),
+                node.kind.short_code().to_string(),
+                node.line,
+                "specific_query_match".to_string(),
+                delta,
+            );
+            boosted_files.insert(node.file.clone());
+        }
+
+        if is_test_file(&node.file)
+            && stem_tokens.len() >= 2
+            && tokens_are_subset(&stem_tokens, query_tokens)
+        {
+            if let Some(source_nodes) = source_stems.get(&stem_tokens) {
+                for source in source_nodes.iter().take(3) {
+                    add_file_score(
+                        file_scores,
+                        &source.file,
+                        7.0,
+                        format!("test-owned source matched by {}", node.file),
+                    );
+                    add_symbol_score(
+                        symbol_scores,
+                        &source.file,
+                        &source.name,
+                        Some(&source.id),
+                        source.kind.short_code().to_string(),
+                        source.line,
+                        "test_owner".to_string(),
+                        3.5,
+                    );
+                    boosted_files.insert(source.file.clone());
+                }
+            }
+        }
+    }
+
+    if boosted_files.is_empty() {
+        return;
+    }
 }
 
 fn finalize_file_recommendations(
@@ -5661,8 +5852,11 @@ fn memory_overview_phrase(memory: &MemoryHighlight) -> String {
 
 fn compactify_file_recommendations(items: &mut [FileRecommendation]) {
     for item in items {
-        item.reasons.clear();
-        item.evidence.clear();
+        item.reasons.truncate(1);
+        for reason in item.reasons.iter_mut() {
+            *reason = truncate_text(reason, 64);
+        }
+        item.evidence.truncate(2);
     }
 }
 
@@ -5674,8 +5868,11 @@ fn compactify_symbol_recommendations(items: &mut [SymbolRecommendation]) {
 
 fn compactify_test_recommendations(items: &mut [TestRecommendation]) {
     for item in items {
-        item.reasons.clear();
-        item.evidence.clear();
+        item.reasons.truncate(1);
+        for reason in item.reasons.iter_mut() {
+            *reason = truncate_text(reason, 64);
+        }
+        item.evidence.truncate(2);
     }
 }
 
@@ -5724,6 +5921,31 @@ fn compactify_scenario_signals(items: &mut [ScenarioSignal]) {
     }
 }
 
+fn task_bundle_search_guidance(
+    primary_files: &[FileRecommendation],
+    symbols: &[SymbolRecommendation],
+) -> String {
+    if primary_files.is_empty() && symbols.is_empty() {
+        "No strong graph-backed match; use rg for exact strings or identifiers, then retry with an entry file.".to_string()
+    } else {
+        "Use this instead of rg for a working set; use rg directly for exact literal-string lookup."
+            .to_string()
+    }
+}
+
+fn keep_search_guidance(rationale: &mut Vec<String>) {
+    if let Some(guidance) = rationale
+        .iter()
+        .find(|item| item.contains("use rg") || item.contains("Use this instead of rg"))
+        .cloned()
+    {
+        rationale.clear();
+        rationale.push(guidance);
+    } else {
+        rationale.truncate(1);
+    }
+}
+
 fn ultra_compactify_task_bundle(
     primary_files: &mut Vec<FileRecommendation>,
     secondary_files: &mut Vec<FileRecommendation>,
@@ -5742,7 +5964,7 @@ fn ultra_compactify_task_bundle(
         risks.truncate(ULTRA_COMPACT_RISK_LIMIT);
         test_gaps.clear();
         matched_rules.clear();
-        rationale.clear();
+        keep_search_guidance(rationale);
     } else {
         primary_files.truncate(ULTRA_COMPACT_PRIMARY_FILE_LIMIT + 1);
         secondary_files.truncate(ULTRA_COMPACT_SECONDARY_FILE_LIMIT);
@@ -5751,7 +5973,7 @@ fn ultra_compactify_task_bundle(
         risks.truncate(ULTRA_COMPACT_RISK_LIMIT + 1);
         test_gaps.truncate(1);
         matched_rules.truncate(1);
-        rationale.truncate(1);
+        keep_search_guidance(rationale);
     }
 }
 
@@ -7574,6 +7796,29 @@ fn focus_tokens_for_file(file: &str) -> Vec<String> {
     tokens
 }
 
+fn normalized_file_stem_tokens(file: &str) -> Vec<String> {
+    let basename = file.rsplit('/').next().unwrap_or(file);
+    let stem = basename.split('.').next().unwrap_or(basename);
+    let normalized = stem
+        .strip_prefix("test_")
+        .or_else(|| stem.strip_prefix("test-"))
+        .unwrap_or(stem)
+        .strip_suffix("_test")
+        .or_else(|| stem.strip_suffix("-test"))
+        .unwrap_or_else(|| {
+            stem.strip_prefix("test_")
+                .or_else(|| stem.strip_prefix("test-"))
+                .unwrap_or(stem)
+        });
+    let mut tokens = tokenize_path(normalized);
+    dedupe_strings(&mut tokens);
+    tokens
+}
+
+fn tokens_are_subset(tokens: &[String], query_tokens: &HashSet<String>) -> bool {
+    tokens.iter().all(|token| query_tokens.contains(token))
+}
+
 fn normalize_token(part: &str) -> String {
     let lower = part.to_lowercase();
     if lower == "cert" {
@@ -7663,13 +7908,17 @@ fn infer_file_evidence(reasons: &[String]) -> Vec<String> {
             Some("entry")
         } else if reason.starts_with("pivot symbol") || reason.starts_with("supporting symbol") {
             Some("capsule")
+        } else if reason.contains("test-owned source") {
+            Some("test")
         } else if reason.contains(" dependency via ") || reason.contains(" dependent via ") {
             Some("graph")
-        } else if reason.contains("matches source file stem")
+        } else if reason.contains("matches exact file stem")
+            || reason.contains("matches exact symbol phrase")
+            || reason.contains("matches source file stem")
             || reason.contains("shares ")
             || reason.contains("matches ")
         {
-            Some("lexical")
+            Some("stem")
         } else {
             None
         };

@@ -209,21 +209,22 @@ fn extract_markdown_links(from: &SymbolId, file_path: &str, body: &str) -> Vec<L
             break;
         };
         let start = cursor + start_rel;
-        let label_start = start + 1;
-        let Some(middle_rel) = body[label_start..].find("](") else {
-            cursor = label_start;
+        let Some(label_end) = find_balanced_delimiter(body, start, '[', ']') else {
+            cursor = start + 1;
             continue;
         };
-        let middle = label_start + middle_rel;
-        let target_start = middle + 2;
-        let Some(end_rel) = body[target_start..].find(')') else {
+        let target_start = label_end + 1;
+        if body.as_bytes().get(target_start) != Some(&b'(') {
             cursor = target_start;
             continue;
+        }
+        let Some(target_end) = find_balanced_delimiter(body, target_start, '(', ')') else {
+            cursor = target_start + 1;
+            continue;
         };
-        let end = target_start + end_rel;
 
-        let label = body[label_start..middle].trim();
-        let target = body[target_start..end].trim();
+        let label = body[start + 1..label_end].trim();
+        let target = body[target_start + 1..target_end].trim();
         if let Some((resolved_target, heading)) = parse_link_target(file_path, target) {
             links.push(LinkInfo {
                 from: from.clone(),
@@ -238,10 +239,47 @@ fn extract_markdown_links(from: &SymbolId, file_path: &str, body: &str) -> Vec<L
             });
         }
 
-        cursor = end + 1;
+        cursor = target_end + 1;
     }
 
     links
+}
+
+fn find_balanced_delimiter(body: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut iter = body[start..].char_indices();
+    let (_, first) = iter.next()?;
+    if first != open {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut escaped = false;
+
+    for (offset, ch) in iter {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == open {
+            depth += 1;
+            continue;
+        }
+
+        if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + offset);
+            }
+        }
+    }
+
+    None
 }
 
 fn extract_wiki_links(from: &SymbolId, file_path: &str, body: &str) -> Vec<LinkInfo> {

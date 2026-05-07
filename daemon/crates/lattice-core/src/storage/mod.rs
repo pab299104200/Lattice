@@ -7,7 +7,9 @@ pub mod vector_store;
 #[cfg(test)]
 mod tests;
 
-pub use graph_store::GraphStore;
+pub use graph_store::{
+    FileIndexEntry, GraphStore, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+};
 pub use usearch_index::UsearchVectorIndex;
 pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
 pub use vector_store::VectorStore;

@@ -1,5 +1,8 @@
-use super::graph_store::GraphStore;
+use super::graph_store::{
+    FileIndexEntry, GraphStore, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+};
 use crate::graph::model::{CodeGraph, EdgeKind};
+use crate::parser::parse_file;
 use crate::storage::VectorStore;
 use crate::storage::{UsearchVectorIndex, VectorIndex, VectorScope};
 use crate::symbols::{Language, SymbolId, SymbolKind};
@@ -117,6 +120,44 @@ fn test_save_replaces_previous() {
 
     let loaded = store.load_graph().expect("Failed to load graph");
     assert_eq!(loaded.node_count(), 1);
+}
+
+#[test]
+fn test_file_index_and_parsed_files_round_trip() {
+    let store = GraphStore::open_in_memory().expect("Failed to open in-memory store");
+    let entry = FileIndexEntry {
+        file: "src/auth.ts".to_string(),
+        content_hash: "abc123".to_string(),
+        mtime_ns: 42,
+        size_bytes: 128,
+        parser_version: FILE_INDEX_PARSER_VERSION,
+        schema_version: FILE_INDEX_SCHEMA_VERSION,
+        last_indexed_at: 1000,
+    };
+    store
+        .save_file_index(&[entry.clone()])
+        .expect("save file index");
+
+    let loaded_index = store.load_file_index().expect("load file index");
+    assert_eq!(loaded_index.get("src/auth.ts"), Some(&entry));
+
+    let parsed = parse_file(
+        "src/auth.ts",
+        "export function loginUser() { return true; }",
+    )
+    .expect("parse source");
+    let mut parsed_files = std::collections::HashMap::new();
+    parsed_files.insert(parsed.file.clone(), parsed);
+    store
+        .save_parsed_files(&parsed_files)
+        .expect("save parsed files");
+
+    let loaded_parsed = store.load_parsed_files().expect("load parsed files");
+    let auth = loaded_parsed
+        .get("src/auth.ts")
+        .expect("expected parsed auth file");
+    assert_eq!(auth.symbols.len(), 1);
+    assert_eq!(auth.symbols[0].name, "loginUser");
 }
 
 #[test]

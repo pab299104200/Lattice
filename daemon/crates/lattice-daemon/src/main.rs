@@ -5,8 +5,11 @@ mod vector_sync;
 mod watcher;
 
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
@@ -14,11 +17,14 @@ use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::MemoryStore;
+use lattice_core::parser;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{
-    GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
+    FileIndexEntry, GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
+    FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
 };
+use lattice_core::symbols::ParsedFile;
 use lattice_core::watcher as core_watcher;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
@@ -48,12 +54,9 @@ async fn main() -> Result<()> {
     let lattice_dir = workspace_root.join(".lattice");
     let _ = std::fs::create_dir_all(&lattice_dir);
 
-    // File-backed memory store — observations persist across daemon restarts
+    // File-backed memory store — observations persist across daemon restarts when available.
     let memories_path = lattice_dir.join("memories.db");
-    let ms = MemoryStore::open(&memories_path).expect("Failed to open memory store");
-    let memory_store = Arc::new(Mutex::new(ms));
-    let ms_for_engine =
-        MemoryStore::open(&memories_path).expect("Failed to open memory store for engine");
+    let (memory_store, ms_for_engine, _) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
 
     let graph_path = lattice_dir.join("graph.db");
@@ -127,85 +130,83 @@ async fn main() -> Result<()> {
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
             let files_indexed = if let Some(wm) = &ws_manager_bg {
-                // Multi-repo: index each workspace through WorkspaceManager
-                let wm_clone = Arc::clone(wm);
+                let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
                 let roots = ws_roots_bg.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut wm = wm_clone.blocking_lock();
-                    let mut total = 0usize;
-                    for root in &roots {
+                let incremental = tokio::task::spawn_blocking(move || {
+                    build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!("Incremental multi-repo indexing task failed: {}", err);
+                    IncrementalIndexResult::empty()
+                });
+
+                {
+                    let mut wm = wm.lock().await;
+                    for root in &ws_roots_bg {
                         let repo_name = repo_name_for_root(root);
                         if let Err(e) = wm.add_repo(repo_name.clone(), root.clone()) {
                             tracing::warn!("Failed to add repo {}: {}", repo_name, e);
                             continue;
                         }
-                        let sf = SecurityFilter::new(root);
-                        let count = index_workspace_via_manager(root, &repo_name, &mut wm, &sf);
-                        tracing::info!("Indexed {} files from repo '{}'", count, repo_name);
-                        total += count;
+                        let repo_prefix = format!("{}/", repo_name);
+                        let repo_files: HashMap<String, ParsedFile> = incremental
+                            .parsed_files
+                            .iter()
+                            .filter(|(file, _)| file.starts_with(&repo_prefix))
+                            .map(|(file, parsed)| (file.clone(), parsed.clone()))
+                            .collect();
+                        wm.replace_repo_parsed_files(&repo_name, repo_files);
                     }
                     wm.detect_cross_repo_edges();
                     tracing::info!("Detected {} cross-repo edges", wm.cross_repo_edges().len());
-                    total
+                }
+
+                persist_incremental_cache(
+                    &graph_store_bg,
+                    &incremental.graph,
+                    &incremental.file_index,
+                    &incremental.parsed_files,
+                )
+                .await;
+                tracing::info!(
+                    "Incremental multi-repo indexing: {} current files, {} parsed/updated, {} removed",
+                    incremental.file_index.len(),
+                    incremental.changed_count,
+                    incremental.removed_count
+                );
+                incremental.changed_count
+            } else {
+                let ws = ws_root.clone();
+                let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
+                let incremental = tokio::task::spawn_blocking(move || {
+                    build_incremental_index_for_roots(&[ws], Some(&manifest), parsed_cache)
                 })
                 .await
-                .unwrap_or(0)
-            } else {
-                // Single repo: collect files, then index in batches with engine updates
-                let ws = ws_root.clone();
-                let sf = SecurityFilter::new(&ws);
+                .unwrap_or_else(|err| {
+                    tracing::warn!("Incremental indexing task failed: {}", err);
+                    IncrementalIndexResult::empty()
+                });
 
-                // Collect all file paths first (fast, no lock needed)
-                let all_files = collect_indexable_files(&ws, &sf);
-                tracing::info!("Found {} files to index", all_files.len());
-
-                let mut total_indexed = 0usize;
-                for chunk in all_files.chunks(100) {
-                    let mut batch = Vec::new();
-                    for path in chunk {
-                        let rel_path = path
-                            .strip_prefix(&ws)
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
-                        match std::fs::read_to_string(path) {
-                            Ok(content) => batch.push((rel_path, content)),
-                            Err(e) => tracing::warn!("Failed to read {}: {}", path.display(), e),
-                        }
-                    }
-
-                    if batch.is_empty() {
-                        continue;
-                    }
-
-                    let snapshot = {
-                        let mut idx = indexer_bg.lock().await;
-                        match idx.index_file_batch_contents(batch).await {
-                            Ok(indexed) => {
-                                total_indexed += indexed;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Batch indexing failed: {}", e);
-                            }
-                        }
-                        idx.graph().clone()
-                    };
-
-                    {
-                        let gs = graph_store_bg.lock().await;
-                        if let Err(e) = gs.save_graph(&snapshot) {
-                            tracing::warn!("Failed to save graph checkpoint: {}", e);
-                        }
-                    }
-
-                    {
-                        let mut eng = engine_bg.lock().await;
-                        eng.update_graph(snapshot);
-                    }
-
-                    tracing::info!("Indexed {}/{} files", total_indexed, all_files.len());
+                {
+                    let mut idx = indexer_bg.lock().await;
+                    idx.replace_parsed_files(incremental.parsed_files.clone());
                 }
-                total_indexed
+
+                persist_incremental_cache(
+                    &graph_store_bg,
+                    &incremental.graph,
+                    &incremental.file_index,
+                    &incremental.parsed_files,
+                )
+                .await;
+                tracing::info!(
+                    "Incremental indexing: {} current files, {} parsed/updated, {} removed",
+                    incremental.file_index.len(),
+                    incremental.changed_count,
+                    incremental.removed_count
+                );
+                incremental.changed_count
             };
             tracing::info!("Indexed {} files total", files_indexed);
 
@@ -401,6 +402,165 @@ fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryStoreMode {
+    Persistent,
+    RecoveredPersistent,
+    InMemoryFallback,
+}
+
+fn open_memory_stores(path: &Path) -> (Arc<Mutex<MemoryStore>>, MemoryStore, MemoryStoreMode) {
+    match try_open_persistent_memory_stores(path) {
+        Ok((primary, engine)) => {
+            tracing::info!("Persistent memory store ready: {}", path.display());
+            (
+                Arc::new(Mutex::new(primary)),
+                engine,
+                MemoryStoreMode::Persistent,
+            )
+        }
+        Err(initial_err) => {
+            tracing::warn!(
+                "Failed to open persistent memory store at {} ({}). Attempting recovery by quarantining the existing workspace memory artifacts and rebuilding a fresh database.",
+                path.display(),
+                initial_err
+            );
+
+            match recover_persistent_memory_store(path) {
+                Ok((primary, engine, quarantine_dir)) => {
+                    tracing::warn!(
+                        "Recovered persistent memory store at {} by quarantining the previous artifacts under {}. The old memory database is preserved there for manual inspection, and new durable memory writes will use a fresh store.",
+                        path.display(),
+                        quarantine_dir.display()
+                    );
+                    (
+                        Arc::new(Mutex::new(primary)),
+                        engine,
+                        MemoryStoreMode::RecoveredPersistent,
+                    )
+                }
+                Err(recovery_err) => fallback_to_in_memory_memory_stores(
+                    path,
+                    format!("initial open failed: {initial_err}; recovery failed: {recovery_err}"),
+                ),
+            }
+        }
+    }
+}
+
+fn try_open_persistent_memory_stores(path: &Path) -> Result<(MemoryStore, MemoryStore), String> {
+    let primary = MemoryStore::open(path)
+        .map_err(|err| format!("primary store initialization failed: {err}"))?;
+    let engine = MemoryStore::open(path)
+        .map_err(|err| format!("secondary store initialization failed: {err}"))?;
+    Ok((primary, engine))
+}
+
+fn recover_persistent_memory_store(
+    path: &Path,
+) -> Result<(MemoryStore, MemoryStore, PathBuf), String> {
+    let quarantine_dir = quarantine_memory_store_artifacts(path)?;
+    let (primary, engine) = try_open_persistent_memory_stores(path).map_err(|err| {
+        format!(
+            "quarantined previous artifacts to {} but reopening still failed: {}",
+            quarantine_dir.display(),
+            err
+        )
+    })?;
+    Ok((primary, engine, quarantine_dir))
+}
+
+fn quarantine_memory_store_artifacts(path: &Path) -> Result<PathBuf, String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "memory database path {} has no parent directory",
+            path.display()
+        )
+    })?;
+    let recovery_root = parent.join("recovered-memory");
+    std::fs::create_dir_all(&recovery_root).map_err(|err| {
+        format!(
+            "failed to create recovery directory {}: {}",
+            recovery_root.display(),
+            err
+        )
+    })?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let quarantine_dir = recovery_root.join(format!("memories-db-{timestamp}"));
+    std::fs::create_dir_all(&quarantine_dir).map_err(|err| {
+        format!(
+            "failed to create quarantine directory {}: {}",
+            quarantine_dir.display(),
+            err
+        )
+    })?;
+
+    let mut moved_any = false;
+    for artifact in memory_store_artifact_paths(path) {
+        if !artifact.exists() {
+            continue;
+        }
+
+        moved_any = true;
+        let file_name = artifact.file_name().ok_or_else(|| {
+            format!(
+                "memory store artifact path {} has no terminal file name",
+                artifact.display()
+            )
+        })?;
+        let target = quarantine_dir.join(file_name);
+        std::fs::rename(&artifact, &target).map_err(|err| {
+            format!(
+                "failed to move {} to {}: {}",
+                artifact.display(),
+                target.display(),
+                err
+            )
+        })?;
+    }
+
+    if !moved_any {
+        return Err(format!(
+            "no memory store artifacts were present at {} to recover",
+            path.display()
+        ));
+    }
+
+    Ok(quarantine_dir)
+}
+
+fn memory_store_artifact_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ]
+}
+
+fn fallback_to_in_memory_memory_stores(
+    path: &Path,
+    reason: String,
+) -> (Arc<Mutex<MemoryStore>>, MemoryStore, MemoryStoreMode) {
+    tracing::warn!(
+        "Failed to open persistent memory store at {} ({}). Falling back to in-memory memory for this session; durable memory writes are disabled until the workspace database is repaired.",
+        path.display(),
+        reason
+    );
+
+    let primary = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
+    let engine =
+        MemoryStore::open_in_memory().expect("Failed to create in-memory engine memory store");
+    (
+        Arc::new(Mutex::new(primary)),
+        engine,
+        MemoryStoreMode::InMemoryFallback,
+    )
+}
+
 fn open_sqlite_vector_fallback(path: &Path) -> Option<SharedVectorIndex> {
     match VectorStore::open(path.to_string_lossy().as_ref()) {
         Ok(store) => match store.initialize(384).and_then(|_| store.warm()) {
@@ -509,23 +669,206 @@ fn generate_session_id() -> String {
     format!("s-{:08x}{:08x}", (h >> 32) as u32, now.subsec_nanos())
 }
 
-/// Walk the workspace directory and index via WorkspaceManager.
-fn index_workspace_via_manager(
-    root: &PathBuf,
-    repo_name: &str,
-    manager: &mut WorkspaceManager,
-    security_filter: &SecurityFilter,
-) -> usize {
-    let mut count = 0;
-    let rn = repo_name.to_string();
-    walk_and_index(
-        root,
-        root,
-        security_filter,
-        &mut count,
-        &mut |rel_path, content| manager.index_file(&rn, rel_path, content).is_ok(),
-    );
-    count
+#[derive(Debug, Clone)]
+struct SourceFileRecord {
+    indexed_path: String,
+    rel_path: String,
+    root: PathBuf,
+    content_hash: String,
+    mtime_ns: i64,
+    size_bytes: i64,
+}
+
+#[derive(Clone)]
+struct IncrementalIndexResult {
+    graph: CodeGraph,
+    parsed_files: HashMap<String, ParsedFile>,
+    file_index: Vec<FileIndexEntry>,
+    changed_count: usize,
+    removed_count: usize,
+}
+
+impl IncrementalIndexResult {
+    fn empty() -> Self {
+        Self {
+            graph: CodeGraph::new(),
+            parsed_files: HashMap::new(),
+            file_index: Vec::new(),
+            changed_count: 0,
+            removed_count: 0,
+        }
+    }
+}
+
+async fn load_incremental_cache(
+    graph_store: &Arc<Mutex<GraphStore>>,
+) -> (HashMap<String, FileIndexEntry>, HashMap<String, ParsedFile>) {
+    let store = graph_store.lock().await;
+    let manifest = store.load_file_index().unwrap_or_else(|err| {
+        tracing::warn!("Failed to load file index manifest: {}", err);
+        HashMap::new()
+    });
+    let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
+        tracing::warn!("Failed to load cached parsed files: {}", err);
+        HashMap::new()
+    });
+    (manifest, parsed_files)
+}
+
+async fn persist_incremental_cache(
+    graph_store: &Arc<Mutex<GraphStore>>,
+    graph: &CodeGraph,
+    file_index: &[FileIndexEntry],
+    parsed_files: &HashMap<String, ParsedFile>,
+) {
+    let store = graph_store.lock().await;
+    if let Err(err) = store.save_graph(graph) {
+        tracing::warn!("Failed to save graph: {}", err);
+    }
+    if let Err(err) = store.save_file_index(file_index) {
+        tracing::warn!("Failed to save file index manifest: {}", err);
+    }
+    if let Err(err) = store.save_parsed_files(parsed_files) {
+        tracing::warn!("Failed to save cached parsed files: {}", err);
+    }
+}
+
+fn build_incremental_index_for_roots(
+    roots: &[PathBuf],
+    manifest: Option<&HashMap<String, FileIndexEntry>>,
+    mut parsed_files: HashMap<String, ParsedFile>,
+) -> IncrementalIndexResult {
+    let manifest = manifest.cloned().unwrap_or_default();
+    let records = collect_indexable_file_records(roots);
+    let current_files: HashSet<String> = records
+        .iter()
+        .map(|record| record.indexed_path.clone())
+        .collect();
+    let removed_count = manifest
+        .keys()
+        .filter(|file| !current_files.contains(*file))
+        .count();
+
+    parsed_files.retain(|file, _| current_files.contains(file));
+
+    let mut changed_count = 0usize;
+    let mut file_index = Vec::with_capacity(records.len());
+    let now = unix_timestamp_secs();
+    for record in records {
+        let previous = manifest.get(&record.indexed_path);
+        let unchanged = previous
+            .map(|entry| {
+                entry.content_hash == record.content_hash
+                    && entry.parser_version == FILE_INDEX_PARSER_VERSION
+                    && entry.schema_version == FILE_INDEX_SCHEMA_VERSION
+                    && parsed_files.contains_key(&record.indexed_path)
+            })
+            .unwrap_or(false);
+
+        if !unchanged {
+            let abs_path = record.root.join(&record.rel_path);
+            match fs::read_to_string(&abs_path) {
+                Ok(content) => match parser::parse_file(&record.indexed_path, &content) {
+                    Ok(parsed) => {
+                        parsed_files.insert(record.indexed_path.clone(), parsed);
+                        changed_count += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to parse {}: {}", record.indexed_path, err);
+                        parsed_files.remove(&record.indexed_path);
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!("Failed to read {}: {}", abs_path.display(), err);
+                    parsed_files.remove(&record.indexed_path);
+                }
+            }
+        }
+
+        file_index.push(FileIndexEntry {
+            file: record.indexed_path,
+            content_hash: record.content_hash,
+            mtime_ns: record.mtime_ns,
+            size_bytes: record.size_bytes,
+            parser_version: FILE_INDEX_PARSER_VERSION,
+            schema_version: FILE_INDEX_SCHEMA_VERSION,
+            last_indexed_at: now,
+        });
+    }
+
+    let mut indexer = Indexer::new(PathBuf::new());
+    indexer.replace_parsed_files(parsed_files.clone());
+    IncrementalIndexResult {
+        graph: indexer.graph().clone(),
+        parsed_files,
+        file_index,
+        changed_count,
+        removed_count,
+    }
+}
+
+fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
+    let multi_repo = roots.len() > 1;
+    let mut records = Vec::new();
+    for root in roots {
+        let security_filter = SecurityFilter::new(root);
+        let mut files = collect_indexable_files(root, &security_filter);
+        prioritize_indexable_paths(root, &mut files);
+        let repo_name = repo_name_for_root(root);
+        for path in files {
+            let rel_path = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let indexed_path = if multi_repo {
+                lattice_core::workspace::repo_rel_path(&repo_name, &rel_path)
+            } else {
+                rel_path.clone()
+            };
+            let Ok(content) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            records.push(SourceFileRecord {
+                indexed_path,
+                rel_path,
+                root: root.clone(),
+                content_hash: stable_content_hash(&content),
+                mtime_ns: metadata_mtime_ns(&metadata),
+                size_bytes: metadata.len() as i64,
+            });
+        }
+    }
+    records.sort_by(|a, b| a.indexed_path.cmp(&b.indexed_path));
+    records
+}
+
+fn stable_content_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64 * 1_000_000_000 + duration.subsec_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Collect all indexable file paths from a workspace root.
@@ -620,53 +963,202 @@ fn collect_files_recursive(
     }
 }
 
-/// Recursively walk a directory and index files via a callback.
-fn walk_and_index(
-    dir: &PathBuf,
-    root: &PathBuf,
-    security_filter: &SecurityFilter,
-    count: &mut usize,
-    index_fn: &mut dyn FnMut(&str, &str) -> bool,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_incremental_index_for_roots, memory_store_artifact_paths, open_memory_stores,
+        MemoryStoreMode,
     };
+    use lattice_core::memory::{Memory, MemoryScope, MemoryType};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("lattice-daemon-{name}-{unique}"))
+    }
 
-        if path.is_dir() {
-            // Use SecurityFilter for directory exclusions (includes .gitignore patterns)
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if security_filter.is_excluded_dir(dir_name) {
-                    continue;
-                }
-            }
-            walk_and_index(&path, root, security_filter, count, index_fn);
-        } else if path.is_file() {
-            let rel_path = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+    fn write_file(path: &std::path::Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("file should have parent"))
+            .expect("create parent dir");
+        std::fs::write(path, content).expect("write test file");
+    }
 
-            // Check security filter (.gitignore + .lattice_ignore + default patterns + excluded dirs)
-            if security_filter.is_excluded(&rel_path) {
-                continue;
-            }
+    fn make_memory(content: &str) -> Memory {
+        Memory {
+            id: String::new(),
+            session_id: "test-session".to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Observation,
+            scope: MemoryScope::Session,
+            confidence: 1.0,
+            linked_symbols: Vec::new(),
+            linked_files: Vec::new(),
+            workspace_id: None,
+            branch: None,
+            refresh_key: None,
+            source_query: None,
+            created_at: 0,
+            last_accessed: 0,
+            access_count: 0,
+            is_stale: false,
+            stale_reason: None,
+        }
+    }
 
-            // Check for supported language extension
-            if !core_watcher::should_index_file(&rel_path) {
-                continue;
-            }
+    #[test]
+    fn test_incremental_index_reuses_cached_parsed_files_when_hash_unchanged() {
+        let root = unique_temp_path("incremental-index");
+        write_file(
+            &root.join("src/auth.ts"),
+            "export function loginUser() { return true; }",
+        );
 
-            // Read and index
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if index_fn(&rel_path, &content) {
-                    *count += 1;
-                }
+        let first = build_incremental_index_for_roots(&[root.clone()], None, Default::default());
+        assert_eq!(first.changed_count, 1);
+        assert_eq!(first.graph.stats().file_count, 1);
+
+        let manifest = first
+            .file_index
+            .iter()
+            .cloned()
+            .map(|entry| (entry.file.clone(), entry))
+            .collect();
+        let second =
+            build_incremental_index_for_roots(&[root.clone()], Some(&manifest), first.parsed_files);
+        assert_eq!(second.changed_count, 0);
+        assert_eq!(second.removed_count, 0);
+        assert_eq!(second.graph.stats().file_count, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn cleanup_memory_store_artifacts(path: &PathBuf) {
+        for artifact in memory_store_artifact_paths(path) {
+            if artifact.is_dir() {
+                let _ = std::fs::remove_dir_all(&artifact);
+            } else {
+                let _ = std::fs::remove_file(&artifact);
             }
         }
+    }
+
+    #[test]
+    fn test_open_memory_stores_uses_persistent_store_when_available() {
+        let root = unique_temp_path("persistent-root");
+        std::fs::create_dir_all(&root).expect("failed to create temp root");
+        let db_path = root.join("memories.db");
+
+        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+        assert_eq!(mode, MemoryStoreMode::Persistent);
+        assert!(
+            db_path.exists(),
+            "persistent store should create the sqlite file"
+        );
+
+        let stored_id = memory_store
+            .try_lock()
+            .expect("memory store lock should be available")
+            .store(make_memory("persistent write"))
+            .expect("persistent memory store should accept writes");
+        drop(memory_store);
+        drop(engine_store);
+
+        let reopened = lattice_core::memory::MemoryStore::open(&db_path)
+            .expect("reopening persistent memory store should succeed");
+        let stored = reopened
+            .get_by_id(&stored_id)
+            .expect("reopen lookup should succeed");
+        assert!(stored.is_some(), "persistent memory should survive reopen");
+
+        cleanup_memory_store_artifacts(&db_path);
+        let _ = std::fs::remove_dir(&root);
+    }
+
+    #[test]
+    fn test_open_memory_stores_falls_back_when_persistent_open_fails() {
+        let db_path = unique_temp_path("missing-parent")
+            .join("missing")
+            .join("memories.db");
+
+        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+
+        assert_eq!(mode, MemoryStoreMode::InMemoryFallback);
+        assert!(
+            !db_path.exists(),
+            "fallback path should not create an unusable persistent database"
+        );
+
+        memory_store
+            .try_lock()
+            .expect("memory store lock should be available")
+            .store(make_memory("fallback primary write"))
+            .expect("primary in-memory fallback should accept writes");
+        let stored_id = engine_store
+            .store(make_memory("fallback engine write"))
+            .expect("engine in-memory fallback should accept writes");
+        let stored = engine_store
+            .get_by_id(&stored_id)
+            .expect("fallback lookup should succeed");
+        assert!(stored.is_some(), "fallback memory should be queryable");
+    }
+
+    #[test]
+    fn test_open_memory_stores_recovers_by_quarantining_broken_artifacts() {
+        let root = unique_temp_path("recover-root");
+        std::fs::create_dir_all(&root).expect("failed to create temp root");
+        let db_path = root.join("memories.db");
+
+        std::fs::create_dir_all(&db_path)
+            .expect("failed to create blocking directory at database path");
+
+        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+
+        assert_eq!(mode, MemoryStoreMode::RecoveredPersistent);
+        assert!(
+            db_path.is_file(),
+            "recovery should recreate the sqlite database"
+        );
+
+        let recovery_root = root.join("recovered-memory");
+        let recovery_entries = std::fs::read_dir(&recovery_root)
+            .expect("recovery directory should exist after quarantine")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("recovery directory should be readable");
+        assert_eq!(
+            recovery_entries.len(),
+            1,
+            "expected exactly one quarantine directory"
+        );
+        let quarantined_db = recovery_entries[0].path().join("memories.db");
+        assert!(
+            quarantined_db.is_dir(),
+            "the blocking artifact should be preserved in quarantine"
+        );
+
+        let stored_id = memory_store
+            .try_lock()
+            .expect("memory store lock should be available")
+            .store(make_memory("recovered persistent write"))
+            .expect("recovered persistent store should accept writes");
+        drop(memory_store);
+        drop(engine_store);
+
+        let reopened = lattice_core::memory::MemoryStore::open(&db_path)
+            .expect("reopening recovered memory store should succeed");
+        let stored = reopened
+            .get_by_id(&stored_id)
+            .expect("reopen lookup should succeed after recovery");
+        assert!(
+            stored.is_some(),
+            "recovered persistent memory should survive reopen"
+        );
+
+        cleanup_memory_store_artifacts(&db_path);
+        let _ = std::fs::remove_dir_all(&recovery_root);
+        let _ = std::fs::remove_dir(&root);
     }
 }
