@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 21 tests
+test contract_tests::identity_event_memory::diagnostic_observed_payload_embeds_typed_file_identity ... ok
+test contract_tests::identity_event_memory::evidence_anchor_docsection_serializes_with_typed_doc_section_id ... ok
+test contract_tests::identity_event_memory::evidence_anchor_filespan_serializes_with_typed_fileid_struct ... ok
+test contract_tests::identity_event_memory::file_read_payload_embeds_typed_file_identity_not_path_string ... ok
+test contract_tests::identity_event_memory::memory_link_file_target_resolves_under_file_rename_compat_without_link_rewrite ... ok
+test contract_tests::identity_event_memory::migration_emits_typed_file_ids_in_linked_files_json_not_path_strings ... ok
+test contract_tests::identity_event_memory::migration_preserves_memory_id_workspace_scoping_in_destination_memory_id_column ... ok
+test contract_tests::identity_event_memory::event_table_references_json_column_only_holds_typed_stable_refs ... ok
+test contract_tests::identity_event_memory::memory_retrieved_payload_round_trips_memory_ids_through_event_log ... ok
+test contract_tests::identity_event_memory::memory_columns_holding_identity_references_store_typed_shapes_not_raw_strings ... ok
+test contract_tests::identity_event_memory::patch_applied_capture_records_only_typed_file_and_symbol_refs ... ok
+test contract_tests::identity_event_memory::stable_ref_file_variant_serializes_to_typed_identity_struct_not_path_string ... ok
+test contract_tests::identity_event_memory::evidence_anchor_filespan_round_trips_through_memory_evidence_table ... ok
+test contract_tests::identity_event_memory::stable_ref_symbol_variant_serializes_to_typed_identity_struct_not_qualified_name_string ... ok
+test contract_tests::identity_event_memory::memory_link_round_trips_through_get_links_from_with_typed_target ... ok
+test contract_tests::identity_event_memory::end_to_end_identity_event_memory_round_trip_preserves_typed_references_at_every_boundary ... ok
+test contract_tests::identity_event_memory::memory_link_target_symbol_persists_encoded_identity_in_target_id_column ... ok
+test contract_tests::identity_event_memory::round_tripped_event_id_resolves_via_identity_resolver_to_same_target ... ok
+test contract_tests::identity_event_memory::stable_ref_round_trips_through_event_store_byte_equivalent ... ok
+test contract_tests::identity_event_memory::replay_emits_memory_id_column_as_encoded_identity_after_full_replay ... ok
+test contract_tests::identity_event_memory::replay_preserves_identity_typed_evidence_anchor_after_full_replay ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 551 filtered out; finished in 0.73s
+

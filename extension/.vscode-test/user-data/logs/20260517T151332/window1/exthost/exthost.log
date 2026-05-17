@@ -1,0 +1,18 @@
+2026-05-17 15:13:42.313 [info] Extension host with pid 3904164 started
+2026-05-17 15:13:42.313 [info] Skipping acquiring lock for /home/pete/cadres/lattice/extension/.vscode-test/user-data/User/workspaceStorage/19942f9ed43d59239276b68942ab2088.
+2026-05-17 15:13:42.812 [info] ExtensionService#_doActivateExtension vscode.github-authentication, startup: false, activationEvent: 'onAuthenticationRequest:github'
+2026-05-17 15:13:43.017 [info] ExtensionService#_doActivateExtension vscode.emmet, startup: false, activationEvent: 'onLanguage'
+2026-05-17 15:13:43.480 [info] ExtensionService#_doActivateExtension vscode.git-base, startup: true, activationEvent: '*', root cause: vscode.git
+2026-05-17 15:13:43.597 [info] ExtensionService#_doActivateExtension vscode.git, startup: true, activationEvent: '*'
+2026-05-17 15:13:43.957 [info] ExtensionService#_doActivateExtension vscode.github, startup: true, activationEvent: '*'
+2026-05-17 15:13:44.203 [warning] [vscode.git] Accessing a resource scoped configuration without providing a resource is not expected. To get the effective value for 'git.openRepositoryInParentFolders', provide the URI of a resource or 'null' for any resource.
+2026-05-17 15:13:44.203 [warning] [vscode.git] Accessing a resource scoped configuration without providing a resource is not expected. To get the effective value for 'git.showProgress', provide the URI of a resource or 'null' for any resource.
+2026-05-17 15:13:44.348 [info] Eager extensions activated
+2026-05-17 15:13:44.902 [info] ExtensionService#_doActivateExtension vscode.debug-auto-launch, startup: false, activationEvent: 'onStartupFinished'
+2026-05-17 15:13:44.910 [info] ExtensionService#_doActivateExtension vscode.merge-conflict, startup: false, activationEvent: 'onStartupFinished'
+2026-05-17 15:13:45.032 [info] ExtensionService#_doActivateExtension lattice.lattice, startup: false, activationEvent: 'onStartupFinished'
+2026-05-17 15:13:46.149 [warning] [Decorations] CAPPING events from decorations provider vscode.git 1392
+2026-05-17 15:13:48.407 [warning] [Decorations] CAPPING events from decorations provider vscode.git 1394
+2026-05-17 15:13:49.821 [warning] lattice.lattice created a webview without a content security policy: https://aka.ms/vscode-webview-missing-csp
+2026-05-17 15:13:49.917 [info] Extension host terminating: received terminate message from renderer
+2026-05-17 15:13:50.027 [info] Extension host with pid 3904164 exiting with code 0

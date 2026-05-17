@@ -246,6 +246,7 @@ fn test_stale_memory_on_file_change() {
             linked_files: vec!["src/auth.ts".to_string()],
             workspace_id: None,
             branch: None,
+            scope_organization_id: None,
             refresh_key: None,
             source_query: None,
             created_at: 0,
@@ -253,6 +254,7 @@ fn test_stale_memory_on_file_change() {
             access_count: 0,
             is_stale: false,
             stale_reason: None,
+            verification_status: crate::memory::MemoryVerificationStatus::Unverified,
         })
         .unwrap();
 
@@ -303,6 +305,7 @@ fn test_file_linked_memory_stales_even_without_symbol_diff() {
             linked_files: vec!["src/auth.ts".to_string()],
             workspace_id: None,
             branch: None,
+            scope_organization_id: None,
             refresh_key: None,
             source_query: None,
             created_at: 0,
@@ -310,6 +313,7 @@ fn test_file_linked_memory_stales_even_without_symbol_diff() {
             access_count: 0,
             is_stale: false,
             stale_reason: None,
+            verification_status: crate::memory::MemoryVerificationStatus::Unverified,
         })
         .unwrap();
 

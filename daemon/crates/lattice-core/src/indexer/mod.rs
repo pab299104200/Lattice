@@ -6,10 +6,13 @@ mod tests;
 use crate::error::LatticeError;
 use crate::graph::builder::GraphBuilder;
 use crate::graph::CodeGraph;
+use crate::identity::FileId;
 use crate::parser;
 use crate::symbols::ParsedFile;
+use crate::verification::IncrementalVerifier;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Incremental indexer that maintains a code graph from parsed files.
 ///
@@ -20,7 +23,29 @@ pub struct Indexer {
     #[allow(dead_code)]
     root: PathBuf,
     graph: CodeGraph,
+    graph_snapshot_id: u64,
     parsed_files: HashMap<String, ParsedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexFailureKind {
+    ParseError,
+    WorkerPanic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFailure {
+    pub file: String,
+    pub kind: IndexFailureKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchIndexReport {
+    pub requested_count: usize,
+    pub indexed_count: usize,
+    pub is_partial: bool,
+    pub failures: Vec<IndexFailure>,
 }
 
 impl Indexer {
@@ -29,6 +54,7 @@ impl Indexer {
         Self {
             root,
             graph: CodeGraph::new(),
+            graph_snapshot_id: 0,
             parsed_files: HashMap::new(),
         }
     }
@@ -45,6 +71,10 @@ impl Indexer {
 
     pub fn parsed_files(&self) -> &HashMap<String, ParsedFile> {
         &self.parsed_files
+    }
+
+    pub fn graph_snapshot_id(&self) -> u64 {
+        self.graph_snapshot_id
     }
 
     pub fn replace_parsed_files(&mut self, parsed_files: HashMap<String, ParsedFile>) {
@@ -81,31 +111,92 @@ impl Indexer {
         &mut self,
         files: Vec<(String, String)>,
     ) -> anyhow::Result<usize> {
+        Ok(self
+            .index_file_batch_contents_with_report(files)
+            .await?
+            .indexed_count)
+    }
+
+    pub async fn index_file_batch_contents_with_report(
+        &mut self,
+        files: Vec<(String, String)>,
+    ) -> anyhow::Result<BatchIndexReport> {
+        let parser =
+            Arc::new(|rel_path: &str, content: &str| crate::parser::parse_file(rel_path, content));
+        Ok(self
+            .index_file_batch_contents_with_parser(files, parser)
+            .await)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn index_file_batch_contents_with_test_parser(
+        &mut self,
+        files: Vec<(String, String)>,
+        parser: Arc<dyn Fn(&str, &str) -> Result<ParsedFile, LatticeError> + Send + Sync>,
+    ) -> BatchIndexReport {
+        self.index_file_batch_contents_with_parser(files, parser)
+            .await
+    }
+
+    async fn index_file_batch_contents_with_parser(
+        &mut self,
+        files: Vec<(String, String)>,
+        parser: Arc<dyn Fn(&str, &str) -> Result<ParsedFile, LatticeError> + Send + Sync>,
+    ) -> BatchIndexReport {
         if files.is_empty() {
-            return Ok(0);
+            return BatchIndexReport {
+                requested_count: 0,
+                indexed_count: 0,
+                is_partial: false,
+                failures: Vec::new(),
+            };
         }
 
         let mut handles = Vec::new();
+        let requested_count = files.len();
         for (rel_path, content) in files {
+            let parser = parser.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                crate::parser::parse_file(&rel_path, &content)
+                let parse_result = parser(&rel_path, &content);
+                (rel_path, parse_result)
             }));
         }
 
         let mut count = 0usize;
+        let mut failures = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(Ok(parsed)) => {
+                Ok((_file, Ok(parsed))) => {
                     self.parsed_files.insert(parsed.file.clone(), parsed);
                     count += 1;
                 }
-                Ok(Err(e)) => tracing::warn!("Parse error: {}", e),
-                Err(e) => tracing::warn!("Task error: {}", e),
+                Ok((file, Err(error))) => {
+                    tracing::warn!(file = file.as_str(), "Parse error: {}", error);
+                    failures.push(IndexFailure {
+                        file,
+                        kind: IndexFailureKind::ParseError,
+                        message: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    let file = "<worker>".to_string();
+                    tracing::warn!(file = file.as_str(), "Task error: {}", error);
+                    failures.push(IndexFailure {
+                        file,
+                        kind: IndexFailureKind::WorkerPanic,
+                        message: error.to_string(),
+                    });
+                }
             }
         }
 
         self.rebuild_graph();
-        Ok(count)
+        BatchIndexReport {
+            requested_count,
+            indexed_count: count,
+            is_partial: count != requested_count || !failures.is_empty(),
+            failures,
+        }
     }
 
     /// Remove a file from the index and rebuild the graph.
@@ -126,6 +217,7 @@ impl Indexer {
             builder.add_file(parsed.clone());
         }
         self.graph = builder.build();
+        self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
     }
 
     /// Index a directory using parallel file parsing.
@@ -220,6 +312,55 @@ impl Indexer {
         self.parsed_files.insert(rel_path.to_string(), new_parsed);
         self.rebuild_graph();
 
+        Ok(changes)
+    }
+
+    pub fn index_file_with_stale_proposals(
+        &mut self,
+        rel_path: &str,
+        content: &str,
+        stale_marker: Option<&mut crate::consolidation::StaleMarker<'_>>,
+    ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
+        let changes = self.index_file_content_with_diff(rel_path, content)?;
+        if let Some(marker) = stale_marker {
+            let _ = marker.on_graph_change(vec![rel_path.to_string()]);
+        }
+        Ok(changes)
+    }
+
+    pub fn index_file_with_verification_proposals(
+        &mut self,
+        file_id: FileId,
+        content: &str,
+        stale_marker: Option<&mut crate::consolidation::StaleMarker<'_>>,
+        incremental_verifier: Option<&mut IncrementalVerifier<'_>>,
+    ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
+        let prior_snapshot_id = self.graph_snapshot_id;
+        let changes = self.index_file_content_with_diff(&file_id.repo_relative_path, content)?;
+        let new_snapshot_id = self.graph_snapshot_id;
+        if let Some(marker) = stale_marker {
+            let _ = marker.on_graph_change(vec![file_id.repo_relative_path.clone()]);
+        }
+        if let Some(verifier) = incremental_verifier {
+            let _ = verifier.on_graph_delta(prior_snapshot_id, new_snapshot_id, vec![file_id]);
+        }
+        Ok(changes)
+    }
+
+    fn index_file_content_with_diff(
+        &mut self,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
+        let new_parsed = crate::parser::parse_file(rel_path, content)?;
+        let old_symbols = self
+            .parsed_files
+            .get(rel_path)
+            .map(|file| file.symbols.clone())
+            .unwrap_or_default();
+        let changes = crate::diff::diff_symbols(&old_symbols, &new_parsed.symbols);
+        self.parsed_files.insert(rel_path.to_string(), new_parsed);
+        self.rebuild_graph();
         Ok(changes)
     }
 }

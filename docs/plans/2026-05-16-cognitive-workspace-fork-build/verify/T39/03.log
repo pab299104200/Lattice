@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test consolidation::proposal_tests::queue_drops_jobs_after_depth_bound_and_logs_warning ... ok
+test consolidation::proposal_tests::consolidation_schema_round_trips_under_memory_store_migration ... ok
+test consolidation::proposal_tests::deterministic_job_emits_proposal_without_mutating_memory ... ok
+test consolidation::proposal_tests::reject_leaves_memory_unchanged_and_records_decision ... ok
+test consolidation::proposal_tests::apply_materializes_memory_and_writes_consolidated_event_with_states ... ok
+test consolidation::proposal_tests::double_apply_is_no_op_after_first_decision ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.45s
+

@@ -1,0 +1,619 @@
+[
+  {
+    "fixture": "python-repo",
+    "deterministic_seed": 20260516,
+    "indexed_files": 5,
+    "node_count": 13,
+    "edge_count": 19,
+    "task_reports": [
+      {
+        "task_id": "py_invoice_tax_total",
+        "intent": "prepare_change",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 413,
+            "payload_bytes": 1636,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 452,
+            "payload_bytes": 2084,
+            "anchor_count": 9
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 100,
+            "payload_bytes": 635,
+            "anchor_count": 3
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 179,
+            "payload_bytes": 1911,
+            "anchor_count": 8
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 355,
+            "payload_bytes": 2047,
+            "anchor_count": 9
+          }
+        ],
+        "returned_anchors": [
+          "docs/billing.md::Billing Flow",
+          "src/taskflow/billing.py",
+          "src/taskflow/billing.py::Invoice",
+          "src/taskflow/billing.py::InvoiceLine",
+          "src/taskflow/billing.py::calculate_invoice_total",
+          "tests/test_billing.py",
+          "tests/test_billing.py::test_calculate_invoice_total_adds_tax_once",
+          "tests/test_payments.py"
+        ],
+        "expected_anchors": [
+          "src/taskflow/billing.py::calculate_invoice_total",
+          "src/taskflow/billing.py::calculate_tax_cents",
+          "tests/test_billing.py::test_calculate_invoice_total_adds_tax_once"
+        ],
+        "expected_tests": [
+          "tests/test_billing.py",
+          "tests/test_payments.py"
+        ],
+        "recommended_tests": [
+          "tests/test_billing.py",
+          "tests/test_payments.py"
+        ]
+      },
+      {
+        "task_id": "py_payment_failure_diagnosis",
+        "intent": "diagnose_failure",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 442,
+            "payload_bytes": 2267,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 439,
+            "payload_bytes": 2018,
+            "anchor_count": 9
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 74,
+            "payload_bytes": 422,
+            "anchor_count": 3
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 162,
+            "payload_bytes": 1761,
+            "anchor_count": 8
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 347,
+            "payload_bytes": 1884,
+            "anchor_count": 9
+          }
+        ],
+        "returned_anchors": [
+          "src/taskflow/payments.py",
+          "src/taskflow/payments.py::PaymentGateway",
+          "src/taskflow/payments.py::PaymentRequest",
+          "src/taskflow/payments.py::build_payment_request",
+          "src/taskflow/payments.py::process_payment",
+          "tests/test_payments.py",
+          "tests/test_payments.py::test_process_payment_uses_invoice_total"
+        ],
+        "expected_anchors": [
+          "src/taskflow/payments.py::PaymentGateway.charge",
+          "src/taskflow/payments.py::build_payment_request",
+          "src/taskflow/payments.py::process_payment"
+        ],
+        "expected_tests": [
+          "tests/test_payments.py",
+          "tests/test_billing.py"
+        ],
+        "recommended_tests": [
+          "tests/test_payments.py"
+        ]
+      }
+    ],
+    "metrics": [
+      {
+        "signal": "tool_calls_per_successful_task",
+        "value": 5.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "irrelevant_files_opened_per_task",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "relevant_anchor_recall",
+        "value": 0.6666666666666666,
+        "denominator": 6,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_inclusion_precision",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_later_used_rate",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "stale_memory_surfaced_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no stale retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "contradiction_missed_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no contradicted retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "tests_recommended_vs_needed",
+        "value": 0.75,
+        "denominator": 4,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "workflow_success_after_first_plan",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      }
+    ],
+    "recorded_at": "1779058826"
+  },
+  {
+    "fixture": "rust-repo",
+    "deterministic_seed": 20260516,
+    "indexed_files": 5,
+    "node_count": 19,
+    "edge_count": 6,
+    "task_reports": [
+      {
+        "task_id": "rust_scheduler_retry_policy",
+        "intent": "prepare_change",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 583,
+            "payload_bytes": 3064,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 436,
+            "payload_bytes": 1729,
+            "anchor_count": 9
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 65,
+            "payload_bytes": 412,
+            "anchor_count": 3
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 120,
+            "payload_bytes": 1373,
+            "anchor_count": 7
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 271,
+            "payload_bytes": 1883,
+            "anchor_count": 9
+          }
+        ],
+        "returned_anchors": [
+          "docs/scheduler.md::Scheduler Workflow",
+          "src/audit.rs",
+          "src/audit.rs::audit_schedule",
+          "src/lib.rs::audit",
+          "src/lib.rs::scheduler",
+          "src/scheduler.rs",
+          "src/scheduler.rs::RetryPolicy",
+          "src/scheduler.rs::Scheduler",
+          "src/scheduler.rs::Scheduler<S>.schedule",
+          "src/scheduler.rs::build_default_scheduler",
+          "tests/scheduler_tests.rs",
+          "tests/scheduler_tests.rs::scheduler_records_job_and_audit_event"
+        ],
+        "expected_anchors": [
+          "src/scheduler.rs::RetryPolicy::bounded",
+          "src/scheduler.rs::Scheduler::schedule",
+          "src/audit.rs::audit_schedule"
+        ],
+        "expected_tests": [
+          "tests/scheduler_tests.rs"
+        ],
+        "recommended_tests": [
+          "tests/scheduler_tests.rs"
+        ]
+      },
+      {
+        "task_id": "rust_audit_trait_impact",
+        "intent": "impact_from_diff",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 506,
+            "payload_bytes": 3050,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 442,
+            "payload_bytes": 1697,
+            "anchor_count": 9
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 65,
+            "payload_bytes": 412,
+            "anchor_count": 3
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 102,
+            "payload_bytes": 917,
+            "anchor_count": 6
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 291,
+            "payload_bytes": 1885,
+            "anchor_count": 9
+          }
+        ],
+        "returned_anchors": [
+          "docs/scheduler.md::Scheduler Workflow",
+          "src/audit.rs",
+          "src/audit.rs::AuditEvent",
+          "src/audit.rs::AuditSink",
+          "src/audit.rs::audit_schedule",
+          "src/lib.rs::scheduler",
+          "src/scheduler.rs",
+          "src/scheduler.rs::Scheduler",
+          "src/scheduler.rs::Scheduler<S>.schedule",
+          "src/scheduler.rs::build_default_scheduler",
+          "tests/scheduler_tests.rs",
+          "tests/scheduler_tests.rs::scheduler_records_job_and_audit_event"
+        ],
+        "expected_anchors": [
+          "src/audit.rs::AuditSink",
+          "src/audit.rs::VecAuditSink",
+          "src/scheduler.rs::Scheduler"
+        ],
+        "expected_tests": [
+          "tests/scheduler_tests.rs"
+        ],
+        "recommended_tests": [
+          "tests/scheduler_tests.rs"
+        ]
+      }
+    ],
+    "metrics": [
+      {
+        "signal": "tool_calls_per_successful_task",
+        "value": 5.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "irrelevant_files_opened_per_task",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "relevant_anchor_recall",
+        "value": 0.5,
+        "denominator": 6,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_inclusion_precision",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_later_used_rate",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "stale_memory_surfaced_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no stale retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "contradiction_missed_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no contradicted retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "tests_recommended_vs_needed",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "workflow_success_after_first_plan",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      }
+    ],
+    "recorded_at": "1779058804"
+  },
+  {
+    "fixture": "typescript-repo",
+    "deterministic_seed": 20260516,
+    "indexed_files": 4,
+    "node_count": 12,
+    "edge_count": 7,
+    "task_reports": [
+      {
+        "task_id": "ts_incident_assignment_flow",
+        "intent": "prepare_change",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 169,
+            "payload_bytes": 609,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 167,
+            "payload_bytes": 1592,
+            "anchor_count": 8
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 20,
+            "payload_bytes": 203,
+            "anchor_count": 4
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 56,
+            "payload_bytes": 1210,
+            "anchor_count": 6
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 102,
+            "payload_bytes": 1531,
+            "anchor_count": 7
+          }
+        ],
+        "returned_anchors": [
+          "docs/incidents.md::Incident Assignment",
+          "src/models.ts",
+          "src/models.ts::AssignmentGroup",
+          "src/models.ts::Incident",
+          "tests/assignment.test.ts"
+        ],
+        "expected_anchors": [
+          "src/models.ts::assignIncident",
+          "src/models.ts::IncidentQueue",
+          "tests/assignment.test.ts::incident assignment"
+        ],
+        "expected_tests": [
+          "tests/assignment.test.ts"
+        ],
+        "recommended_tests": []
+      },
+      {
+        "task_id": "ts_react_summary_render",
+        "intent": "get_context_capsule",
+        "tool_reports": [
+          {
+            "tool": "get_context_capsule",
+            "latency_us": 245,
+            "payload_bytes": 1520,
+            "anchor_count": 6
+          },
+          {
+            "tool": "prepare_change",
+            "latency_us": 207,
+            "payload_bytes": 1608,
+            "anchor_count": 8
+          },
+          {
+            "tool": "find_relevant_tests",
+            "latency_us": 28,
+            "payload_bytes": 252,
+            "anchor_count": 4
+          },
+          {
+            "tool": "impact_from_diff",
+            "latency_us": 74,
+            "payload_bytes": 1291,
+            "anchor_count": 6
+          },
+          {
+            "tool": "diagnose_failure",
+            "latency_us": 91,
+            "payload_bytes": 1283,
+            "anchor_count": 7
+          }
+        ],
+        "returned_anchors": [
+          "docs/incidents.md::Incident Assignment",
+          "src/IncidentSummary.tsx::IncidentSummary",
+          "src/IncidentSummary.tsx::IncidentSummaryProps",
+          "src/models.ts",
+          "src/models.ts::Incident",
+          "src/notifications.ts",
+          "src/notifications.ts::buildAssignmentNotice"
+        ],
+        "expected_anchors": [
+          "src/IncidentSummary.tsx::IncidentSummary",
+          "src/notifications.ts::buildAssignmentNotice",
+          "src/models.ts::Incident"
+        ],
+        "expected_tests": [
+          "tests/assignment.test.ts"
+        ],
+        "recommended_tests": []
+      }
+    ],
+    "metrics": [
+      {
+        "signal": "tool_calls_per_successful_task",
+        "value": 5.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "irrelevant_files_opened_per_task",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "relevant_anchor_recall",
+        "value": 0.5,
+        "denominator": 6,
+        "sample_count": 2,
+        "source": "event_log",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_inclusion_precision",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "memory_later_used_rate",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "memory_store",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "stale_memory_surfaced_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no stale retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "contradiction_missed_rate",
+        "sample_count": 0,
+        "source": "verifier",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false,
+        "reason_if_null": "no contradicted retrieved memories matched the requested scope"
+      },
+      {
+        "signal": "tests_recommended_vs_needed",
+        "value": 0.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      },
+      {
+        "signal": "workflow_success_after_first_plan",
+        "value": 1.0,
+        "denominator": 2,
+        "sample_count": 2,
+        "source": "workflow_outcome",
+        "computed_at": "2026-05-17T06:40:00Z",
+        "incomplete": false
+      }
+    ],
+    "recorded_at": "1779058812"
+  }
+]

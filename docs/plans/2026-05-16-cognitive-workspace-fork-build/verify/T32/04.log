@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 2 tests
+test retrieval_v1::benchmark::irrelevant_memory_rate_is_measured_and_regressed ... ok
+test retrieval_v1::benchmark::retrieval_v1_benchmark_writes_metrics_snapshot ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.15s
+

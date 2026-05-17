@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_extra_large_fixture ... ok
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_medium_typescript_fixture ... ok
+test hardening::large_repo_tests::test_event_log_compaction_keeps_hot_path_p99_within_5ms_budget has been running for over 60 seconds
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_large_polyglot_fixture has been running for over 60 seconds
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_small_rust_fixture has been running for over 60 seconds
+test hardening::large_repo_tests::test_payload_spillover_round_trips_under_5ms_budget has been running for over 60 seconds
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_small_rust_fixture ... ok
+test hardening::large_repo_tests::test_event_log_compaction_keeps_hot_path_p99_within_5ms_budget ... ok
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_large_polyglot_fixture ... ok
+test hardening::large_repo_tests::test_payload_spillover_round_trips_under_5ms_budget ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 97.96s
+

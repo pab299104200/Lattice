@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test memory_graph::contradiction_tests::low_confidence_contradiction_records_link_without_flipping_high_confidence_target ... ok
+test memory_graph::contradiction_tests::contradiction_link_contradicts_target_and_emits_memory_updated_event ... ok
+test memory_graph::contradiction_tests::counter_memory_can_be_invalidated_without_reopening_its_target ... ok
+test memory_graph::contradiction_tests::counter_memory_is_first_class_record_and_can_be_superseded_independently ... ok
+test memory_graph::contradiction_tests::every_link_type_inserts_reads_deletes_and_emits_events ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 1.29s
+

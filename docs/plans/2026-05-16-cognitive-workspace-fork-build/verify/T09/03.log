@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 10 tests
+test identity::resolver_tests::test_resolve_event_ref_round_trips_through_encoding ... ok
+test identity::resolver_tests::test_resolve_path_after_file_rename_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_section_after_section_move_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_legacy_symbol_name_routes_via_default_workspace ... ok
+test identity::resolver_tests::test_resolve_path_unique_returns_fileid ... ok
+test identity::resolver_tests::test_resolve_path_after_file_rename_legacy_name_returns_via_compat_shim ... ok
+test identity::resolver_tests::test_resolve_section_after_heading_rename_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_symbol_duplicate_name_returns_ambiguous_with_disambiguation_hint ... ok
+test identity::resolver_tests::test_resolve_symbol_on_different_branch_returns_branch_scoped_id ... ok
+test identity::resolver_tests::test_resolve_symbol_unique_returns_symbolid ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 562 filtered out; finished in 0.00s
+

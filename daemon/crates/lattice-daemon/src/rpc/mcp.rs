@@ -1,13 +1,21 @@
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
+use tracing::Instrument;
 
+use lattice_core::consolidation::{
+    EpisodeOutcome, EpisodeTemplate, SessionConsolidationConfig, SessionConsolidator,
+};
 use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::events::{
+    BranchRef, EventPage, EventQuery, EventReader, EventWriter, QueryOrder, SessionId,
+};
 use lattice_core::graph::model::{CodeGraph, GraphNode};
+use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, find_stale_docs, get_backlinks,
@@ -18,17 +26,30 @@ use lattice_core::intelligence::{
     WorkingSetContext,
 };
 use lattice_core::memory::model::MemoryStructuredFields;
-use lattice_core::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
+use lattice_core::memory::{
+    Memory, MemoryClass, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus,
+};
 use lattice_core::query::{ContextCapsule, QueryEngine};
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::symbols::stable_file_handle;
+use lattice_core::symbols::ParsedFile;
+use lattice_core::verification::ScopeFilter;
 use lattice_core::watcher::should_index_file;
+use lattice_core::working_memory::{summarize_state, CheckpointScope, WorkingMemoryState};
 use lattice_core::workspace::WorkspaceManager;
 
 use super::context_cache::ContextHandleCache;
+use super::event_capture::{EventCapture, ToolOutcome};
+use super::memory_v2;
+use super::metrics_surface::{detail_payload, MetricsSurface};
 use super::server::RequestHandler;
 use super::session_metrics::{SessionMetrics, SessionMetricsReport, ToolCallMetadata};
+use super::workflow_v2::outcome_capture::WorkflowOutcomeRecorder;
+use super::workflow_v2::{
+    self, VecEventSink, WorkflowBundle, WorkflowRenderChoice, WorkflowRequest,
+};
+use super::working_memory_tool;
 
 /// MCP (Model Context Protocol) handler that routes JSON-RPC methods
 /// to the appropriate tool implementations.
@@ -47,6 +68,13 @@ pub struct McpHandler {
     indexing: Arc<AtomicBool>,
     context_cache: Arc<Mutex<ContextHandleCache>>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
+    event_capture: Option<Arc<EventCapture>>,
+    workflow_outcome_recorder: Arc<WorkflowOutcomeRecorder>,
+    session_consolidator: Option<Arc<StdMutex<SessionConsolidator>>>,
+    working_memory_states: Arc<Mutex<HashMap<String, WorkingMemoryState>>>,
+    working_memory_snapshots: Arc<Mutex<HashMap<String, WorkingMemoryState>>>,
+    verify_explain_reports:
+        Arc<Mutex<HashMap<String, memory_v2::verify_explain_memory::ExplainReport>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +166,43 @@ impl McpHandler {
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
         workspace_roots: Vec<PathBuf>,
         indexing: Arc<AtomicBool>,
+        event_writer: Option<Arc<EventWriter>>,
     ) -> Self {
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        let branch = current_git_branch(&workspace_root).unwrap_or_else(|| "unknown".to_string());
+        let event_capture = event_writer.as_ref().and_then(|writer| {
+            match EventCapture::new(
+                writer.clone(),
+                workspace_id,
+                branch,
+                SessionId {
+                    value: session_id.clone(),
+                },
+            ) {
+                Ok(capture) => Some(Arc::new(capture)),
+                Err(error) => {
+                    tracing::warn!(%error, "event capture disabled for session");
+                    None
+                }
+            }
+        });
+        let session_consolidator = event_writer.as_ref().and_then(|writer| {
+            let memory_db_path = workspace_root.join(".lattice").join("memories.db");
+            if !memory_db_path.exists() {
+                return None;
+            }
+            match SessionConsolidator::open(
+                writer.store(),
+                &memory_db_path,
+                SessionConsolidationConfig::default(),
+            ) {
+                Ok(consolidator) => Some(Arc::new(StdMutex::new(consolidator))),
+                Err(error) => {
+                    tracing::warn!(%error, "session consolidation disabled for workspace");
+                    None
+                }
+            }
+        });
         Self {
             engine,
             indexer,
@@ -155,6 +219,12 @@ impl McpHandler {
                 context_cache_path,
             ))),
             session_metrics: Arc::new(Mutex::new(SessionMetrics::new())),
+            event_capture,
+            workflow_outcome_recorder: Arc::new(WorkflowOutcomeRecorder::new()),
+            session_consolidator,
+            working_memory_states: Arc::new(Mutex::new(HashMap::new())),
+            working_memory_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            verify_explain_reports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -162,6 +232,16 @@ impl McpHandler {
         self.embedding_engine
             .get()
             .and_then(|eng| eng.embed(query).ok())
+    }
+
+    fn current_memory_scope_filter(&self) -> ScopeFilter {
+        let branch = current_git_branch(&self.workspace_root).map(|name| BranchRef { name });
+        ScopeFilter::new(
+            self.workspace_root.to_string_lossy().to_string(),
+            branch,
+            None,
+        )
+        .for_session(self.session_id.clone())
     }
 
     async fn lock_query_engine_for_workflow(&self) -> Result<MutexGuard<'_, QueryEngine>, ()> {
@@ -261,7 +341,7 @@ impl McpHandler {
     }
 
     fn handle_tools_list(&self) -> Value {
-        json!({
+        let mut result = json!({
             "tools": [
                 {
                     "name": "get_context_capsule",
@@ -1178,6 +1258,7 @@ impl McpHandler {
                         "required": []
                     }
                 },
+                working_memory_tool::tool_definition(),
                 {
                     "name": "list_observations",
                     "description": "List stored observations and memories. Returns all non-invalidated memories, newest first.",
@@ -1343,7 +1424,23 @@ impl McpHandler {
                     }
                 }
             ]
-        })
+        });
+        if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.extend([
+                memory_v2::consolidate_session::tool_definition(),
+                memory_v2::get_memory_metrics::tool_definition(),
+                memory_v2::get_event_trace::tool_definition(),
+                memory_v2::get_task_memory::tool_definition(),
+                memory_v2::save_memory::tool_definition(),
+                memory_v2::propose_memory_evolution::tool_definition(),
+                memory_v2::propose_memory_evolution::apply_shim_tool_definition(),
+                memory_v2::verify_explain_memory::tool_definition(),
+                memory_v2::verify_explain_memory::verify_shim_tool_definition(),
+                memory_v2::verify_explain_memory::explain_shim_tool_definition(),
+                memory_v2::list_memory_conflicts::tool_definition(),
+            ]);
+        }
+        result
     }
 
     async fn handle_tools_call(&self, params: &Value) -> Result<Value, (i32, String)> {
@@ -1351,55 +1448,160 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing tool name".to_string()))?;
         let arguments = &params["arguments"];
+        let span = tracing::info_span!("tool", name = tool_name);
+        let tool_called_event = self.capture_tool_called(tool_name, arguments);
 
-        let result = match tool_name {
-            "get_context_capsule" | "query_context" => self.tool_query_context(arguments).await,
-            "prepare_change" => self.tool_prepare_change(arguments).await,
-            "plan_edit" => self.tool_plan_edit(arguments).await,
-            "trace_scenario" => self.tool_trace_scenario(arguments).await,
-            "find_relevant_tests" => self.tool_find_relevant_tests(arguments).await,
-            "impact_from_diff" => self.tool_impact_from_diff(arguments).await,
-            "get_working_set_context" => self.tool_get_working_set_context(arguments).await,
-            "summarize_subsystem" => self.tool_summarize_subsystem(arguments).await,
-            "get_repo_playbook" => self.tool_get_repo_playbook(arguments).await,
-            "get_docs_capsule" => self.tool_get_docs_capsule(arguments).await,
-            "get_backlinks" => self.tool_get_backlinks(arguments).await,
-            "get_outgoing_links" => self.tool_get_outgoing_links(arguments).await,
-            "find_stale_docs" => self.tool_find_stale_docs(arguments).await,
-            "diagnose_failure" => self.tool_diagnose_failure(arguments).await,
-            "record_workflow_outcome" => self.tool_record_workflow_outcome(arguments).await,
-            "expand_context" => self.tool_expand_context(arguments).await,
-            "get_symbol" => self.tool_get_symbol(arguments).await,
-            "get_dependents" => self.tool_get_dependents(arguments).await,
-            "get_dependencies" => self.tool_get_dependencies(arguments).await,
-            "get_impact_graph" | "blast_radius" => self.tool_blast_radius(arguments).await,
-            "search_symbols" => self.tool_search_symbols(arguments).await,
-            "get_skeleton" | "get_file_context" => self.tool_get_file_context(arguments).await,
-            "save_observation" | "store_memory" => self.tool_store_memory(arguments).await,
-            "get_session_context" => self.tool_get_session_context(arguments).await,
-            "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
-            "list_observations" => self.tool_list_observations(arguments).await,
-            "list_stale_memories" => self.tool_list_stale_memories(arguments).await,
-            "promote_observation" => self.tool_promote_observation(arguments).await,
-            "refresh_memory" => self.tool_refresh_memory(arguments).await,
-            "delete_observation" => self.tool_delete_observation(arguments).await,
-            "update_observation" => self.tool_update_observation(arguments).await,
-            "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
-            "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
-            "workspace_setup" => self.tool_workspace_setup(arguments).await,
-            "index_status" => self.tool_index_status(arguments).await,
-            "get_session_metrics" => self.tool_get_session_metrics(arguments).await,
-            "get_project_rules" => self.tool_get_project_rules(arguments).await,
-            _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
-        };
+        let result = async {
+            match tool_name {
+                "get_context_capsule" | "query_context" => self.tool_query_context(arguments).await,
+                "prepare_change" => self.tool_prepare_change(arguments).await,
+                "plan_edit" => self.tool_plan_edit(arguments).await,
+                "trace_scenario" => self.tool_trace_scenario(arguments).await,
+                "find_relevant_tests" => self.tool_find_relevant_tests(arguments).await,
+                "impact_from_diff" => self.tool_impact_from_diff(arguments).await,
+                "get_working_set_context" => self.tool_get_working_set_context(arguments).await,
+                "summarize_subsystem" => self.tool_summarize_subsystem(arguments).await,
+                "get_repo_playbook" => self.tool_get_repo_playbook(arguments).await,
+                "get_docs_capsule" => self.tool_get_docs_capsule(arguments).await,
+                "get_backlinks" => self.tool_get_backlinks(arguments).await,
+                "get_outgoing_links" => self.tool_get_outgoing_links(arguments).await,
+                "find_stale_docs" => self.tool_find_stale_docs(arguments).await,
+                "diagnose_failure" => self.tool_diagnose_failure(arguments).await,
+                "record_workflow_outcome" => self.tool_record_workflow_outcome(arguments).await,
+                "expand_context" => self.tool_expand_context(arguments).await,
+                "get_symbol" => self.tool_get_symbol(arguments).await,
+                "get_dependents" => self.tool_get_dependents(arguments).await,
+                "get_dependencies" => self.tool_get_dependencies(arguments).await,
+                "get_impact_graph" | "blast_radius" => self.tool_blast_radius(arguments).await,
+                "search_symbols" => self.tool_search_symbols(arguments).await,
+                "get_skeleton" | "get_file_context" => self.tool_get_file_context(arguments).await,
+                "save_observation" | "store_memory" => self.tool_store_memory(arguments).await,
+                "get_session_context" => self.tool_get_session_context(arguments).await,
+                "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
+                "list_observations" => self.tool_list_observations(arguments).await,
+                "list_stale_memories" => self.tool_list_stale_memories(arguments).await,
+                "promote_observation" => self.tool_promote_observation(arguments).await,
+                "refresh_memory" => self.tool_refresh_memory(arguments).await,
+                "delete_observation" => self.tool_delete_observation(arguments).await,
+                "update_observation" => self.tool_update_observation(arguments).await,
+                "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
+                "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
+                "workspace_setup" => self.tool_workspace_setup(arguments).await,
+                "index_status" => self.tool_index_status(arguments).await,
+                "get_session_metrics" => self.tool_get_session_metrics(arguments).await,
+                "get_project_rules" => self.tool_get_project_rules(arguments).await,
+                "inspect_working_memory" => self.tool_inspect_working_memory(arguments).await,
+                "consolidate_session" => self.tool_consolidate_session_v2(arguments).await,
+                "get_memory_metrics" => self.tool_get_memory_metrics_v2(arguments).await,
+                "get_event_trace" => self.tool_get_event_trace_v2(arguments).await,
+                "get_task_memory" => self.tool_get_task_memory_v2(arguments).await,
+                "save_memory" => self.tool_save_memory_v2(arguments).await,
+                "propose_memory_evolution" => {
+                    self.tool_propose_memory_evolution_v2(arguments).await
+                }
+                "apply_memory_evolution" => self.tool_apply_memory_evolution_v2(arguments).await,
+                "verify_explain_memory" => self.tool_verify_explain_memory(arguments, None).await,
+                "verify_memory" => {
+                    self.tool_verify_memory(
+                        arguments,
+                        Some(
+                            "verify_memory is deprecated; use verify_explain_memory(mode=verify). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
+                                .to_string(),
+                        ),
+                    )
+                    .await
+                }
+                "explain_memory" => {
+                    self.tool_explain_memory(
+                        arguments,
+                        Some(
+                            "explain_memory is deprecated; use verify_explain_memory(mode=explain). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
+                                .to_string(),
+                        ),
+                    )
+                    .await
+                }
+                "list_memory_conflicts" => self.tool_list_memory_conflicts(arguments).await,
+                _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
+            }
+        }
+        .instrument(span)
+        .await;
 
         if let Ok(ref value) = result {
             if tool_name != "get_session_metrics" {
                 self.record_tool_metrics(tool_name, value).await;
             }
         }
+        self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
+            .await;
 
         result
+    }
+
+    fn capture_tool_called(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Option<lattice_core::identity::EventId> {
+        let capture = self.event_capture.as_ref()?;
+        if let Err(error) = capture.ensure_task_started("MCP tool-call session") {
+            tracing::warn!(tool = tool_name, %error, "failed to capture task start event");
+        }
+        match capture.record_tool_called(tool_name, arguments) {
+            Ok(event_id) => Some(event_id),
+            Err(error) => {
+                tracing::warn!(tool = tool_name, %error, "failed to capture tool call event");
+                None
+            }
+        }
+    }
+
+    async fn capture_tool_result(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        result: &Result<Value, (i32, String)>,
+        tool_called_event: Option<lattice_core::identity::EventId>,
+    ) {
+        let Some(capture) = self.event_capture.as_ref() else {
+            return;
+        };
+        let Some(parent) = tool_called_event else {
+            return;
+        };
+        let outcome = match result {
+            Ok(value) => ToolOutcome::Success(value.clone()),
+            Err((code, message)) => ToolOutcome::Error {
+                code: *code,
+                message: message.clone(),
+            },
+        };
+        let tool_result = match capture.record_tool_result(tool_name, &outcome, parent) {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                tracing::warn!(tool = tool_name, %error, "failed to capture tool result event");
+                return;
+            }
+        };
+        if !WorkflowOutcomeRecorder::should_record(tool_name) {
+            if let Err(error) = capture.record_workflow_events(tool_name, &outcome, tool_result) {
+                tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+            }
+            return;
+        }
+
+        let mut metrics = self.session_metrics.lock().await;
+        if let Err(error) = self.workflow_outcome_recorder.record(
+            capture,
+            &mut metrics,
+            tool_name,
+            arguments,
+            result,
+            &tool_result,
+        ) {
+            tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+        }
     }
 
     // ── Tool Implementations ──────────────────────────────────────────
@@ -1408,7 +1610,7 @@ impl McpHandler {
         let query = args["query"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
-        let focused = args["mode"].as_str().unwrap_or("full") == "focused";
+        let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
 
         let mut engine = match self.lock_query_engine_for_workflow().await {
@@ -1429,23 +1631,41 @@ impl McpHandler {
                 response_options.render,
             ));
         }
-        let capsule = engine.query(query, None, focused);
-        let seed = seed_from_context_capsule(engine.graph(), &capsule);
-        let suggested_expand = context_capsule_suggested_expand(&capsule, engine.graph());
+        let capsule = engine.query(
+            query,
+            None,
+            matches!(render_choice, WorkflowRenderChoice::Focused),
+        );
+        let request = workflow_v2::WorkflowRequest {
+            input: query.to_string(),
+            entry_files: Vec::new(),
+            entry_symbols: Vec::new(),
+            render_mode: format!("{:?}", render_choice).to_lowercase(),
+        };
+        let mut bundle = workflow_v2::context_capsule::build_bundle(
+            engine.graph(),
+            &self.workspace_root.to_string_lossy(),
+            &request,
+            &capsule,
+            render_choice,
+        );
+        let seed = workflow_v2::build_expand_seed(&bundle);
         drop(engine);
 
         let handle = self.store_context_handle("get_context_capsule", seed).await;
-        let mut value = serde_json::to_value(&capsule)
+        self.enrich_workflow_bundle_relevance(
+            "get_context_capsule",
+            &handle.legacy_handle,
+            None,
+            &mut bundle,
+        )
+        .await;
+        let mut value = serde_json::to_value(&bundle)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
-        attach_context_handle(&mut value, &handle, "get_context_capsule");
-        attach_context_capsule_suggested_expand(&mut value, suggested_expand);
+        attach_context_handle(&mut value, &handle.legacy_handle, "get_context_capsule");
 
         let metadata = WorkflowRunMetadata {
-            delivery_mode: if focused {
-                "tiny".to_string()
-            } else {
-                "compact".to_string()
-            },
+            delivery_mode: format!("{:?}", render_choice).to_lowercase(),
             wire_format: "standard".to_string(),
             single_anchor_used: false,
             _mode_reason: "context capsule defaults to bounded first-pass retrieval".to_string(),
@@ -1566,11 +1786,32 @@ impl McpHandler {
         let handle = self
             .store_context_handle("prepare_change", seed_from_task_bundle(&bundle))
             .await;
+        let request = WorkflowRequest {
+            input: query.to_string(),
+            entry_files: entry_files.clone(),
+            entry_symbols: entry_symbols.clone(),
+            render_mode: metadata.delivery_mode.clone(),
+        };
+        let mut sink = VecEventSink::default();
+        let mut workflow_bundle = workflow_v2::prepare_change::run(
+            &self.workspace_root.to_string_lossy(),
+            &request,
+            &bundle,
+            &capsule,
+            &mut sink,
+        );
+        self.enrich_workflow_bundle_relevance(
+            "prepare_change",
+            &handle.legacy_handle,
+            None,
+            &mut workflow_bundle,
+        )
+        .await;
 
         self.serialize_workflow_with_context_handle(
             "prepare_change",
-            bundle,
-            &handle,
+            workflow_bundle,
+            &handle.legacy_handle,
             "prepare_change",
             &metadata,
             &response_options,
@@ -1688,11 +1929,32 @@ impl McpHandler {
         let handle = self
             .store_context_handle("plan_edit", seed_from_plan_edit_bundle(&bundle))
             .await;
+        let request = WorkflowRequest {
+            input: query.to_string(),
+            entry_files: entry_files.clone(),
+            entry_symbols: entry_symbols.clone(),
+            render_mode: metadata.delivery_mode.clone(),
+        };
+        let mut sink = VecEventSink::default();
+        let mut workflow_bundle = workflow_v2::plan_edit::run(
+            &self.workspace_root.to_string_lossy(),
+            &request,
+            &bundle,
+            &capsule,
+            &mut sink,
+        );
+        self.enrich_workflow_bundle_relevance(
+            "plan_edit",
+            &handle.legacy_handle,
+            None,
+            &mut workflow_bundle,
+        )
+        .await;
 
         self.serialize_workflow_with_context_handle(
             "plan_edit",
-            bundle,
-            &handle,
+            workflow_bundle,
+            &handle.legacy_handle,
             "plan_edit",
             &metadata,
             &response_options,
@@ -1752,11 +2014,32 @@ impl McpHandler {
         let handle = self
             .store_context_handle("trace_scenario", seed_from_trace_scenario_bundle(&bundle))
             .await;
+        let request = WorkflowRequest {
+            input: scenario.to_string(),
+            entry_files: entry_files.clone(),
+            entry_symbols: entry_symbols.clone(),
+            render_mode: metadata.delivery_mode.clone(),
+        };
+        let mut sink = VecEventSink::default();
+        let mut workflow_bundle = workflow_v2::trace_scenario::run(
+            &self.workspace_root.to_string_lossy(),
+            &request,
+            &bundle,
+            &[],
+            &mut sink,
+        );
+        self.enrich_workflow_bundle_relevance(
+            "trace_scenario",
+            &handle.legacy_handle,
+            None,
+            &mut workflow_bundle,
+        )
+        .await;
 
         self.serialize_workflow_with_context_handle(
             "trace_scenario",
-            bundle,
-            &handle,
+            workflow_bundle,
+            &handle.legacy_handle,
             "trace_scenario",
             &metadata,
             &response_options,
@@ -1769,21 +2052,63 @@ impl McpHandler {
         let symbols = parse_string_array(args, "symbols");
         let diff = args["diff"].as_str();
         let limit = (args["limit"].as_u64().unwrap_or(8) as usize).min(50);
+        let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
+        let response_options = parse_workflow_response_options(args);
 
-        let engine = self.engine.lock().await;
-        let project_rules = detect_project_rules(engine.graph());
-        let report = find_relevant_tests(
-            engine.graph(),
-            &files,
-            &symbols,
-            diff,
-            &project_rules,
-            limit,
-        );
+        let mut bundle = {
+            let engine = self.engine.lock().await;
+            let project_rules = detect_project_rules(engine.graph());
+            let report = find_relevant_tests(
+                engine.graph(),
+                &files,
+                &symbols,
+                diff,
+                &project_rules,
+                limit,
+            );
+            let request = workflow_v2::WorkflowRequest {
+                input: diff.unwrap_or("relevant tests").to_string(),
+                entry_files: files.clone(),
+                entry_symbols: symbols.clone(),
+                render_mode: format!("{:?}", render_choice).to_lowercase(),
+            };
+            workflow_v2::relevant_tests::build_bundle(
+                &self.workspace_root.to_string_lossy(),
+                &request,
+                &report,
+                render_choice,
+            )
+        };
+        let handle = self
+            .store_context_handle(
+                "find_relevant_tests",
+                workflow_v2::build_expand_seed(&bundle),
+            )
+            .await;
+        self.enrich_workflow_bundle_relevance(
+            "find_relevant_tests",
+            &handle.legacy_handle,
+            None,
+            &mut bundle,
+        )
+        .await;
 
-        serde_json::to_value(&report)
-            .map(|v| wrap_tool_result(v))
-            .map_err(|e| (-32603, format!("Serialization error: {}", e)))
+        self.serialize_workflow_with_context_handle(
+            "find_relevant_tests",
+            bundle,
+            &handle.legacy_handle,
+            "find_relevant_tests",
+            &WorkflowRunMetadata {
+                delivery_mode: format!("{:?}", render_choice).to_lowercase(),
+                wire_format: "standard".to_string(),
+                single_anchor_used: false,
+                _mode_reason: "ranked tests default to compact verification guidance".to_string(),
+                semantic_fallback_used: false,
+                outcome_memory_reuse_count: 0,
+            },
+            &response_options,
+        )
+        .await
     }
 
     async fn tool_impact_from_diff(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -1792,58 +2117,71 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: diff".to_string()))?;
         let files = parse_string_array(args, "files");
         let symbols = parse_string_array(args, "symbols");
-        let requested_mode = parse_requested_bundle_mode(args);
+        let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
         let hops = (args["hops"].as_u64().unwrap_or(2) as usize).min(5);
 
-        let (report, metadata) = {
+        let (bundle, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            let compact_report = impact_from_diff(
+            let report = impact_from_diff(
                 engine.graph(),
                 diff,
                 &files,
                 &symbols,
                 &project_rules,
-                BundleMode::Compact,
+                if matches!(
+                    render_choice,
+                    WorkflowRenderChoice::Full | WorkflowRenderChoice::Diagnostic
+                ) {
+                    BundleMode::Full
+                } else {
+                    BundleMode::Compact
+                },
                 hops,
             );
-            let (delivery_mode, mode_reason) =
-                select_diff_impact_mode(requested_mode, &compact_report);
-            let report = if matches!(delivery_mode, BundleMode::Full) {
-                impact_from_diff(
-                    engine.graph(),
-                    diff,
-                    &files,
-                    &symbols,
-                    &project_rules,
-                    BundleMode::Full,
-                    hops,
-                )
-            } else {
-                compact_report
+            let request = workflow_v2::WorkflowRequest {
+                input: diff.to_string(),
+                entry_files: files.clone(),
+                entry_symbols: symbols.clone(),
+                render_mode: format!("{:?}", render_choice).to_lowercase(),
             };
+            let bundle = workflow_v2::impact_from_diff::build_bundle(
+                engine.graph(),
+                &self.workspace_root.to_string_lossy(),
+                &request,
+                &report,
+                render_choice,
+            );
 
             (
-                report,
+                bundle,
                 WorkflowRunMetadata {
-                    delivery_mode: delivery_mode.as_str().to_string(),
+                    delivery_mode: format!("{:?}", render_choice).to_lowercase(),
                     wire_format: "standard".to_string(),
                     single_anchor_used: false,
-                    _mode_reason: mode_reason,
+                    _mode_reason: "bounded diff impact traversal".to_string(),
                     semantic_fallback_used: false,
                     outcome_memory_reuse_count: 0,
                 },
             )
         };
         let handle = self
-            .store_context_handle("impact_from_diff", seed_from_diff_impact(&report))
+            .store_context_handle("impact_from_diff", workflow_v2::build_expand_seed(&bundle))
             .await;
+        let mut bundle = bundle;
+        self.enrich_workflow_bundle_relevance(
+            "impact_from_diff",
+            &handle.legacy_handle,
+            None,
+            &mut bundle,
+        )
+        .await;
 
         self.serialize_workflow_with_context_handle(
             "impact_from_diff",
-            report,
-            &handle,
+            bundle,
+            &handle.legacy_handle,
             "impact_from_diff",
             &metadata,
             &response_options,
@@ -1925,7 +2263,7 @@ impl McpHandler {
         self.serialize_workflow_with_context_handle(
             "get_working_set_context",
             report,
-            &handle,
+            &handle.legacy_handle,
             "get_working_set_context",
             &metadata,
             &response_options,
@@ -2114,7 +2452,7 @@ impl McpHandler {
 
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
-        attach_context_handle(&mut value, &handle, "summarize_subsystem");
+        attach_context_handle(&mut value, &handle.legacy_handle, "summarize_subsystem");
         attach_playbook_memory(&mut value, playbook_memory);
         self.finalize_workflow_value("summarize_subsystem", value, &metadata, &response_options)
             .await
@@ -2184,7 +2522,7 @@ impl McpHandler {
 
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
-        attach_context_handle(&mut value, &handle, "get_repo_playbook");
+        attach_context_handle(&mut value, &handle.legacy_handle, "get_repo_playbook");
         attach_playbook_memory(&mut value, playbook_memory);
         self.finalize_workflow_value("get_repo_playbook", value, &metadata, &response_options)
             .await
@@ -2197,12 +2535,52 @@ impl McpHandler {
         let files = parse_string_array(args, "files");
         let symbols = parse_string_array(args, "symbols");
         let limit = (args["limit"].as_u64().unwrap_or(6) as usize).clamp(1, 20);
+        let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
+        let response_options = parse_workflow_response_options(args);
 
-        let engine = self.engine.lock().await;
-        let report = get_docs_capsule(engine.graph(), query, &files, &symbols, limit);
-        let value = serde_json::to_value(&report)
-            .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
-        Ok(wrap_tool_result(value))
+        let mut bundle = {
+            let engine = self.engine.lock().await;
+            let report = get_docs_capsule(engine.graph(), query, &files, &symbols, limit);
+            let request = workflow_v2::WorkflowRequest {
+                input: query.to_string(),
+                entry_files: files.clone(),
+                entry_symbols: symbols.clone(),
+                render_mode: format!("{:?}", render_choice).to_lowercase(),
+            };
+            workflow_v2::docs_capsule::build_bundle(
+                &self.workspace_root.to_string_lossy(),
+                &request,
+                &report,
+                render_choice,
+            )
+        };
+        let handle = self
+            .store_context_handle("get_docs_capsule", workflow_v2::build_expand_seed(&bundle))
+            .await;
+        self.enrich_workflow_bundle_relevance(
+            "get_docs_capsule",
+            &handle.legacy_handle,
+            None,
+            &mut bundle,
+        )
+        .await;
+
+        self.serialize_workflow_with_context_handle(
+            "get_docs_capsule",
+            bundle,
+            &handle.legacy_handle,
+            "get_docs_capsule",
+            &WorkflowRunMetadata {
+                delivery_mode: format!("{:?}", render_choice).to_lowercase(),
+                wire_format: "standard".to_string(),
+                single_anchor_used: false,
+                _mode_reason: "docs capsules prefer authoritative markdown pivots".to_string(),
+                semantic_fallback_used: false,
+                outcome_memory_reuse_count: 0,
+            },
+            &response_options,
+        )
+        .await
     }
 
     async fn tool_get_backlinks(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -2315,11 +2693,32 @@ impl McpHandler {
         let handle = self
             .store_context_handle("diagnose_failure", seed_from_failure_diagnosis(&report))
             .await;
+        let request = WorkflowRequest {
+            input: input.to_string(),
+            entry_files: report.extracted_files.clone(),
+            entry_symbols: report.extracted_symbols.clone(),
+            render_mode: metadata.delivery_mode.clone(),
+        };
+        let mut sink = VecEventSink::default();
+        let mut workflow_bundle = workflow_v2::diagnose_failure::run(
+            &self.workspace_root.to_string_lossy(),
+            &request,
+            &report,
+            &memories,
+            &mut sink,
+        );
+        self.enrich_workflow_bundle_relevance(
+            "diagnose_failure",
+            &handle.legacy_handle,
+            None,
+            &mut workflow_bundle,
+        )
+        .await;
 
         self.serialize_workflow_with_context_handle(
             "diagnose_failure",
-            report,
-            &handle,
+            workflow_bundle,
+            &handle.legacy_handle,
             "diagnose_failure",
             &metadata,
             &response_options,
@@ -2434,6 +2833,7 @@ impl McpHandler {
                     linked_files: files.clone(),
                     workspace_id: Some(workspace_id),
                     branch: branch.clone(),
+                    scope_organization_id: None,
                     refresh_key: Some(refresh_key.clone()),
                     source_query,
                     created_at: 0,
@@ -2441,6 +2841,7 @@ impl McpHandler {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .map_err(|e| {
                     (
@@ -2461,8 +2862,40 @@ impl McpHandler {
         drop(store);
         self.record_auto_memory_write(1).await;
         self.record_outcome_pattern_write(1).await;
+        self.trigger_session_consolidation(task, status);
 
         Ok(wrap_tool_result(value))
+    }
+
+    fn trigger_session_consolidation(&self, task: &str, status: &str) {
+        let Some(consolidator) = self.session_consolidator.as_ref().cloned() else {
+            return;
+        };
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let task_id = task.to_string();
+        let outcome = match status {
+            "failure" | "failed" => EpisodeOutcome::Failure,
+            "abandoned" => EpisodeOutcome::Abandoned,
+            _ => EpisodeOutcome::Success,
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut consolidator = match consolidator.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!("session consolidation lock was poisoned");
+                    return;
+                }
+            };
+            if let Err(error) = consolidator.on_task_complete(
+                &workspace_id,
+                &lattice_core::events::TaskId {
+                    value: task_id.clone(),
+                },
+                outcome,
+            ) {
+                tracing::warn!(task_id = task_id.as_str(), %error, "session consolidation failed");
+            }
+        });
     }
 
     async fn tool_expand_context(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -2491,9 +2924,25 @@ impl McpHandler {
         Ok(wrap_tool_result(value))
     }
 
-    async fn store_context_handle(&self, origin: &str, seed: ExpandContextSeed) -> String {
+    async fn current_parsed_files_snapshot(&self) -> HashMap<String, ParsedFile> {
+        if let Ok(indexer) = self.indexer.try_lock() {
+            return indexer.parsed_files().clone();
+        }
+        self.indexer.lock().await.parsed_files().clone()
+    }
+
+    async fn store_context_handle(
+        &self,
+        origin: &str,
+        seed: ExpandContextSeed,
+    ) -> super::context_cache::HandleRecord {
         let mut cache = self.context_cache.lock().await;
-        cache.insert(origin, seed)
+        cache.insert(
+            origin,
+            seed,
+            &self.workspace_root.to_string_lossy(),
+            &self.session_id,
+        )
     }
 
     async fn serialize_workflow_with_context_handle<T: serde::Serialize>(
@@ -2607,18 +3056,29 @@ impl McpHandler {
         let memory_query = build_memory_query(query, files, symbols);
         let store = self.memory_store.lock().await;
         let branch = current_git_branch(&self.workspace_root);
+        let scope_filter = self.current_memory_scope_filter();
 
-        let current = store
-            .get_session_memories(&self.session_id, limit.min(3))
-            .map_err(|e| (-32603, format!("Failed to load session memories: {}", e)))?;
+        let scoped_memories = store
+            .list_all_scoped(&scope_filter)
+            .map_err(|e| (-32603, format!("Failed to load scoped memories: {}", e)))?;
+        let current: Vec<_> = scoped_memories
+            .iter()
+            .filter(|memory| memory.session_id == self.session_id)
+            .take(limit.min(3))
+            .cloned()
+            .collect();
         let mut values = serialize_memory_values(&store, &current, true)?;
 
         if values.len() < limit {
             let remaining = limit.saturating_sub(values.len());
             if let Some(ref keyword) = memory_query {
                 let previous = store
-                    .search_across_sessions(keyword, Some(&self.session_id), remaining)
-                    .map_err(|e| (-32603, format!("Failed to search memories: {}", e)))?;
+                    .query(Some(keyword), remaining, &scope_filter)
+                    .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
+                let previous: Vec<_> = previous
+                    .into_iter()
+                    .filter(|memory| memory.session_id != self.session_id)
+                    .collect();
                 values.extend(serialize_memory_values(&store, &previous, true)?);
             }
         }
@@ -2632,9 +3092,10 @@ impl McpHandler {
         let workspace_id = self.workspace_root.to_string_lossy().to_string();
         let store = self.memory_store.lock().await;
         let branch = current_git_branch(&self.workspace_root);
+        let scope_filter = self.current_memory_scope_filter();
         let mut memories = store
-            .list_all()
-            .map_err(|e| (-32603, format!("Failed to list memories: {}", e)))?;
+            .list_all_scoped(&scope_filter)
+            .map_err(|e| (-32603, format!("Failed to list scoped memories: {}", e)))?;
 
         memories.retain(|memory| {
             !memory.is_stale
@@ -2763,11 +3224,16 @@ impl McpHandler {
 
         if values.len() < 2 {
             if let Some(keyword) = build_memory_query(Some(query), files, symbols) {
-                let mut searched = store
-                    .search_across_sessions(&keyword, Some(&self.session_id), 2)
-                    .map_err(|e| (-32603, format!("Failed to search outcome memories: {}", e)))?;
+                let scope_filter = self.current_memory_scope_filter();
+                let mut searched = store.query(Some(&keyword), 2, &scope_filter).map_err(|e| {
+                    (
+                        -32603,
+                        format!("Failed to search scoped outcome memories: {}", e),
+                    )
+                })?;
                 searched.retain(|memory| {
-                    memory.workspace_id.as_deref() == Some(workspace_id.as_str())
+                    memory.session_id != self.session_id
+                        && memory.workspace_id.as_deref() == Some(workspace_id.as_str())
                         && memory
                             .refresh_key
                             .as_deref()
@@ -2846,6 +3312,7 @@ impl McpHandler {
                     linked_files,
                     workspace_id: Some(workspace_id),
                     branch: scoped_branch.clone(),
+                    scope_organization_id: None,
                     refresh_key: Some(refresh_key.clone()),
                     source_query,
                     created_at: 0,
@@ -2853,6 +3320,7 @@ impl McpHandler {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .map_err(|e| (-32603, format!("Failed to store playbook memory: {}", e)))?;
             json!({
@@ -3199,6 +3667,7 @@ impl McpHandler {
             linked_files: linked_files.clone(),
             workspace_id: workspace_id.clone(),
             branch: branch.clone(),
+            scope_organization_id: None,
             refresh_key: refresh_key.clone(),
             source_query: None,
             created_at: 0,
@@ -3206,6 +3675,7 @@ impl McpHandler {
             access_count: 0,
             is_stale: false,
             stale_reason: None,
+            verification_status: MemoryVerificationStatus::Unverified,
         };
 
         let store = self.memory_store.lock().await;
@@ -3231,25 +3701,37 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(20) as usize).min(100);
 
         let store = self.memory_store.lock().await;
+        let scope_filter = self.current_memory_scope_filter();
 
         // Current session memories (always included)
-        let current = store
-            .get_session_memories(&self.session_id, limit)
-            .map_err(|e| (-32603, format!("Failed to get session memories: {}", e)))?;
+        let scoped_memories = store
+            .list_all_scoped(&scope_filter)
+            .map_err(|e| (-32603, format!("Failed to get scoped memories: {}", e)))?;
+        let current: Vec<_> = scoped_memories
+            .iter()
+            .filter(|memory| memory.session_id == self.session_id)
+            .take(limit)
+            .cloned()
+            .collect();
 
         // Previous session memories: if query provided, search; otherwise get recent across sessions
         let remaining = limit.saturating_sub(current.len());
         let previous = if remaining > 0 {
             let keyword = query.unwrap_or("");
             if keyword.is_empty() {
-                // Get recent memories from other sessions
-                store
-                    .search_across_sessions("", Some(&self.session_id), remaining)
-                    .unwrap_or_default()
+                scoped_memories
+                    .iter()
+                    .filter(|memory| memory.session_id != self.session_id)
+                    .take(remaining)
+                    .cloned()
+                    .collect()
             } else {
                 store
-                    .search_across_sessions(keyword, Some(&self.session_id), remaining)
+                    .query(Some(keyword), remaining, &scope_filter)
                     .unwrap_or_default()
+                    .into_iter()
+                    .filter(|memory| memory.session_id != self.session_id)
+                    .collect()
             }
         } else {
             vec![]
@@ -3280,9 +3762,10 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(10) as usize).min(100);
 
         let store = self.memory_store.lock().await;
+        let scope_filter = self.current_memory_scope_filter();
         let memories = store
-            .search_across_sessions(query, None, limit)
-            .map_err(|e| (-32603, format!("Failed to search memories: {}", e)))?;
+            .query(Some(query), limit, &scope_filter)
+            .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
 
         let mut memory_values = serialize_memory_values(&store, &memories, true)?;
         sort_memory_values_for_recall(
@@ -3302,15 +3785,20 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(50) as usize).min(200);
 
         let store = self.memory_store.lock().await;
+        let scope_filter = self.current_memory_scope_filter();
 
-        let memories = if let Some(sid) = session_id {
+        let memories: Vec<Memory> = if let Some(sid) = session_id {
             store
-                .get_session_memories(sid, limit)
-                .map_err(|e| (-32603, format!("Failed to list observations: {}", e)))?
+                .list_all_scoped(&scope_filter)
+                .map_err(|e| (-32603, format!("Failed to list scoped observations: {}", e)))?
+                .into_iter()
+                .filter(|memory| memory.session_id == sid)
+                .take(limit)
+                .collect()
         } else {
             let all = store
-                .list_all()
-                .map_err(|e| (-32603, format!("Failed to list observations: {}", e)))?;
+                .list_all_scoped(&scope_filter)
+                .map_err(|e| (-32603, format!("Failed to list scoped observations: {}", e)))?;
             all.into_iter().take(limit).collect()
         };
 
@@ -3699,6 +4187,863 @@ impl McpHandler {
             "rules": rule_values,
             "count": rule_values.len()
         })))
+    }
+
+    async fn tool_inspect_working_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed = working_memory_tool::parse_args(args).map_err(|message| (-32602, message))?;
+        let (state, checkpoint_id) = self
+            .load_working_memory_state(&parsed.task_id)
+            .await?
+            .ok_or_else(|| {
+                (
+                    -32004,
+                    format!(
+                        "No active or checkpointed working memory state exists for task `{}`",
+                        parsed.task_id
+                    ),
+                )
+            })?;
+        let expansion_handle = self
+            .store_working_memory_snapshot(&parsed.task_id, &state)
+            .await;
+        let value = match parsed.mode {
+            working_memory_tool::InspectWorkingMemoryMode::Compact => {
+                working_memory_tool::compact_response_value(
+                    parsed.task_id,
+                    checkpoint_id,
+                    expansion_handle,
+                    summarize_state(&state),
+                )
+            }
+            working_memory_tool::InspectWorkingMemoryMode::Diagnostic => {
+                let mut diagnostic_state = state.clone();
+                if !parsed.include_excluded {
+                    diagnostic_state.excluded_memories.clear();
+                }
+                working_memory_tool::diagnostic_response_value(
+                    parsed.task_id,
+                    checkpoint_id,
+                    expansion_handle,
+                    diagnostic_state,
+                )
+            }
+        }
+        .map_err(|message| (-32603, message))?;
+        Ok(wrap_tool_result(value))
+    }
+
+    async fn tool_get_task_memory_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed =
+            memory_v2::get_task_memory::parse_args(args).map_err(|message| (-32602, message))?;
+        let (state, checkpoint_id) = self
+            .load_working_memory_state(&parsed.task_id)
+            .await?
+            .ok_or_else(|| {
+                (
+                    -32004,
+                    format!(
+                        "No active or checkpointed working memory state exists for task `{}`",
+                        parsed.task_id
+                    ),
+                )
+            })?;
+        let scope_filter = self.current_memory_scope_filter();
+        let store = self.memory_store.lock().await;
+        let candidates = store
+            .list_all_scoped(&scope_filter)
+            .map_err(|error| (-32603, format!("Failed to list scoped memories: {error}")))?;
+        let ranked = memory_v2::get_task_memory::rank_memories(
+            &store,
+            &self.workspace_root.to_string_lossy(),
+            &state,
+            candidates,
+            parsed.intent_hint.as_deref(),
+            current_git_branch(&self.workspace_root).as_deref(),
+        )
+        .map_err(|error| (-32603, error))?;
+        let clipped = memory_v2::get_task_memory::clip_to_budget(&ranked, parsed.budget_tokens);
+        let bundle = memory_v2::get_task_memory::build_bundle(
+            &store,
+            &self.workspace_root.to_string_lossy(),
+            parsed.task_id,
+            checkpoint_id,
+            &state,
+            clipped,
+        )
+        .map_err(|error| (-32603, error))?;
+        if let Some(capture) = &self.event_capture {
+            let ids: Vec<_> = bundle
+                .memories
+                .iter()
+                .map(|memory| MemoryId {
+                    workspace_id: self.workspace_root.to_string_lossy().to_string(),
+                    ulid: memory.id.clone(),
+                })
+                .collect();
+            let reasons: Vec<String> = bundle
+                .memories
+                .iter()
+                .map(|memory| memory.inclusion_reason.clone())
+                .collect();
+            if let Err(error) = capture.record_memory_retrieved(&ids, &reasons) {
+                tracing::warn!(tool = "get_task_memory", %error, "failed to capture memory retrieval");
+            }
+        }
+        serde_json::to_value(&bundle)
+            .map(wrap_tool_result)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_save_memory_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed =
+            memory_v2::save_memory::parse_args(args).map_err(|message| (-32602, message))?;
+        memory_v2::save_memory::validate_args(&parsed).map_err(|message| (-32602, message))?;
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let (memory, structured) =
+            memory_v2::save_memory::build_memory(&self.session_id, &workspace_id, &parsed);
+        let store = self.memory_store.lock().await;
+        let memory_id = store
+            .store(memory)
+            .map_err(|error| (-32603, format!("Failed to store memory: {error}")))?;
+        store
+            .update_structured_fields(&memory_id, &structured)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to persist structured memory fields: {error}"),
+                )
+            })?;
+        let verification_job_id = store
+            .enqueue_verification_job(&workspace_id, &memory_id)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to enqueue verification job: {error}"),
+                )
+            })?;
+        let response = memory_v2::save_memory::build_response(
+            &store,
+            &workspace_id,
+            &memory_id,
+            verification_job_id,
+        )
+        .map_err(|error| (-32603, error))?;
+        if let Some(capture) = &self.event_capture {
+            let memory_identity = MemoryId {
+                workspace_id: workspace_id.clone(),
+                ulid: memory_id.clone(),
+            };
+            if let Err(error) = capture.record_memory_created(memory_identity, &[]) {
+                tracing::warn!(tool = "save_memory", %error, "failed to capture memory creation");
+            }
+        }
+        serde_json::to_value(&response)
+            .map(wrap_tool_result)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_propose_memory_evolution_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::propose_memory_evolution::parse_args(args)
+            .map_err(|message| (-32602, message))?;
+        memory_v2::propose_memory_evolution::validate_args(&parsed)
+            .map_err(|message| (-32602, message))?;
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let store = self.memory_store.lock().await;
+        match parsed.action {
+            memory_v2::EvolutionAction::Propose => {
+                let proposal = memory_v2::propose_memory_evolution::build_proposal(
+                    &workspace_id,
+                    &store,
+                    &parsed,
+                )
+                .map_err(|error| (-32603, error))?;
+                let workspace_for_persist = workspace_id.clone();
+                let proposal_kind = proposal.proposal_kind;
+                let proposal_id = proposal.proposal_id.clone();
+                let prior_state = proposal.prior_state.clone();
+                let proposed_state = proposal.proposed_state.clone();
+                store
+                    .with_connection(|conn| {
+                        lattice_core::consolidation::persist_pending_proposal(
+                            conn,
+                            &workspace_for_persist,
+                            proposal_kind.as_str(),
+                            lattice_core::consolidation::ConsolidationJobMode::SynchronousPostTask,
+                            &proposal,
+                        )
+                        .map(|_| ())
+                    })
+                    .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
+                let response = memory_v2::EvolutionProposal {
+                    proposal_id,
+                    action: parsed.action,
+                    source_memory_id: parsed.memory_id,
+                    proposal_kind: proposal_kind.as_str().to_string(),
+                    decision: "pending".to_string(),
+                    prior_state,
+                    proposed_state,
+                    deprecation_warning: None,
+                };
+                serde_json::to_value(&response)
+                    .map(wrap_tool_result)
+                    .map_err(|error| (-32603, format!("Serialization error: {error}")))
+            }
+            memory_v2::EvolutionAction::Apply | memory_v2::EvolutionAction::Reject => {
+                let proposal_id = parsed
+                    .proposal_id
+                    .as_deref()
+                    .ok_or((-32602, "Missing proposal_id".to_string()))?;
+                let capture = self.event_capture.as_ref().ok_or((
+                    -32603,
+                    "Event capture is not configured for this session".to_string(),
+                ))?;
+                let writer = capture.writer();
+                let decided_by = parsed.decided_by.as_deref().unwrap_or("assistant");
+                store
+                    .with_connection(|conn| {
+                        let proposal = lattice_core::consolidation::ConsolidationProposal::load(
+                            conn,
+                            proposal_id,
+                        )?
+                        .ok_or_else(|| {
+                            lattice_core::LatticeError::Storage(format!(
+                                "Proposal `{proposal_id}` was not found"
+                            ))
+                        })?;
+                        match parsed.action {
+                            memory_v2::EvolutionAction::Apply => {
+                                proposal.apply(
+                                    conn,
+                                    &store,
+                                    writer.as_ref(),
+                                    decided_by,
+                                    parsed.reason.as_deref(),
+                                )?;
+                            }
+                            memory_v2::EvolutionAction::Reject => {
+                                proposal.reject(
+                                    conn,
+                                    writer.as_ref(),
+                                    decided_by,
+                                    parsed.reason.as_deref(),
+                                )?;
+                            }
+                            memory_v2::EvolutionAction::Propose => {}
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| (-32603, format!("Failed to decide proposal: {error}")))?;
+                let record = store
+                    .with_connection(|conn| {
+                        lattice_core::consolidation::ConsolidationProposal::load_record(
+                            conn,
+                            proposal_id,
+                        )
+                        .map_err(Into::into)
+                        .and_then(|value| {
+                            value.ok_or_else(|| {
+                                lattice_core::LatticeError::Storage(format!(
+                                    "Proposal `{proposal_id}` was not found after decision"
+                                ))
+                            })
+                        })
+                    })
+                    .map_err(|error| (-32603, format!("Failed to reload proposal: {error}")))?;
+                let response = memory_v2::EvolutionProposal {
+                    proposal_id: record.proposal_id.clone(),
+                    action: parsed.action,
+                    source_memory_id: record.target_memory_id.clone(),
+                    proposal_kind: record.proposal_kind.as_str().to_string(),
+                    decision: record.decision.as_str().to_string(),
+                    prior_state: record.prior_state.clone(),
+                    proposed_state: record.proposed_state.clone(),
+                    deprecation_warning: None,
+                };
+                serde_json::to_value(&response)
+                    .map(wrap_tool_result)
+                    .map_err(|error| (-32603, format!("Serialization error: {error}")))
+            }
+        }
+    }
+
+    async fn tool_apply_memory_evolution_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::propose_memory_evolution::parse_apply_shim_args(args)
+            .map_err(|message| (-32602, message))?;
+        let response = self
+            .tool_propose_memory_evolution_v2(&serde_json::to_value(&parsed).map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to serialize shim arguments: {error}"),
+                )
+            })?)
+            .await?;
+        let mut payload: Value = serde_json::from_str(
+            response["content"][0]["text"]
+                .as_str()
+                .ok_or((-32603, "Missing tool payload text".to_string()))?,
+        )
+        .map_err(|error| (-32603, format!("Failed to parse shim payload: {error}")))?;
+        payload["deprecation_warning"] = json!(
+            "apply_memory_evolution is deprecated; use propose_memory_evolution(action=apply). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
+        );
+        Ok(wrap_tool_result(payload))
+    }
+
+    async fn tool_consolidate_session_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::consolidate_session::parse_args(args)
+            .map_err(|message| (-32602, message))?;
+        memory_v2::consolidate_session::validate_args(&parsed)
+            .map_err(|message| (-32602, message))?;
+        let render_mode = parsed.render_mode.unwrap_or_default();
+        let mode = parsed.mode.unwrap_or_default();
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let capture = self.event_capture.as_ref().ok_or((
+            -32603,
+            "Event capture is not configured for this session".to_string(),
+        ))?;
+        let reader = EventReader::new(capture.writer().store());
+        let events = reader
+            .execute(
+                EventQuery::new()
+                    .session(parsed.session_id.clone())
+                    .workspace(workspace_id.clone())
+                    .order(QueryOrder::OldestFirst)
+                    .limit(1_000),
+            )
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to read session event trace: {error}"),
+                )
+            })?;
+        let slices = memory_v2::consolidate_session::group_task_slices(&events);
+        let mut store = self.memory_store.lock().await;
+        let proposals =
+            persist_session_consolidation_proposals(&workspace_id, &mut store, &slices, mode)?;
+        emit_consolidation_proposal_events(capture, &workspace_id, &proposals)?;
+        tracing::info!(
+            tool = "consolidate_session",
+            scope = parsed.session_id.as_str(),
+            proposal_count = proposals.len(),
+            "session consolidation proposals generated"
+        );
+        serde_json::to_value(build_consolidation_report(
+            parsed,
+            mode,
+            render_mode,
+            proposals,
+        ))
+        .map(wrap_tool_result)
+        .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_get_memory_metrics_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed =
+            memory_v2::get_memory_metrics::parse_args(args).map_err(|message| (-32602, message))?;
+        let render_mode = parsed.render_mode.unwrap_or_default();
+        let scope = parsed
+            .scope
+            .unwrap_or(memory_v2::get_memory_metrics::MetricScopeKind::Session);
+        let events = self
+            .load_metric_scope_events(scope, parsed.time_range.as_ref())
+            .await?;
+        let collector = lattice_core::metrics::MetricsCollector::new().with_events(events.clone());
+        let session_snapshot = self.session_metrics.lock().await.snapshot();
+        let surface = MetricsSurface::new(
+            self.workspace_root.to_string_lossy(),
+            collector,
+            Some(session_snapshot),
+        );
+        let metric_scope = self.build_metric_scope(scope, parsed.time_range.clone());
+        let signals = surface.collect(
+            metric_scope,
+            &memory_v2::get_memory_metrics::requested_signals(&parsed),
+        );
+        let incomplete = signals.iter().any(|signal| signal.incomplete)
+            || signals
+                .iter()
+                .any(|signal| signal.source == lattice_core::metrics::MetricSource::SessionMetrics);
+        let notes = build_metric_snapshot_notes(&signals);
+        tracing::info!(
+            tool = "get_memory_metrics",
+            scope = ?scope,
+            event_count = events.len(),
+            "memory metrics snapshot generated"
+        );
+        serde_json::to_value(memory_v2::get_memory_metrics::MetricSnapshot {
+            scope,
+            render_mode,
+            signals,
+            incomplete,
+            notes,
+        })
+        .map(wrap_tool_result)
+        .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_get_event_trace_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed =
+            memory_v2::get_event_trace::parse_args(args).map_err(|message| (-32602, message))?;
+        memory_v2::get_event_trace::validate_args(&parsed).map_err(|message| (-32602, message))?;
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        if parsed
+            .workspace_id
+            .as_deref()
+            .is_some_and(|value| value != workspace_id)
+        {
+            return Err((
+                -32011,
+                format!(
+                    "Event trace scope `{}` is outside the active workspace",
+                    parsed.workspace_id.unwrap_or_default()
+                ),
+            ));
+        }
+        let capture = self.event_capture.as_ref().ok_or((
+            -32603,
+            "Event capture is not configured for this session".to_string(),
+        ))?;
+        let render_mode = parsed.render_mode.unwrap_or_default();
+        let limit = parsed.limit.unwrap_or(25).min(100);
+        let reader = EventReader::new(capture.writer().store());
+        let query = build_event_trace_query(
+            &parsed,
+            &workspace_id,
+            current_git_branch(&self.workspace_root).as_deref(),
+            limit,
+        );
+        let cursor = parsed
+            .cursor
+            .as_deref()
+            .map(memory_v2::get_event_trace::decode_cursor)
+            .transpose()
+            .map_err(|message| (-32602, message))?;
+        let EventPage {
+            events,
+            next_cursor_row_id,
+        } = reader
+            .execute_page(query, cursor)
+            .map_err(|error| (-32603, format!("Failed to load event trace page: {error}")))?;
+        tracing::info!(
+            tool = "get_event_trace",
+            scope = event_trace_scope_kind(&parsed),
+            event_count = events.len(),
+            "event trace page generated"
+        );
+        serde_json::to_value(build_event_trace_page(
+            parsed,
+            render_mode,
+            events,
+            next_cursor_row_id,
+            limit,
+        ))
+        .map(wrap_tool_result)
+        .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn load_metric_scope_events(
+        &self,
+        scope: memory_v2::get_memory_metrics::MetricScopeKind,
+        time_range: Option<&memory_v2::get_memory_metrics::MetricTimeRange>,
+    ) -> Result<Vec<lattice_core::events::EventEnvelope>, (i32, String)> {
+        let capture = self.event_capture.as_ref().ok_or((
+            -32603,
+            "Event capture is not configured for this session".to_string(),
+        ))?;
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let mut query = match scope {
+            memory_v2::get_memory_metrics::MetricScopeKind::Session => EventQuery::new()
+                .session(self.session_id.clone())
+                .workspace(workspace_id),
+            memory_v2::get_memory_metrics::MetricScopeKind::Branch
+            | memory_v2::get_memory_metrics::MetricScopeKind::Repo => {
+                let branch =
+                    current_git_branch(&self.workspace_root).unwrap_or_else(|| "main".to_string());
+                EventQuery::new().workspace(workspace_id).branch(branch)
+            }
+            memory_v2::get_memory_metrics::MetricScopeKind::User
+            | memory_v2::get_memory_metrics::MetricScopeKind::Organization => {
+                return Ok(Vec::new());
+            }
+        }
+        .order(QueryOrder::OldestFirst)
+        .limit(1_000);
+        if let Some(range) = time_range {
+            if let Some(since) = range.since {
+                query = query.after(since);
+            }
+            if let Some(until) = range.until {
+                query = query.before(until);
+            }
+        }
+        EventReader::new(capture.writer().store())
+            .execute(query)
+            .map_err(|error| (-32603, format!("Failed to read metric events: {error}")))
+    }
+
+    fn build_metric_scope(
+        &self,
+        scope: memory_v2::get_memory_metrics::MetricScopeKind,
+        time_range: Option<memory_v2::get_memory_metrics::MetricTimeRange>,
+    ) -> lattice_core::metrics::MetricScope {
+        let scope = match scope {
+            memory_v2::get_memory_metrics::MetricScopeKind::Session => {
+                lattice_core::metrics::MetricScope::session(self.session_id.clone())
+            }
+            memory_v2::get_memory_metrics::MetricScopeKind::Branch => {
+                let branch =
+                    current_git_branch(&self.workspace_root).unwrap_or_else(|| "main".to_string());
+                lattice_core::metrics::MetricScope::branch(
+                    self.workspace_root.to_string_lossy(),
+                    branch,
+                )
+            }
+            memory_v2::get_memory_metrics::MetricScopeKind::Repo => {
+                lattice_core::metrics::MetricScope::repo(self.workspace_root.to_string_lossy())
+            }
+            memory_v2::get_memory_metrics::MetricScopeKind::User => {
+                let mut scope =
+                    lattice_core::metrics::MetricScope::session(self.session_id.clone());
+                scope.kind = lattice_core::metrics::MetricScopeKind::User;
+                scope.session_id = None;
+                scope
+            }
+            memory_v2::get_memory_metrics::MetricScopeKind::Organization => {
+                let mut scope =
+                    lattice_core::metrics::MetricScope::session(self.session_id.clone());
+                scope.kind = lattice_core::metrics::MetricScopeKind::Organization;
+                scope.session_id = None;
+                scope
+            }
+        };
+        if let Some(range) = time_range {
+            return scope.with_time_range(range.since, range.until);
+        }
+        scope
+    }
+
+    async fn enrich_workflow_bundle_relevance(
+        &self,
+        tool_name: &str,
+        call_id: &str,
+        request_scope: Option<String>,
+        bundle: &mut WorkflowBundle,
+    ) {
+        let session_snapshot = self.session_metrics.lock().await.snapshot();
+        let mut surface = MetricsSurface::new(
+            self.workspace_root.to_string_lossy(),
+            lattice_core::metrics::MetricsCollector::new(),
+            Some(session_snapshot),
+        );
+        let report = surface.build_call_relevance_report(
+            call_id.to_string(),
+            tool_name,
+            request_scope,
+            bundle,
+        );
+        surface.record_call(report.clone());
+        let Ok(report) = surface.collect_for_call(call_id, tool_name) else {
+            return;
+        };
+        bundle.workflow_record.excluded_high_scoring_candidates = report
+            .excluded_high_scoring_candidates
+            .iter()
+            .map(|candidate| format!("{}: {}", candidate.label, candidate.rejection_reason))
+            .collect();
+        let compact_mode = matches!(
+            bundle.render_choice.mode.as_str(),
+            "compact" | "focused" | "tiny"
+        );
+
+        for (pivot, detail) in bundle.ranked_pivots.iter_mut().zip(report.pivots.iter()) {
+            let focus = format!("memory:{}", detail.pivot_key);
+            let seed = ExpandContextSeed {
+                query: Some(detail.label.clone()),
+                files: pivot.file.clone().into_iter().collect(),
+                symbols: pivot.symbol.clone().into_iter().collect(),
+                tests: Vec::new(),
+                memories: vec![detail_payload(
+                    &detail.label,
+                    &detail.pivot_key,
+                    "pivot",
+                    &detail.inclusion_reason,
+                    &detail.breakdown,
+                )],
+            };
+            let handle = self.store_context_handle("relevance_detail", seed).await;
+            pivot.relevance_detail_handle = Some(handle.legacy_handle);
+            pivot.relevance_detail_focus = Some(focus);
+            if compact_mode {
+                pivot.relevance_summary =
+                    Some(surface.summarize_for_compact_mode(&detail.breakdown));
+                pivot.relevance_breakdown = None;
+            } else {
+                pivot.relevance_summary = None;
+                pivot.relevance_breakdown = Some(detail.breakdown.clone());
+            }
+        }
+
+        for (memory, detail) in bundle
+            .memory_highlights
+            .iter_mut()
+            .zip(report.memories.iter())
+        {
+            let focus = format!("memory:{}", detail.memory_key);
+            let seed = ExpandContextSeed {
+                query: Some(memory.content.clone()),
+                files: Vec::new(),
+                symbols: Vec::new(),
+                tests: Vec::new(),
+                memories: vec![detail_payload(
+                    &memory.content,
+                    &detail.memory_key,
+                    "memory",
+                    &detail.inclusion_reason,
+                    &detail.breakdown,
+                )],
+            };
+            let handle = self.store_context_handle("relevance_detail", seed).await;
+            memory.relevance_detail_handle = Some(handle.legacy_handle);
+            memory.relevance_detail_focus = Some(focus);
+            if compact_mode {
+                memory.relevance_summary =
+                    Some(surface.summarize_for_compact_mode(&detail.breakdown));
+                memory.relevance_breakdown = None;
+            } else {
+                memory.relevance_summary = None;
+                memory.relevance_breakdown = Some(detail.breakdown.clone());
+            }
+        }
+    }
+
+    async fn tool_verify_explain_memory(
+        &self,
+        args: &Value,
+        deprecation_warning: Option<String>,
+    ) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::verify_explain_memory::parse_args(args)
+            .map_err(|message| (-32602, message))?;
+        let scope_filter = self.current_memory_scope_filter();
+        let store = self.memory_store.lock().await;
+        let indexer = self.indexer.lock().await;
+        let graph_store = self.graph_store.lock().await;
+        let mut reports = self.verify_explain_reports.lock().await;
+        let execution = memory_v2::verify_explain_memory::execute(
+            &store,
+            &indexer,
+            &graph_store,
+            &self.workspace_root,
+            &scope_filter,
+            &mut reports,
+            parsed.clone(),
+        )
+        .map_err(|message| (-32603, message))?;
+        drop(reports);
+        drop(graph_store);
+        drop(indexer);
+        drop(store);
+
+        let handle = self
+            .store_context_handle("verify_explain_memory", execution.expansion_seed.clone())
+            .await;
+        let response = memory_v2::verify_explain_memory::render_response(
+            &execution.report,
+            parsed.render_mode,
+            handle.legacy_handle,
+            deprecation_warning,
+        );
+        tracing::info!(
+            tool = "verify_explain_memory",
+            memory_id = execution.memory_id.ulid.as_str(),
+            scope = execution.memory_id.workspace_id.as_str(),
+            status = execution.report.status.as_str(),
+            check_count = response.checks.len(),
+            "memory verification completed"
+        );
+        if let Some(capture) = &self.event_capture {
+            let reason = vec![format!(
+                "verify_explain_memory:{}",
+                execution.report.status.as_str()
+            )];
+            if let Err(error) =
+                capture.record_memory_retrieved(&[execution.memory_id.clone()], &reason)
+            {
+                tracing::warn!(tool = "verify_explain_memory", %error, "failed to capture memory retrieval");
+            }
+            if execution.prior_status == lattice_core::verification::VerificationStatus::Verified
+                && execution.report.status
+                    != lattice_core::verification::VerificationStatus::Verified
+            {
+                if let Err(error) = capture.record_memory_invalidated(
+                    execution.memory_id.clone(),
+                    execution
+                        .report
+                        .summary_lines
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("verification status changed away from verified"),
+                ) {
+                    tracing::warn!(tool = "verify_explain_memory", %error, "failed to capture invalidation");
+                }
+            }
+        }
+        serde_json::to_value(&response)
+            .map(wrap_tool_result)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_explain_memory(
+        &self,
+        args: &Value,
+        deprecation_warning: Option<String>,
+    ) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::verify_explain_memory::parse_explain_shim_args(args)
+            .map_err(|message| (-32602, message))?;
+        self.tool_verify_explain_memory(
+            &serde_json::to_value(&parsed).map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to serialize explain shim arguments: {error}"),
+                )
+            })?,
+            deprecation_warning,
+        )
+        .await
+    }
+
+    async fn tool_verify_memory(
+        &self,
+        args: &Value,
+        deprecation_warning: Option<String>,
+    ) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::verify_explain_memory::parse_verify_shim_args(args)
+            .map_err(|message| (-32602, message))?;
+        self.tool_verify_explain_memory(
+            &serde_json::to_value(&parsed).map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to serialize verify shim arguments: {error}"),
+                )
+            })?,
+            deprecation_warning,
+        )
+        .await
+    }
+
+    async fn tool_list_memory_conflicts(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed = memory_v2::list_memory_conflicts::parse_args(args)
+            .map_err(|message| (-32602, message))?;
+        let scope_filter = self.current_memory_scope_filter();
+        let store = self.memory_store.lock().await;
+        let execution = memory_v2::list_memory_conflicts::execute(&store, &scope_filter, parsed)
+            .map_err(|message| (-32603, message))?;
+        tracing::info!(
+            tool = "list_memory_conflicts",
+            scope = scope_filter.workspace_id.as_str(),
+            status = "ok",
+            check_count = execution.response.conflicts.len(),
+            "memory conflicts listed"
+        );
+        if let Some(capture) = &self.event_capture {
+            let reasons =
+                vec!["list_memory_conflicts".to_string(); execution.surfaced_memory_ids.len()];
+            if let Err(error) =
+                capture.record_memory_retrieved(&execution.surfaced_memory_ids, &reasons)
+            {
+                tracing::warn!(tool = "list_memory_conflicts", %error, "failed to capture conflict retrieval");
+            }
+        }
+        serde_json::to_value(&execution.response)
+            .map(wrap_tool_result)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn load_working_memory_state(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(WorkingMemoryState, Option<i64>)>, (i32, String)> {
+        if let Some(state) = self
+            .working_memory_states
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+        {
+            return Ok(Some((state, None)));
+        }
+
+        let scope = CheckpointScope::new(
+            self.workspace_root.to_string_lossy().to_string(),
+            self.session_id.clone(),
+            task_id.to_string(),
+        );
+        let checkpoint = self
+            .memory_store
+            .lock()
+            .await
+            .load_latest_working_memory_checkpoint(&scope)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to load working memory checkpoint for `{task_id}`: {error}"),
+                )
+            })?;
+        if let Some((checkpoint_id, state)) = checkpoint {
+            self.working_memory_states
+                .lock()
+                .await
+                .insert(task_id.to_string(), state.clone());
+            return Ok(Some((state, Some(checkpoint_id))));
+        }
+        Ok(None)
+    }
+
+    async fn store_working_memory_snapshot(
+        &self,
+        task_id: &str,
+        state: &WorkingMemoryState,
+    ) -> String {
+        let handle = self
+            .store_context_handle(
+                "inspect_working_memory",
+                ExpandContextSeed {
+                    query: Some(format!("inspect working memory {task_id}")),
+                    files: Vec::new(),
+                    symbols: Vec::new(),
+                    tests: Vec::new(),
+                    memories: Vec::new(),
+                },
+            )
+            .await;
+        self.working_memory_snapshots
+            .lock()
+            .await
+            .insert(handle.legacy_handle.clone(), state.clone());
+        handle.legacy_handle
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn remember_working_memory_state_for_test(
+        &self,
+        task_id: &str,
+        state: WorkingMemoryState,
+    ) {
+        self.working_memory_states
+            .lock()
+            .await
+            .insert(task_id.to_string(), state);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resolve_working_memory_snapshot_for_test(
+        &self,
+        handle: &str,
+    ) -> Option<WorkingMemoryState> {
+        self.working_memory_snapshots
+            .lock()
+            .await
+            .get(handle)
+            .cloned()
     }
 
     async fn tool_search_logic_flow(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -5784,10 +7129,21 @@ fn memory_to_value(
     structured_fields: Option<&MemoryStructuredFields>,
     include_session_id: bool,
 ) -> Value {
+    // The review-UI bridge in `extension/src/review/rpcPayloads.ts ::
+    // normalizeMemory` consumes the canonical Memory V2 wire shape (see
+    // `daemon/crates/lattice-daemon/src/rpc/memory_v2/mod.rs :: MemoryRecord`).
+    // The legacy `list_observations` / `recall_memories` paths predate that
+    // shape and historically only emitted `type`. Emit `memory_class` as the
+    // canonical alias here so the contract gate at
+    // `docs/plans/2026-05-16-cognitive-workspace-fork-build/reviews/R79-contract-extension-daemon.md`
+    // sees a round-trippable payload without forcing a v2 migration of every
+    // legacy memory call site.
+    let memory_class = MemoryClass::from_memory_type(&memory.memory_type);
     let mut value = json!({
         "id": memory.id,
         "content": memory.content,
         "type": memory.memory_type.as_str(),
+        "memory_class": memory_class.as_str(),
         "scope": memory.scope.as_str(),
         "confidence": memory.confidence,
         "linked_symbols": memory.linked_symbols,
@@ -6862,7 +8218,7 @@ mod tests {
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, wrap_tool_result,
         wrap_workflow_tool_result, McpHandler, RequestHandler, WorkflowRenderMode,
-        COMPACT_WORKFLOW_TOKEN_CAP,
+        COMPACT_WORKFLOW_TOKEN_CAP, FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -7568,6 +8924,7 @@ mod tests {
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         (handler, memory_store, workspace_root)
@@ -7696,6 +9053,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/auth.ts".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("login timeout".to_string()),
                     created_at: 10,
@@ -7703,6 +9061,7 @@ export function sendGreeting(): string {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store observation")
         };
@@ -7726,6 +9085,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/auth.ts".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: Some(refresh_key),
                     source_query: Some("verified from code and tests".to_string()),
                     created_at: 20,
@@ -7733,6 +9093,7 @@ export function sendGreeting(): string {
                     access_count: 2,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store outcome");
             let mut fields = store
@@ -7811,6 +9172,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/auth.ts".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("login timeout".to_string()),
                     created_at: 11,
@@ -7818,6 +9180,7 @@ export function sendGreeting(): string {
                     access_count: 1,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store durable observation")
         };
@@ -7836,6 +9199,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/auth.ts".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: Some("workflow_outcome::login-timeout".to_string()),
                     source_query: Some("verified from code and tests".to_string()),
                     created_at: 12,
@@ -7843,6 +9207,7 @@ export function sendGreeting(): string {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store durable outcome");
             let mut fields = store
@@ -7897,6 +9262,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/isolation.rs".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("org isolation".to_string()),
                     created_at: 30,
@@ -7904,6 +9270,7 @@ export function sendGreeting(): string {
                     access_count: 1,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store base memory");
 
@@ -7920,6 +9287,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/isolation.rs".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("org isolation verified".to_string()),
                     created_at: 31,
@@ -7927,6 +9295,7 @@ export function sendGreeting(): string {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store superseding memory");
 
@@ -7943,6 +9312,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/isolation.rs".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("org isolation verified".to_string()),
                     created_at: 32,
@@ -7950,6 +9320,7 @@ export function sendGreeting(): string {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store contradictor memory");
 
@@ -7965,6 +9336,7 @@ export function sendGreeting(): string {
                     linked_files: vec!["src/isolation.rs".to_string()],
                     workspace_id: Some(workspace_id.clone()),
                     branch: None,
+                    scope_organization_id: None,
                     refresh_key: None,
                     source_query: Some("org isolation".to_string()),
                     created_at: 33,
@@ -7972,6 +9344,7 @@ export function sendGreeting(): string {
                     access_count: 0,
                     is_stale: false,
                     stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
                 })
                 .expect("store stale memory");
 
@@ -7995,6 +9368,8 @@ export function sendGreeting(): string {
                 reference: Some("src/isolation.rs".to_string()),
                 detail: Some("org isolation branch".to_string()),
                 captured_at: Some(40),
+                span: None,
+                evidence_content_hash: None,
             }];
             store
                 .update_structured_fields(&base_id, &fields)
@@ -8154,6 +9529,7 @@ export function sendGreeting(): string {
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         let response = RequestHandler::handle(
@@ -8265,6 +9641,7 @@ export function sendGreeting(): string {
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         let response = RequestHandler::handle(
@@ -8274,7 +9651,9 @@ export function sendGreeting(): string {
                 "name": "get_context_capsule",
                 "arguments": {
                     "query": "how does loginUser authenticate credentials",
-                    "render": "json"
+                    "render": "json",
+                    "wire_format": "standard",
+                    "budget": "full"
                 }
             }),
         )
@@ -8297,18 +9676,19 @@ export function sendGreeting(): string {
             payload["agent_retrieval_contract"]["use_rg_if"].as_str(),
             Some("Use rg when you need an exact string, identifier spelling, config key, error text, or exhaustive textual occurrences.")
         );
+        let pivots_array = payload["pivots"]
+            .as_array()
+            .or_else(|| payload["ranked_pivots"].as_array());
         assert!(
-            payload["pivots"]
-                .as_array()
-                .is_some_and(|items| items.len() <= 3
-                    && items.iter().all(|item| item.get("source").is_none())),
+            pivots_array.is_some_and(|items| items.len() <= 3
+                && items.iter().all(|item| item.get("source").is_none())),
             "expected bounded pivots without full source: {payload:?}"
         );
         assert!(
             payload["budget_max_tokens"]
                 .as_u64()
-                .is_some_and(|tokens| tokens <= COMPACT_WORKFLOW_TOKEN_CAP as u64),
-            "expected compact hard cap metadata: {payload:?}"
+                .is_some_and(|tokens| tokens <= FULL_WORKFLOW_TOKEN_CAP as u64),
+            "expected workflow token cap metadata: {payload:?}"
         );
         assert!(
             payload
@@ -8316,14 +9696,6 @@ export function sendGreeting(): string {
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| !value.is_empty()),
             "expected context handle: {payload:?}"
-        );
-        assert!(
-            payload
-                .get("suggested_expand")
-                .and_then(|value| value.get("focus"))
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| !value.is_empty()),
-            "expected suggested expand: {payload:?}"
         );
 
         let _ = std::fs::remove_file(context_cache_path);
@@ -8353,6 +9725,7 @@ export function sendGreeting(): string {
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(true)),
+            None,
         );
 
         let response = RequestHandler::handle(
@@ -8424,6 +9797,7 @@ def detect_agent_version_drift(agent, rollout):
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(true)),
+            None,
         );
 
         let response = RequestHandler::handle(
@@ -8449,18 +9823,21 @@ def detect_agent_version_drift(agent, rollout):
             Some(true),
             "live indexer graph should be promoted instead of returning an indexing placeholder: {payload:?}"
         );
+        let primary_files = payload["primary_files"]
+            .as_array()
+            .or_else(|| payload["structured_payload"]["primary_files"].as_array());
         assert!(
-            payload["primary_files"]
-                .as_array()
-                .is_some_and(|files| files.iter().any(
-                    |file| file["file"].as_str() == Some("backend/core/agent_version_drift.py")
-                )),
+            primary_files.is_some_and(|files| files.iter().any(
+                |file| file["file"].as_str() == Some("backend/core/agent_version_drift.py")
+            )),
             "expected promoted live graph to produce a working set: {payload:?}"
         );
+        let context_handle = payload
+            .get("context_handle")
+            .or_else(|| payload.get("h"))
+            .and_then(|value| value.as_str());
         assert!(
-            payload["context_handle"]
-                .as_str()
-                .is_some_and(|handle| !handle.is_empty()),
+            context_handle.is_some_and(|handle| !handle.is_empty()),
             "expected context handle from promoted live graph response: {payload:?}"
         );
 
@@ -8509,6 +9886,7 @@ def detect_agent_version_drift(agent, rollout):
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         let response = RequestHandler::handle(
@@ -8614,6 +9992,7 @@ def detect_agent_version_drift(agent, rollout):
             None,
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
+            None,
         );
 
         let stable_focus = cert_symbol_id.stable_handle();
@@ -8638,7 +10017,7 @@ def detect_agent_version_drift(agent, rollout):
             json!({
                 "name": "expand_context",
                 "arguments": {
-                    "handle": handle,
+                    "handle": handle.legacy_handle,
                     "focus": stable_focus
                 }
             }),
@@ -8756,6 +10135,337 @@ fn detect_project_rules(
     files.sort();
     files.dedup();
     RulesDetector::new().detect_rules(&files)
+}
+
+fn persist_session_consolidation_proposals(
+    workspace_id: &str,
+    store: &mut MemoryStore,
+    slices: &[Vec<lattice_core::events::EventEnvelope>],
+    mode: memory_v2::consolidate_session::ConsolidationMode,
+) -> Result<Vec<memory_v2::consolidate_session::ConsolidationProposalItem>, (i32, String)> {
+    let mut items = Vec::new();
+    for slice in slices {
+        if slice.is_empty() {
+            continue;
+        }
+        let template = EpisodeTemplate::from_task_slice(slice)
+            .map_err(|error| (-32603, format!("Failed to build episode template: {error}")))?;
+        let proposal = memory_v2::consolidate_session::build_episode_proposal(
+            workspace_id,
+            store,
+            &template,
+            mode,
+        )
+        .map_err(|error| (-32603, error))?;
+        let existing = store
+            .with_connection(|conn| {
+                lattice_core::consolidation::ConsolidationProposal::load_record(
+                    conn,
+                    &proposal.proposal_id,
+                )
+            })
+            .map_err(|error| (-32603, format!("Failed to query proposal: {error}")))?;
+        if existing.is_none() {
+            store
+                .with_connection(|conn| {
+                    lattice_core::consolidation::persist_pending_proposal(
+                        conn,
+                        workspace_id,
+                        &format!("session_consolidation:{}", template.task_id.value),
+                        mode.job_mode(),
+                        &proposal,
+                    )
+                    .map(|_| ())
+                })
+                .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
+        }
+        let record = store
+            .with_connection(|conn| {
+                lattice_core::consolidation::ConsolidationProposal::load_record(
+                    conn,
+                    &proposal.proposal_id,
+                )
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value.ok_or_else(|| {
+                        lattice_core::LatticeError::Storage(format!(
+                            "Proposal `{}` was not persisted for review",
+                            proposal.proposal_id
+                        ))
+                    })
+                })
+            })
+            .map_err(|error| (-32603, format!("Failed to reload proposal record: {error}")))?;
+        items.push(consolidation_report_item(
+            &record,
+            &template.summary_text,
+            &template.task_id.value,
+        ));
+    }
+    Ok(items)
+}
+
+fn consolidation_report_item(
+    record: &lattice_core::consolidation::ConsolidationProposalRecord,
+    summary: &str,
+    task_id: &str,
+) -> memory_v2::consolidate_session::ConsolidationProposalItem {
+    let proposed_state = record.proposed_state.clone();
+    let prior_state = record.prior_state.clone();
+    let evidence = record.evidence.clone();
+    let proposed_memory = extract_review_memory_state(&proposed_state);
+    let prior_memory = extract_review_memory_state(&prior_state);
+    memory_v2::consolidate_session::ConsolidationProposalItem {
+        proposal_id: record.proposal_id.clone(),
+        job_id: record.job_id.clone(),
+        proposal_kind: record.proposal_kind.as_str().to_string(),
+        task_id: task_id.to_string(),
+        category: "episode_summary".to_string(),
+        summary: summary.to_string(),
+        target_memory_id: record.target_memory_id.clone(),
+        enqueued_at: record.enqueued_at,
+        decision: record.decision.as_str().to_string(),
+        proposed_class: string_field(&proposed_memory, "memory_class"),
+        current_scope: string_field(&prior_memory, "scope"),
+        target_scope: string_field(&proposed_memory, "scope"),
+        confidence: number_field(&proposed_memory, "confidence"),
+        evidence_count: evidence_count(&evidence),
+        prior_state,
+        proposed_state,
+        evidence,
+        provenance: record
+            .provenance
+            .as_ref()
+            .map(|value| serde_json::to_value(value).unwrap_or(Value::Null)),
+    }
+}
+
+fn extract_review_memory_state(value: &Value) -> Value {
+    value
+        .get("memory")
+        .cloned()
+        .unwrap_or_else(|| value.clone())
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn number_field(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn evidence_count(value: &Value) -> usize {
+    match value {
+        Value::Array(entries) => entries.len(),
+        Value::Object(entries) => entries
+            .values()
+            .map(|entry| match entry {
+                Value::Array(values) => values.len(),
+                Value::Null => 0,
+                _ => 1,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn emit_consolidation_proposal_events(
+    capture: &EventCapture,
+    workspace_id: &str,
+    proposals: &[memory_v2::consolidate_session::ConsolidationProposalItem],
+) -> Result<(), (i32, String)> {
+    for item in proposals {
+        let memory_id = MemoryId {
+            workspace_id: workspace_id.to_string(),
+            ulid: format!("proposed-{}", item.task_id),
+        };
+        capture
+            .record_memory_consolidation_proposed(
+                &[],
+                memory_id,
+                &[],
+                &item.summary,
+                &item.proposal_id,
+                None,
+                None,
+            )
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to capture consolidation event: {error}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn build_consolidation_report(
+    args: memory_v2::consolidate_session::ConsolidateSessionArgs,
+    mode: memory_v2::consolidate_session::ConsolidationMode,
+    render_mode: memory_v2::consolidate_session::ConsolidationRenderMode,
+    proposals: Vec<memory_v2::consolidate_session::ConsolidationProposalItem>,
+) -> memory_v2::consolidate_session::ConsolidationReport {
+    let episode_ids: Vec<String> = proposals
+        .iter()
+        .map(|item| item.proposal_id.clone())
+        .collect();
+    let mut notes = Vec::new();
+    if !matches!(
+        render_mode,
+        memory_v2::consolidate_session::ConsolidationRenderMode::Diagnostic
+    ) {
+        notes.push(
+            "LLM-driven procedure, failure-pattern, supersession, and duplicate proposals were not generated by this bounded manual trigger."
+                .to_string(),
+        );
+    }
+    memory_v2::consolidate_session::ConsolidationReport {
+        session_id: args.session_id,
+        mode,
+        render_mode,
+        budget_ms: args.budget_ms,
+        proposals,
+        categories: vec![
+            memory_v2::consolidate_session::ConsolidationCategoryReport {
+                category: "episode_summary".to_string(),
+                proposal_ids: episode_ids,
+                note: None,
+            },
+            memory_v2::consolidate_session::ConsolidationCategoryReport {
+                category: "procedure".to_string(),
+                proposal_ids: Vec::new(),
+                note: Some("No reusable multi-trace procedure candidate was produced by this bounded trigger.".to_string()),
+            },
+            memory_v2::consolidate_session::ConsolidationCategoryReport {
+                category: "failure_pattern".to_string(),
+                proposal_ids: Vec::new(),
+                note: Some("No failure-pattern cluster was produced by this bounded trigger.".to_string()),
+            },
+            memory_v2::consolidate_session::ConsolidationCategoryReport {
+                category: "supersession_candidate".to_string(),
+                proposal_ids: Vec::new(),
+                note: Some("No supersession candidate was produced by this bounded trigger.".to_string()),
+            },
+            memory_v2::consolidate_session::ConsolidationCategoryReport {
+                category: "duplicate_detection".to_string(),
+                proposal_ids: Vec::new(),
+                note: Some("No duplicate-detection proposal was produced by this bounded trigger.".to_string()),
+            },
+        ],
+        incomplete: true,
+        notes,
+    }
+}
+
+fn build_metric_snapshot_notes(signals: &[lattice_core::metrics::MetricValue]) -> Vec<String> {
+    let mut notes = Vec::new();
+    if signals
+        .iter()
+        .any(|signal| signal.source == lattice_core::metrics::MetricSource::SessionMetrics)
+    {
+        notes.push(
+            "Some signals used the explicit SessionMetrics fallback because the canonical collector returned an honest null for this session scope."
+                .to_string(),
+        );
+    }
+    if signals.iter().any(|signal| signal.value.is_none()) {
+        notes.push(
+            "Signals with null values lacked enough bounded evidence; reasons are reported per signal and were not fabricated."
+                .to_string(),
+        );
+    }
+    if signals.iter().any(|signal| signal.incomplete) {
+        notes.push(
+            "At least one signal was computed from a truncated bounded evidence slice; inspect the per-signal `incomplete` flag."
+                .to_string(),
+        );
+    }
+    if notes.is_empty() {
+        notes.push(
+            "All requested signals were served by the canonical Phase 9 collector.".to_string(),
+        );
+    }
+    notes
+}
+
+fn build_event_trace_query(
+    args: &memory_v2::get_event_trace::GetEventTraceArgs,
+    workspace_id: &str,
+    branch: Option<&str>,
+    limit: usize,
+) -> EventQuery {
+    let mut query = match (
+        args.task_id.as_ref(),
+        args.session_id.as_ref(),
+        args.workspace_id.as_ref(),
+    ) {
+        (Some(task_id), None, None) => EventQuery::new()
+            .task(task_id.clone())
+            .workspace(workspace_id.to_string()),
+        (None, Some(session_id), None) => EventQuery::new()
+            .session(session_id.clone())
+            .workspace(workspace_id.to_string()),
+        (None, None, Some(_)) => EventQuery::new()
+            .workspace(workspace_id.to_string())
+            .branch(branch.unwrap_or("main").to_string()),
+        _ => EventQuery::new()
+            .workspace(workspace_id.to_string())
+            .branch(branch.unwrap_or("main").to_string()),
+    }
+    .order(QueryOrder::OldestFirst)
+    .limit(limit);
+    if !args.kinds.is_empty() {
+        query = query.kinds(&args.kinds);
+    }
+    if let Some(since) = args.since {
+        query = query.after(since);
+    }
+    if let Some(until) = args.until {
+        query = query.before(until);
+    }
+    query
+}
+
+fn build_event_trace_page(
+    args: memory_v2::get_event_trace::GetEventTraceArgs,
+    render_mode: memory_v2::get_event_trace::EventTraceRenderMode,
+    events: Vec<lattice_core::events::EventEnvelope>,
+    next_cursor_row_id: Option<i64>,
+    limit: usize,
+) -> memory_v2::get_event_trace::EventTracePage {
+    let next_cursor = if events.len() == limit {
+        next_cursor_row_id.map(memory_v2::get_event_trace::encode_cursor)
+    } else {
+        None
+    };
+    memory_v2::get_event_trace::EventTracePage {
+        scope: memory_v2::get_event_trace::EventTraceScope {
+            kind: event_trace_scope_kind(&args).to_string(),
+            value: args
+                .task_id
+                .or(args.session_id)
+                .or(args.workspace_id)
+                .unwrap_or_default(),
+        },
+        render_mode,
+        cursor: args.cursor,
+        next_cursor,
+        events: events
+            .iter()
+            .map(|event| memory_v2::get_event_trace::build_entry(event, render_mode))
+            .collect(),
+    }
+}
+
+fn event_trace_scope_kind(args: &memory_v2::get_event_trace::GetEventTraceArgs) -> &'static str {
+    if args.task_id.is_some() {
+        "task"
+    } else if args.session_id.is_some() {
+        "session"
+    } else {
+        "workspace"
+    }
 }
 
 /// Wrap a tool result in the MCP content format.

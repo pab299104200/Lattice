@@ -1,0 +1,1044 @@
+warning: method `current_parsed_files_snapshot` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:2927:14
+     |
+ 154 | impl McpHandler {
+     | --------------- method in this implementation
+...
+2927 |     async fn current_parsed_files_snapshot(&self) -> HashMap<String, ParsedFile> {
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `select_diff_impact_mode` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5737:4
+     |
+5737 | fn select_diff_impact_mode(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `diff_impact_widen_reason` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5942:4
+     |
+5942 | fn diff_impact_widen_reason(report: &DiffImpactReport) -> Option<&'static str> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_context_capsule` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7621:4
+     |
+7621 | fn seed_from_context_capsule(graph: &CodeGraph, capsule: &ContextCapsule) -> ExpandContextSeed {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_diff_impact` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7650:4
+     |
+7650 | fn seed_from_diff_impact(report: &DiffImpactReport) -> ExpandContextSeed {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `attach_context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7859:4
+     |
+7859 | fn attach_context_capsule_suggested_expand(value: &mut Value, suggested_expand: Option<Value>) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7871:4
+     |
+7871 | fn context_capsule_suggested_expand(capsule: &ContextCapsule, graph: &CodeGraph) -> Option<Value> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_capsule_symbol_handle` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7897:4
+     |
+7897 | fn resolve_capsule_symbol_handle(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RankedMemory` is never constructed
+  --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:24:19
+   |
+24 | pub(crate) struct RankedMemory {
+   |                   ^^^^^^^^^^^^
+
+warning: function `token_budget_limit` is never used
+   --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:171:15
+    |
+171 | pub(crate) fn token_budget_limit(budget_tokens: Option<usize>) -> usize {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: `lattice-daemon` (lib) generated 10 warnings
+warning: unused import: `COMPACT_WORKFLOW_TOKEN_CAP`
+    --> crates/lattice-daemon/src/rpc/mcp.rs:8221:9
+     |
+8221 |         COMPACT_WORKFLOW_TOKEN_CAP, FULL_WORKFLOW_TOKEN_CAP,
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+  --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:93:82
+   |
+93 |     let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+   |                                                                                  ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:150:82
+    |
+150 |     let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+    |                                                                                  ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:233:13
+    |
+233 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:230:82
+    |
+230 |     let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+    |                                                                                  ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:361:13
+    |
+361 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:391:13
+    |
+391 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: `lattice-daemon` (bin "lattice" test) generated 17 warnings (10 duplicates) (run `cargo fix --bin "lattice" -p lattice-daemon --tests` to apply 7 suggestions)
+warning: `lattice-daemon` (lib test) generated 17 warnings (17 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 572 tests
+test consolidation::deterministic_tests::every_scanner_is_no_op_on_empty_store ... ok
+test consolidation::deterministic_tests::stale_marker_emits_mark_stale_proposal_for_deleted_anchor_file ... ok
+test consolidation::integration_tests::test_bounded_queue_overflow_drops_jobs_with_warning_event ... ok
+test consolidation::deterministic_tests::demotion_scanner_emits_demote_proposal_for_never_accessed_low_score_memory ... ok
+test consolidation::deterministic_tests::refresh_scanner_emits_refresh_proposal_when_evidence_still_matches ... ok
+test consolidation::deterministic_tests::duplicate_detector_emits_supersession_proposal ... ok
+test consolidation::deterministic_tests::scanners_route_through_runtime_without_direct_writes ... ok
+test consolidation::integration_tests::test_deterministic_supersession_proposal_apply_then_reject_round_trip ... ok
+test consolidation::integration_tests::test_llm_malformed_response_leaves_memory_unchanged_and_emits_failure_event ... ok
+test consolidation::integration_tests::test_llm_synchronous_mode_is_forbidden_and_driver_never_called ... ok
+test consolidation::integration_tests::test_high_scope_proposal_routes_to_manual_review_queue ... ok
+test consolidation::integration_tests::test_llm_episode_job_well_formed_response_emits_proposal_with_provenance ... ok
+test consolidation::llm::provenance_tests::budget_architecture_doc_contains_required_headings ... ok
+test consolidation::llm::provenance_tests::budget_overruns_route_to_required_outcomes ... ok
+test consolidation::llm::provenance_tests::identical_prompt_and_response_reproduce_hashes ... ok
+test consolidation::llm::provenance_tests::per_kind_queue_overflow_drops_job_and_emits_failure_event ... ok
+test consolidation::llm::provenance_tests::successful_job_provenance_records_deterministic_hashes ... ok
+test consolidation::integration_tests::test_synchronous_session_consolidation_emits_proposal_not_silent_write ... ok
+test consolidation::llm::llm_tests::well_formed_episode_response_enqueues_proposal_without_mutating_memory ... ok
+test consolidation::proposal_tests::consolidation_schema_round_trips_under_memory_store_migration ... ok
+test consolidation::proposal_tests::apply_materializes_memory_and_writes_consolidated_event_with_states ... ok
+test consolidation::proposal_tests::queue_drops_jobs_after_depth_bound_and_logs_warning ... ok
+test consolidation::proposal_tests::deterministic_job_emits_proposal_without_mutating_memory ... ok
+test consolidation::proposal_tests::double_apply_is_no_op_after_first_decision ... ok
+test consolidation::proposal_tests::reject_leaves_memory_unchanged_and_records_decision ... ok
+test consolidation::llm::llm_tests::driver_error_emits_failure_event_and_no_proposal_for_every_job ... ok
+test consolidation::llm::llm_tests::malformed_json_emits_failure_event_and_no_proposal_for_every_job ... ok
+test consolidation::replay_tests::replay_never_calls_live_llm_driver ... ok
+test consolidation::llm::llm_tests::synchronous_post_task_mode_is_forbidden_before_driver_call_for_every_job ... ok
+test consolidation::replay_tests::replay_succeeds_with_cached_llm_responses_and_fails_cleanly_without_them ... ok
+test consolidation::replay_tests::reverse_is_idempotent_for_already_reverted_proposals ... ok
+test consolidation::llm::llm_tests::structured_outputs_round_trip_into_expected_memory_states ... ok
+test consolidation::replay_tests::reverse_refresh_restores_last_verified_at_exactly ... ok
+test consolidation::review_queue_tests::branch_scope_proposal_is_not_gated_and_auto_applies ... ok
+test consolidation::integration_tests::test_replay_from_genesis_reconstructs_memory_state ... ok
+test consolidation::replay_tests::reverse_supersede_restores_status_and_clears_memory_links ... ok
+test consolidation::review_queue_tests::decide_apply_routes_through_proposal_apply_and_records_operator ... ok
+test consolidation::review_queue_tests::decision_reason_column_round_trips ... ok
+test consolidation::review_queue_tests::decide_reject_leaves_memory_unchanged_and_records_rejection ... ok
+test consolidation::session_tests::session_consolidation_hot_path_stays_under_five_milliseconds_p99 ... ignored, p99 timing assertion; run via --include-ignored so it is not affected by parallel test CPU contention
+test consolidation::review_queue_tests::organization_scope_proposal_is_gated_and_stays_pending ... ok
+test consolidation::session_tests::session_module_forbids_llm_references ... ok
+test consolidation::review_queue_tests::list_pending_returns_oldest_first_and_honors_filters ... ok
+test contract_tests::identity_event_memory::diagnostic_observed_payload_embeds_typed_file_identity ... ok
+test consolidation::session_tests::session_consolidation_never_mutates_memories_directly ... ok
+test consolidation::review_queue_tests::repo_scope_proposal_is_gated_and_stays_pending ... ok
+test contract_tests::identity_event_memory::evidence_anchor_docsection_serializes_with_typed_doc_section_id ... ok
+test consolidation::session_tests::oversized_task_slice_redirects_to_background_mode ... ok
+test contract_tests::identity_event_memory::evidence_anchor_filespan_serializes_with_typed_fileid_struct ... ok
+test contract_tests::identity_event_memory::file_read_payload_embeds_typed_file_identity_not_path_string ... ok
+test consolidation::review_queue_tests::second_decision_is_idempotent ... ok
+test contract_tests::identity_event_memory::memory_link_file_target_resolves_under_file_rename_compat_without_link_rewrite ... ok
+test consolidation::review_queue_tests::session_scope_proposal_is_not_gated_and_auto_applies ... ok
+test consolidation::session_tests::small_task_slice_emits_create_memory_proposal_with_deterministic_summary ... ok
+test contract_tests::identity_event_memory::event_table_references_json_column_only_holds_typed_stable_refs ... ok
+test contract_tests::identity_event_memory::end_to_end_identity_event_memory_round_trip_preserves_typed_references_at_every_boundary ... ok
+test contract_tests::identity_event_memory::migration_emits_typed_file_ids_in_linked_files_json_not_path_strings ... ok
+test contract_tests::identity_event_memory::migration_preserves_memory_id_workspace_scoping_in_destination_memory_id_column ... ok
+test contract_tests::identity_event_memory::evidence_anchor_filespan_round_trips_through_memory_evidence_table ... ok
+test contract_tests::identity_event_memory::memory_columns_holding_identity_references_store_typed_shapes_not_raw_strings ... ok
+test contract_tests::identity_event_memory::memory_link_target_symbol_persists_encoded_identity_in_target_id_column ... ok
+test contract_tests::identity_event_memory::memory_link_round_trips_through_get_links_from_with_typed_target ... ok
+test contract_tests::identity_event_memory::stable_ref_file_variant_serializes_to_typed_identity_struct_not_path_string ... ok
+test contract_tests::identity_event_memory::stable_ref_symbol_variant_serializes_to_typed_identity_struct_not_qualified_name_string ... ok
+test contract_tests::memory_verification_retrieval::end_to_end_memory_verification_retrieval_round_trip_holds_for_all_statuses_and_scopes ... ok
+test contract_tests::identity_event_memory::memory_retrieved_payload_round_trips_memory_ids_through_event_log ... ok
+test contract_tests::memory_verification_retrieval::test_retrieval_api_requires_scope_filter_argument ... ok
+test contract_tests::memory_verification_retrieval::test_scope_filter_round_trip_for_all_scope_kinds ... ok
+test contract_tests::memory_verification_retrieval::test_verification_status_enums_agree_variant_for_variant ... ok
+test contract_tests::memory_verification_retrieval::test_stale_label_round_trip_retrieval_to_surfaced_bundle ... ok
+test diff::tests::test_detect_added_function ... ok
+test diff::tests::test_detect_modified_function ... ok
+test diff::tests::test_detect_removed_function ... ok
+test diff::tests::test_no_changes ... ok
+test embeddings::tests::tests::test_embed_batch ... ignored
+test embeddings::tests::tests::test_embed_single_text ... ignored
+test embeddings::tests::tests::test_semantic_similarity ... ignored
+test events::budget_tests::get_context_capsule_payload_p99_stays_within_budget ... ignored
+test events::budget_tests::prepare_change_payload_p99_stays_within_budget ... ignored
+test events::budget_tests::spilled_payload_p99_stays_within_budget ... ignored
+test contract_tests::memory_verification_retrieval::test_verification_status_round_trip_memory_to_retrieval ... ok
+test events::corruption_tests::corrupted_inline_payload_hash_returns_typed_error ... ok
+test contract_tests::identity_event_memory::patch_applied_capture_records_only_typed_file_and_symbol_refs ... ok
+test events::corruption_tests::events_table_update_fails_with_append_only_trigger_error ... ok
+test contract_tests::identity_event_memory::replay_emits_memory_id_column_as_encoded_identity_after_full_replay ... ok
+test events::corruption_tests::corrupted_payload_bytes_return_typed_error ... ok
+test events::reader_tests::limit_ceiling_is_enforced ... ok
+test events::reader_tests::missing_scope_returns_unscoped_error ... ok
+test events::reader_tests::session_scoped_query_returns_only_matching_session_events ... ok
+test events::reader_tests::payload_corruption_returns_typed_error ... ok
+test events::reader_tests::stream_yields_same_events_as_execute_in_order ... ok
+test events::reader_tests::tail_returns_newest_events_for_session_scope ... ok
+test events::reader_tests::tail_returns_newest_events_for_task_scope ... ok
+test events::reader_tests::workspace_branch_query_returns_only_matching_workspace_branch_events ... ok
+test events::reader_tests::task_scoped_query_returns_only_matching_task_events ... ok
+test contract_tests::identity_event_memory::round_tripped_event_id_resolves_via_identity_resolver_to_same_target ... ok
+test contract_tests::identity_event_memory::replay_preserves_identity_typed_evidence_anchor_after_full_replay ... ok
+test events::corruption_tests::truncated_snapshot_without_fallback_returns_content_hash_mismatch ... ok
+test contract_tests::identity_event_memory::stable_ref_round_trips_through_event_store_byte_equivalent ... ok
+test events::snapshot_tests::bootstrap_from_snapshot_and_tail_events_matches_full_replay_count ... ok
+test events::corruption_tests::truncated_latest_snapshot_falls_back_to_prior_snapshot ... ok
+test events::replay_tests::workspace_and_branch_scopes_do_not_leak_across_neighbors ... ok
+test events::replay_tests::bootstrap_snapshot_plus_tail_matches_full_state_for_state_neutral_events ... ok
+test events::snapshot_tests::content_hash_mismatch_returns_content_hash_mismatch ... ok
+test events::store_tests::content_addressed_payloads_dedupe_identical_bytes ... ok
+test events::snapshot_tests::compaction_is_idempotent_when_no_new_compactable_events_arrive ... ok
+test events::snapshot_tests::format_version_mismatch_returns_unsupported_without_panic ... ok
+test events::store_tests::events_table_rejects_update_and_delete ... ok
+test events::snapshot_tests::scheduler_shutdown_stops_without_partial_truncation ... ok
+test events::store_tests::payload_spillover_row_ids_round_trip ... ok
+test events::store_tests::required_indexes_exist ... ok
+test events::tests::compact_summary_enforces_byte_ceiling ... ok
+test events::tests::compact_summary_rejects_oversized_deserialization ... ok
+test events::tests::event_envelope_constructor_rejects_kind_payload_mismatch ... ok
+test events::store_tests::schema_applies_on_fresh_database ... ok
+test events::store_tests::scoped_queries_are_bounded_and_ordered ... ok
+test events::tests::event_kind_serde_round_trips_with_canonical_wire_names ... ok
+test events::writer_tests::canonical_hash_is_stable_for_equivalent_key_order_variations ... ok
+test events::writer_tests::hash_payload_is_deterministic_for_typed_payloads ... ok
+test events::snapshot_tests::snapshot_write_and_read_preserves_graph_and_memory_state ... ok
+test events::tests::every_payload_serializes_deterministically ... ok
+test events::writer_tests::inline_ceiling_boundary_is_honored_exactly ... ok
+test events::writer_tests::concurrent_appends_preserve_monotonic_row_ids ... ok
+test graph::tests::test_add_and_retrieve_node ... ok
+test graph::tests::test_add_edge_and_get_dependents ... ok
+test events::writer_tests::spilled_payloads_dedupe_by_hash ... ok
+test graph::tests::test_build_graph_from_markdown_links ... ok
+test graph::tests::test_build_graph_from_parsed_files ... ok
+test graph::tests::test_edge_kind_short_codes ... ok
+test graph::tests::test_build_graph_from_markdown_links_with_nested_delimiters ... ok
+test graph::tests::test_find_call_paths ... ok
+test graph::tests::test_find_call_paths_disconnected ... ok
+test events::writer_tests::workspace_mismatch_is_rejected ... ok
+test graph::tests::test_markdown_sections_mention_code_symbols ... ok
+test graph::tests::test_n_hop_neighbors ... ok
+test graph::tests::test_graph_stats ... ok
+test graph::tests::test_remove_file_nodes ... ok
+test graph::tests::test_symbol_kind_short_codes ... ok
+test hardening::concurrency_tests::test_compaction_during_write_preserves_snapshot_plus_post_snapshot_log ... ignored
+test hardening::concurrency_tests::test_consolidation_replay_proposals_are_deterministic_and_apply_is_idempotent ... ignored
+test graph::tests::test_intra_file_call_edges ... ok
+test hardening::concurrency_tests::test_parallel_event_writers_do_not_drop_events_or_reorder_each_writer ... ignored
+test hardening::concurrency_tests::test_parallel_memory_creates_keep_unique_ids_and_valid_invariants ... ignored
+test graph::tests::test_no_self_loop_edges ... ok
+test hardening::concurrency_tests::test_parallel_memory_links_and_accesses_do_not_tear_or_drop_rows ... ignored
+test hardening::concurrency_tests::test_parallel_sessions_preserve_order_scope_and_unique_event_ids ... ignored
+test hardening::concurrency_tests::test_reader_never_observes_partial_or_per_session_time_regressions ... ignored
+test events::store_tests::migration_is_idempotent_on_reopen ... ok
+test events::writer_tests::sync_flush_makes_rows_visible_to_new_connection ... ok
+test hardening::corruption_tests::test_invalid_event_kind_returns_clear_error_without_panic ... ok
+test hardening::corruption_tests::test_corrupted_payload_quarantines_row_without_panic ... ok
+test hardening::large_repo_tests::test_event_log_compaction_keeps_hot_path_p99_within_5ms_budget ... ignored
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_extra_large_fixture ... ignored
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_large_polyglot_fixture ... ignored
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_medium_typescript_fixture ... ignored
+test hardening::large_repo_tests::test_hot_path_p99_budgets_on_small_rust_fixture ... ignored
+test hardening::large_repo_tests::test_payload_spillover_round_trips_under_5ms_budget ... ignored
+test hardening::migration_tests::forward_migration_order_matches_policy_and_rejects_out_of_order ... ok
+test hardening::corruption_tests::test_mismatched_payload_hash_logs_corruption_and_continues ... ok
+test hardening::corruption_tests::test_snapshot_version_mismatch_refuses_bootstrap_with_clear_error ... ok
+test hardening::corruption_tests::test_invalid_stable_reference_emits_dangling_reference_signal ... ok
+test hardening::corruption_tests::test_truncated_event_log_file_reports_recovery_or_sqlite_error_without_panic ... ok
+test hardening::migration_tests::legacy_memory_with_malformed_json_is_quarantined_without_aborting ... ok
+test hardening::migration_tests::rollback_policy_documents_inverse_for_every_migration ... ok
+test hardening::migration_tests::idempotent_migration_second_run_is_noop ... ok
+test hardening::migration_tests::pre_event_log_state_bootstraps_event_schema_and_memory_migration ... ok
+test hardening::partial_index_tests::test_ignored_import_target_does_not_create_edges_or_trigger_broad_fallback ... ok
+test hardening::migration_tests::legacy_memory_rows_migrate_to_memory_links_and_evidence ... ok
+test hardening::partial_index_tests::test_parse_failure_is_reported_per_file_without_dropping_other_results ... ok
+test hardening::partial_index_tests::test_syntax_error_file_keeps_surviving_symbols_queryable_without_panic ... ok
+test hardening::partial_index_tests::test_worker_panic_does_not_abort_remaining_batch_and_surviving_graph_is_queryable ... ok
+test hardening::partial_index_tests::test_partial_batch_report_keeps_cold_start_queries_bounded_and_explicit ... ok
+test hardening::partial_index_tests::test_file_change_marks_memories_stale_with_snapshot_gap_visible_to_queries ... ok
+test hardening::recovery_tests::test_replay_from_event_log_only_survives_without_snapshot ... ok
+test hardening::recovery_tests::test_partial_event_write_emits_recovery_and_stream_continues ... ok
+test hardening::workspace_boundary_tests::test_branch_and_session_scoped_memories_do_not_leak ... ok
+test hardening::workspace_boundary_tests::test_event_queries_remain_workspace_scoped ... ok
+test hardening::recovery_tests::test_wal_restart_reopens_cleanly_without_losing_committed_events ... ok
+test hardening::recovery_tests::test_replay_from_snapshot_plus_tail_reconstructs_state ... ok
+test hardening::workspace_boundary_tests::test_ignored_files_never_appear_in_query_or_workflow_tool_results ... ok
+test hardening::workspace_boundary_tests::test_workspace_file_reader_rejects_path_traversal_outside_root ... ok
+test identity::ambiguity::tests::display_reports_candidate_count_and_hint ... ok
+test hardening::recovery_tests::test_partial_snapshot_falls_back_to_full_replay_without_data_loss ... ok
+test identity::budget_tests::test_resolve_path_p99_within_2ms_budget ... ignored
+test identity::budget_tests::test_resolve_section_p99_within_2ms_budget ... ignored
+test identity::budget_tests::test_resolve_symbol_p99_within_2ms_budget ... ignored
+test identity::budget_tests::test_resolver_does_not_regress_baseline_workflow_p99 ... ignored
+test identity::ambiguity::tests::hint_helpers_match_expected_resolution_guidance ... ok
+test identity::resolver::tests::resolve_legacy_symbol_name_uses_default_workspace ... ok
+test identity::resolver::tests::resolve_path_returns_stable_file_id ... ok
+test identity::resolver::tests::resolve_symbol_reports_ambiguity_for_duplicate_names ... ok
+test identity::resolver_tests::test_resolve_event_ref_round_trips_through_encoding ... ok
+test hardening::workspace_boundary_tests::test_unresolved_queries_do_not_fall_back_to_broad_workspace_dump ... ok
+test identity::resolver_tests::test_resolve_path_after_file_rename_legacy_name_returns_via_compat_shim ... ok
+test identity::resolver_tests::test_resolve_path_unique_returns_fileid ... ok
+test identity::resolver_tests::test_resolve_path_after_file_rename_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_section_after_heading_rename_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_section_after_section_move_returns_new_id ... ok
+test identity::resolver_tests::test_resolve_symbol_duplicate_name_returns_ambiguous_with_disambiguation_hint ... ok
+test identity::resolver_tests::test_resolve_symbol_on_different_branch_returns_branch_scoped_id ... ok
+test identity::resolver_tests::test_resolve_symbol_unique_returns_symbolid ... ok
+test identity::serialization::tests::ambiguity_payload_shape_is_structured ... ok
+test identity::resolver_tests::test_resolve_legacy_symbol_name_routes_via_default_workspace ... ok
+test identity::serialization::tests::compact_form_round_trips ... ok
+test identity::serialization::tests::legacy_name_is_preserved ... ok
+test identity::serialization::tests::not_found_outcome_is_truthful ... ok
+test identity::serialization::tests::structured_form_is_accepted ... ok
+test identity::tests::decode_rejects_malformed_ulid ... ok
+test identity::tests::decode_rejects_empty_identity_string ... ok
+test identity::tests::decode_rejects_malformed_hash ... ok
+test identity::tests::decode_rejects_missing_prefix ... ok
+test identity::tests::equality_semantics_include_stability_fields ... ok
+test identity::tests::hash_is_deterministic_for_same_inputs ... ok
+test identity::tests::identity_kind_reports_wrapped_variant ... ok
+test identity::tests::legacy_symbol_id_migrates_to_unified_symbol_id ... ok
+test identity::tests::display_uses_compact_wire_encoding ... ok
+test identity::tests::round_trip_encoding_for_every_identity_kind ... ok
+test indexer::tests::test_incremental_update ... ok
+test indexer::tests::test_batch_indexing_rebuilds_once_for_multiple_files ... ok
+test indexer::tests::test_lazy_queue_boost_priority ... ok
+test indexer::tests::test_index_single_file ... ok
+test indexer::tests::test_lazy_queue_no_duplicates ... ok
+test indexer::tests::test_lazy_queue_priority_ordering ... ok
+test indexer::tests::test_parallel_indexing ... ok
+test hardening::workspace_boundary_tests::test_repo_user_and_organization_scope_queries_require_explicit_opt_in ... ok
+test intelligence::agent_tests::test_diagnose_failure_downgrades_graph_only_related_symbols ... ok
+test intelligence::agent_tests::test_diagnose_failure_keeps_multiple_line_refs_for_same_file ... ok
+test intelligence::agent_tests::test_diagnose_failure_maps_files_symbols_and_tests ... ok
+test intelligence::agent_tests::test_diagnose_failure_prefers_matching_file_for_duplicate_symbol_names ... ok
+test intelligence::agent_tests::test_diagnose_failure_prefers_most_specific_line_match ... ok
+test intelligence::agent_tests::test_expand_context_memory_focus_prefers_verified_match ... ok
+test indexer::tests::test_file_linked_memory_stales_even_without_symbol_diff ... ok
+test intelligence::agent_tests::test_expand_context_returns_delta_for_cached_symbol_focus ... ok
+test intelligence::agent_tests::test_expand_context_keeps_legacy_symbol_name_fallback_for_duplicate_symbols ... ok
+test intelligence::agent_tests::test_find_relevant_tests_matches_certificate_domain_tokens ... ok
+test intelligence::agent_tests::test_find_relevant_tests_filters_generic_symbol_overlap_noise ... ok
+test intelligence::agent_tests::test_find_relevant_tests_uses_diff_paths ... ok
+test intelligence::agent_tests::test_find_relevant_tests_ignores_assistant_worktrees_and_prefers_graph_links ... ok
+test intelligence::agent_tests::test_find_relevant_tests_prefers_supplied_file_for_duplicate_symbols ... ok
+test indexer::tests::test_stale_memory_on_file_change ... ok
+test intelligence::agent_tests::test_get_repo_playbook_surfaces_key_files_symbols_and_patterns ... ok
+test intelligence::agent_tests::test_get_working_set_context_collects_symbols_tests_and_memories ... ok
+test intelligence::agent_tests::test_impact_from_diff_maps_changed_symbols_and_dependents ... ok
+test intelligence::agent_tests::test_get_working_set_context_prefers_verified_structured_memories ... ok
+test intelligence::agent_tests::test_prepare_change_prioritizes_primary_files_and_tests ... ok
+test intelligence::agent_tests::test_prepare_change_promotes_specific_file_stem_over_broad_path_match ... ok
+test intelligence::agent_tests::test_prepare_change_promotes_entry_file_over_duplicate_symbol_helpers ... ok
+test intelligence::agent_tests::test_prepare_change_uses_repo_name_query_as_scope_hint ... ok
+test intelligence::agent_tests::test_prepare_change_test_selection_stays_anchored_to_entry_files ... ok
+test intelligence::agent_tests::test_prepare_change_suggested_expand_uses_stable_handle_for_duplicate_symbols ... ok
+test intelligence::agent_tests::test_summarize_subsystem_compresses_key_files_symbols_and_tests ... ok
+test intelligence::agent_tests::test_summarize_subsystem_skips_test_helpers_for_code_review_query ... ok
+test intelligence::benchmark_tests::workflow_bench_assistant_scorecard ... ignored
+test intelligence::benchmark_tests::workflow_bench_plan_edit_scorecard ... ignored
+test intelligence::benchmark_tests::workflow_bench_scorecard ... ignored
+test intelligence::benchmark_tests::workflow_bench_trace_scenario_scorecard ... ignored
+test intelligence::agent_tests::test_summarize_subsystem_ignores_markdown_only_explicit_files_for_code_query ... ok
+test intelligence::benchmark_tests::workflow_guardrail_structured_memory_trust_case ... ok
+test intelligence::docs_tests::test_find_stale_docs_resolves_absolute_files_and_qualified_symbols ... ok
+test intelligence::benchmark_tests::workflow_guardrail_certificate_noise_case ... ok
+test intelligence::docs_tests::test_find_stale_docs_returns_docs_that_link_to_changed_markdown ... ok
+test intelligence::docs_tests::test_find_stale_docs_returns_sections_that_mention_changed_code ... ok
+test intelligence::docs_tests::test_get_backlinks_finds_markdown_mentions_for_symbol ... ok
+test intelligence::docs_tests::test_get_backlinks_resolves_file_qualified_symbol_targets ... ok
+test intelligence::docs_tests::test_get_docs_capsule_handles_unicode_markdown_previews ... ok
+test intelligence::docs_tests::test_get_docs_capsule_resolves_absolute_anchor_inputs ... ok
+test intelligence::docs_tests::test_get_docs_capsule_returns_matching_sections_and_symbols ... ok
+test intelligence::docs_tests::test_get_outgoing_links_resolves_absolute_doc_paths ... ok
+test intelligence::tests::test_co_change_detection ... ok
+test intelligence::agent_tests::test_trace_scenario_separates_likely_and_plausible_entrypoints_and_paths ... ok
+test intelligence::tests::test_detect_project_rules ... ok
+test intelligence::docs_tests::test_get_outgoing_links_returns_doc_links_and_code_mentions ... ok
+test intelligence::tests::test_detect_dead_ends ... ok
+test intelligence::agent_tests::test_trace_scenario_surfaces_guard_failure_and_relevant_tests_docs ... ok
+test intelligence::tests::test_detect_thrashing ... ok
+test intelligence::tests::test_hotspot_score ... ok
+test memory::tests::test_find_by_refresh_key_prefers_repo_workflow_outcome_over_newer_session_observation ... ok
+test memory::tests::test_get_and_update_structured_fields_round_trip ... ok
+test memory::tests::test_find_by_refresh_key_prefers_stronger_verified_memory_over_newer_weaker_memory ... ok
+test memory::tests::test_find_by_refresh_key_prefers_matching_workspace_and_branch ... ok
+test memory::tests::test_list_stale_memories_with_query ... ok
+test memory::tests::test_invalidate_memory ... ok
+test memory::tests::test_get_session_memories ... ok
+test memory::tests::test_mark_memory_superseded_updates_structured_fields ... ok
+test memory::tests::test_mark_stale_by_file ... ok
+test memory::tests::test_mark_stale_by_symbol ... ok
+test memory::tests::test_memory_decay_and_pruning ... ok
+test memory::tests::test_mark_stale_preserves_structured_metadata_for_contradictions ... ok
+test memory::tests::test_promote_memory_updates_scope_and_metadata ... ok
+test memory::tests::test_refresh_memory_preserves_extended_assertion_type ... ok
+test memory::tests::test_refresh_memory_preserves_unset_fields ... ok
+test memory::tests::test_refresh_memory_updates_content_and_metadata ... ok
+test memory::tests::test_search_across_sessions ... ok
+test memory::tests::test_search_across_sessions_keeps_camel_case_identifier_queries_precise ... ok
+test memory::tests::test_search_memories_by_keyword ... ok
+test memory::tests::test_mark_memory_contradicted_persists_reverse_edges ... ok
+test memory::tests::test_search_memories_by_keyword_keeps_identifier_queries_precise ... ok
+test memory::tests::test_session_id_stored_and_retrieved ... ok
+test memory::tests::test_store_and_retrieve_memory ... ok
+test memory::tests::test_structured_memory_fields_round_trip ... ok
+test memory::tests::test_store_rewrite_preserves_extended_assertion_type ... ok
+test memory::tests::test_search_across_sessions_after_reopen_for_new_session ... ok
+test memory::tests::test_open_backfills_fts_for_legacy_memory_rows ... ok
+test memory::tests::test_two_connections_can_recall_previous_session_memories ... ok
+test memory_graph::contradiction_tests::contradiction_link_contradicts_target_and_emits_memory_updated_event ... ok
+test memory_graph::contradiction_tests::counter_memory_can_be_invalidated_without_reopening_its_target ... ok
+test memory_graph::links_tests::accesses_can_be_marked_used_after_the_fact ... ok
+test memory_graph::contradiction_tests::counter_memory_is_first_class_record_and_can_be_superseded_independently ... ok
+test memory_graph::links_tests::every_link_type_round_trips ... ok
+test memory_graph::links_tests::evidence_anchors_round_trip_including_file_span_sha256 ... ok
+test memory_graph::links_tests::strength_outside_unit_interval_is_rejected ... ok
+test memory_graph::links_tests::score_history_orders_newest_first ... ok
+test memory_graph::links_tests::target_dispatch_round_trips_memory_and_graph_nodes ... ok
+test memory_graph::migration_tests::curated_legacy_rows_migrate_exactly_once ... ok
+test memory_graph::migration_tests::empty_source_migrates_to_empty_destination ... ok
+test memory_graph::migration_tests::dry_run_matches_real_report_but_writes_nothing ... ok
+test memory_graph::migration_tests::second_run_after_success_is_noop ... ok
+test memory_graph::migration_tests::failed_batch_rolls_back_and_follow_up_run_completes ... ok
+test memory_graph::migration_tests::unmappable_rows_are_reported_and_do_not_halt_migration ... ok
+test memory_graph::contradiction_tests::low_confidence_contradiction_records_link_without_flipping_high_confidence_target ... ok
+test memory_graph::replay_tests::corrupted_replay_snapshot_returns_typed_error_and_preserves_partial_state ... ok
+test memory_graph::replay_tests::event_log_replay_matches_original_memory_tables_byte_for_byte ... ok
+test memory_graph::replay_tests::snapshot_plus_tail_replay_matches_full_replay_state ... ok
+test memory_graph::scope_tests::test_admin_query_path_is_explicit_and_unscoped ... ok
+test memory_graph::scope_tests::test_branch_scope_never_leaks_across_branches ... ok
+test memory_graph::scope_tests::test_classify_stream_mapping_is_exhaustive_over_memory_class ... ok
+test memory_graph::scope_tests::test_default_policy_matches_expected_defaults ... ok
+test memory_graph::scope_tests::test_enforce_subset_rejects_identity_mismatch ... ok
+test memory_graph::scope_tests::test_enforce_subset_rejects_scope_widening ... ok
+test memory_graph::scope_tests::test_org_scope_requires_explicit_opt_in ... ok
+test memory_graph::scope_tests::test_scope_query_without_explicit_scope_returns_underspecified ... ok
+test memory_graph::scope_tests::test_user_scope_never_leaks_across_users ... ok
+test memory_graph::replay_tests::workflow_outcome_stream_classification_survives_replay ... ok
+test memory_graph::replay_tests::stale_transition_is_persisted_and_visible_through_scope_filtered_reads ... ok
+test memory_graph::store_tests::create_and_get_round_trip_persists_initial_evidence_and_event ... ok
+test memory_graph::store_tests::create_with_same_idempotency_key_returns_existing_record ... ok
+test memory_graph::contradiction_tests::every_link_type_inserts_reads_deletes_and_emits_events ... ok
+test memory_graph::store_tests::soft_delete_marks_memory_invalidated_and_keeps_row_readable ... ok
+test memory_graph::store_tests::transitions_emit_expected_lifecycle_events ... ok
+test memory_graph::store_tests::update_preserves_immutable_fields ... ok
+test memory_graph::store_tests::illegal_transitions_return_disallowed_transition ... ok
+test memory_graph::supersession_tests::supersedes_transitions_prior_memory_to_superseded_and_sets_successor ... ok
+test memory_graph::supersession_tests::current_claim_walks_to_latest_successor_and_historical_lookup_preserves_prior_state ... ok
+test memory_graph::supersession_tests::supersession_chain_is_traversable_and_cycles_are_rejected ... ok
+test metrics::regression_tests::test_discovery_tool_calls_at_least_30pct_below_baseline ... ok
+test metrics::regression_tests::test_irrelevant_file_reads_at_least_40pct_below_baseline ... ok
+test metrics::regression_tests::test_memory_inclusion_precision_at_least_80pct ... ok
+test consolidation::replay_tests::replay_from_genesis_reconstructs_same_state_for_fifty_mixed_proposals ... ok
+test metrics::report_tests::benchmark_evidence_round_trips_to_signal_rows ... ok
+test metrics::report_tests::fail_on_regression_exit_code_is_non_zero_only_when_requested ... ok
+test metrics::report_tests::null_signals_render_as_na_with_reason_never_zero ... ok
+test metrics::report_tests::report_computes_baseline_delta_and_reduction ... ok
+test metrics::report_tests::report_renders_deterministically_in_all_formats ... ok
+test metrics::report_tests::threshold_logic_covers_each_initial_target ... ok
+test metrics::signals_tests::collectors_report_honest_nulls_when_scope_has_no_data ... ok
+test metrics::signals_tests::collectors_return_expected_values_for_handcrafted_fixture ... ok
+test metrics::signals_tests::every_metric_signal_variant_collects_deterministically ... ok
+test metrics::signals_tests::sample_size_bounds_mark_metrics_incomplete ... ok
+test metrics::signals_tests::scope_filters_prevent_cross_scope_leakage ... ok
+test parser::tests::test_parse_go_function_and_struct ... ok
+test parser::tests::test_parse_java_class_and_methods ... ok
+test parser::tests::test_parse_markdown_document_and_sections ... ok
+test parser::tests::test_parse_markdown_links_with_nested_delimiters ... ok
+test parser::tests::test_parse_python_class ... ok
+test parser::tests::test_parse_python_function ... ok
+test parser::tests::test_parse_python_imports ... ok
+test parser::tests::test_parse_python_sqlalchemy_model ... ok
+test parser::tests::test_parse_rust_function_and_struct ... ok
+test parser::tests::test_parse_typescript_class ... ok
+test parser::tests::test_parse_typescript_function ... ok
+test parser::tests::test_parse_typescript_imports ... ok
+test parser::tests::test_parse_typescript_interface ... ok
+test parser::tests::test_parse_typescript_type_alias_and_enum ... ok
+test query::tests::benchmark_tests::bench_precision_assistant_scorecard ... ignored
+test query::tests::benchmark_tests::bench_precision_auth ... ignored
+test query::tests::benchmark_tests::bench_precision_host ... ignored
+test query::tests::benchmark_tests::bench_precision_patch ... ignored
+test query::tests::benchmark_tests::bench_precision_scorecard ... ignored
+test query::tests::benchmark_tests::bench_precision_snmp ... ignored
+test query::tests::benchmark_tests::bench_product_working_set_vs_rg ... ignored
+test query::tests::test_adaptive_budget_expands_on_repeat ... ok
+test query::tests::test_context_relationship_has_edge_info ... ok
+test query::tests::test_detect_add_feature_intent ... ok
+test query::tests::test_detect_explore_intent ... ok
+test query::tests::test_detect_explore_with_flow_keyword ... ok
+test query::tests::test_detect_fix_bug_intent ... ok
+test query::tests::test_detect_keyword_heavy_explore ... ok
+test query::tests::test_detect_refactor_intent ... ok
+test query::tests::test_merge_seed_hits_keeps_keyword_matches_when_semantic_hits_exist ... ok
+test query::tests::test_pivot_has_positive_score ... ok
+test query::tests::test_query_engine_can_return_markdown_sections ... ok
+test query::tests::test_query_engine_identifier_queries_still_prefer_keyword_hits_over_scoped_semantic ... ok
+test query::tests::test_query_engine_keeps_tool_identifiers_source_first_when_name_contains_docs ... ok
+test query::tests::test_query_engine_prefers_source_over_markdown_for_workflow_queries ... ok
+test query::tests::test_query_engine_produces_capsule ... ok
+test query::tests::test_query_engine_reranks_semantic_hits_using_graph_proximity ... ok
+test query::tests::test_query_engine_reranks_semantic_hits_using_identifier_and_intent_signals ... ok
+test query::tests::test_query_engine_token_budget ... ok
+test query::tests::test_query_engine_uses_file_summary_vectors_to_seed_file_symbols ... ok
+test query::tests::test_query_engine_uses_vector_index_abstraction_for_semantic_hits ... ok
+test query::tests::test_query_filter_parsing ... ok
+test query::tests::test_query_no_filters ... ok
+test query::tests::test_query_prefers_markdown_results_only_for_explicit_doc_terms ... ok
+test query::tests::test_query_with_file_filter ... ok
+test query::tests::test_query_with_language_filter ... ok
+test query::tests::test_query_with_multiple_filters ... ok
+test retrieval_v1::anchors_tests::ambiguous_symbol_names_return_candidate_set_and_reason ... ok
+test retrieval_v1::anchors_tests::command_api_config_and_error_anchors_can_resolve_via_existing_identities ... ok
+test retrieval_v1::anchors_tests::debug_intent_surfaces_error_anchors_first ... ok
+test retrieval_v1::anchors_tests::detects_every_anchor_variant_from_canonical_inputs ... ok
+test retrieval_v1::anchors_tests::diagnostics_round_trip_through_serde ... ok
+test retrieval_v1::anchors_tests::empty_input_returns_empty_vector ... ok
+test retrieval_v1::anchors_tests::resolver_round_trip_preserves_source_spans ... ok
+test retrieval_v1::anchors_tests::unknown_paths_resolve_to_unresolved_without_panicking ... ok
+test retrieval_v1::benchmark::irrelevant_memory_rate_is_measured_and_regressed ... ignored
+test retrieval_v1::benchmark::retrieval_v1_benchmark_writes_metrics_snapshot ... ignored
+test retrieval_v1::candidates_tests::bounded_expansion_records_traversal_paths ... ok
+test retrieval_v1::candidates_tests::budgets_are_enforced_for_large_graphs ... ok
+test retrieval_v1::candidates_tests::each_spec_named_source_produces_candidates ... ok
+test retrieval_v1::candidates_tests::empty_anchor_list_still_yields_events_and_working_memory ... ok
+test retrieval_v1::candidates_tests::fts_embeddings_and_event_similarity_participate_when_present ... ok
+test retrieval_v1::candidates_tests::intent_gating_skips_disqualified_event_sources ... ok
+test retrieval_v1::candidates_tests::working_memory_window_returns_most_recent_items ... ok
+test retrieval_v1::golden_tests::api_diagnose_failure_anchor_returns_diagnose_failure ... ok
+test retrieval_v1::golden_tests::api_prepare_change_anchor_returns_prepare_change ... ok
+test retrieval_v1::golden_tests::api_search_logic_flow_anchor_returns_search_logic_flow ... ok
+test retrieval_v1::golden_tests::budget_login_user_anchor_keeps_pinned_symbol_under_truncation ... ok
+test metrics::regression_tests::test_relevant_test_recommendation_at_least_90pct ... ok
+test retrieval_v1::golden_tests::budget_truncation_preserves_pinned_result_and_token_cap ... ok
+test retrieval_v1::golden_tests::command_cargo_test_anchor_returns_session_file ... ok
+test retrieval_v1::golden_tests::command_python_anchor_returns_cli_file ... ok
+test retrieval_v1::golden_tests::command_rg_anchor_returns_login_user ... ok
+test metrics::regression_tests::test_zero_trusted_display_of_contradicted_memory ... ok
+test retrieval_v1::golden_tests::config_event_log_anchor_returns_event_log_symbol ... ok
+test retrieval_v1::golden_tests::config_index_root_anchor_returns_index_root_symbol ... ok
+test retrieval_v1::golden_tests::error_missing_symbol_anchor_returns_login_user ... ok
+test retrieval_v1::golden_tests::config_workflow_cache_ttl_anchor_returns_workflow_cache_ttl ... ok
+test retrieval_v1::golden_tests::every_anchor_type_has_three_golden_tasks ... ok
+test metrics::regression_tests::test_zero_trusted_display_of_stale_memory_without_label ... ok
+test retrieval_v1::golden_tests::error_traceback_anchor_returns_cli_file ... ok
+test retrieval_v1::golden_tests::error_panic_path_anchor_returns_auth_file ... ok
+test retrieval_v1::golden_tests::path_section_anchor_returns_retrieval_engine_section ... ok
+test retrieval_v1::golden_tests::path_auth_file_anchor_returns_auth_file ... ok
+test retrieval_v1::golden_tests::path_session_file_anchor_returns_session_file ... ok
+test retrieval_v1::golden_tests::stale_memory_ranks_below_trusted_result ... ok
+test retrieval_v1::intent_tests::test_ambiguous_tasks_return_multiple_labels_with_documented_tie_break ... ok
+test retrieval_v1::intent_tests::test_diagnostics_round_trip_through_serde ... ok
+test retrieval_v1::intent_tests::test_empty_or_whitespace_input_returns_unknown ... ok
+test retrieval_v1::intent_tests::test_every_label_has_a_canonical_statement ... ok
+test retrieval_v1::intent_tests::test_feature_kinds_remain_inspectable ... ok
+test retrieval_v1::intent_tests::test_long_input_truncates_tail_without_losing_leading_verb ... ok
+test retrieval_v1::scoring_tests::compact_mode_produces_non_empty_single_line_reason ... ok
+test retrieval_v1::scoring_tests::diagnostic_mode_round_trips_signal_scores_and_reasons_through_serde ... ok
+test retrieval_v1::scoring_tests::missing_signal_data_scores_zero_with_documented_reason ... ok
+test retrieval_v1::scoring_tests::representative_candidate_evaluates_all_thirteen_signals ... ok
+test retrieval_v1::scoring_tests::stale_and_contradicted_memories_rank_below_trusted_peers ... ok
+test retrieval_v1::scoring_tests::user_preference_compatibility_raises_matches_and_lowers_conflicts ... ok
+test retrieval_v1::scoring_tests::weight_overrides_change_ranking_deterministically ... ok
+test retrieval_v1::shaper_tests::compression_respects_budget_without_dropping_pinned_results ... ok
+test retrieval_v1::shaper_tests::deduplication_merges_signal_scores_and_sources ... ok
+test retrieval_v1::shaper_tests::diagnostic_mode_populates_diagnostics_and_compact_mode_does_not ... ok
+test retrieval_v1::shaper_tests::every_bundle_result_has_compact_inclusion_reason ... ok
+test retrieval_v1::shaper_tests::every_expansion_handle_resolves_back_to_original_identity ... ok
+test retrieval_v1::shaper_tests::serde_round_trip_preserves_schema_for_phase_five_checkpointing ... ok
+test retrieval_v1::shaper_tests::truncation_flag_is_set_when_results_are_dropped ... ok
+test security::tests::test_default_exclusions ... ok
+test security::tests::test_excluded_dirs ... ok
+test security::tests::test_gitignore_integration ... ok
+test security::tests::test_is_excluded_dir ... ok
+test security::tests::test_normal_files_not_excluded ... ok
+test security::tests::test_redact_aws_key ... ok
+test security::tests::test_redact_password ... ok
+test retrieval_v1::golden_tests::symbol_login_user_anchor_returns_login_user ... ok
+test retrieval_v1::golden_tests::symbol_refresh_session_anchor_returns_refresh_session ... ok
+test storage::tests::test_file_index_and_parsed_files_round_trip ... ok
+test storage::tests::test_save_and_load_graph ... ok
+test storage::tests::test_save_replaces_previous ... ok
+test retrieval_v1::golden_tests::symbol_search_logic_flow_anchor_returns_search_logic_flow ... ok
+test events::replay_tests::concurrent_appends_keep_event_row_ids_and_event_ids_monotonic ... ok
+test storage::tests::test_vector_delete_by_file ... ok
+test storage::tests::test_vector_store_and_search ... ok
+test storage::tests::test_file_based_store ... ok
+test storage::tests::test_vector_store_scope_search_supports_file_summary_vectors ... ok
+test storage::tests::test_usearch_scope_search_supports_file_summary_vectors ... ok
+test storage::tests::test_usearch_delete_by_file_updates_persisted_index ... ok
+test storage::tests::test_usearch_index_persists_and_searches ... ok
+test storage::tests::test_vector_store_cache_performance ... ok
+test verification::existence_tests::deleted_symbol_emits_invalidated_proposal ... ok
+test verification::existence_tests::deleted_test_emits_invalidated_proposal ... ok
+test verification::existence_tests::existing_doc_section_emits_verified_proposal ... ok
+test verification::existence_tests::deleting_file_emits_invalidated_proposal ... ok
+test verification::existence_tests::live_file_evidence_emits_verified_proposal ... ok
+test verification::existence_tests::verification_schema_round_trips_under_runtime_migration ... ok
+test verification::incremental_tests::expiry_scanner_marks_expired_and_is_idempotent ... ok
+test verification::incremental_tests::deleted_file_invalidates_verified_memory_on_next_delta ... ok
+test verification::incremental_tests::successful_verification_advances_last_verified_graph_snapshot_id ... ok
+test verification::integration_tests::test_contradicted_memory_never_appears_in_trusted_bundle ... ok
+test verification::incremental_tests::graph_delta_reverifies_only_impacted_memories ... ok
+test verification::integration_tests::test_expired_memory_never_appears_in_trusted_bundle ... ok
+test verification::integration_tests::test_scope_leak_blocked_at_store_boundary_for_all_scopes ... ok
+test verification::integration_tests::test_ranker_excludes_non_verified_from_top_n ... ok
+test memory_graph::store_tests::legal_transitions_cover_full_allowed_matrix ... ok
+test verification::scope_leak_tests::audit_memory_invalidates_leaked_memory ... ok
+test verification::integration_tests::test_invalidated_memory_never_appears_in_trusted_bundle ... ok
+test verification::scope_leak_tests::branch_scope_memory_does_not_list_for_unrelated_branch ... ok
+test verification::scope_leak_tests::debug_guard_panics_when_leaked_row_reaches_boundary ... ok
+test verification::scope_leak_tests::organization_scope_requires_matching_organization ... ok
+test verification::scope_leak_tests::repo_scope_memory_does_not_list_for_unrelated_workspace ... ok
+test verification::scope_leak_tests::scope_filter_event_is_emitted_for_each_store_boundary_drop ... ok
+test verification::spans_tests::crlf_flip_is_reported_as_encoding_changed ... ok
+test verification::spans_tests::evidence_without_span_is_a_verified_no_op ... ok
+test verification::spans_tests::modified_content_at_span_returns_stale_content_changed ... ok
+test verification::spans_tests::span_validation_never_reads_the_whole_file ... ok
+test verification::spans_tests::truncated_file_below_span_returns_file_shrunk_below_span ... ok
+test verification::spans_tests::unchanged_content_at_span_returns_verified ... ok
+test verification::surfacing_tests::classify_covers_all_verification_status_variants ... ok
+test verification::surfacing_tests::debug_assertion_fires_when_non_trusted_memory_is_injected_into_trusted - should panic ... ok
+test verification::surfacing_tests::label_reason_is_non_empty_and_uses_verifier_reason_scope_file_and_expiry ... ok
+test verification::surfacing_tests::ranker_top_n_excludes_every_non_verified_memory_regardless_of_score ... ok
+test verification::scope_leak_tests::session_scope_memory_does_not_list_for_different_session ... ok
+test verification::surfacing_tests::verified_memories_land_in_trusted_and_all_other_states_are_advisory ... ok
+test watcher::tests::test_should_index_python ... ok
+test watcher::tests::test_should_index_typescript ... ok
+test watcher::tests::test_should_not_index_excluded_dirs ... ok
+test watcher::tests::test_should_not_index_non_code ... ok
+test watcher::tests::test_should_not_index_secrets ... ok
+test working_memory::budget_tests::budget_changes_only_affect_subsequent_operations ... ok
+test working_memory::budget_tests::evict_absent_identity_is_a_documented_no_op ... ok
+test working_memory::budget_tests::evict_no_op_emits_no_mutation_or_event ... ok
+test working_memory::budget_tests::evict_present_identity_moves_it_to_excluded_with_reason ... ok
+test working_memory::budget_tests::evict_refuses_pinned_identity_without_force ... ok
+test working_memory::budget_tests::compress_honors_token_budget_and_updates_budget_decisions ... ok
+test working_memory::budget_tests::evicted_identity_can_be_retrieved_again_in_same_session ... ok
+test working_memory::budget_tests::forced_evict_records_force_in_exclusion_reason ... ok
+test working_memory::budget_tests::pin_survives_checkpoint_round_trip ... ok
+test working_memory::budget_tests::pin_survives_compress ... ok
+test working_memory::budget_tests::pin_twice_is_idempotent ... ok
+test working_memory::budget_tests::retrieve_moves_truncated_results_to_excluded_with_budget_reason ... ok
+test working_memory::budget_tests::retrieve_over_budget_bundle_keeps_truncated_report ... ok
+test working_memory::checkpoint_tests::checkpoint_round_trip_is_byte_identical ... ok
+test working_memory::checkpoint_tests::checkpoints_with_same_name_get_distinct_ids_and_round_trip ... ok
+test working_memory::checkpoint_tests::loading_checkpoint_restores_selected_excluded_and_budget_together ... ok
+test working_memory::checkpoint_tests::loading_newer_state_version_is_rejected_clearly ... ok
+test working_memory::checkpoint_tests::loading_unknown_checkpoint_id_returns_storage_error ... ok
+test working_memory::operations_tests::checkpoint_name_versions_instead_of_overwriting ... ok
+test working_memory::operations_tests::checkpoint_round_trips_state_bytes ... ok
+test working_memory::operations_tests::evict_forced_identity_records_reason_and_absent_count ... ok
+test working_memory::operations_tests::evict_of_pinned_identity_without_force_is_refused ... ok
+test working_memory::operations_tests::expand_appends_new_high_ranked_candidates ... ok
+test working_memory::operations_tests::filter_records_predicate_description ... ok
+test working_memory::budget_tests::huge_candidate_set_is_bounded_by_compress ... ok
+test working_memory::operations_tests::pin_is_idempotent_and_compress_preserves_pinned_identity ... ok
+test working_memory::operations_tests::summarize_returns_expected_fields ... ok
+test working_memory::state_tests::default_constructed_state_has_required_fields ... ok
+test verification::integration_tests::test_verifier_emits_explainable_label_reason_for_every_non_verified_state ... ok
+test working_memory::state_tests::excluded_memories_require_exclusion_reason ... ok
+test working_memory::operations_tests::retrieve_populates_selected_and_excluded_memories ... ok
+test working_memory::state_tests::loading_checkpoint_with_unknown_state_version_is_rejected ... ok
+test working_memory::state_tests::serde_round_trips_state_without_data_loss ... ok
+test working_memory::state_tests::state_hash_matches_between_save_and_load ... ok
+test working_memory::state_tests::save_then_load_checkpoint_returns_byte_identical_state ... ok
+test workspace::tests::test_add_and_remove_repo ... ok
+test workspace::tests::test_multi_repo_stats ... ok
+test workspace::tests::test_remove_file_uses_repo_namespace ... ok
+test workspace::tests::test_index_file_in_repo ... ok
+test workspace::tests::test_unified_graph_namespaces_duplicate_relative_paths ... ok
+test workspace::tests::test_cross_repo_edge_detection ... ok
+test verification::integration_tests::test_stale_memory_never_appears_in_trusted_bundle ... ok
+test events::replay_tests::stream_returns_task_events_in_monotonic_event_id_order_after_concurrent_writes ... ok
+test verification::integration_tests::test_incremental_verification_narrows_to_changed_files_only ... ok
+test verification::incremental_tests::bounded_work_budget_reenqueues_remaining_memories ... ok
+test hardening::migration_tests::large_legacy_dataset_migrates_without_losing_rows_under_budget has been running for over 60 seconds
+test hardening::migration_tests::large_legacy_dataset_migrates_without_losing_rows_under_budget ... ok
+
+test result: ok. 535 passed; 0 failed; 37 ignored; 0 measured; 0 filtered out; finished in 110.95s
+
+     Running unittests src/lib.rs (target/debug/deps/lattice_daemon-3bd623e697040ee9)
+
+running 154 tests
+test rpc::context_cache::tests::test_cache_evicts_oldest_when_over_capacity ... ok
+test rpc::context_cache::tests::test_cache_skips_expired_persisted_handles ... ok
+test rpc::context_cache::tests::test_cache_round_trip ... ok
+test rpc::identity_payload::tests::ambiguous_resolver_outcome_surfaces_diagnostic ... ok
+test rpc::context_cache::tests::test_cache_persists_and_restores_handles ... ok
+test rpc::identity_payload::tests::full_tool_response_includes_identity_payloads_and_legacy_fields ... ok
+test rpc::mcp::tests::test_build_failure_overview_value_uses_short_memory_reference ... ok
+test rpc::event_capture_tests::batched_flush_writer_records_multiple_tool_calls_for_same_session ... ok
+test rpc::mcp::tests::test_count_outcome_memory_reuse_only_counts_workflow_outcomes ... ok
+test rpc::event_capture_tests::event_capture_new_rejects_workspace_mismatch ... ok
+test rpc::mcp::tests::test_extract_wrapped_tool_metrics_reads_dense_workflow_metadata ... ok
+test rpc::mcp::tests::test_extract_wrapped_tool_metrics_reads_workflow_metadata ... ok
+test rpc::mcp::tests::test_file_symbols_returns_extension_compatible_fields ... ok
+test rpc::event_capture_tests::dispatch_error_records_tool_result_and_preserves_json_rpc_error ... ok
+test rpc::event_capture_tests::dispatch_error_tail_includes_tool_called_and_failed_result_events ... ok
+test rpc::mcp::tests::test_memory_seed_values_falls_back_to_highlights ... ok
+test rpc::mcp::tests::test_plan_edit_suggested_expand_prefers_candidate_span_handle ... ok
+test rpc::mcp::tests::test_context_capsule_tool_path_is_bounded_and_strips_source ... ok
+test rpc::mcp::tests::test_expand_context_tool_path_supports_stable_and_legacy_focus ... ok
+test rpc::event_capture_tests::dispatch_success_records_task_tool_result_and_workflow_events ... ok
+test rpc::mcp::tests::test_report_memory_highlights_truncates_content ... ok
+test rpc::mcp::tests::test_augment_memory_values_with_playbooks_prefers_verified_workflow_outcome ... ok
+test rpc::mcp::tests::test_seed_from_plan_edit_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_seed_from_task_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_seed_from_trace_scenario_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_summarize_workflow_outcome_content_stays_compact ... ok
+test rpc::mcp::tests::test_trace_scenario_suggested_expand_uses_execution_path_handle ... ok
+test rpc::mcp::tests::test_index_status_uses_live_indexer_snapshot_while_indexing ... ok
+test rpc::mcp::tests::test_prepare_change_reports_indexing_when_no_warm_graph_is_available ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_hybrid_prefixes_summary_before_json_payload ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_prefers_symbol_handle_in_suggested_expand ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_markdown_keeps_hidden_metrics_comment ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_summarizes_context_capsule_payload ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_uses_stable_file_handle_when_symbol_missing ... ok
+test rpc::mcp::tests::test_load_durable_memory_values_prefers_verified_workflow_outcome ... ok
+test rpc::mcp::tests::test_plan_edit_tool_path_returns_context_handle_and_origin ... ok
+test rpc::mcp::tests::test_prepare_change_promotes_live_indexer_graph_while_indexing ... ok
+test rpc::mcp::tests::test_search_memory_surfaces_structured_weaker_metadata ... ok
+test rpc::mcp::tests::test_trace_scenario_tool_path_returns_context_handle_and_origin ... ok
+test rpc::mcp_schema_tests::backward_compat::consolidate_session_accepts_only_session_id ... ok
+test rpc::mcp_schema_tests::backward_compat::get_event_trace_accepts_empty_filter_request ... ok
+test rpc::mcp_schema_tests::backward_compat::get_event_trace_accepts_typed_event_kinds ... ok
+test rpc::mcp_schema_tests::backward_compat::get_memory_metrics_accepts_empty_request ... ok
+test rpc::mcp_schema_tests::backward_compat::get_task_memory_accepts_only_task_id ... ok
+test rpc::mcp_schema_tests::backward_compat::inspect_working_memory_accepts_minimal_request ... ok
+test rpc::mcp_schema_tests::backward_compat::list_memory_conflicts_accepts_legacy_memory_anchor_string ... ok
+test rpc::mcp_schema_tests::backward_compat::propose_memory_evolution_accepts_only_action_for_dispatch ... ok
+test rpc::mcp_schema_tests::backward_compat::save_memory_accepts_minimum_payload_without_optional_links ... ok
+test rpc::mcp_schema_tests::backward_compat::verify_explain_memory_accepts_legacy_memory_id_string ... ok
+test rpc::mcp_compat_tests::compat_matrix_extends_mcp_schema_contract_without_changing_tool_list ... ok
+test rpc::event_capture_tests::all_dispatched_workflow_tools_emit_call_and_result_events ... ok
+test rpc::mcp_compat_tests::stable_context_handle_round_trips_through_expand_context ... ok
+test rpc::mcp_compat_tests::deprecated_with_deadline_tools_warn_with_successor_and_deadline ... ok
+test rpc::mcp_schema_tests::render_modes::get_memory_metrics_renders_each_mode_with_honest_nulls ... ok
+test rpc::mcp_schema_tests::render_modes::get_event_trace_renders_compact_full_and_diagnostic_with_handles ... ok
+test rpc::mcp_schema_tests::render_modes::get_task_memory_emits_expansion_handles_per_memory ... ok
+test rpc::mcp_schema_tests::round_trip::consolidate_session_request_and_response_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::evolution_proposal_round_trip_keeps_deprecation_field_optional ... ok
+test rpc::mcp_schema_tests::round_trip::get_event_trace_request_and_page_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::get_memory_metrics_request_round_trip_includes_all_signals ... ok
+test rpc::mcp_schema_tests::round_trip::get_task_memory_args_round_trip_with_and_without_optionals ... ok
+test rpc::mcp_schema_tests::round_trip::inspect_working_memory_args_deserialize_each_mode ... ok
+test rpc::mcp_schema_tests::round_trip::list_memory_conflicts_args_round_trip_for_every_anchor_kind ... ok
+test rpc::mcp_schema_tests::round_trip::list_memory_conflicts_response_round_trip_carries_summary_lines ... ok
+test rpc::mcp_schema_tests::round_trip::memory_class_and_assertion_type_serde_uses_snake_case_wire_form ... ok
+test rpc::mcp_schema_tests::round_trip::propose_memory_evolution_args_round_trip_for_each_action ... ok
+test rpc::mcp_schema_tests::round_trip::save_memory_args_round_trip_preserves_snake_case_assertion_type ... ok
+test rpc::mcp_schema_tests::round_trip::save_memory_response_round_trip_includes_full_memory_record ... ok
+test rpc::mcp_schema_tests::render_modes::consolidate_session_renders_compact_full_and_diagnostic ... ok
+test rpc::mcp_schema_tests::round_trip::task_memory_bundle_and_memory_record_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::verify_explain_args_round_trip_with_legacy_and_structured_memory_id ... ok
+test rpc::mcp_schema_tests::round_trip::workflow_bundle_round_trip_keeps_render_choice_and_stable_handles ... ok
+test rpc::mcp_compat_tests::every_r64_legacy_alias_still_responds_with_legacy_shape_and_events ... ok
+test rpc::mcp_schema_tests::round_trip::verify_explain_response_round_trip_includes_optional_diagnostic_trace ... ok
+test rpc::mcp_schema_tests::render_modes::inspect_working_memory_supports_compact_and_diagnostic_modes ... ok
+test rpc::mcp_schema_tests::render_modes::list_memory_conflicts_renders_each_mode_for_legacy_memory_anchor ... ok
+test rpc::mcp_schema_tests::shims::blast_radius_alias_dispatches_to_get_impact_graph ... ok
+test rpc::mcp_schema_tests::shims::get_file_context_alias_dispatches_to_get_skeleton ... ok
+test rpc::mcp_schema_tests::shims::explain_memory_shim_forces_explain_mode_and_attaches_deprecation_warning ... ok
+test rpc::mcp_compat_tests::additive_tools_accept_legacy_minimal_requests_as_supersets ... ok
+test rpc::mcp_schema_tests::render_modes::verify_explain_memory_renders_compact_full_and_diagnostic ... ok
+test rpc::mcp_schema_tests::shims::deprecation_warning_field_is_absent_from_canonical_responses ... ok
+test rpc::mcp_schema_tests::shims::query_context_alias_dispatches_to_get_context_capsule ... ok
+test rpc::mcp_schema_tests::shims::apply_memory_evolution_shim_forwards_to_propose_action_apply ... ok
+test rpc::mcp_schema_tests::shims::recall_memories_alias_dispatches_to_search_memory ... ok
+test rpc::mcp_schema_tests::tool_list::advertised_tool_list_matches_the_reference_exactly ... ok
+test rpc::mcp_schema_tests::tool_list::callable_aliases_dispatch_without_being_advertised ... ok
+test rpc::mcp_schema_tests::tool_list::every_advertised_tool_carries_name_description_and_input_schema ... ok
+test rpc::memory_v2::admin_tools_tests::serde_round_trips_admin_tool_requests_and_responses ... ok
+test rpc::mcp_schema_tests::shims::store_memory_alias_dispatches_to_save_observation ... ok
+test rpc::mcp_schema_tests::tool_list::unknown_tool_call_returns_a_dispatcher_error ... ok
+test rpc::mcp_schema_tests::shims::verify_memory_shim_forces_verify_mode_and_attaches_deprecation_warning ... ok
+test rpc::memory_v2::admin_tools_tests::get_memory_metrics_returns_every_required_signal_or_honest_null ... ok
+test rpc::memory_v2::memory_tools_tests::get_task_memory_surfaces_inclusion_reason_and_verification_status ... ok
+test rpc::memory_v2::memory_tools_tests::serde_round_trips_memory_tool_requests_and_responses ... ok
+test rpc::memory_v2::admin_tools_tests::get_event_trace_enforces_workspace_boundary_and_has_stable_pagination ... ok
+test rpc::memory_v2::memory_tools_tests::get_task_memory_respects_scope_boundaries ... ok
+test rpc::memory_v2::memory_tools_tests::apply_memory_evolution_shim_forwards_with_deprecation_warning ... ok
+test rpc::memory_v2::admin_tools_tests::consolidate_session_emits_proposals_without_direct_writes_and_proposals_are_actionable ... ok
+test rpc::memory_v2::verify_explain_tests::serde_round_trips_verify_and_conflict_requests_and_responses ... ok
+test rpc::memory_v2::verify_explain_tests::deleted_linked_symbol_transitions_to_stale_with_linked_symbol_missing_failure ... ok
+test rpc::memory_v2::memory_tools_tests::save_memory_defaults_unverified_persists_fields_emits_event_and_queues_verification ... ok
+test rpc::metrics_surface_tests::call_relevance_exposes_every_ranking_signal_column ... ok
+test rpc::metrics_surface_tests::collect_for_call_rejects_cross_workspace_and_scope_reports ... ok
+test rpc::metrics_surface_tests::collect_reports_honest_null_with_reason_when_evidence_is_missing ... ok
+test rpc::metrics_surface_tests::collect_returns_every_required_metric_signal_variant ... ok
+test rpc::metrics_surface_tests::compact_mode_digest_is_bounded ... ok
+test rpc::metrics_surface_tests::diagnostic_expansion_handle_dereferences_to_full_breakdown ... ok
+test rpc::metrics_surface_tests::serde_round_trip_preserves_surface_request_and_response ... ok
+test rpc::server::tests::test_abort_all_requests_aborts_every_in_flight_task ... ok
+test rpc::server::tests::test_cancel_active_request_aborts_matching_task ... ok
+test rpc::server::tests::test_cancelled_request_key_reads_mcp_request_id ... ok
+test rpc::server::tests::test_should_write_tracked_response_accepts_current_generation ... ok
+test rpc::server::tests::test_should_write_tracked_response_drops_stale_duplicate_generation ... ok
+test rpc::session_metrics::tests::test_session_metrics_groups_expand_context_under_prior_task ... ok
+test rpc::session_metrics::tests::test_session_metrics_only_counts_true_follow_up_avoidance ... ok
+test rpc::memory_v2::verify_explain_tests::list_memory_conflicts_returns_contradicts_and_supersedes_with_correct_directionality ... ok
+test rpc::session_metrics::tests::test_session_metrics_tracks_auto_memory_writes ... ok
+test rpc::tests::test_format_error_response ... ok
+test rpc::tests::test_format_success_response ... ok
+test rpc::tests::test_parse_notification ... ok
+test rpc::tests::test_parse_valid_request ... ok
+test rpc::memory_v2::verify_explain_tests::every_check_result_carries_an_evidence_reference ... ok
+test rpc::workflow_v2::composition_tests::every_outer_call_emits_exactly_one_outcome_event_and_excluded_candidates_are_recorded ... ignored, p99 timing assertion; run via --include-ignored so it is not affected by parallel test CPU contention
+test rpc::memory_v2::memory_tools_tests::propose_apply_and_reject_memory_evolution_are_auditable ... ok
+test rpc::memory_v2::verify_explain_tests::verify_explain_memory_uses_phase7_status_taxonomy_only ... ok
+test rpc::memory_v2::verify_explain_tests::scope_leak_negative_paths_return_explicit_errors ... ok
+test rpc::workflow_v2::discovery_workflows_tests::context_capsule_returns_expansion_handle_that_expand_context_can_use ... ok
+test rpc::workflow_v2::discovery_workflows_tests::default_render_mode_is_compact_and_bundle_is_bounded ... ok
+test rpc::workflow_v2::discovery_workflows_tests::impact_from_diff_stays_bounded_and_surfaces_affected_docs ... ok
+test rpc::workflow_v2::discovery_workflows_tests::relevant_tests_recovers_the_golden_test_target ... ok
+test rpc::memory_v2::verify_explain_tests::verify_and_explain_deprecation_shims_forward_correctly ... ok
+test rpc::workflow_v2::discovery_workflows_tests::stale_memories_are_labeled_when_present ... ok
+test rpc::mcp_compat_tests::compact_and_full_render_modes_work_for_workflow_and_review_tools ... ok
+test rpc::workflow_v2::discovery_workflows_tests::serde_round_trips_each_discovery_workflow_response ... ok
+test rpc::workflow_v2::edit_workflows_tests::prepare_change_returns_complete_workflow_bundle ... ok
+test rpc::workflow_v2::composition_tests::get_context_capsule_and_expand_context_backlink_to_origin_without_redundant_payload ... ok
+test rpc::workflow_v2::edit_workflows_tests::plan_edit_steps_reference_stable_identities ... ok
+test rpc::workflow_v2::edit_workflows_tests::diagnose_failure_recovers_injected_failure_pattern ... ok
+test rpc::workflow_v2::edit_workflows_tests::stale_memories_are_explicitly_labeled ... ok
+test rpc::workflow_v2::edit_workflows_tests::workflow_events_are_emitted_in_order_under_budget ... ok
+test rpc::workflow_v2::edit_workflows_tests::serde_round_trips_each_edit_workflow_response ... ok
+test rpc::working_memory_tool_tests::compact_mode_returns_summary_and_snapshot_handle ... ok
+test rpc::workflow_v2::composition_tests::consolidate_session_apply_chain_and_scope_protection_survive_recorder ... ok
+test rpc::working_memory_tool_tests::retrieve_and_expand_emit_event_diffs_through_single_mutation_observer ... ok
+test vector_sync::tests::test_build_embedding_text_includes_high_signal_anchors ... ok
+test vector_sync::tests::test_build_file_summary_embedding_text_includes_file_granularity_signals ... ok
+test rpc::workflow_v2::composition_tests::save_memory_and_verify_explain_emit_linked_outcomes_and_verified_status ... ok
+test rpc::working_memory_tool_tests::tool_falls_back_to_latest_checkpoint_when_session_cache_is_empty ... ok
+test rpc::working_memory_tool_tests::diagnostic_mode_returns_full_state_and_include_excluded_controls_visibility ... ok
+test rpc::workflow_v2::composition_tests::diagnose_failure_and_prepare_change_reuse_failure_anchors ... ok
+test rpc::working_memory_tool_tests::tools_list_registers_inspect_working_memory_schema ... ok
+test rpc::workflow_v2::composition_tests::prepare_plan_patch_and_manual_outcome_emit_expected_sequence ... ok
+test vector_sync::tests::test_build_embedding_text_is_bounded ... ok
+
+test result: ok. 153 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.23s
+
+     Running unittests src/main.rs (target/debug/deps/lattice-850370b98a36052d)
+
+running 158 tests
+test rpc::context_cache::tests::test_cache_evicts_oldest_when_over_capacity ... ok
+test rpc::context_cache::tests::test_cache_round_trip ... ok
+test rpc::context_cache::tests::test_cache_skips_expired_persisted_handles ... ok
+test rpc::context_cache::tests::test_cache_persists_and_restores_handles ... ok
+test rpc::identity_payload::tests::ambiguous_resolver_outcome_surfaces_diagnostic ... ok
+test rpc::identity_payload::tests::full_tool_response_includes_identity_payloads_and_legacy_fields ... ok
+test rpc::mcp::tests::test_build_failure_overview_value_uses_short_memory_reference ... ok
+test rpc::event_capture_tests::event_capture_new_rejects_workspace_mismatch ... ok
+test rpc::mcp::tests::test_count_outcome_memory_reuse_only_counts_workflow_outcomes ... ok
+test rpc::event_capture_tests::batched_flush_writer_records_multiple_tool_calls_for_same_session ... ok
+test rpc::mcp::tests::test_extract_wrapped_tool_metrics_reads_dense_workflow_metadata ... ok
+test rpc::mcp::tests::test_extract_wrapped_tool_metrics_reads_workflow_metadata ... ok
+test rpc::event_capture_tests::dispatch_error_tail_includes_tool_called_and_failed_result_events ... ok
+test rpc::event_capture_tests::dispatch_success_records_task_tool_result_and_workflow_events ... ok
+test rpc::event_capture_tests::dispatch_error_records_tool_result_and_preserves_json_rpc_error ... ok
+test rpc::mcp::tests::test_memory_seed_values_falls_back_to_highlights ... ok
+test rpc::mcp::tests::test_plan_edit_suggested_expand_prefers_candidate_span_handle ... ok
+test rpc::mcp::tests::test_expand_context_tool_path_supports_stable_and_legacy_focus ... ok
+test rpc::mcp::tests::test_index_status_uses_live_indexer_snapshot_while_indexing ... ok
+test rpc::mcp::tests::test_context_capsule_tool_path_is_bounded_and_strips_source ... ok
+test rpc::mcp::tests::test_report_memory_highlights_truncates_content ... ok
+test rpc::mcp::tests::test_augment_memory_values_with_playbooks_prefers_verified_workflow_outcome ... ok
+test rpc::mcp::tests::test_seed_from_plan_edit_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_seed_from_task_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_file_symbols_returns_extension_compatible_fields ... ok
+test rpc::mcp::tests::test_seed_from_trace_scenario_bundle_includes_stable_and_legacy_handles ... ok
+test rpc::mcp::tests::test_summarize_workflow_outcome_content_stays_compact ... ok
+test rpc::mcp::tests::test_trace_scenario_suggested_expand_uses_execution_path_handle ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_hybrid_prefixes_summary_before_json_payload ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_markdown_keeps_hidden_metrics_comment ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_prefers_symbol_handle_in_suggested_expand ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_summarizes_context_capsule_payload ... ok
+test rpc::mcp::tests::test_wrap_workflow_tool_result_uses_stable_file_handle_when_symbol_missing ... ok
+test rpc::mcp::tests::test_load_durable_memory_values_prefers_verified_workflow_outcome ... ok
+test rpc::mcp::tests::test_plan_edit_tool_path_returns_context_handle_and_origin ... ok
+test rpc::mcp::tests::test_prepare_change_reports_indexing_when_no_warm_graph_is_available ... ok
+test rpc::mcp::tests::test_trace_scenario_tool_path_returns_context_handle_and_origin ... ok
+test rpc::mcp::tests::test_prepare_change_promotes_live_indexer_graph_while_indexing ... ok
+test rpc::mcp::tests::test_search_memory_surfaces_structured_weaker_metadata ... ok
+test rpc::mcp_schema_tests::backward_compat::consolidate_session_accepts_only_session_id ... ok
+test rpc::mcp_schema_tests::backward_compat::get_event_trace_accepts_empty_filter_request ... ok
+test rpc::mcp_schema_tests::backward_compat::get_event_trace_accepts_typed_event_kinds ... ok
+test rpc::mcp_schema_tests::backward_compat::get_memory_metrics_accepts_empty_request ... ok
+test rpc::mcp_schema_tests::backward_compat::get_task_memory_accepts_only_task_id ... ok
+test rpc::mcp_compat_tests::compat_matrix_extends_mcp_schema_contract_without_changing_tool_list ... ok
+test rpc::mcp_schema_tests::backward_compat::inspect_working_memory_accepts_minimal_request ... ok
+test rpc::mcp_schema_tests::backward_compat::list_memory_conflicts_accepts_legacy_memory_anchor_string ... ok
+test rpc::mcp_schema_tests::backward_compat::propose_memory_evolution_accepts_only_action_for_dispatch ... ok
+test rpc::mcp_schema_tests::backward_compat::save_memory_accepts_minimum_payload_without_optional_links ... ok
+test rpc::mcp_schema_tests::backward_compat::verify_explain_memory_accepts_legacy_memory_id_string ... ok
+test rpc::mcp_compat_tests::stable_context_handle_round_trips_through_expand_context ... ok
+test rpc::mcp_compat_tests::deprecated_with_deadline_tools_warn_with_successor_and_deadline ... ok
+test rpc::event_capture_tests::all_dispatched_workflow_tools_emit_call_and_result_events ... ok
+test rpc::mcp_schema_tests::render_modes::get_event_trace_renders_compact_full_and_diagnostic_with_handles ... ok
+test rpc::mcp_schema_tests::render_modes::get_memory_metrics_renders_each_mode_with_honest_nulls ... ok
+test rpc::mcp_compat_tests::every_r64_legacy_alias_still_responds_with_legacy_shape_and_events ... ok
+test rpc::mcp_schema_tests::round_trip::consolidate_session_request_and_response_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::evolution_proposal_round_trip_keeps_deprecation_field_optional ... ok
+test rpc::mcp_schema_tests::round_trip::get_event_trace_request_and_page_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::get_memory_metrics_request_round_trip_includes_all_signals ... ok
+test rpc::mcp_schema_tests::round_trip::get_task_memory_args_round_trip_with_and_without_optionals ... ok
+test rpc::mcp_schema_tests::round_trip::inspect_working_memory_args_deserialize_each_mode ... ok
+test rpc::mcp_schema_tests::render_modes::inspect_working_memory_supports_compact_and_diagnostic_modes ... ok
+test rpc::mcp_schema_tests::round_trip::list_memory_conflicts_args_round_trip_for_every_anchor_kind ... ok
+test rpc::mcp_schema_tests::round_trip::list_memory_conflicts_response_round_trip_carries_summary_lines ... ok
+test rpc::mcp_schema_tests::round_trip::memory_class_and_assertion_type_serde_uses_snake_case_wire_form ... ok
+test rpc::mcp_schema_tests::round_trip::propose_memory_evolution_args_round_trip_for_each_action ... ok
+test rpc::mcp_schema_tests::round_trip::save_memory_args_round_trip_preserves_snake_case_assertion_type ... ok
+test rpc::mcp_schema_tests::round_trip::save_memory_response_round_trip_includes_full_memory_record ... ok
+test rpc::mcp_schema_tests::round_trip::verify_explain_args_round_trip_with_legacy_and_structured_memory_id ... ok
+test rpc::mcp_schema_tests::round_trip::task_memory_bundle_and_memory_record_round_trip ... ok
+test rpc::mcp_schema_tests::round_trip::verify_explain_response_round_trip_includes_optional_diagnostic_trace ... ok
+test rpc::mcp_schema_tests::round_trip::workflow_bundle_round_trip_keeps_render_choice_and_stable_handles ... ok
+test rpc::mcp_schema_tests::render_modes::get_task_memory_emits_expansion_handles_per_memory ... ok
+test rpc::mcp_schema_tests::render_modes::list_memory_conflicts_renders_each_mode_for_legacy_memory_anchor ... ok
+test rpc::mcp_schema_tests::render_modes::consolidate_session_renders_compact_full_and_diagnostic ... ok
+test rpc::mcp_schema_tests::shims::blast_radius_alias_dispatches_to_get_impact_graph ... ok
+test rpc::mcp_compat_tests::additive_tools_accept_legacy_minimal_requests_as_supersets ... ok
+test rpc::mcp_schema_tests::shims::deprecation_warning_field_is_absent_from_canonical_responses ... ok
+test rpc::mcp_schema_tests::render_modes::verify_explain_memory_renders_compact_full_and_diagnostic ... ok
+test rpc::mcp_schema_tests::shims::apply_memory_evolution_shim_forwards_to_propose_action_apply ... ok
+test rpc::mcp_schema_tests::shims::get_file_context_alias_dispatches_to_get_skeleton ... ok
+test rpc::mcp_schema_tests::shims::query_context_alias_dispatches_to_get_context_capsule ... ok
+test rpc::mcp_schema_tests::shims::store_memory_alias_dispatches_to_save_observation ... ok
+test rpc::mcp_schema_tests::shims::explain_memory_shim_forces_explain_mode_and_attaches_deprecation_warning ... ok
+test rpc::mcp_schema_tests::shims::recall_memories_alias_dispatches_to_search_memory ... ok
+test rpc::mcp_schema_tests::tool_list::advertised_tool_list_matches_the_reference_exactly ... ok
+test rpc::mcp_schema_tests::shims::verify_memory_shim_forces_verify_mode_and_attaches_deprecation_warning ... ok
+test rpc::mcp_schema_tests::tool_list::callable_aliases_dispatch_without_being_advertised ... ok
+test rpc::memory_v2::admin_tools_tests::serde_round_trips_admin_tool_requests_and_responses ... ok
+test rpc::mcp_schema_tests::tool_list::every_advertised_tool_carries_name_description_and_input_schema ... ok
+test rpc::mcp_schema_tests::tool_list::unknown_tool_call_returns_a_dispatcher_error ... ok
+test rpc::memory_v2::admin_tools_tests::get_event_trace_enforces_workspace_boundary_and_has_stable_pagination ... ok
+test rpc::memory_v2::memory_tools_tests::get_task_memory_respects_scope_boundaries ... ok
+test rpc::memory_v2::memory_tools_tests::serde_round_trips_memory_tool_requests_and_responses ... ok
+test rpc::memory_v2::admin_tools_tests::consolidate_session_emits_proposals_without_direct_writes_and_proposals_are_actionable ... ok
+test rpc::memory_v2::memory_tools_tests::get_task_memory_surfaces_inclusion_reason_and_verification_status ... ok
+test rpc::memory_v2::admin_tools_tests::get_memory_metrics_returns_every_required_signal_or_honest_null ... ok
+test rpc::memory_v2::memory_tools_tests::save_memory_defaults_unverified_persists_fields_emits_event_and_queues_verification ... ok
+test rpc::memory_v2::verify_explain_tests::serde_round_trips_verify_and_conflict_requests_and_responses ... ok
+test rpc::memory_v2::memory_tools_tests::apply_memory_evolution_shim_forwards_with_deprecation_warning ... ok
+test rpc::memory_v2::verify_explain_tests::list_memory_conflicts_returns_contradicts_and_supersedes_with_correct_directionality ... ok
+test rpc::memory_v2::verify_explain_tests::deleted_linked_symbol_transitions_to_stale_with_linked_symbol_missing_failure ... ok
+test rpc::metrics_surface_tests::call_relevance_exposes_every_ranking_signal_column ... ok
+test rpc::metrics_surface_tests::collect_for_call_rejects_cross_workspace_and_scope_reports ... ok
+test rpc::metrics_surface_tests::collect_returns_every_required_metric_signal_variant ... ok
+test rpc::metrics_surface_tests::compact_mode_digest_is_bounded ... ok
+test rpc::metrics_surface_tests::collect_reports_honest_null_with_reason_when_evidence_is_missing ... ok
+test rpc::memory_v2::verify_explain_tests::scope_leak_negative_paths_return_explicit_errors ... ok
+test rpc::metrics_surface_tests::diagnostic_expansion_handle_dereferences_to_full_breakdown ... ok
+test rpc::server::tests::test_abort_all_requests_aborts_every_in_flight_task ... ok
+test rpc::server::tests::test_cancel_active_request_aborts_matching_task ... ok
+test rpc::server::tests::test_should_write_tracked_response_accepts_current_generation ... ok
+test rpc::server::tests::test_should_write_tracked_response_drops_stale_duplicate_generation ... ok
+test rpc::session_metrics::tests::test_session_metrics_groups_expand_context_under_prior_task ... ok
+test rpc::session_metrics::tests::test_session_metrics_only_counts_true_follow_up_avoidance ... ok
+test rpc::metrics_surface_tests::serde_round_trip_preserves_surface_request_and_response ... ok
+test rpc::session_metrics::tests::test_session_metrics_tracks_auto_memory_writes ... ok
+test rpc::tests::test_format_error_response ... ok
+test rpc::server::tests::test_cancelled_request_key_reads_mcp_request_id ... ok
+test rpc::tests::test_parse_valid_request ... ok
+test rpc::tests::test_format_success_response ... ok
+test rpc::tests::test_parse_notification ... ok
+test rpc::workflow_v2::composition_tests::every_outer_call_emits_exactly_one_outcome_event_and_excluded_candidates_are_recorded ... ignored, p99 timing assertion; run via --include-ignored so it is not affected by parallel test CPU contention
+test rpc::memory_v2::memory_tools_tests::propose_apply_and_reject_memory_evolution_are_auditable ... ok
+test rpc::memory_v2::verify_explain_tests::verify_explain_memory_uses_phase7_status_taxonomy_only ... ok
+test rpc::memory_v2::verify_explain_tests::every_check_result_carries_an_evidence_reference ... ok
+test rpc::workflow_v2::discovery_workflows_tests::context_capsule_returns_expansion_handle_that_expand_context_can_use ... ok
+test rpc::workflow_v2::discovery_workflows_tests::default_render_mode_is_compact_and_bundle_is_bounded ... ok
+test rpc::workflow_v2::discovery_workflows_tests::impact_from_diff_stays_bounded_and_surfaces_affected_docs ... ok
+test rpc::workflow_v2::discovery_workflows_tests::relevant_tests_recovers_the_golden_test_target ... ok
+test rpc::workflow_v2::discovery_workflows_tests::serde_round_trips_each_discovery_workflow_response ... ok
+test rpc::workflow_v2::discovery_workflows_tests::stale_memories_are_labeled_when_present ... ok
+test rpc::memory_v2::verify_explain_tests::verify_and_explain_deprecation_shims_forward_correctly ... ok
+test rpc::workflow_v2::edit_workflows_tests::diagnose_failure_recovers_injected_failure_pattern ... ok
+test rpc::mcp_compat_tests::compact_and_full_render_modes_work_for_workflow_and_review_tools ... ok
+test rpc::workflow_v2::edit_workflows_tests::plan_edit_steps_reference_stable_identities ... ok
+test rpc::workflow_v2::edit_workflows_tests::prepare_change_returns_complete_workflow_bundle ... ok
+test rpc::workflow_v2::edit_workflows_tests::stale_memories_are_explicitly_labeled ... ok
+test rpc::workflow_v2::composition_tests::get_context_capsule_and_expand_context_backlink_to_origin_without_redundant_payload ... ok
+test rpc::workflow_v2::edit_workflows_tests::serde_round_trips_each_edit_workflow_response ... ok
+test rpc::workflow_v2::edit_workflows_tests::workflow_events_are_emitted_in_order_under_budget ... ok
+test rpc::working_memory_tool_tests::compact_mode_returns_summary_and_snapshot_handle ... ok
+test rpc::working_memory_tool_tests::retrieve_and_expand_emit_event_diffs_through_single_mutation_observer ... ok
+test tests::test_incremental_index_reuses_cached_parsed_files_when_hash_unchanged ... ok
+test rpc::workflow_v2::composition_tests::consolidate_session_apply_chain_and_scope_protection_survive_recorder ... ok
+test rpc::workflow_v2::composition_tests::save_memory_and_verify_explain_emit_linked_outcomes_and_verified_status ... ok
+test rpc::working_memory_tool_tests::diagnostic_mode_returns_full_state_and_include_excluded_controls_visibility ... ok
+test vector_sync::tests::test_build_embedding_text_includes_high_signal_anchors ... ok
+test rpc::working_memory_tool_tests::tool_falls_back_to_latest_checkpoint_when_session_cache_is_empty ... ok
+test vector_sync::tests::test_build_file_summary_embedding_text_includes_file_granularity_signals ... ok
+test rpc::workflow_v2::composition_tests::diagnose_failure_and_prepare_change_reuse_failure_anchors ... ok
+test rpc::working_memory_tool_tests::tools_list_registers_inspect_working_memory_schema ... ok
+test tests::test_open_memory_stores_falls_back_when_persistent_open_fails ... ok
+test rpc::workflow_v2::composition_tests::prepare_plan_patch_and_manual_outcome_emit_expected_sequence ... ok
+test vector_sync::tests::test_build_embedding_text_is_bounded ... ok
+test tests::test_open_memory_stores_recovers_by_quarantining_broken_artifacts ... ok
+test tests::test_open_memory_stores_uses_persistent_store_when_available ... ok
+
+test result: ok. 157 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running unittests src/bin/lattice_report.rs (target/debug/deps/lattice_report-fb5b884bd17b19aa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lattice_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lattice_daemon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,212 @@
+[
+  {
+    "task_id": "rust_scheduler_retry_policy",
+    "repo": "rust-repo",
+    "intent": "prepare_change",
+    "task_prompt": "Change scheduler retry policy capping and verify the cross-module audit behavior.",
+    "expected_anchors": [
+      {
+        "file": "src/scheduler.rs",
+        "symbol": "RetryPolicy::bounded",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      },
+      {
+        "file": "src/scheduler.rs",
+        "symbol": "Scheduler::schedule",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      },
+      {
+        "file": "src/audit.rs",
+        "symbol": "audit_schedule",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      }
+    ],
+    "expected_tests": ["tests/scheduler_tests.rs"],
+    "expected_memory_classes": ["workflow_outcome", "pattern"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  },
+  {
+    "task_id": "rust_audit_trait_impact",
+    "repo": "rust-repo",
+    "intent": "impact_from_diff",
+    "task_prompt": "Review the impact of changing the AuditSink trait used by scheduler job creation.",
+    "expected_anchors": [
+      {
+        "file": "src/audit.rs",
+        "symbol": "AuditSink",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      },
+      {
+        "file": "src/audit.rs",
+        "symbol": "VecAuditSink",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      },
+      {
+        "file": "src/scheduler.rs",
+        "symbol": "Scheduler",
+        "doc_section": "docs/scheduler.md#Scheduler Workflow"
+      }
+    ],
+    "expected_tests": ["tests/scheduler_tests.rs"],
+    "expected_memory_classes": ["architecture_invariant", "workflow_outcome"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  },
+  {
+    "task_id": "ts_incident_assignment_flow",
+    "repo": "typescript-repo",
+    "intent": "prepare_change",
+    "task_prompt": "Fix incident assignment so inactive assignment groups fail with clear errors.",
+    "expected_anchors": [
+      {
+        "file": "src/models.ts",
+        "symbol": "assignIncident",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      },
+      {
+        "file": "src/models.ts",
+        "symbol": "IncidentQueue",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      },
+      {
+        "file": "tests/assignment.test.ts",
+        "symbol": "incident assignment",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      }
+    ],
+    "expected_tests": ["tests/assignment.test.ts"],
+    "expected_memory_classes": ["workflow_outcome", "pattern"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  },
+  {
+    "task_id": "ts_react_summary_render",
+    "repo": "typescript-repo",
+    "intent": "get_context_capsule",
+    "task_prompt": "Understand how the incident summary render obtains assignment notification copy.",
+    "expected_anchors": [
+      {
+        "file": "src/IncidentSummary.tsx",
+        "symbol": "IncidentSummary",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      },
+      {
+        "file": "src/notifications.ts",
+        "symbol": "buildAssignmentNotice",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      },
+      {
+        "file": "src/models.ts",
+        "symbol": "Incident",
+        "doc_section": "docs/incidents.md#Incident Assignment"
+      }
+    ],
+    "expected_tests": ["tests/assignment.test.ts"],
+    "expected_memory_classes": ["observation", "workflow_outcome"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  },
+  {
+    "task_id": "py_invoice_tax_total",
+    "repo": "python-repo",
+    "intent": "prepare_change",
+    "task_prompt": "Change invoice total calculation while preserving final tax rounding behavior.",
+    "expected_anchors": [
+      {
+        "file": "src/taskflow/billing.py",
+        "symbol": "calculate_invoice_total",
+        "doc_section": "docs/billing.md#Billing Flow"
+      },
+      {
+        "file": "src/taskflow/billing.py",
+        "symbol": "calculate_tax_cents",
+        "doc_section": "docs/billing.md#Billing Flow"
+      },
+      {
+        "file": "tests/test_billing.py",
+        "symbol": "test_calculate_invoice_total_adds_tax_once",
+        "doc_section": "docs/billing.md#Billing Flow"
+      }
+    ],
+    "expected_tests": ["tests/test_billing.py", "tests/test_payments.py"],
+    "expected_memory_classes": ["architecture_invariant", "workflow_outcome"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  },
+  {
+    "task_id": "py_payment_failure_diagnosis",
+    "repo": "python-repo",
+    "intent": "diagnose_failure",
+    "task_prompt": "Diagnose a payment failure where the gateway rejects a zero-cent request.",
+    "expected_anchors": [
+      {
+        "file": "src/taskflow/payments.py",
+        "symbol": "PaymentGateway.charge",
+        "doc_section": "docs/billing.md#Billing Flow"
+      },
+      {
+        "file": "src/taskflow/payments.py",
+        "symbol": "build_payment_request",
+        "doc_section": "docs/billing.md#Billing Flow"
+      },
+      {
+        "file": "src/taskflow/payments.py",
+        "symbol": "process_payment",
+        "doc_section": "docs/billing.md#Billing Flow"
+      }
+    ],
+    "expected_tests": ["tests/test_payments.py", "tests/test_billing.py"],
+    "expected_memory_classes": ["failure_pattern", "workflow_outcome"],
+    "expected_render_mode": "compact",
+    "success_criteria_thresholds": {
+      "tool_calls_reduction": 0.30,
+      "irrelevant_file_reads_reduction": 0.40,
+      "relevant_anchor_recall": 0.80,
+      "memory_inclusion_precision": 0.80,
+      "contradiction_missed_rate": 0.0,
+      "stale_memory_unlabeled_rate": 0.0,
+      "tests_recommended_vs_needed": 0.90
+    }
+  }
+]

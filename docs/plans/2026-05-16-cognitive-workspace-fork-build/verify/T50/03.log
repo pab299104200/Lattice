@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test verification::scope_leak_tests::audit_memory_invalidates_leaked_memory ... ok
+test verification::scope_leak_tests::debug_guard_panics_when_leaked_row_reaches_boundary ... ok
+test verification::scope_leak_tests::branch_scope_memory_does_not_list_for_unrelated_branch ... ok
+test verification::scope_leak_tests::repo_scope_memory_does_not_list_for_unrelated_workspace ... ok
+test verification::scope_leak_tests::organization_scope_requires_matching_organization ... ok
+test verification::scope_leak_tests::session_scope_memory_does_not_list_for_different_session ... ok
+test verification::scope_leak_tests::scope_filter_event_is_emitted_for_each_store_boundary_drop ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.05s
+

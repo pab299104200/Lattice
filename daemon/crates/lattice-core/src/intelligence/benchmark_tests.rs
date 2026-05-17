@@ -939,6 +939,7 @@ fn benchmark_memory(
             .collect(),
         workspace_id: Some("lattice-benchmark".to_string()),
         branch: Some("main".to_string()),
+        scope_organization_id: None,
         refresh_key: None,
         source_query: None,
         created_at: 0,
@@ -946,6 +947,7 @@ fn benchmark_memory(
         access_count: 0,
         is_stale: false,
         stale_reason: None,
+        verification_status: crate::memory::MemoryVerificationStatus::Unverified,
     }
 }
 

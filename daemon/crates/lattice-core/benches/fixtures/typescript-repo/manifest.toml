@@ -1,0 +1,11 @@
+name = "typescript-repo"
+size_class = "medium"
+documentation_style = "rich"
+benchmark_tasks = ["ts_incident_assignment_flow", "ts_react_summary_render"]
+golden_anchors_path = "../golden_anchors.json"
+
+[expected_event_counts]
+indexed_files = 8
+minimum_symbols = 12
+workflow_tool_calls = 5
+workflow_successes = 2

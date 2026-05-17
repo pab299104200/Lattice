@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test events::writer_tests::canonical_hash_is_stable_for_equivalent_key_order_variations ... ok
+test events::writer_tests::hash_payload_is_deterministic_for_typed_payloads ... ok
+test events::writer_tests::workspace_mismatch_is_rejected ... ok
+test events::writer_tests::inline_ceiling_boundary_is_honored_exactly ... ok
+test events::writer_tests::concurrent_appends_preserve_monotonic_row_ids ... ok
+test events::writer_tests::spilled_payloads_dedupe_by_hash ... ok
+test events::writer_tests::sync_flush_makes_rows_visible_to_new_connection ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.03s
+

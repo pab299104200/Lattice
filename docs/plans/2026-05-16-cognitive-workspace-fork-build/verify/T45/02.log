@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test consolidation::replay_tests::replay_never_calls_live_llm_driver ... ok
+test consolidation::replay_tests::replay_succeeds_with_cached_llm_responses_and_fails_cleanly_without_them ... ok
+test consolidation::replay_tests::reverse_refresh_restores_last_verified_at_exactly ... ok
+test consolidation::replay_tests::reverse_is_idempotent_for_already_reverted_proposals ... ok
+test consolidation::replay_tests::reverse_supersede_restores_status_and_clears_memory_links ... ok
+test consolidation::replay_tests::replay_from_genesis_reconstructs_same_state_for_fifty_mixed_proposals ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 4.50s
+

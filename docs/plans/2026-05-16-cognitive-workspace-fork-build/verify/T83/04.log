@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test hardening::workspace_boundary_tests::test_event_queries_remain_workspace_scoped ... ok
+test hardening::workspace_boundary_tests::test_unresolved_queries_do_not_fall_back_to_broad_workspace_dump ... ok
+test hardening::workspace_boundary_tests::test_workspace_file_reader_rejects_path_traversal_outside_root ... ok
+test hardening::workspace_boundary_tests::test_ignored_files_never_appear_in_query_or_workflow_tool_results ... ok
+test hardening::workspace_boundary_tests::test_branch_and_session_scoped_memories_do_not_leak ... ok
+test hardening::workspace_boundary_tests::test_repo_user_and_organization_scope_queries_require_explicit_opt_in ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.04s
+

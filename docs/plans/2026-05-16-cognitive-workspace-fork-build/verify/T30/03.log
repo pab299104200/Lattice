@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test retrieval_v1::scoring_tests::missing_signal_data_scores_zero_with_documented_reason ... ok
+test retrieval_v1::scoring_tests::representative_candidate_evaluates_all_thirteen_signals ... ok
+test retrieval_v1::scoring_tests::user_preference_compatibility_raises_matches_and_lowers_conflicts ... ok
+test retrieval_v1::scoring_tests::weight_overrides_change_ranking_deterministically ... ok
+test retrieval_v1::scoring_tests::compact_mode_produces_non_empty_single_line_reason ... ok
+test retrieval_v1::scoring_tests::stale_and_contradicted_memories_rank_below_trusted_peers ... ok
+test retrieval_v1::scoring_tests::diagnostic_mode_round_trips_signal_scores_and_reasons_through_serde ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.00s
+

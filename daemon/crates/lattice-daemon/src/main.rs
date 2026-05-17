@@ -14,9 +14,13 @@ use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::events::{
+    CompactionConfig, Compactor, EventStore, EventWriter, FlushPolicy, SchedulerHandle,
+};
 use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::MemoryStore;
+use lattice_core::memory_graph::MemoryMigrator;
 use lattice_core::parser;
 use lattice_core::query::QueryEngine;
 use lattice_core::security::SecurityFilter;
@@ -37,6 +41,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    if is_memory_migrate_command() {
+        return run_memory_migrate_cli();
+    }
+
     tracing::info!("Lattice daemon starting...");
 
     // ── Parse workspace roots ────────────────────────────────────────
@@ -56,8 +64,17 @@ async fn main() -> Result<()> {
 
     // File-backed memory store — observations persist across daemon restarts when available.
     let memories_path = lattice_dir.join("memories.db");
-    let (memory_store, ms_for_engine, _) = open_memory_stores(&memories_path);
+    let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
+    let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
+    let event_writer = Arc::new(
+        EventWriter::new(
+            event_store.clone(),
+            workspace_root.to_string_lossy().to_string(),
+            4096,
+        )
+        .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
+    );
 
     let graph_path = lattice_dir.join("graph.db");
     let graph_store = match GraphStore::open(&graph_path) {
@@ -89,6 +106,7 @@ async fn main() -> Result<()> {
             CodeGraph::new()
         }
     };
+    let compaction_graph = Arc::new(std::sync::Mutex::new(graph.clone()));
 
     let engine = QueryEngine::new(
         graph,
@@ -98,6 +116,14 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(graph_store));
+    let compaction_scheduler = start_event_compaction_scheduler(
+        &lattice_dir,
+        memory_mode,
+        &memories_path,
+        Arc::clone(&event_store),
+        Arc::clone(&event_writer),
+        Arc::clone(&compaction_graph),
+    );
 
     // Multi-repo workspace manager (only used when multiple workspaces)
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = if is_multi_repo {
@@ -117,6 +143,7 @@ async fn main() -> Result<()> {
         let engine_bg = Arc::clone(&engine);
         let indexer_bg = Arc::clone(&indexer);
         let graph_store_bg = Arc::clone(&graph_store);
+        let compaction_graph_bg = Arc::clone(&compaction_graph);
         let embedding_engine_bg = Arc::clone(&embedding_engine);
         let indexing_bg = Arc::clone(&indexing);
         let ws_manager_bg = workspace_manager.clone();
@@ -233,6 +260,11 @@ async fn main() -> Result<()> {
                     if let Err(e) = gs.save_graph(&new_graph) {
                         tracing::warn!("Failed to save graph: {}", e);
                     }
+                }
+                if let Ok(mut graph) = compaction_graph_bg.lock() {
+                    *graph = new_graph.clone();
+                } else {
+                    tracing::warn!("Failed to refresh compaction graph snapshot handle");
                 }
 
                 let mut eng = engine_bg.lock().await;
@@ -359,13 +391,91 @@ async fn main() -> Result<()> {
         workspace_manager,
         workspace_roots,
         indexing,
+        Some(event_writer),
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
     server.run().await?;
+    if let Some(scheduler) = compaction_scheduler {
+        scheduler.shutdown().await;
+    }
     tracing::info!("Stdio server exited");
 
     Ok(())
+}
+
+fn start_event_compaction_scheduler(
+    lattice_dir: &Path,
+    memory_mode: MemoryStoreMode,
+    memories_path: &Path,
+    event_store: Arc<EventStore>,
+    event_writer: Arc<EventWriter>,
+    graph: Arc<std::sync::Mutex<CodeGraph>>,
+) -> Option<SchedulerHandle> {
+    if memory_mode == MemoryStoreMode::InMemoryFallback {
+        tracing::warn!(
+            "Event compaction scheduler disabled because memory storage is in-memory fallback"
+        );
+        return None;
+    }
+    let memory = match MemoryStore::open(memories_path) {
+        Ok(store) => Arc::new(std::sync::Mutex::new(store)),
+        Err(err) => {
+            tracing::error!(
+                "Failed to open compaction memory store at {}: {}",
+                memories_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    let compactor = Compactor::new(
+        event_store,
+        event_writer,
+        graph,
+        memory,
+        event_compaction_config(lattice_dir),
+    );
+    Some(compactor.spawn_scheduler())
+}
+
+fn event_compaction_config(lattice_dir: &Path) -> CompactionConfig {
+    let mut config = CompactionConfig::new(lattice_dir.join("snapshots"));
+    config.interval = env_duration_secs("LATTICE_EVENT_COMPACTION_INTERVAL_SECS", config.interval);
+    config.min_events_since_last = env_u64(
+        "LATTICE_EVENT_COMPACTION_MIN_EVENTS",
+        config.min_events_since_last,
+    );
+    config.retain_snapshots = env_usize(
+        "LATTICE_EVENT_COMPACTION_RETAIN_SNAPSHOTS",
+        config.retain_snapshots,
+    );
+    config
+}
+
+fn env_duration_secs(name: &str, fallback: std::time::Duration) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(fallback)
+}
+
+fn env_u64(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn env_usize(name: &str, fallback: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
 }
 
 fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
@@ -624,6 +734,126 @@ fn parse_workspace_roots() -> Vec<PathBuf> {
 
     // Anti-double-indexing: remove any root that is a subdirectory of another
     deduplicate_roots(roots)
+}
+
+fn is_memory_migrate_command() -> bool {
+    std::env::args().nth(1).as_deref() == Some("memory-migrate")
+}
+
+fn run_memory_migrate_cli() -> Result<()> {
+    let options = parse_memory_migrate_options()?;
+    let source = rusqlite::Connection::open(&options.source_path)?;
+    let dest = rusqlite::Connection::open(&options.dest_path)?;
+    let migrator = MemoryMigrator::new(
+        Arc::new(std::sync::Mutex::new(source)),
+        Arc::new(std::sync::Mutex::new(dest)),
+        options.batch_size,
+        options.dry_run,
+    );
+    let plan = migrator.plan()?;
+    print_migration_plan(&plan);
+    let report = migrator.run(&plan)?;
+    print_migration_report(&report);
+    Ok(())
+}
+
+struct MemoryMigrateOptions {
+    source_path: PathBuf,
+    dest_path: PathBuf,
+    batch_size: usize,
+    dry_run: bool,
+}
+
+fn parse_memory_migrate_options() -> Result<MemoryMigrateOptions> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut source_path = None;
+    let mut dest_path = None;
+    let mut batch_size = 500_usize;
+    let mut dry_run = false;
+    let mut apply = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => dry_run = true,
+            "--apply" => apply = true,
+            "--source" => {
+                source_path = args.get(i + 1).map(PathBuf::from);
+                i += 1;
+            }
+            "--dest" => {
+                dest_path = args.get(i + 1).map(PathBuf::from);
+                i += 1;
+            }
+            "--batch-size" => {
+                batch_size = parse_batch_size(args.get(i + 1))?;
+                i += 1;
+            }
+            other => anyhow::bail!("unknown memory-migrate argument `{other}`"),
+        }
+        i += 1;
+    }
+    if dry_run == apply {
+        anyhow::bail!("memory-migrate requires exactly one of --dry-run or --apply");
+    }
+    let workspace = parse_workspace_roots().remove(0);
+    let lattice_dir = workspace.join(".lattice");
+    Ok(MemoryMigrateOptions {
+        source_path: source_path.unwrap_or_else(|| lattice_dir.join("memories.db")),
+        dest_path: dest_path.unwrap_or_else(|| lattice_dir.join("memory_graph.db")),
+        batch_size,
+        dry_run,
+    })
+}
+
+fn parse_batch_size(value: Option<&String>) -> Result<usize> {
+    let Some(value) = value else {
+        anyhow::bail!("--batch-size requires a positive integer");
+    };
+    let parsed = value.parse::<usize>()?;
+    if parsed == 0 {
+        anyhow::bail!("--batch-size must be positive");
+    }
+    Ok(parsed)
+}
+
+fn print_migration_plan(plan: &lattice_core::memory_graph::MigrationPlan) {
+    println!("Memory migration plan");
+    println!("source_rows={}", plan.source_rows);
+    println!("already_migrated_rows={}", plan.already_migrated_rows);
+    println!("planned_memories={}", plan.destination_inserts.memories);
+    println!("planned_links={}", plan.destination_inserts.memory_links);
+    println!(
+        "planned_evidence={}",
+        plan.destination_inserts.memory_evidence
+    );
+    println!(
+        "planned_accesses={}",
+        plan.destination_inserts.memory_accesses
+    );
+    println!("planned_scores={}", plan.destination_inserts.memory_scores);
+    println!("planned_skipped_rows={}", plan.skipped_rows.len());
+}
+
+fn print_migration_report(report: &lattice_core::memory_graph::MigrationReport) {
+    println!("Memory migration report");
+    println!("dry_run={}", report.dry_run);
+    println!("migrated_rows={}", report.migrated_rows);
+    println!("already_migrated_rows={}", report.already_migrated_rows);
+    println!("inserted_memories={}", report.destination_inserts.memories);
+    println!("inserted_links={}", report.destination_inserts.memory_links);
+    println!(
+        "inserted_evidence={}",
+        report.destination_inserts.memory_evidence
+    );
+    println!(
+        "inserted_accesses={}",
+        report.destination_inserts.memory_accesses
+    );
+    println!(
+        "inserted_scores={}",
+        report.destination_inserts.memory_scores
+    );
+    println!("skipped_rows={}", report.skipped_rows.len());
 }
 
 pub(crate) fn repo_name_for_root(root: &Path) -> String {
@@ -969,7 +1199,7 @@ mod tests {
         build_incremental_index_for_roots, memory_store_artifact_paths, open_memory_stores,
         MemoryStoreMode,
     };
-    use lattice_core::memory::{Memory, MemoryScope, MemoryType};
+    use lattice_core::memory::{Memory, MemoryScope, MemoryType, MemoryVerificationStatus};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -999,6 +1229,7 @@ mod tests {
             linked_files: Vec::new(),
             workspace_id: None,
             branch: None,
+            scope_organization_id: None,
             refresh_key: None,
             source_query: None,
             created_at: 0,
@@ -1006,6 +1237,7 @@ mod tests {
             access_count: 0,
             is_stale: false,
             stale_reason: None,
+            verification_status: MemoryVerificationStatus::Unverified,
         }
     }
 

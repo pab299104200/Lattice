@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test memory_graph::store_tests::create_and_get_round_trip_persists_initial_evidence_and_event ... ok
+test memory_graph::store_tests::create_with_same_idempotency_key_returns_existing_record ... ok
+test memory_graph::store_tests::update_preserves_immutable_fields ... ok
+test memory_graph::store_tests::soft_delete_marks_memory_invalidated_and_keeps_row_readable ... ok
+test memory_graph::store_tests::transitions_emit_expected_lifecycle_events ... ok
+test memory_graph::store_tests::illegal_transitions_return_disallowed_transition ... ok
+test memory_graph::store_tests::legal_transitions_cover_full_allowed_matrix ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 3.16s
+

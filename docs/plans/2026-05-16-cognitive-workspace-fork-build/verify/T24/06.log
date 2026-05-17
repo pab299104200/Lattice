@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test memory_graph::replay_tests::workflow_outcome_stream_classification_survives_replay ... ok
+test memory_graph::replay_tests::stale_transition_is_persisted_and_visible_through_scope_filtered_reads ... ok
+test memory_graph::replay_tests::corrupted_replay_snapshot_returns_typed_error_and_preserves_partial_state ... ok
+test memory_graph::replay_tests::event_log_replay_matches_original_memory_tables_byte_for_byte ... ok
+test memory_graph::replay_tests::snapshot_plus_tail_replay_matches_full_replay_state ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.56s
+

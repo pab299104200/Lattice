@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test retrieval_v1::candidates_tests::working_memory_window_returns_most_recent_items ... ok
+test retrieval_v1::candidates_tests::bounded_expansion_records_traversal_paths ... ok
+test retrieval_v1::candidates_tests::empty_anchor_list_still_yields_events_and_working_memory ... ok
+test retrieval_v1::candidates_tests::budgets_are_enforced_for_large_graphs ... ok
+test retrieval_v1::candidates_tests::intent_gating_skips_disqualified_event_sources ... ok
+test retrieval_v1::candidates_tests::fts_embeddings_and_event_similarity_participate_when_present ... ok
+test retrieval_v1::candidates_tests::each_spec_named_source_produces_candidates ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.02s
+

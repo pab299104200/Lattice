@@ -1,11 +1,23 @@
 use super::model::{
-    Memory, MemoryAssertionType, MemoryEvidence, MemoryFreshnessPolicy, MemoryProvenance,
-    MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
+    Memory, MemoryAccessRecord, MemoryAssertionType, MemoryClass, MemoryEvidence,
+    MemoryFreshnessPolicy, MemoryLinkRecord, MemoryProvenance, MemoryScope, MemoryScoreKind,
+    MemoryScoreRecord, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
 };
 use crate::error::LatticeError;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::verification::{
+    allows as scope_allows, MemoryScopeFilteredEvent, ScopeFilter, ScopeFilterError,
+};
+use crate::working_memory::{
+    load_latest_checkpoint_for_scope, save_checkpoint_for_scope, CheckpointId, CheckpointScope,
+    WorkingMemoryState,
+};
+use crate::{DateTime, Utc};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MEMORY_DB_BUSY_TIMEOUT_SECS: u64 = 5;
@@ -13,9 +25,19 @@ const MEMORY_DB_AUTO_CHECKPOINT_PAGES: u32 = 100;
 const MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES: u32 = 1_048_576;
 const MEMORIES_FTS_TABLE: &str = "memories_fts";
 
+fn now_unix_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(i64::MAX as u128) as i64
+}
+
 /// SQLite-backed store for session memories.
 pub struct MemoryStore {
     conn: Connection,
+    #[cfg(test)]
+    direct_write_count: AtomicUsize,
 }
 
 impl MemoryStore {
@@ -26,7 +48,11 @@ impl MemoryStore {
 
         configure_connection(&conn, true)?;
 
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            #[cfg(test)]
+            direct_write_count: AtomicUsize::new(0),
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -39,9 +65,63 @@ impl MemoryStore {
 
         configure_connection(&conn, false)?;
 
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            #[cfg(test)]
+            direct_write_count: AtomicUsize::new(0),
+        };
         store.initialize()?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub fn reset_direct_write_count(&self) {
+        self.direct_write_count.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn direct_write_count(&self) -> usize {
+        self.direct_write_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn record_direct_write(&self) {}
+
+    #[cfg(test)]
+    fn record_direct_write(&self) {
+        self.direct_write_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn with_connection<T, F>(&self, op: F) -> Result<T, LatticeError>
+    where
+        F: FnOnce(&Connection) -> Result<T, LatticeError>,
+    {
+        op(&self.conn)
+    }
+
+    pub fn enqueue_verification_job(
+        &self,
+        workspace_id: &str,
+        memory_id: &str,
+    ) -> Result<String, LatticeError> {
+        let job_id = format!("verify-job-{}-{}", memory_id, now_unix_micros());
+        self.conn
+            .execute(
+                "INSERT INTO verification_jobs
+                    (job_id, workspace_id, target_memory_id, check_kind, status, verdict, reason, queued_at)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', NULL, NULL, ?5)",
+                params![
+                    job_id,
+                    workspace_id,
+                    memory_id,
+                    "existence",
+                    now_unix_micros(),
+                ],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to enqueue verification job: {error}"))
+            })?;
+        Ok(job_id)
     }
 
     /// Create the memories table if it doesn't already exist.
@@ -59,8 +139,10 @@ impl MemoryStore {
                     linked_files    TEXT NOT NULL DEFAULT '[]',
                     workspace_id    TEXT,
                     branch          TEXT,
+                    scope_organization_id TEXT,
                     refresh_key     TEXT,
                     source_query    TEXT,
+                    memory_class    TEXT NOT NULL DEFAULT 'observation',
                     assertion_type  TEXT NOT NULL DEFAULT 'observation',
                     verification_status TEXT NOT NULL DEFAULT 'unverified',
                     confidence_reason TEXT,
@@ -70,20 +152,74 @@ impl MemoryStore {
                     contradicted_by_memory_ids TEXT NOT NULL DEFAULT '[]',
                     freshness_policy TEXT NOT NULL DEFAULT 'session_scoped',
                     freshness_policy_detail TEXT,
+                    validity_conditions_json TEXT NOT NULL DEFAULT '[]',
+                    invalidation_triggers_json TEXT NOT NULL DEFAULT '[]',
                     provenance_json TEXT NOT NULL DEFAULT '[]',
                     evidence_json   TEXT NOT NULL DEFAULT '[]',
+                    linked_docs_json TEXT NOT NULL DEFAULT '[]',
+                    linked_tests_json TEXT NOT NULL DEFAULT '[]',
+                    linked_memories_json TEXT NOT NULL DEFAULT '[]',
+                    expires_at      INTEGER,
                     created_at      INTEGER NOT NULL,
                     last_accessed   INTEGER NOT NULL,
                     access_count    INTEGER NOT NULL DEFAULT 0,
                     is_stale        INTEGER NOT NULL DEFAULT 0,
                     stale_reason    TEXT,
-                    is_invalidated  INTEGER NOT NULL DEFAULT 0
+                    is_invalidated  INTEGER NOT NULL DEFAULT 0,
+                    last_verified_at INTEGER,
+                    last_verified_graph_snapshot_id INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_memories_created
                     ON memories(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memories_type
-                    ON memories(memory_type);",
+                    ON memories(memory_type);
+
+                CREATE TABLE IF NOT EXISTS memory_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    reference TEXT,
+                    detail TEXT,
+                    captured_at INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_links (
+                    link_id TEXT PRIMARY KEY,
+                    source_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    target_memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    link_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    verification_status TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_accesses (
+                    access_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    accessed_at INTEGER NOT NULL,
+                    inclusion_reason TEXT NOT NULL,
+                    was_used INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_scores (
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    score_kind TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    computed_at INTEGER NOT NULL,
+                    computed_from_window_secs INTEGER NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    PRIMARY KEY (memory_id, score_kind, computed_at)
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_scope_filter_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    attempted_workspace_id TEXT NOT NULL,
+                    attempted_branch TEXT,
+                    memory_scope TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory schema: {}", e))
@@ -108,9 +244,17 @@ impl MemoryStore {
         let _ = self
             .conn
             .execute("ALTER TABLE memories ADD COLUMN branch TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN scope_organization_id TEXT",
+            [],
+        );
         let _ = self
             .conn
             .execute("ALTER TABLE memories ADD COLUMN refresh_key TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN memory_class TEXT NOT NULL DEFAULT 'observation'",
+            [],
+        );
         let _ = self.conn.execute(
             "ALTER TABLE memories ADD COLUMN assertion_type TEXT NOT NULL DEFAULT 'observation'",
             [],
@@ -147,11 +291,42 @@ impl MemoryStore {
             [],
         );
         let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN validity_conditions_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN invalidation_triggers_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
             "ALTER TABLE memories ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '[]'",
             [],
         );
         let _ = self.conn.execute(
             "ALTER TABLE memories ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN linked_docs_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN linked_tests_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN linked_memories_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE memories ADD COLUMN expires_at INTEGER", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN last_verified_at INTEGER",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE memories ADD COLUMN last_verified_graph_snapshot_id INTEGER",
             [],
         );
 
@@ -165,8 +340,24 @@ impl MemoryStore {
                     ON memories(session_id);
                  CREATE INDEX IF NOT EXISTS idx_memories_verification_status
                     ON memories(verification_status);
+                 CREATE INDEX IF NOT EXISTS idx_memories_expires_at
+                    ON memories(expires_at);
+                 CREATE INDEX IF NOT EXISTS idx_memories_last_verified_graph_snapshot
+                    ON memories(last_verified_graph_snapshot_id);
                  CREATE INDEX IF NOT EXISTS idx_memories_superseded_by
-                    ON memories(superseded_by_memory_id);",
+                    ON memories(superseded_by_memory_id);
+                 CREATE INDEX IF NOT EXISTS idx_memory_evidence_kind_reference
+                    ON memory_evidence(kind, reference);
+                 CREATE INDEX IF NOT EXISTS idx_memory_evidence_memory
+                    ON memory_evidence(memory_id);
+                 CREATE INDEX IF NOT EXISTS idx_memory_links_source
+                    ON memory_links(source_memory_id);
+                 CREATE INDEX IF NOT EXISTS idx_memory_links_target
+                    ON memory_links(target_memory_id);
+                 CREATE INDEX IF NOT EXISTS idx_memory_accesses_memory_time
+                    ON memory_accesses(memory_id, accessed_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_memory_scores_memory_kind
+                    ON memory_scores(memory_id, score_kind, computed_at DESC);",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory indexes: {}", e))
@@ -187,6 +378,11 @@ impl MemoryStore {
             })?;
 
         self.rebuild_fts()?;
+        crate::working_memory::initialize_schema(&self.conn).map_err(|e| {
+            LatticeError::Storage(format!("Failed to initialize working memory schema: {}", e))
+        })?;
+        crate::consolidation::initialize_schema(&self.conn)?;
+        crate::verification::initialize_schema(&self.conn)?;
 
         Ok(())
     }
@@ -195,6 +391,7 @@ impl MemoryStore {
     /// If created_at is 0, the current timestamp is used.
     /// Returns the id of the stored memory.
     pub fn store(&self, mut memory: Memory) -> Result<String, LatticeError> {
+        self.record_direct_write();
         if memory.id.is_empty() {
             memory.id = generate_id();
         }
@@ -232,20 +429,48 @@ impl MemoryStore {
         let evidence_json = serde_json::to_string(&structured_fields.evidence).map_err(|e| {
             LatticeError::Storage(format!("Failed to serialize evidence_json: {}", e))
         })?;
+        let validity_conditions_json =
+            serde_json::to_string(&structured_fields.validity_conditions).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize validity_conditions_json: {}",
+                    e
+                ))
+            })?;
+        let invalidation_triggers_json =
+            serde_json::to_string(&structured_fields.invalidation_triggers).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize invalidation_triggers_json: {}",
+                    e
+                ))
+            })?;
+        let linked_docs_json =
+            serde_json::to_string(&structured_fields.linked_docs).map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize linked_docs_json: {}", e))
+            })?;
+        let linked_tests_json =
+            serde_json::to_string(&structured_fields.linked_tests).map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize linked_tests_json: {}", e))
+            })?;
+        let linked_memories_json = serde_json::to_string(&structured_fields.linked_memories)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to serialize linked_memories_json: {}", e))
+            })?;
+        let metadata = self.load_existing_verification_metadata(&memory.id)?;
 
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO memories
                     (id, session_id, content, memory_type, scope, confidence, linked_symbols, linked_files,
-                     workspace_id, branch, refresh_key, source_query,
-                     assertion_type, verification_status, confidence_reason, supersedes_memory_id,
+                     workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                     memory_class, assertion_type, verification_status, confidence_reason, supersedes_memory_id,
                      superseded_by_memory_id, contradicts_memory_ids, contradicted_by_memory_ids,
-                     freshness_policy, freshness_policy_detail, provenance_json, evidence_json,
+                     freshness_policy, freshness_policy_detail, validity_conditions_json, invalidation_triggers_json,
+                     provenance_json, evidence_json, linked_docs_json, linked_tests_json, linked_memories_json, expires_at,
                      created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated)
                  VALUES
-                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                      ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                      ?25, ?26, ?27, ?28, 0)",
+                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                      ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, 0)",
                 params![
                     memory.id,
                     memory.session_id,
@@ -257,8 +482,10 @@ impl MemoryStore {
                     linked_files_json,
                     memory.workspace_id,
                     memory.branch,
+                    memory.scope_organization_id,
                     memory.refresh_key,
                     memory.source_query,
+                    structured_fields.memory_class.as_str(),
                     structured_fields.assertion_type.as_str(),
                     structured_fields.verification_status.as_str(),
                     structured_fields.confidence_reason,
@@ -268,8 +495,14 @@ impl MemoryStore {
                     contradicted_by_json,
                     structured_fields.freshness_policy.as_str(),
                     structured_fields.freshness_policy_detail,
+                    validity_conditions_json,
+                    invalidation_triggers_json,
                     provenance_json,
                     evidence_json,
+                    linked_docs_json,
+                    linked_tests_json,
+                    linked_memories_json,
+                    metadata.expires_at.map(|value| value.unix_seconds()),
                     memory.created_at as i64,
                     memory.last_accessed as i64,
                     memory.access_count as i64,
@@ -279,9 +512,150 @@ impl MemoryStore {
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to store memory: {}", e)))?;
 
+        self.sync_memory_evidence(&memory.id, &structured_fields.evidence)?;
+
         self.upsert_fts_row(&memory)?;
 
         Ok(memory.id)
+    }
+
+    pub fn save_working_memory_checkpoint_for_scope(
+        &self,
+        state: &WorkingMemoryState,
+        name: &str,
+        scope: &CheckpointScope,
+    ) -> Result<CheckpointId, LatticeError> {
+        save_checkpoint_for_scope(state, name, scope, &self.conn)
+    }
+
+    pub fn load_latest_working_memory_checkpoint(
+        &self,
+        scope: &CheckpointScope,
+    ) -> Result<Option<(CheckpointId, WorkingMemoryState)>, LatticeError> {
+        load_latest_checkpoint_for_scope(scope, &self.conn)
+    }
+
+    /// Scope-enforced memory query. Callers must pass an explicit scope filter.
+    pub fn query(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+        scope: &ScopeFilter,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let predicate = scope_sql_predicate(scope);
+        let mut bind_values = predicate.bind_values;
+        let sql = if let Some(fts_query) = build_fts_query(keyword.unwrap_or_default()) {
+            let sql = format!(
+                "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                        memories.scope, memories.confidence, memories.linked_symbols,
+                        memories.linked_files, memories.workspace_id, memories.branch,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.last_accessed, memories.access_count, memories.is_stale,
+                        memories.stale_reason, memories.verification_status
+                 FROM memories
+                 INNER JOIN {table}
+                    ON {table}.memory_id = memories.id
+                 WHERE memories.is_invalidated = 0
+                   AND {scope_predicate}
+                   AND {table} MATCH ?
+                 ORDER BY memories.created_at DESC
+                 LIMIT ?",
+                table = MEMORIES_FTS_TABLE,
+                scope_predicate = predicate.where_clause,
+            );
+            bind_values.push(Value::Text(fts_query));
+            bind_values.push(Value::Integer(limit as i64));
+            sql
+        } else {
+            let sql = format!(
+                "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
+                 FROM memories
+                 WHERE is_invalidated = 0
+                   AND {}
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+                predicate.where_clause,
+            );
+            bind_values.push(Value::Integer(limit as i64));
+            sql
+        };
+
+        let memories = self.query_memories_values(&sql, bind_values, "scoped memory query")?;
+        self.enforce_scope_boundary(memories, scope, "scoped memory query")
+    }
+
+    pub fn list_all_scoped(&self, scope: &ScopeFilter) -> Result<Vec<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let memories = self.list_all()?;
+        self.filter_scope_boundary(memories, scope)
+    }
+
+    pub fn get_by_id_scoped(
+        &self,
+        id: &str,
+        scope: &ScopeFilter,
+    ) -> Result<Option<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let Some(memory) = self.get_by_id(id)? else {
+            return Ok(None);
+        };
+        if scope_allows(&memory, scope) {
+            return Ok(Some(memory));
+        }
+        self.record_scope_filtered(&memory, scope)?;
+        Ok(None)
+    }
+
+    pub fn search_by_keyword_scoped(
+        &self,
+        keyword: &str,
+        scope: &ScopeFilter,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let memories = self.search_by_keyword(keyword)?;
+        self.filter_scope_boundary(memories, scope)
+    }
+
+    /// Explicit unscoped path for migrations, snapshots, and legacy admin flows.
+    pub fn query_unscoped_admin(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        if let Some(fts_query) = build_fts_query(keyword.unwrap_or_default()) {
+            let sql = format!(
+                "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
+                        memories.scope, memories.confidence, memories.linked_symbols,
+                        memories.linked_files, memories.workspace_id, memories.branch,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.last_accessed, memories.access_count, memories.is_stale,
+                        memories.stale_reason, memories.verification_status
+                 FROM memories
+                 INNER JOIN {table}
+                    ON {table}.memory_id = memories.id
+                 WHERE memories.is_invalidated = 0
+                   AND {table} MATCH ?1
+                 ORDER BY memories.created_at DESC
+                 LIMIT ?2",
+                table = MEMORIES_FTS_TABLE,
+            );
+            return self.query_memories(&sql, params![fts_query, limit as i64], "admin query");
+        }
+
+        self.query_memories(
+            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                    linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
+             FROM memories
+             WHERE is_invalidated = 0
+             ORDER BY created_at DESC
+             LIMIT ?1",
+            params![limit as i64],
+            "admin query",
+        )
     }
 
     /// List all non-invalidated memories, ordered by created_at DESC.
@@ -290,8 +664,8 @@ impl MemoryStore {
             .conn
             .prepare(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0
                  ORDER BY created_at DESC",
@@ -311,13 +685,17 @@ impl MemoryStore {
                     linked_files_json: row.get(7)?,
                     workspace_id: row.get(8)?,
                     branch: row.get(9)?,
-                    refresh_key: row.get(10)?,
-                    source_query: row.get(11)?,
-                    created_at: row.get(12)?,
-                    last_accessed: row.get(13)?,
-                    access_count: row.get(14)?,
-                    is_stale: row.get(15)?,
-                    stale_reason: row.get(16)?,
+                    scope_organization_id: row.get(10)?,
+                    refresh_key: row.get(11)?,
+                    source_query: row.get(12)?,
+                    created_at: row.get(13)?,
+                    last_accessed: row.get(14)?,
+                    access_count: row.get(15)?,
+                    is_stale: row.get(16)?,
+                    stale_reason: row.get(17)?,
+                    verification_status: Some(MemoryVerificationStatus::from_str(
+                        &row.get::<_, String>(18)?,
+                    )),
                 })
             })
             .map_err(|e| LatticeError::Storage(format!("Failed to query memories: {}", e)))?;
@@ -338,8 +716,8 @@ impl MemoryStore {
             .conn
             .prepare(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE id = ?1 AND is_invalidated = 0
                  LIMIT 1",
@@ -361,13 +739,17 @@ impl MemoryStore {
                     linked_files_json: row.get(7)?,
                     workspace_id: row.get(8)?,
                     branch: row.get(9)?,
-                    refresh_key: row.get(10)?,
-                    source_query: row.get(11)?,
-                    created_at: row.get(12)?,
-                    last_accessed: row.get(13)?,
-                    access_count: row.get(14)?,
-                    is_stale: row.get(15)?,
-                    stale_reason: row.get(16)?,
+                    scope_organization_id: row.get(10)?,
+                    refresh_key: row.get(11)?,
+                    source_query: row.get(12)?,
+                    created_at: row.get(13)?,
+                    last_accessed: row.get(14)?,
+                    access_count: row.get(15)?,
+                    is_stale: row.get(16)?,
+                    stale_reason: row.get(17)?,
+                    verification_status: Some(MemoryVerificationStatus::from_str(
+                        &row.get::<_, String>(18)?,
+                    )),
                 })
             })
             .optional()
@@ -388,8 +770,8 @@ impl MemoryStore {
             .conn
             .prepare(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0
                    AND refresh_key = ?1
@@ -443,13 +825,17 @@ impl MemoryStore {
                     linked_files_json: row.get(7)?,
                     workspace_id: row.get(8)?,
                     branch: row.get(9)?,
-                    refresh_key: row.get(10)?,
-                    source_query: row.get(11)?,
-                    created_at: row.get(12)?,
-                    last_accessed: row.get(13)?,
-                    access_count: row.get(14)?,
-                    is_stale: row.get(15)?,
-                    stale_reason: row.get(16)?,
+                    scope_organization_id: row.get(10)?,
+                    refresh_key: row.get(11)?,
+                    source_query: row.get(12)?,
+                    created_at: row.get(13)?,
+                    last_accessed: row.get(14)?,
+                    access_count: row.get(15)?,
+                    is_stale: row.get(16)?,
+                    stale_reason: row.get(17)?,
+                    verification_status: Some(MemoryVerificationStatus::from_str(
+                        &row.get::<_, String>(18)?,
+                    )),
                 })
             })
             .optional()
@@ -471,11 +857,13 @@ impl MemoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT assertion_type, verification_status, confidence_reason,
+                "SELECT memory_class, assertion_type, verification_status, confidence_reason,
                         supersedes_memory_id, superseded_by_memory_id,
                         contradicts_memory_ids, contradicted_by_memory_ids,
                         freshness_policy, freshness_policy_detail,
-                        provenance_json, evidence_json
+                        validity_conditions_json, invalidation_triggers_json,
+                        provenance_json, evidence_json, linked_docs_json, linked_tests_json,
+                        linked_memories_json
                  FROM memories
                  WHERE id = ?1 AND is_invalidated = 0
                  LIMIT 1",
@@ -494,12 +882,540 @@ impl MemoryStore {
         Ok(row.map(StructuredMemoryRow::into_structured_fields))
     }
 
+    pub fn get_last_verified_at(&self, id: &str) -> Result<Option<u64>, LatticeError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT last_verified_at
+                 FROM memories
+                 WHERE id = ?1 AND is_invalidated = 0
+                 LIMIT 1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|e| LatticeError::Storage(format!("Failed to load last_verified_at: {}", e)))?
+            .flatten();
+        Ok(value.map(|timestamp| timestamp.max(0) as u64))
+    }
+
+    pub fn get_last_verified_graph_snapshot_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<u64>, LatticeError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT last_verified_graph_snapshot_id
+                 FROM memories
+                 WHERE id = ?1 AND is_invalidated = 0
+                 LIMIT 1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to load last_verified_graph_snapshot_id: {}",
+                    e
+                ))
+            })?
+            .flatten();
+        Ok(value.map(|snapshot_id| snapshot_id.max(0) as u64))
+    }
+
+    pub fn get_expires_at(&self, id: &str) -> Result<Option<DateTime<Utc>>, LatticeError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT expires_at
+                 FROM memories
+                 WHERE id = ?1 AND is_invalidated = 0
+                 LIMIT 1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|e| LatticeError::Storage(format!("Failed to load expires_at: {}", e)))?
+            .flatten();
+        Ok(value.map(DateTime::from_unix_seconds))
+    }
+
+    pub fn set_last_verified_at(
+        &self,
+        id: &str,
+        last_verified_at: u64,
+    ) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET last_verified_at = ?1
+                 WHERE id = ?2 AND is_invalidated = 0",
+                params![last_verified_at as i64, id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to update last_verified_at: {}", e))
+            })?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_last_verified_graph_snapshot_id(
+        &self,
+        id: &str,
+        snapshot_id: u64,
+    ) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET last_verified_graph_snapshot_id = ?1
+                 WHERE id = ?2 AND is_invalidated = 0",
+                params![snapshot_id as i64, id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to update last_verified_graph_snapshot_id: {}",
+                    e
+                ))
+            })?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_expires_at(&self, id: &str, expires_at: DateTime<Utc>) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET expires_at = ?1
+                 WHERE id = ?2 AND is_invalidated = 0",
+                params![expires_at.unix_seconds(), id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to update expires_at: {}", e)))?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clear_last_verified_at(&self, id: &str) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET last_verified_at = NULL
+                 WHERE id = ?1 AND is_invalidated = 0",
+                params![id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to clear last_verified_at: {}", e))
+            })?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clear_last_verified_graph_snapshot_id(&self, id: &str) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET last_verified_graph_snapshot_id = NULL
+                 WHERE id = ?1 AND is_invalidated = 0",
+                params![id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to clear last_verified_graph_snapshot_id: {}",
+                    e
+                ))
+            })?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clear_expires_at(&self, id: &str) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET expires_at = NULL
+                 WHERE id = ?1 AND is_invalidated = 0",
+                params![id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear expires_at: {}", e)))?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn list_workspace_memories(&self, workspace_id: &str) -> Result<Vec<Memory>, LatticeError> {
+        self.query_memories(
+            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                    linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
+             FROM memories
+             WHERE is_invalidated = 0
+               AND workspace_id = ?1
+             ORDER BY created_at DESC",
+            params![workspace_id],
+            "workspace memories",
+        )
+    }
+
+    pub fn list_memories_expired_before(
+        &self,
+        workspace_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        self.query_memories(
+            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                    linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
+             FROM memories
+             WHERE is_invalidated = 0
+               AND workspace_id = ?1
+               AND expires_at IS NOT NULL
+               AND expires_at <= ?2
+               AND verification_status != 'expired'
+             ORDER BY created_at DESC",
+            params![workspace_id, now.unix_seconds()],
+            "expired memories",
+        )
+    }
+
+    pub fn find_impacted_memory_ids_for_graph_delta(
+        &self,
+        workspace_id: &str,
+        changed_files: &[String],
+        changed_symbols: &[String],
+    ) -> Result<Vec<String>, LatticeError> {
+        self.find_impacted_memory_ids_impl(workspace_id, changed_files, changed_symbols, true)
+    }
+
+    pub fn count_memory_evidence_rows_for_graph_delta(
+        &self,
+        workspace_id: &str,
+        changed_files: &[String],
+        changed_symbols: &[String],
+    ) -> Result<usize, LatticeError> {
+        Ok(self
+            .find_impacted_memory_ids_impl(workspace_id, changed_files, changed_symbols, false)?
+            .len())
+    }
+
+    pub fn scope_filter_events(&self) -> Result<Vec<MemoryScopeFilteredEvent>, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT memory_id, attempted_workspace_id, attempted_branch, memory_scope
+                 FROM memory_scope_filter_events
+                 ORDER BY event_id ASC",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to prepare memory scope filter event query: {}",
+                    e
+                ))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MemoryScopeFilteredEvent {
+                    memory_id: row.get(0)?,
+                    attempted_workspace_id: row.get(1)?,
+                    attempted_branch: row.get(2)?,
+                    memory_scope: MemoryScope::from_str(&row.get::<_, String>(3)?),
+                })
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to query memory scope filter events: {}", e))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            LatticeError::Storage(format!(
+                "Failed to read memory scope filter event row: {}",
+                e
+            ))
+        })
+    }
+
+    pub fn record_memory_access(
+        &self,
+        memory_id: &str,
+        access_id: &str,
+        accessed_at: u64,
+        inclusion_reason: &str,
+        was_used: Option<bool>,
+    ) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_accesses
+                    (access_id, memory_id, accessed_at, inclusion_reason, was_used)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    access_id,
+                    memory_id,
+                    accessed_at as i64,
+                    inclusion_reason,
+                    was_used.map(|value| if value { 1 } else { 0 }),
+                ],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to record memory access: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn count_memory_accesses_since(
+        &self,
+        memory_id: &str,
+        cutoff: u64,
+    ) -> Result<u64, LatticeError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memory_accesses
+                 WHERE memory_id = ?1
+                   AND accessed_at >= ?2",
+                params![memory_id, cutoff as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to count memory accesses: {}", e))
+            })?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn list_memory_accesses(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryAccessRecord>, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT access_id, accessed_at, inclusion_reason, was_used
+                 FROM memory_accesses
+                 WHERE memory_id = ?1
+                 ORDER BY accessed_at DESC, access_id DESC",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare memory access query: {}", e))
+            })?;
+        let rows = statement
+            .query_map(params![memory_id], |row| {
+                Ok(MemoryAccessRecord {
+                    access_id: row.get(0)?,
+                    accessed_at: row.get::<_, i64>(1)?.max(0) as u64,
+                    inclusion_reason: row.get(2)?,
+                    was_used: row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
+                })
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to execute memory access query: {}", e))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LatticeError::Storage(format!("Failed to read memory access row: {}", e)))
+    }
+
+    pub fn write_memory_score(
+        &self,
+        memory_id: &str,
+        score: &MemoryScoreRecord,
+    ) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_scores
+                    (memory_id, score_kind, value, computed_at, computed_from_window_secs, sample_size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    memory_id,
+                    score.score_kind.as_str(),
+                    score.value,
+                    score.computed_at as i64,
+                    score.computed_from_window_secs as i64,
+                    score.sample_size as i64,
+                ],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to write memory score: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn latest_memory_score(
+        &self,
+        memory_id: &str,
+        score_kind: MemoryScoreKind,
+    ) -> Result<Option<MemoryScoreRecord>, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT score_kind, value, computed_at, computed_from_window_secs, sample_size
+                 FROM memory_scores
+                 WHERE memory_id = ?1
+                   AND score_kind = ?2
+                 ORDER BY computed_at DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare memory score query: {}", e))
+            })?;
+        let score = statement
+            .query_row(params![memory_id, score_kind.as_str()], |row| {
+                Ok(MemoryScoreRecord {
+                    score_kind: MemoryScoreKind::from_str(&row.get::<_, String>(0)?),
+                    value: row.get(1)?,
+                    computed_at: row.get::<_, i64>(2)?.max(0) as u64,
+                    computed_from_window_secs: row.get::<_, i64>(3)?.max(0) as u64,
+                    sample_size: row.get::<_, i64>(4)?.max(0) as u32,
+                })
+            })
+            .optional()
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to load latest memory score: {}", e))
+            })?;
+        Ok(score)
+    }
+
+    pub fn insert_memory_link(&self, link: &MemoryLinkRecord) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_links
+                    (link_id, source_memory_id, target_memory_id, link_type, reason, created_at, verification_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    link.link_id,
+                    link.source_memory_id,
+                    link.target_memory_id,
+                    link.link_type,
+                    link.reason,
+                    link.created_at as i64,
+                    link.verification_status,
+                ],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to insert memory link: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_memory_links_from(
+        &self,
+        source_memory_id: &str,
+    ) -> Result<Vec<MemoryLinkRecord>, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT link_id, source_memory_id, target_memory_id, link_type, reason, created_at, verification_status
+                 FROM memory_links
+                 WHERE source_memory_id = ?1
+                 ORDER BY created_at DESC, link_id DESC",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare memory link query: {}", e))
+            })?;
+        let rows = statement
+            .query_map(params![source_memory_id], |row| {
+                Ok(MemoryLinkRecord {
+                    link_id: row.get(0)?,
+                    source_memory_id: row.get(1)?,
+                    target_memory_id: row.get(2)?,
+                    link_type: row.get(3)?,
+                    reason: row.get(4)?,
+                    created_at: row.get::<_, i64>(5)?.max(0) as u64,
+                    verification_status: row.get(6)?,
+                })
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to execute memory link query: {}", e))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LatticeError::Storage(format!("Failed to read memory link row: {}", e)))
+    }
+
+    pub fn list_memory_links_to(
+        &self,
+        target_memory_id: &str,
+    ) -> Result<Vec<MemoryLinkRecord>, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT link_id, source_memory_id, target_memory_id, link_type, reason, created_at, verification_status
+                 FROM memory_links
+                 WHERE target_memory_id = ?1
+                 ORDER BY created_at DESC, link_id DESC",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare inbound memory link query: {}", e))
+            })?;
+        let rows = statement
+            .query_map(params![target_memory_id], |row| {
+                Ok(MemoryLinkRecord {
+                    link_id: row.get(0)?,
+                    source_memory_id: row.get(1)?,
+                    target_memory_id: row.get(2)?,
+                    link_type: row.get(3)?,
+                    reason: row.get(4)?,
+                    created_at: row.get::<_, i64>(5)?.max(0) as u64,
+                    verification_status: row.get(6)?,
+                })
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to execute inbound memory link query: {}",
+                    e
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            LatticeError::Storage(format!("Failed to read inbound memory link row: {}", e))
+        })
+    }
+
+    pub fn delete_memory_links_from(&self, source_memory_id: &str) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "DELETE FROM memory_links WHERE source_memory_id = ?1",
+                params![source_memory_id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to delete memory links: {}", e)))?;
+        Ok(())
+    }
+
     /// Replace structured assertion metadata for an existing, non-invalidated memory.
     pub fn update_structured_fields(
         &self,
         id: &str,
         fields: &MemoryStructuredFields,
     ) -> Result<(), LatticeError> {
+        self.record_direct_write();
         self.persist_structured_fields(id, fields)
     }
 
@@ -509,6 +1425,7 @@ impl MemoryStore {
         id: &str,
         superseded_by_memory_id: &str,
     ) -> Result<(), LatticeError> {
+        self.record_direct_write();
         let mut fields = self.get_structured_fields(id)?.ok_or_else(|| {
             LatticeError::Storage(format!("Memory '{}' not found or invalidated", id))
         })?;
@@ -523,6 +1440,7 @@ impl MemoryStore {
         id: &str,
         contradicted_by_memory_id: &str,
     ) -> Result<(), LatticeError> {
+        self.record_direct_write();
         let mut fields = self.get_structured_fields(id)?.ok_or_else(|| {
             LatticeError::Storage(format!("Memory '{}' not found or invalidated", id))
         })?;
@@ -548,6 +1466,47 @@ impl MemoryStore {
         Ok(())
     }
 
+    pub fn set_verification_state(
+        &self,
+        id: &str,
+        verification_status: MemoryVerificationStatus,
+        is_stale: bool,
+        stale_reason: Option<&str>,
+        last_verified_at: u64,
+        last_verified_graph_snapshot_id: Option<u64>,
+    ) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                    SET verification_status = ?1,
+                        is_stale = ?2,
+                        stale_reason = ?3,
+                        last_verified_at = ?4,
+                        last_verified_graph_snapshot_id = ?5
+                 WHERE is_invalidated = 0 AND id = ?6",
+                params![
+                    verification_status.as_str(),
+                    if is_stale { 1 } else { 0 },
+                    stale_reason,
+                    last_verified_at as i64,
+                    last_verified_graph_snapshot_id.map(|value| value as i64),
+                    id,
+                ],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to update verification state: {error}"))
+            })?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
     /// Search memories by keyword (per-word AND match on content + linked_symbols). Excludes invalidated.
     pub fn search_by_keyword(&self, keyword: &str) -> Result<Vec<Memory>, LatticeError> {
         let memories = if let Some(fts_query) = build_fts_query(keyword) {
@@ -555,9 +1514,9 @@ impl MemoryStore {
                 "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
                         memories.scope, memories.confidence, memories.linked_symbols,
                         memories.linked_files, memories.workspace_id, memories.branch,
-                        memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
                         memories.last_accessed, memories.access_count, memories.is_stale,
-                        memories.stale_reason
+                        memories.stale_reason, memories.verification_status
                  FROM memories
                  INNER JOIN {table}
                     ON {table}.memory_id = memories.id
@@ -570,8 +1529,8 @@ impl MemoryStore {
         } else {
             self.query_memories(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0
                  ORDER BY created_at DESC",
@@ -595,6 +1554,7 @@ impl MemoryStore {
         symbol_name: &str,
         reason: &str,
     ) -> Result<u64, LatticeError> {
+        self.record_direct_write();
         // The linked_symbols column stores JSON arrays like ["foo","bar"].
         // We match symbol names contained inside the JSON string.
         let escaped = symbol_name.replace('%', "\\%").replace('_', "\\_");
@@ -615,9 +1575,33 @@ impl MemoryStore {
         Ok(updated as u64)
     }
 
+    /// Mark a specific memory as stale with the provided reason.
+    pub fn mark_stale_by_id(&self, id: &str, reason: &str) -> Result<(), LatticeError> {
+        self.record_direct_write();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE memories
+                    SET is_stale = 1,
+                        stale_reason = ?1,
+                        verification_status = 'stale'
+                 WHERE is_invalidated = 0 AND id = ?2",
+                params![reason, id],
+            )
+            .map_err(|e| LatticeError::Storage(format!("Failed to mark memory stale: {}", e)))?;
+        if updated == 0 {
+            return Err(LatticeError::Storage(format!(
+                "Memory '{}' not found or invalidated",
+                id
+            )));
+        }
+        Ok(())
+    }
+
     /// Mark all memories that reference a given file as stale with the provided reason.
     /// Uses LIKE match on the linked_files JSON column.
     pub fn mark_stale_by_file(&self, file_path: &str, reason: &str) -> Result<u64, LatticeError> {
+        self.record_direct_write();
         let escaped = file_path.replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%\"{}\"%", escaped);
 
@@ -664,6 +1648,7 @@ impl MemoryStore {
 
     /// Update the content of a memory in-place. Clears stale flags since the content is now fresh.
     pub fn update_content(&self, id: &str, new_content: &str) -> Result<(), LatticeError> {
+        self.record_direct_write();
         let updated = self
             .conn
             .execute(
@@ -704,6 +1689,7 @@ impl MemoryStore {
         source_query: Option<&str>,
         confidence: Option<f64>,
     ) -> Result<Memory, LatticeError> {
+        self.record_direct_write();
         let mut memory = self.get_by_id(id)?.ok_or_else(|| {
             LatticeError::Storage(format!("Memory '{}' not found or invalidated", id))
         })?;
@@ -758,6 +1744,7 @@ impl MemoryStore {
         branch: Option<&str>,
         refresh_key: Option<&str>,
     ) -> Result<(), LatticeError> {
+        self.record_direct_write();
         let freshness_policy = MemoryFreshnessPolicy::from_scope(&scope);
         let updated = if let Some(linked_files) = linked_files {
             let linked_files_json = serde_json::to_string(linked_files).map_err(|e| {
@@ -908,8 +1895,8 @@ impl MemoryStore {
             .conn
             .prepare(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0 AND session_id = ?1
                  ORDER BY created_at DESC
@@ -932,13 +1919,17 @@ impl MemoryStore {
                     linked_files_json: row.get(7)?,
                     workspace_id: row.get(8)?,
                     branch: row.get(9)?,
-                    refresh_key: row.get(10)?,
-                    source_query: row.get(11)?,
-                    created_at: row.get(12)?,
-                    last_accessed: row.get(13)?,
-                    access_count: row.get(14)?,
-                    is_stale: row.get(15)?,
-                    stale_reason: row.get(16)?,
+                    scope_organization_id: row.get(10)?,
+                    refresh_key: row.get(11)?,
+                    source_query: row.get(12)?,
+                    created_at: row.get(13)?,
+                    last_accessed: row.get(14)?,
+                    access_count: row.get(15)?,
+                    is_stale: row.get(16)?,
+                    stale_reason: row.get(17)?,
+                    verification_status: Some(MemoryVerificationStatus::from_str(
+                        &row.get::<_, String>(18)?,
+                    )),
                 })
             })
             .map_err(|e| {
@@ -967,9 +1958,9 @@ impl MemoryStore {
                     "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
                             memories.scope, memories.confidence, memories.linked_symbols,
                             memories.linked_files, memories.workspace_id, memories.branch,
-                            memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
                             memories.last_accessed, memories.access_count, memories.is_stale,
-                            memories.stale_reason
+                            memories.stale_reason, memories.verification_status
                      FROM memories
                      INNER JOIN {table}
                         ON {table}.memory_id = memories.id
@@ -991,9 +1982,9 @@ impl MemoryStore {
                     "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
                             memories.scope, memories.confidence, memories.linked_symbols,
                             memories.linked_files, memories.workspace_id, memories.branch,
-                            memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
                             memories.last_accessed, memories.access_count, memories.is_stale,
-                            memories.stale_reason
+                            memories.stale_reason, memories.verification_status
                      FROM memories
                      INNER JOIN {table}
                         ON {table}.memory_id = memories.id
@@ -1011,8 +2002,8 @@ impl MemoryStore {
             }
             (None, Some(session_id)) => self.query_memories(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0
                    AND session_id != ?1
@@ -1023,8 +2014,8 @@ impl MemoryStore {
             )?,
             (None, None) => self.query_memories(
                 "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                        linked_files, workspace_id, branch, refresh_key, source_query,
-                        created_at, last_accessed, access_count, is_stale, stale_reason
+                        linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                        created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
                  WHERE is_invalidated = 0
                  ORDER BY created_at DESC
@@ -1053,9 +2044,9 @@ impl MemoryStore {
                 "SELECT memories.id, memories.session_id, memories.content, memories.memory_type,
                         memories.scope, memories.confidence, memories.linked_symbols,
                         memories.linked_files, memories.workspace_id, memories.branch,
-                        memories.refresh_key, memories.source_query, memories.created_at,
+                        memories.scope_organization_id, memories.refresh_key, memories.source_query, memories.created_at,
                         memories.last_accessed, memories.access_count, memories.is_stale,
-                        memories.stale_reason
+                        memories.stale_reason, memories.verification_status
                  FROM memories
                  INNER JOIN {table}
                     ON {table}.memory_id = memories.id
@@ -1075,8 +2066,8 @@ impl MemoryStore {
 
         self.query_memories(
             "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
-                    linked_files, workspace_id, branch, refresh_key, source_query,
-                    created_at, last_accessed, access_count, is_stale, stale_reason
+                    linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
              FROM memories
              WHERE is_invalidated = 0
                AND is_stale = 1
@@ -1095,6 +2086,9 @@ impl MemoryStore {
             .get_structured_fields(&memory.id)?
             .unwrap_or_else(|| self.derive_default_structured_fields(memory));
 
+        if matches!(fields.memory_class, MemoryClass::Observation) {
+            fields.memory_class = MemoryClass::from_memory_type(&memory.memory_type);
+        }
         if !has_extended_assertion_type(&fields) {
             fields.assertion_type = MemoryAssertionType::from_memory_type(&memory.memory_type);
         }
@@ -1124,6 +2118,7 @@ impl MemoryStore {
 
     fn derive_default_structured_fields(&self, memory: &Memory) -> MemoryStructuredFields {
         let mut fields = MemoryStructuredFields {
+            memory_class: MemoryClass::from_memory_type(&memory.memory_type),
             assertion_type: MemoryAssertionType::from_memory_type(&memory.memory_type),
             verification_status: infer_verification_status(memory),
             confidence_reason: memory
@@ -1164,30 +2159,63 @@ impl MemoryStore {
                     e
                 ))
             })?;
+        let validity_conditions_json =
+            serde_json::to_string(&fields.validity_conditions).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize validity conditions metadata: {}",
+                    e
+                ))
+            })?;
+        let invalidation_triggers_json = serde_json::to_string(&fields.invalidation_triggers)
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to serialize invalidation triggers metadata: {}",
+                    e
+                ))
+            })?;
         let provenance_json = serde_json::to_string(&fields.provenance).map_err(|e| {
             LatticeError::Storage(format!("Failed to serialize provenance metadata: {}", e))
         })?;
         let evidence_json = serde_json::to_string(&fields.evidence).map_err(|e| {
             LatticeError::Storage(format!("Failed to serialize evidence metadata: {}", e))
         })?;
+        let linked_docs_json = serde_json::to_string(&fields.linked_docs).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize linked docs metadata: {}", e))
+        })?;
+        let linked_tests_json = serde_json::to_string(&fields.linked_tests).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize linked tests metadata: {}", e))
+        })?;
+        let linked_memories_json = serde_json::to_string(&fields.linked_memories).map_err(|e| {
+            LatticeError::Storage(format!(
+                "Failed to serialize linked memories metadata: {}",
+                e
+            ))
+        })?;
 
         let updated = self
             .conn
             .execute(
                 "UPDATE memories
-                 SET assertion_type = ?1,
-                     verification_status = ?2,
-                     confidence_reason = ?3,
-                     supersedes_memory_id = ?4,
-                     superseded_by_memory_id = ?5,
-                     contradicts_memory_ids = ?6,
-                     contradicted_by_memory_ids = ?7,
-                     freshness_policy = ?8,
-                     freshness_policy_detail = ?9,
-                     provenance_json = ?10,
-                     evidence_json = ?11
-                 WHERE id = ?12 AND is_invalidated = 0",
+                 SET memory_class = ?1,
+                     assertion_type = ?2,
+                     verification_status = ?3,
+                     confidence_reason = ?4,
+                     supersedes_memory_id = ?5,
+                     superseded_by_memory_id = ?6,
+                     contradicts_memory_ids = ?7,
+                     contradicted_by_memory_ids = ?8,
+                     freshness_policy = ?9,
+                     freshness_policy_detail = ?10,
+                     validity_conditions_json = ?11,
+                     invalidation_triggers_json = ?12,
+                     provenance_json = ?13,
+                     evidence_json = ?14,
+                     linked_docs_json = ?15,
+                     linked_tests_json = ?16,
+                     linked_memories_json = ?17
+                 WHERE id = ?18 AND is_invalidated = 0",
                 params![
+                    fields.memory_class.as_str(),
                     fields.assertion_type.as_str(),
                     fields.verification_status.as_str(),
                     fields.confidence_reason,
@@ -1197,8 +2225,13 @@ impl MemoryStore {
                     contradicted_by_json,
                     fields.freshness_policy.as_str(),
                     fields.freshness_policy_detail,
+                    validity_conditions_json,
+                    invalidation_triggers_json,
                     provenance_json,
                     evidence_json,
+                    linked_docs_json,
+                    linked_tests_json,
+                    linked_memories_json,
                     id,
                 ],
             )
@@ -1213,6 +2246,43 @@ impl MemoryStore {
             )));
         }
 
+        self.sync_memory_evidence(id, &fields.evidence)?;
+
+        Ok(())
+    }
+
+    fn sync_memory_evidence(
+        &self,
+        memory_id: &str,
+        evidence: &[MemoryEvidence],
+    ) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                "DELETE FROM memory_evidence WHERE memory_id = ?1",
+                params![memory_id],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to clear memory evidence rows: {}", e))
+            })?;
+        for (index, entry) in evidence.iter().enumerate() {
+            self.conn
+                .execute(
+                    "INSERT INTO memory_evidence
+                        (evidence_id, memory_id, kind, reference, detail, captured_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        format!("{memory_id}:evidence:{index}"),
+                        memory_id,
+                        entry.kind,
+                        entry.reference,
+                        entry.detail,
+                        entry.captured_at.map(|value| value as i64),
+                    ],
+                )
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to sync memory evidence row: {}", e))
+                })?;
+        }
         Ok(())
     }
 
@@ -1306,6 +2376,331 @@ impl MemoryStore {
         }
         Ok(memories)
     }
+
+    fn query_memories_values(
+        &self,
+        sql: &str,
+        bind_values: Vec<Value>,
+        context: &str,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        let mut stmt = self.conn.prepare(sql).map_err(|e| {
+            LatticeError::Storage(format!("Failed to prepare {} query: {}", context, e))
+        })?;
+
+        let rows = stmt
+            .query_map(params_from_iter(bind_values), memory_row_from_row)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to execute {} query: {}", context, e))
+            })?;
+
+        let mut memories = Vec::new();
+        for row in rows {
+            memories.push(
+                row.map_err(|e| {
+                    LatticeError::Storage(format!("Failed to read {} row: {}", context, e))
+                })?
+                .into_memory(),
+            );
+        }
+        Ok(memories)
+    }
+
+    fn filter_scope_boundary(
+        &self,
+        memories: Vec<Memory>,
+        scope: &ScopeFilter,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        let mut allowed = Vec::with_capacity(memories.len());
+        for memory in memories {
+            if scope_allows(&memory, scope) {
+                allowed.push(memory);
+                continue;
+            }
+            self.record_scope_filtered(&memory, scope)?;
+        }
+        Ok(allowed)
+    }
+
+    pub fn enforce_scope_boundary(
+        &self,
+        memories: Vec<Memory>,
+        scope: &ScopeFilter,
+        context: &str,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        let mut allowed = Vec::with_capacity(memories.len());
+        for memory in memories {
+            if scope_allows(&memory, scope) {
+                allowed.push(memory);
+                continue;
+            }
+            self.handle_scope_boundary_failure(&memory, scope, context)?;
+        }
+        Ok(allowed)
+    }
+
+    fn handle_scope_boundary_failure(
+        &self,
+        memory: &Memory,
+        scope: &ScopeFilter,
+        context: &str,
+    ) -> Result<(), LatticeError> {
+        let _ = context;
+        #[cfg(debug_assertions)]
+        {
+            let _ = scope;
+            panic!(
+                "scope leak blocked in {context}: memory_id={} scope={}",
+                memory.id,
+                memory.scope.as_str()
+            );
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            tracing::error!(
+                target: "security",
+                memory_id = memory.id.as_str(),
+                attempted_workspace_id = scope.workspace_id.as_str(),
+                attempted_branch = scope.branch.as_ref().map(|branch| branch.name.as_str()),
+                memory_scope = memory.scope.as_str(),
+                "scope_leak_blocked"
+            );
+            self.record_scope_filtered(memory, scope)?;
+            Ok(())
+        }
+    }
+
+    fn record_scope_filtered(
+        &self,
+        memory: &Memory,
+        scope: &ScopeFilter,
+    ) -> Result<(), LatticeError> {
+        tracing::warn!(
+            target: "security",
+            memory_id = memory.id.as_str(),
+            attempted_workspace_id = scope.workspace_id.as_str(),
+            attempted_branch = scope.branch.as_ref().map(|branch| branch.name.as_str()),
+            memory_scope = memory.scope.as_str(),
+            "scope_leak_blocked"
+        );
+        self.conn
+            .execute(
+                "INSERT INTO memory_scope_filter_events
+                    (memory_id, attempted_workspace_id, attempted_branch, memory_scope, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    memory.id,
+                    scope.workspace_id,
+                    scope.branch.as_ref().map(|branch| branch.name.as_str()),
+                    memory.scope.as_str(),
+                    now_epoch_secs() as i64,
+                ],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to record memory scope filter event: {}", e))
+            })?;
+        Ok(())
+    }
+
+    fn find_impacted_memory_ids_impl(
+        &self,
+        workspace_id: &str,
+        changed_files: &[String],
+        changed_symbols: &[String],
+        distinct_memories: bool,
+    ) -> Result<Vec<String>, LatticeError> {
+        if changed_files.is_empty() && changed_symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let reference_filters = build_graph_delta_reference_filters(changed_files, changed_symbols);
+        if reference_filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let select = if distinct_memories {
+            "SELECT DISTINCT e.memory_id"
+        } else {
+            "SELECT e.memory_id"
+        };
+        let conditions = reference_filters
+            .iter()
+            .map(|filter| {
+                if filter.is_like {
+                    "(e.kind = ? AND e.reference LIKE ? ESCAPE '\\')"
+                } else {
+                    "(e.kind = ? AND e.reference = ?)"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "{select}
+             FROM memory_evidence e
+             INNER JOIN memories m ON m.id = e.memory_id
+             WHERE m.is_invalidated = 0
+               AND m.workspace_id = ?
+               AND ({conditions})"
+        );
+
+        let mut bind_values = Vec::with_capacity(1 + reference_filters.len() * 2);
+        bind_values.push(Value::Text(workspace_id.to_string()));
+        for filter in reference_filters {
+            bind_values.push(Value::Text(filter.kind));
+            bind_values.push(Value::Text(filter.reference));
+        }
+
+        let mut statement = self.conn.prepare(&sql).map_err(|e| {
+            LatticeError::Storage(format!("Failed to prepare impacted-memory query: {}", e))
+        })?;
+        let rows = statement
+            .query_map(params_from_iter(bind_values.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to query impacted memories: {}", e))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            LatticeError::Storage(format!("Failed to decode impacted memory row: {}", e))
+        })
+    }
+
+    fn load_existing_verification_metadata(
+        &self,
+        id: &str,
+    ) -> Result<ExistingVerificationMetadata, LatticeError> {
+        self.conn
+            .query_row(
+                "SELECT expires_at
+                 FROM memories
+                 WHERE id = ?1
+                 LIMIT 1",
+                params![id],
+                |row| {
+                    Ok(ExistingVerificationMetadata {
+                        expires_at: row
+                            .get::<_, Option<i64>>(0)?
+                            .map(DateTime::from_unix_seconds),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to load existing verification metadata: {}",
+                    e
+                ))
+            })?
+            .map_or(Ok(ExistingVerificationMetadata::default()), Ok)
+    }
+}
+
+struct ScopeSqlPredicate {
+    where_clause: String,
+    bind_values: Vec<Value>,
+}
+
+#[derive(Default)]
+struct ExistingVerificationMetadata {
+    expires_at: Option<DateTime<Utc>>,
+}
+
+struct GraphDeltaReferenceFilter {
+    kind: String,
+    reference: String,
+    is_like: bool,
+}
+
+fn scope_sql_predicate(scope: &ScopeFilter) -> ScopeSqlPredicate {
+    let mut predicates = Vec::new();
+    let mut bind_values = Vec::new();
+
+    if let Some(session_id) = &scope.session_id {
+        predicates.push("(scope = ? AND session_id = ?)".to_string());
+        bind_values.push(Value::Text(MemoryScope::Session.as_str().to_string()));
+        bind_values.push(Value::Text(session_id.clone()));
+    }
+    if let Some(branch) = &scope.branch {
+        predicates.push("(scope = ? AND workspace_id = ? AND branch = ?)".to_string());
+        bind_values.push(Value::Text(MemoryScope::Branch.as_str().to_string()));
+        bind_values.push(Value::Text(scope.workspace_id.clone()));
+        bind_values.push(Value::Text(branch.name.clone()));
+    }
+    predicates.push("(scope = ? AND workspace_id = ?)".to_string());
+    bind_values.push(Value::Text(MemoryScope::Repo.as_str().to_string()));
+    bind_values.push(Value::Text(scope.workspace_id.clone()));
+
+    if let Some(organization_id) = &scope.organization_id {
+        predicates.push("(scope = ? AND scope_organization_id = ?)".to_string());
+        bind_values.push(Value::Text(MemoryScope::Organization.as_str().to_string()));
+        bind_values.push(Value::Text(organization_id.clone()));
+    }
+
+    ScopeSqlPredicate {
+        where_clause: format!("({})", predicates.join(" OR ")),
+        bind_values,
+    }
+}
+
+fn build_graph_delta_reference_filters(
+    changed_files: &[String],
+    changed_symbols: &[String],
+) -> Vec<GraphDeltaReferenceFilter> {
+    let mut filters = Vec::new();
+    let mut seen = HashSet::new();
+
+    for file in changed_files {
+        push_graph_delta_filter(&mut filters, &mut seen, "file", file, false);
+        push_graph_delta_filter(
+            &mut filters,
+            &mut seen,
+            "file",
+            &format!("file:%/{}@%", escape_like_literal(file)),
+            true,
+        );
+        push_graph_delta_filter(
+            &mut filters,
+            &mut seen,
+            "symbol",
+            &format!("symbol:%/{}@%", escape_like_literal(file)),
+            true,
+        );
+    }
+
+    for symbol in changed_symbols {
+        push_graph_delta_filter(&mut filters, &mut seen, "symbol", symbol, false);
+    }
+
+    filters
+}
+
+fn push_graph_delta_filter(
+    filters: &mut Vec<GraphDeltaReferenceFilter>,
+    seen: &mut HashSet<(String, String)>,
+    kind: &str,
+    reference: &str,
+    is_like: bool,
+) {
+    let key = (kind.to_string(), reference.to_string());
+    if !seen.insert(key.clone()) {
+        return;
+    }
+    filters.push(GraphDeltaReferenceFilter {
+        kind: key.0,
+        reference: key.1,
+        is_like,
+    });
+}
+
+fn escape_like_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn scope_filter_error(error: ScopeFilterError) -> LatticeError {
+    LatticeError::Storage(format!("Invalid memory scope filter: {}", error))
 }
 
 /// Internal helper to reduce row-mapping boilerplate.
@@ -1320,6 +2715,7 @@ struct MemoryRow {
     linked_files_json: String,
     workspace_id: Option<String>,
     branch: Option<String>,
+    scope_organization_id: Option<String>,
     refresh_key: Option<String>,
     source_query: Option<String>,
     created_at: i64,
@@ -1327,9 +2723,11 @@ struct MemoryRow {
     access_count: i64,
     is_stale: i32,
     stale_reason: Option<String>,
+    verification_status: Option<MemoryVerificationStatus>,
 }
 
 struct StructuredMemoryRow {
+    memory_class_str: String,
     assertion_type_str: String,
     verification_status_str: String,
     confidence_reason: Option<String>,
@@ -1339,29 +2737,41 @@ struct StructuredMemoryRow {
     contradicted_by_memory_ids_json: String,
     freshness_policy_str: String,
     freshness_policy_detail: Option<String>,
+    validity_conditions_json: String,
+    invalidation_triggers_json: String,
     provenance_json: String,
     evidence_json: String,
+    linked_docs_json: String,
+    linked_tests_json: String,
+    linked_memories_json: String,
 }
 
 fn structured_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StructuredMemoryRow> {
     Ok(StructuredMemoryRow {
-        assertion_type_str: row.get(0)?,
-        verification_status_str: row.get(1)?,
-        confidence_reason: row.get(2)?,
-        supersedes_memory_id: row.get(3)?,
-        superseded_by_memory_id: row.get(4)?,
-        contradicts_memory_ids_json: row.get(5)?,
-        contradicted_by_memory_ids_json: row.get(6)?,
-        freshness_policy_str: row.get(7)?,
-        freshness_policy_detail: row.get(8)?,
-        provenance_json: row.get(9)?,
-        evidence_json: row.get(10)?,
+        memory_class_str: row.get(0)?,
+        assertion_type_str: row.get(1)?,
+        verification_status_str: row.get(2)?,
+        confidence_reason: row.get(3)?,
+        supersedes_memory_id: row.get(4)?,
+        superseded_by_memory_id: row.get(5)?,
+        contradicts_memory_ids_json: row.get(6)?,
+        contradicted_by_memory_ids_json: row.get(7)?,
+        freshness_policy_str: row.get(8)?,
+        freshness_policy_detail: row.get(9)?,
+        validity_conditions_json: row.get(10)?,
+        invalidation_triggers_json: row.get(11)?,
+        provenance_json: row.get(12)?,
+        evidence_json: row.get(13)?,
+        linked_docs_json: row.get(14)?,
+        linked_tests_json: row.get(15)?,
+        linked_memories_json: row.get(16)?,
     })
 }
 
 impl StructuredMemoryRow {
     fn into_structured_fields(self) -> MemoryStructuredFields {
         MemoryStructuredFields {
+            memory_class: MemoryClass::from_str(&self.memory_class_str),
             assertion_type: MemoryAssertionType::from_str(&self.assertion_type_str),
             verification_status: MemoryVerificationStatus::from_str(&self.verification_status_str),
             confidence_reason: self.confidence_reason,
@@ -1373,13 +2783,27 @@ impl StructuredMemoryRow {
                 .unwrap_or_default(),
             freshness_policy: MemoryFreshnessPolicy::from_str(&self.freshness_policy_str),
             freshness_policy_detail: self.freshness_policy_detail,
+            validity_conditions: serde_json::from_str(&self.validity_conditions_json)
+                .unwrap_or_default(),
+            invalidation_triggers: serde_json::from_str(&self.invalidation_triggers_json)
+                .unwrap_or_default(),
             provenance: serde_json::from_str(&self.provenance_json).unwrap_or_default(),
             evidence: serde_json::from_str(&self.evidence_json).unwrap_or_default(),
+            linked_docs: serde_json::from_str(&self.linked_docs_json).unwrap_or_default(),
+            linked_tests: serde_json::from_str(&self.linked_tests_json).unwrap_or_default(),
+            linked_memories: serde_json::from_str(&self.linked_memories_json).unwrap_or_default(),
         }
     }
 }
 
 fn memory_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
+    let verification_status = if row.as_ref().column_count() > 18 {
+        let status: String = row.get(18)?;
+        Some(MemoryVerificationStatus::from_str(&status))
+    } else {
+        None
+    };
+
     Ok(MemoryRow {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -1391,13 +2815,15 @@ fn memory_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         linked_files_json: row.get(7)?,
         workspace_id: row.get(8)?,
         branch: row.get(9)?,
-        refresh_key: row.get(10)?,
-        source_query: row.get(11)?,
-        created_at: row.get(12)?,
-        last_accessed: row.get(13)?,
-        access_count: row.get(14)?,
-        is_stale: row.get(15)?,
-        stale_reason: row.get(16)?,
+        scope_organization_id: row.get(10)?,
+        refresh_key: row.get(11)?,
+        source_query: row.get(12)?,
+        created_at: row.get(13)?,
+        last_accessed: row.get(14)?,
+        access_count: row.get(15)?,
+        is_stale: row.get(16)?,
+        stale_reason: row.get(17)?,
+        verification_status,
     })
 }
 
@@ -1407,6 +2833,14 @@ impl MemoryRow {
             serde_json::from_str(&self.linked_json).unwrap_or_default();
         let linked_files: Vec<String> =
             serde_json::from_str(&self.linked_files_json).unwrap_or_default();
+        let is_stale = self.is_stale != 0;
+        let verification_status = self.verification_status.unwrap_or_else(|| {
+            infer_legacy_row_verification_status(
+                is_stale,
+                self.confidence,
+                self.source_query.as_deref(),
+            )
+        });
         Memory {
             id: self.id,
             session_id: self.session_id,
@@ -1418,13 +2852,15 @@ impl MemoryRow {
             linked_files,
             workspace_id: self.workspace_id,
             branch: self.branch,
+            scope_organization_id: self.scope_organization_id,
             refresh_key: self.refresh_key,
             source_query: self.source_query,
             created_at: self.created_at as u64,
             last_accessed: self.last_accessed as u64,
             access_count: self.access_count as u32,
-            is_stale: self.is_stale != 0,
+            is_stale,
             stale_reason: self.stale_reason,
+            verification_status,
         }
     }
 }
@@ -1547,17 +2983,29 @@ fn push_term(seen: &mut HashSet<String>, terms: &mut Vec<String>, term: String) 
 }
 
 fn infer_verification_status(memory: &Memory) -> MemoryVerificationStatus {
-    if memory.is_stale {
+    infer_legacy_row_verification_status(
+        memory.is_stale,
+        memory.confidence,
+        memory.source_query.as_deref(),
+    )
+}
+
+fn infer_legacy_row_verification_status(
+    is_stale: bool,
+    confidence: f64,
+    source_query: Option<&str>,
+) -> MemoryVerificationStatus {
+    if is_stale {
         return MemoryVerificationStatus::Stale;
     }
 
-    if let Some(query) = memory.source_query.as_deref() {
+    if let Some(query) = source_query {
         if query_is_verification_signal(query) {
             return MemoryVerificationStatus::Verified;
         }
     }
 
-    if memory.confidence >= 0.95 {
+    if confidence >= 0.95 {
         MemoryVerificationStatus::InReview
     } else {
         MemoryVerificationStatus::Unverified
@@ -1567,7 +3015,14 @@ fn infer_verification_status(memory: &Memory) -> MemoryVerificationStatus {
 fn has_extended_assertion_type(fields: &MemoryStructuredFields) -> bool {
     matches!(
         fields.assertion_type,
-        MemoryAssertionType::WorkflowOutcome | MemoryAssertionType::Constraint
+        MemoryAssertionType::WorkflowOutcome
+            | MemoryAssertionType::Constraint
+            | MemoryAssertionType::Hypothesis
+            | MemoryAssertionType::Procedure
+            | MemoryAssertionType::Outcome
+            | MemoryAssertionType::Preference
+            | MemoryAssertionType::Question
+            | MemoryAssertionType::Counter
     )
 }
 
@@ -1622,6 +3077,8 @@ fn build_default_evidence(memory: &Memory) -> Vec<MemoryEvidence> {
             reference: Some(symbol.clone()),
             detail: None,
             captured_at: Some(memory.created_at),
+            span: None,
+            evidence_content_hash: None,
         });
     }
 
@@ -1631,6 +3088,8 @@ fn build_default_evidence(memory: &Memory) -> Vec<MemoryEvidence> {
             reference: Some(file.clone()),
             detail: None,
             captured_at: Some(memory.created_at),
+            span: None,
+            evidence_content_hash: None,
         });
     }
 

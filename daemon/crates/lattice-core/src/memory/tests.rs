@@ -1,6 +1,6 @@
 use super::model::{
-    Memory, MemoryAssertionType, MemoryEvidence, MemoryFreshnessPolicy, MemoryProvenance,
-    MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
+    Memory, MemoryAssertionType, MemoryClass, MemoryEvidence, MemoryFreshnessPolicy,
+    MemoryProvenance, MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
 };
 use super::store::MemoryStore;
 use rusqlite::Connection;
@@ -28,6 +28,7 @@ fn make_memory_with_session(
         linked_files: vec![],
         workspace_id: None,
         branch: None,
+        scope_organization_id: None,
         refresh_key: None,
         source_query: None,
         created_at: 0,
@@ -35,6 +36,7 @@ fn make_memory_with_session(
         access_count: 0,
         is_stale: false,
         stale_reason: None,
+        verification_status: crate::memory::MemoryVerificationStatus::Unverified,
     }
 }
 
@@ -255,6 +257,7 @@ fn test_memory_decay_and_pruning() {
             linked_files: vec![],
             workspace_id: None,
             branch: None,
+            scope_organization_id: None,
             refresh_key: None,
             source_query: None,
             created_at: 1000,    // Very old
@@ -262,6 +265,7 @@ fn test_memory_decay_and_pruning() {
             access_count: 0,
             is_stale: false,
             stale_reason: None,
+            verification_status: crate::memory::MemoryVerificationStatus::Unverified,
         })
         .expect("Failed to store memory");
 
@@ -771,6 +775,7 @@ fn test_get_and_update_structured_fields_round_trip() {
         .expect("Failed to store memory");
 
     let expected = MemoryStructuredFields {
+        memory_class: MemoryClass::Constraint,
         assertion_type: MemoryAssertionType::Constraint,
         verification_status: MemoryVerificationStatus::Verified,
         confidence_reason: Some("Validated against tenant boundary checks".to_string()),
@@ -780,6 +785,8 @@ fn test_get_and_update_structured_fields_round_trip() {
         contradicted_by_memory_ids: vec!["newer-constraint".to_string()],
         freshness_policy: MemoryFreshnessPolicy::ManualReview,
         freshness_policy_detail: Some("Recheck when auth rules change".to_string()),
+        validity_conditions: vec!["tenant boundary checks stay enforced".to_string()],
+        invalidation_triggers: vec!["auth rules change".to_string()],
         provenance: vec![MemoryProvenance {
             source: "test".to_string(),
             reference: Some("structured-round-trip".to_string()),
@@ -791,7 +798,12 @@ fn test_get_and_update_structured_fields_round_trip() {
             reference: Some("src/auth.ts".to_string()),
             detail: Some("Tenant boundary validation".to_string()),
             captured_at: Some(1_700_003_001),
+            span: None,
+            evidence_content_hash: None,
         }],
+        linked_docs: vec!["docs/auth.md#TenantBoundaries".to_string()],
+        linked_tests: vec!["tests/test_auth.py::test_tenant_boundaries".to_string()],
+        linked_memories: vec!["sibling-memory".to_string()],
     };
 
     store

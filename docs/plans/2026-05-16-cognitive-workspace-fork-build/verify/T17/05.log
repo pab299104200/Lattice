@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test events::corruption_tests::events_table_update_fails_with_append_only_trigger_error ... ok
+test events::corruption_tests::corrupted_inline_payload_hash_returns_typed_error ... ok
+test events::corruption_tests::corrupted_payload_bytes_return_typed_error ... ok
+test events::corruption_tests::truncated_snapshot_without_fallback_returns_content_hash_mismatch ... ok
+test events::corruption_tests::truncated_latest_snapshot_falls_back_to_prior_snapshot ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.10s
+

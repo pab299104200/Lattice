@@ -1,0 +1,29 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 22 tests
+test retrieval_v1::golden_tests::budget_login_user_anchor_keeps_pinned_symbol_under_truncation ... ok
+test retrieval_v1::golden_tests::command_python_anchor_returns_cli_file ... ok
+test retrieval_v1::golden_tests::api_diagnose_failure_anchor_returns_diagnose_failure ... ok
+test retrieval_v1::golden_tests::command_cargo_test_anchor_returns_session_file ... ok
+test retrieval_v1::golden_tests::command_rg_anchor_returns_login_user ... ok
+test retrieval_v1::golden_tests::api_search_logic_flow_anchor_returns_search_logic_flow ... ok
+test retrieval_v1::golden_tests::api_prepare_change_anchor_returns_prepare_change ... ok
+test retrieval_v1::golden_tests::every_anchor_type_has_three_golden_tasks ... ok
+test retrieval_v1::golden_tests::budget_truncation_preserves_pinned_result_and_token_cap ... ok
+test retrieval_v1::golden_tests::config_event_log_anchor_returns_event_log_symbol ... ok
+test retrieval_v1::golden_tests::config_workflow_cache_ttl_anchor_returns_workflow_cache_ttl ... ok
+test retrieval_v1::golden_tests::path_auth_file_anchor_returns_auth_file ... ok
+test retrieval_v1::golden_tests::error_missing_symbol_anchor_returns_login_user ... ok
+test retrieval_v1::golden_tests::error_panic_path_anchor_returns_auth_file ... ok
+test retrieval_v1::golden_tests::path_section_anchor_returns_retrieval_engine_section ... ok
+test retrieval_v1::golden_tests::error_traceback_anchor_returns_cli_file ... ok
+test retrieval_v1::golden_tests::config_index_root_anchor_returns_index_root_symbol ... ok
+test retrieval_v1::golden_tests::path_session_file_anchor_returns_session_file ... ok
+test retrieval_v1::golden_tests::stale_memory_ranks_below_trusted_result ... ok
+test retrieval_v1::golden_tests::symbol_login_user_anchor_returns_login_user ... ok
+test retrieval_v1::golden_tests::symbol_search_logic_flow_anchor_returns_search_logic_flow ... ok
+test retrieval_v1::golden_tests::symbol_refresh_session_anchor_returns_refresh_session ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 550 filtered out; finished in 0.28s
+

@@ -1,0 +1,474 @@
+[
+  {
+    "fixture": "event-log-compaction",
+    "target_file_count": 0,
+    "measured_file_count": 0,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 0,
+    "compaction_wall_clock_ms": 123,
+    "tools": [
+      {
+        "tool": "event-log-compaction:before",
+        "p50_us": 7270,
+        "p95_us": 7270,
+        "p99_us": 7270,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "event-log-compaction:after",
+        "p50_us": 4520,
+        "p95_us": 4520,
+        "p99_us": 4520,
+        "budget_us": 10000,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 0,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 1000
+    },
+    "recorded_at": "1779059022"
+  },
+  {
+    "fixture": "extra-large",
+    "target_file_count": 250000,
+    "measured_file_count": 20,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 4,
+    "compaction_wall_clock_ms": null,
+    "tools": [
+      {
+        "tool": "identity_resolution",
+        "p50_us": 21,
+        "p95_us": 22,
+        "p99_us": 46,
+        "budget_us": 2000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:prepare_change",
+        "p50_us": 224,
+        "p95_us": 277,
+        "p99_us": 319,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:get_context_capsule",
+        "p50_us": 221,
+        "p95_us": 276,
+        "p99_us": 1158,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "prepare_change",
+        "p50_us": 7325,
+        "p95_us": 17482,
+        "p99_us": 24034,
+        "budget_us": 50341,
+        "samples": 1000
+      },
+      {
+        "tool": "get_context_capsule",
+        "p50_us": 3068,
+        "p95_us": 3181,
+        "p99_us": 3221,
+        "budget_us": 50140,
+        "samples": 1000
+      },
+      {
+        "tool": "expand_context",
+        "p50_us": 105,
+        "p95_us": 201,
+        "p99_us": 213,
+        "budget_us": 50027,
+        "samples": 1000
+      },
+      {
+        "tool": "impact_from_diff",
+        "p50_us": 536,
+        "p95_us": 575,
+        "p99_us": 588,
+        "budget_us": 50051,
+        "samples": 1000
+      },
+      {
+        "tool": "diagnose_failure",
+        "p50_us": 2877,
+        "p95_us": 2967,
+        "p99_us": 3373,
+        "budget_us": 50279,
+        "samples": 1000
+      },
+      {
+        "tool": "search_symbols",
+        "p50_us": 12,
+        "p95_us": 17,
+        "p99_us": 20,
+        "budget_us": 50003,
+        "samples": 1000
+      },
+      {
+        "tool": "find_relevant_tests",
+        "p50_us": 385,
+        "p95_us": 501,
+        "p99_us": 513,
+        "budget_us": 50032,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 2,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 128
+    },
+    "recorded_at": "1779058962"
+  },
+  {
+    "fixture": "large-polyglot",
+    "target_file_count": 100000,
+    "measured_file_count": 20,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 1,
+    "compaction_wall_clock_ms": null,
+    "tools": [
+      {
+        "tool": "identity_resolution",
+        "p50_us": 21,
+        "p95_us": 110,
+        "p99_us": 175,
+        "budget_us": 2000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:prepare_change",
+        "p50_us": 234,
+        "p95_us": 1117,
+        "p99_us": 3417,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:get_context_capsule",
+        "p50_us": 225,
+        "p95_us": 274,
+        "p99_us": 342,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "prepare_change",
+        "p50_us": 6956,
+        "p95_us": 15909,
+        "p99_us": 18381,
+        "budget_us": 50341,
+        "samples": 1000
+      },
+      {
+        "tool": "get_context_capsule",
+        "p50_us": 3067,
+        "p95_us": 6196,
+        "p99_us": 9196,
+        "budget_us": 50140,
+        "samples": 1000
+      },
+      {
+        "tool": "expand_context",
+        "p50_us": 123,
+        "p95_us": 195,
+        "p99_us": 197,
+        "budget_us": 50027,
+        "samples": 1000
+      },
+      {
+        "tool": "impact_from_diff",
+        "p50_us": 533,
+        "p95_us": 553,
+        "p99_us": 847,
+        "budget_us": 50051,
+        "samples": 1000
+      },
+      {
+        "tool": "diagnose_failure",
+        "p50_us": 2687,
+        "p95_us": 5779,
+        "p99_us": 8719,
+        "budget_us": 50279,
+        "samples": 1000
+      },
+      {
+        "tool": "search_symbols",
+        "p50_us": 15,
+        "p95_us": 22,
+        "p99_us": 43,
+        "budget_us": 50003,
+        "samples": 1000
+      },
+      {
+        "tool": "find_relevant_tests",
+        "p50_us": 486,
+        "p95_us": 861,
+        "p99_us": 2835,
+        "budget_us": 50032,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 2,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 128
+    },
+    "recorded_at": "1779059042"
+  },
+  {
+    "fixture": "medium-typescript",
+    "target_file_count": 25000,
+    "measured_file_count": 20,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 1,
+    "compaction_wall_clock_ms": null,
+    "tools": [
+      {
+        "tool": "identity_resolution",
+        "p50_us": 15,
+        "p95_us": 17,
+        "p99_us": 21,
+        "budget_us": 2000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:prepare_change",
+        "p50_us": 213,
+        "p95_us": 258,
+        "p99_us": 286,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:get_context_capsule",
+        "p50_us": 218,
+        "p95_us": 261,
+        "p99_us": 279,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "prepare_change",
+        "p50_us": 7708,
+        "p95_us": 24174,
+        "p99_us": 30712,
+        "budget_us": 50341,
+        "samples": 1000
+      },
+      {
+        "tool": "get_context_capsule",
+        "p50_us": 4030,
+        "p95_us": 12645,
+        "p99_us": 15744,
+        "budget_us": 50140,
+        "samples": 1000
+      },
+      {
+        "tool": "expand_context",
+        "p50_us": 197,
+        "p95_us": 1611,
+        "p99_us": 4295,
+        "budget_us": 50027,
+        "samples": 1000
+      },
+      {
+        "tool": "impact_from_diff",
+        "p50_us": 648,
+        "p95_us": 3753,
+        "p99_us": 5078,
+        "budget_us": 50051,
+        "samples": 1000
+      },
+      {
+        "tool": "diagnose_failure",
+        "p50_us": 6227,
+        "p95_us": 11994,
+        "p99_us": 16138,
+        "budget_us": 50279,
+        "samples": 1000
+      },
+      {
+        "tool": "search_symbols",
+        "p50_us": 15,
+        "p95_us": 22,
+        "p99_us": 23,
+        "budget_us": 50003,
+        "samples": 1000
+      },
+      {
+        "tool": "find_relevant_tests",
+        "p50_us": 526,
+        "p95_us": 589,
+        "p99_us": 3569,
+        "budget_us": 50032,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 2,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 128
+    },
+    "recorded_at": "1779058990"
+  },
+  {
+    "fixture": "payload-spillover",
+    "target_file_count": 0,
+    "measured_file_count": 0,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 0,
+    "compaction_wall_clock_ms": null,
+    "tools": [
+      {
+        "tool": "payload-spillover:before",
+        "p50_us": 3390,
+        "p95_us": 3390,
+        "p99_us": 3390,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "payload-spillover:after",
+        "p50_us": 3390,
+        "p95_us": 3390,
+        "p99_us": 3390,
+        "budget_us": 10000,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 0,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 1000
+    },
+    "recorded_at": "1779059042"
+  },
+  {
+    "fixture": "small-rust",
+    "target_file_count": 5000,
+    "measured_file_count": 20,
+    "requested_fixture_root_exists": false,
+    "t66_fixture_root_exists": true,
+    "indexing_wall_clock_ms": 1,
+    "compaction_wall_clock_ms": null,
+    "tools": [
+      {
+        "tool": "identity_resolution",
+        "p50_us": 20,
+        "p95_us": 21,
+        "p99_us": 35,
+        "budget_us": 2000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:prepare_change",
+        "p50_us": 216,
+        "p95_us": 3242,
+        "p99_us": 3327,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "event_write:get_context_capsule",
+        "p50_us": 221,
+        "p95_us": 3250,
+        "p99_us": 3382,
+        "budget_us": 10000,
+        "samples": 1000
+      },
+      {
+        "tool": "prepare_change",
+        "p50_us": 12720,
+        "p95_us": 21642,
+        "p99_us": 25952,
+        "budget_us": 50341,
+        "samples": 1000
+      },
+      {
+        "tool": "get_context_capsule",
+        "p50_us": 5802,
+        "p95_us": 10662,
+        "p99_us": 13979,
+        "budget_us": 50140,
+        "samples": 1000
+      },
+      {
+        "tool": "expand_context",
+        "p50_us": 189,
+        "p95_us": 226,
+        "p99_us": 529,
+        "budget_us": 50027,
+        "samples": 1000
+      },
+      {
+        "tool": "impact_from_diff",
+        "p50_us": 733,
+        "p95_us": 6760,
+        "p99_us": 7868,
+        "budget_us": 50051,
+        "samples": 1000
+      },
+      {
+        "tool": "diagnose_failure",
+        "p50_us": 5919,
+        "p95_us": 11833,
+        "p99_us": 14206,
+        "budget_us": 50279,
+        "samples": 1000
+      },
+      {
+        "tool": "search_symbols",
+        "p50_us": 14,
+        "p95_us": 21,
+        "p99_us": 24,
+        "budget_us": 50003,
+        "samples": 1000
+      },
+      {
+        "tool": "find_relevant_tests",
+        "p50_us": 479,
+        "p95_us": 2545,
+        "p99_us": 6609,
+        "budget_us": 50032,
+        "samples": 1000
+      }
+    ],
+    "graph_traversal_budget": {
+      "max_hops": 2,
+      "max_neighbors_seen": 0
+    },
+    "event_log_query_budget": {
+      "query_limit": 10000,
+      "rows_scanned": 128
+    },
+    "recorded_at": "1779059020"
+  }
+]

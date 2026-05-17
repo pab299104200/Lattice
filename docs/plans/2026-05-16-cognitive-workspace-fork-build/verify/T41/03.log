@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test consolidation::deterministic_tests::every_scanner_is_no_op_on_empty_store ... ok
+test consolidation::deterministic_tests::demotion_scanner_emits_demote_proposal_for_never_accessed_low_score_memory ... ok
+test consolidation::deterministic_tests::stale_marker_emits_mark_stale_proposal_for_deleted_anchor_file ... ok
+test consolidation::deterministic_tests::refresh_scanner_emits_refresh_proposal_when_evidence_still_matches ... ok
+test consolidation::deterministic_tests::scanners_route_through_runtime_without_direct_writes ... ok
+test consolidation::deterministic_tests::duplicate_detector_emits_supersession_proposal ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.55s
+

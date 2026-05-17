@@ -1,0 +1,1084 @@
+{
+  "created_at": "2026-05-17T02:17:27Z",
+  "events": [
+    {
+      "at": "2026-05-17T02:50:25Z",
+      "error": "feature build plan contains deferral/workaround language in tasks: T11, T12, T13, T14, T15, T16, T17, R18, R88. The harness rejects deferral language by default. Set FEATURE_BUILD_ALLOW_DEFERRALS=1 only when the user explicitly accepts a scoped deferral.",
+      "event": "failed"
+    },
+    {
+      "at": "2026-05-17T02:54:20Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:25Z",
+      "event": "task_agent_failed",
+      "status": 1,
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:25Z",
+      "attempt": 2,
+      "event": "task_started",
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:31Z",
+      "event": "task_agent_failed",
+      "status": 1,
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:31Z",
+      "attempt": 3,
+      "event": "task_started",
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:36Z",
+      "event": "task_agent_failed",
+      "status": 1,
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T02:54:36Z",
+      "error": "agent exited 1; see /home/pete/cadres/lattice/docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T01.log",
+      "event": "failed"
+    },
+    {
+      "at": "2026-05-17T03:01:58Z",
+      "attempt": 3,
+      "event": "task_started",
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T03:06:08Z",
+      "event": "task_complete",
+      "task_id": "T01"
+    },
+    {
+      "at": "2026-05-17T03:06:08Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T02"
+    },
+    {
+      "at": "2026-05-17T03:06:08Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T04"
+    },
+    {
+      "at": "2026-05-17T03:10:25Z",
+      "event": "task_complete",
+      "task_id": "T02"
+    },
+    {
+      "at": "2026-05-17T03:22:56Z",
+      "event": "task_complete",
+      "task_id": "T04"
+    },
+    {
+      "at": "2026-05-17T03:22:56Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T03"
+    },
+    {
+      "at": "2026-05-17T03:27:22Z",
+      "event": "task_complete",
+      "task_id": "T03"
+    },
+    {
+      "at": "2026-05-17T03:27:22Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R05"
+    },
+    {
+      "at": "2026-05-17T03:34:40Z",
+      "event": "task_complete",
+      "task_id": "R05"
+    },
+    {
+      "at": "2026-05-17T03:34:40Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T06"
+    },
+    {
+      "at": "2026-05-17T03:41:20Z",
+      "event": "task_complete",
+      "task_id": "T06"
+    },
+    {
+      "at": "2026-05-17T03:41:20Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T07"
+    },
+    {
+      "at": "2026-05-17T03:53:34Z",
+      "event": "task_complete",
+      "task_id": "T07"
+    },
+    {
+      "at": "2026-05-17T03:53:34Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T08"
+    },
+    {
+      "at": "2026-05-17T04:11:39Z",
+      "event": "task_complete",
+      "task_id": "T08"
+    },
+    {
+      "at": "2026-05-17T04:11:39Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T09"
+    },
+    {
+      "at": "2026-05-17T04:18:41Z",
+      "event": "task_complete",
+      "task_id": "T09"
+    },
+    {
+      "at": "2026-05-17T04:18:41Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R10"
+    },
+    {
+      "at": "2026-05-17T04:36:02Z",
+      "event": "task_complete",
+      "task_id": "R10"
+    },
+    {
+      "at": "2026-05-17T04:36:02Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T11"
+    },
+    {
+      "at": "2026-05-17T04:46:36Z",
+      "event": "task_complete",
+      "task_id": "T11"
+    },
+    {
+      "at": "2026-05-17T04:46:36Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T12"
+    },
+    {
+      "at": "2026-05-17T04:53:41Z",
+      "event": "task_complete",
+      "task_id": "T12"
+    },
+    {
+      "at": "2026-05-17T04:53:41Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T13"
+    },
+    {
+      "at": "2026-05-17T05:01:06Z",
+      "event": "task_complete",
+      "task_id": "T13"
+    },
+    {
+      "at": "2026-05-17T05:01:06Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T14"
+    },
+    {
+      "at": "2026-05-17T05:10:27Z",
+      "event": "task_complete",
+      "task_id": "T14"
+    },
+    {
+      "at": "2026-05-17T05:10:27Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T15"
+    },
+    {
+      "at": "2026-05-17T05:10:27Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T16"
+    },
+    {
+      "at": "2026-05-17T05:27:40Z",
+      "event": "task_complete",
+      "task_id": "T16"
+    },
+    {
+      "at": "2026-05-17T05:32:33Z",
+      "event": "task_complete",
+      "task_id": "T15"
+    },
+    {
+      "at": "2026-05-17T05:32:33Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T17"
+    },
+    {
+      "at": "2026-05-17T05:55:50Z",
+      "event": "task_complete",
+      "task_id": "T17"
+    },
+    {
+      "at": "2026-05-17T05:55:50Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R18"
+    },
+    {
+      "at": "2026-05-17T06:08:15Z",
+      "event": "task_complete",
+      "task_id": "R18"
+    },
+    {
+      "at": "2026-05-17T06:08:15Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T19"
+    },
+    {
+      "at": "2026-05-17T06:13:52Z",
+      "event": "task_complete",
+      "task_id": "T19"
+    },
+    {
+      "at": "2026-05-17T06:13:53Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T20"
+    },
+    {
+      "at": "2026-05-17T06:13:53Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T21"
+    },
+    {
+      "at": "2026-05-17T06:29:19Z",
+      "event": "task_complete",
+      "task_id": "T21"
+    },
+    {
+      "at": "2026-05-17T06:30:06Z",
+      "event": "task_complete",
+      "task_id": "T20"
+    },
+    {
+      "at": "2026-05-17T06:30:06Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T23"
+    },
+    {
+      "at": "2026-05-17T06:30:06Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T22"
+    },
+    {
+      "at": "2026-05-17T06:57:49Z",
+      "event": "task_complete",
+      "task_id": "T22"
+    },
+    {
+      "at": "2026-05-17T06:59:07Z",
+      "event": "task_complete",
+      "task_id": "T23"
+    },
+    {
+      "at": "2026-05-17T06:59:07Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T24"
+    },
+    {
+      "at": "2026-05-17T07:18:22Z",
+      "event": "task_complete",
+      "task_id": "T24"
+    },
+    {
+      "at": "2026-05-17T07:18:22Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R25"
+    },
+    {
+      "at": "2026-05-17T07:27:01Z",
+      "event": "task_complete",
+      "task_id": "R25"
+    },
+    {
+      "at": "2026-05-17T07:27:01Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R26"
+    },
+    {
+      "at": "2026-05-17T07:47:28Z",
+      "event": "task_complete",
+      "task_id": "R26"
+    },
+    {
+      "at": "2026-05-17T07:47:28Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T27"
+    },
+    {
+      "at": "2026-05-17T07:57:08Z",
+      "event": "task_complete",
+      "task_id": "T27"
+    },
+    {
+      "at": "2026-05-17T07:57:08Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T28"
+    },
+    {
+      "at": "2026-05-17T08:06:06Z",
+      "event": "task_complete",
+      "task_id": "T28"
+    },
+    {
+      "at": "2026-05-17T08:06:06Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T29"
+    },
+    {
+      "at": "2026-05-17T08:19:59Z",
+      "event": "task_complete",
+      "task_id": "T29"
+    },
+    {
+      "at": "2026-05-17T08:19:59Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T30"
+    },
+    {
+      "at": "2026-05-17T08:37:52Z",
+      "event": "task_complete",
+      "task_id": "T30"
+    },
+    {
+      "at": "2026-05-17T08:37:52Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T31"
+    },
+    {
+      "at": "2026-05-17T08:47:17Z",
+      "event": "task_complete",
+      "task_id": "T31"
+    },
+    {
+      "at": "2026-05-17T08:47:17Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T32"
+    },
+    {
+      "at": "2026-05-17T09:10:11Z",
+      "event": "task_complete",
+      "task_id": "T32"
+    },
+    {
+      "at": "2026-05-17T09:10:11Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R33"
+    },
+    {
+      "at": "2026-05-17T09:28:07Z",
+      "event": "task_complete",
+      "task_id": "R33"
+    },
+    {
+      "at": "2026-05-17T09:28:07Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T34"
+    },
+    {
+      "at": "2026-05-17T09:36:15Z",
+      "event": "task_complete",
+      "task_id": "T34"
+    },
+    {
+      "at": "2026-05-17T09:36:15Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T35"
+    },
+    {
+      "at": "2026-05-17T09:49:39Z",
+      "event": "task_complete",
+      "task_id": "T35"
+    },
+    {
+      "at": "2026-05-17T09:49:39Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T36"
+    },
+    {
+      "at": "2026-05-17T10:06:59Z",
+      "event": "task_complete",
+      "task_id": "T36"
+    },
+    {
+      "at": "2026-05-17T10:06:59Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T37"
+    },
+    {
+      "at": "2026-05-17T10:12:33Z",
+      "event": "task_complete",
+      "task_id": "T37"
+    },
+    {
+      "at": "2026-05-17T10:12:33Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R38"
+    },
+    {
+      "at": "2026-05-17T10:22:24Z",
+      "event": "task_complete",
+      "task_id": "R38"
+    },
+    {
+      "at": "2026-05-17T10:22:24Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T39"
+    },
+    {
+      "at": "2026-05-17T10:34:07Z",
+      "event": "task_complete",
+      "task_id": "T39"
+    },
+    {
+      "at": "2026-05-17T10:34:07Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T41"
+    },
+    {
+      "at": "2026-05-17T10:34:07Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T40"
+    },
+    {
+      "at": "2026-05-17T10:51:00Z",
+      "event": "task_complete",
+      "task_id": "T41"
+    },
+    {
+      "at": "2026-05-17T10:52:54Z",
+      "event": "task_complete",
+      "task_id": "T40"
+    },
+    {
+      "at": "2026-05-17T10:52:54Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T42"
+    },
+    {
+      "at": "2026-05-17T11:05:48Z",
+      "event": "task_complete",
+      "task_id": "T42"
+    },
+    {
+      "at": "2026-05-17T11:05:48Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T43"
+    },
+    {
+      "at": "2026-05-17T11:05:48Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T44"
+    },
+    {
+      "at": "2026-05-17T11:05:48Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T45"
+    },
+    {
+      "at": "2026-05-17T11:22:38Z",
+      "event": "task_complete",
+      "task_id": "T43"
+    },
+    {
+      "at": "2026-05-17T11:25:14Z",
+      "event": "task_complete",
+      "task_id": "T45"
+    },
+    {
+      "at": "2026-05-17T11:25:14Z",
+      "event": "task_complete",
+      "task_id": "T44"
+    },
+    {
+      "at": "2026-05-17T11:25:14Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T46"
+    },
+    {
+      "at": "2026-05-17T11:38:37Z",
+      "event": "task_complete",
+      "task_id": "T46"
+    },
+    {
+      "at": "2026-05-17T11:38:37Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R47"
+    },
+    {
+      "at": "2026-05-17T11:49:52Z",
+      "event": "task_complete",
+      "task_id": "R47"
+    },
+    {
+      "at": "2026-05-17T11:49:52Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T48"
+    },
+    {
+      "at": "2026-05-17T12:05:19Z",
+      "event": "task_complete",
+      "task_id": "T48"
+    },
+    {
+      "at": "2026-05-17T12:05:19Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T49"
+    },
+    {
+      "at": "2026-05-17T12:05:19Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T50"
+    },
+    {
+      "at": "2026-05-17T12:22:50Z",
+      "event": "task_complete",
+      "task_id": "T49"
+    },
+    {
+      "at": "2026-05-17T12:23:59Z",
+      "event": "task_complete",
+      "task_id": "T50"
+    },
+    {
+      "at": "2026-05-17T12:23:59Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T51"
+    },
+    {
+      "at": "2026-05-17T12:41:12Z",
+      "event": "task_complete",
+      "task_id": "T51"
+    },
+    {
+      "at": "2026-05-17T12:41:12Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T52"
+    },
+    {
+      "at": "2026-05-17T12:51:44Z",
+      "event": "task_complete",
+      "task_id": "T52"
+    },
+    {
+      "at": "2026-05-17T12:51:44Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T53"
+    },
+    {
+      "at": "2026-05-17T13:01:09Z",
+      "event": "task_complete",
+      "task_id": "T53"
+    },
+    {
+      "at": "2026-05-17T13:01:09Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R54"
+    },
+    {
+      "at": "2026-05-17T13:08:47Z",
+      "event": "task_complete",
+      "task_id": "R54"
+    },
+    {
+      "at": "2026-05-17T13:08:47Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R55"
+    },
+    {
+      "at": "2026-05-17T13:23:50Z",
+      "event": "task_complete",
+      "task_id": "R55"
+    },
+    {
+      "at": "2026-05-17T13:23:50Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T56"
+    },
+    {
+      "at": "2026-05-17T13:23:50Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T57"
+    },
+    {
+      "at": "2026-05-17T13:23:50Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T58"
+    },
+    {
+      "at": "2026-05-17T13:47:40Z",
+      "error": "command failed (101): cd daemon && cargo test -p lattice-daemon --lib rpc::workflow_v2::discovery_workflows_tests",
+      "event": "task_verify_failed",
+      "task_id": "T57"
+    },
+    {
+      "at": "2026-05-17T13:47:40Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T59"
+    },
+    {
+      "at": "2026-05-17T13:52:01Z",
+      "event": "task_complete",
+      "task_id": "T58"
+    },
+    {
+      "at": "2026-05-17T13:52:01Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T60"
+    },
+    {
+      "at": "2026-05-17T13:55:37Z",
+      "event": "task_complete",
+      "task_id": "T56"
+    },
+    {
+      "at": "2026-05-17T14:14:52Z",
+      "event": "task_complete",
+      "task_id": "T60"
+    },
+    {
+      "at": "2026-05-17T14:16:14Z",
+      "event": "task_complete",
+      "task_id": "T59"
+    },
+    {
+      "at": "2026-05-17T14:16:14Z",
+      "event": "task_already_complete",
+      "task_id": "T57"
+    },
+    {
+      "at": "2026-05-17T14:16:14Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T61"
+    },
+    {
+      "at": "2026-05-17T14:21:58Z",
+      "event": "task_complete",
+      "task_id": "T61"
+    },
+    {
+      "at": "2026-05-17T14:21:58Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T62"
+    },
+    {
+      "at": "2026-05-17T14:38:43Z",
+      "event": "task_complete",
+      "task_id": "T62"
+    },
+    {
+      "at": "2026-05-17T14:38:43Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R63"
+    },
+    {
+      "at": "2026-05-17T14:50:59Z",
+      "event": "task_complete",
+      "task_id": "R63"
+    },
+    {
+      "at": "2026-05-17T14:50:59Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R64"
+    },
+    {
+      "at": "2026-05-17T15:11:01Z",
+      "event": "task_complete",
+      "task_id": "R64"
+    },
+    {
+      "at": "2026-05-17T15:11:01Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T65"
+    },
+    {
+      "at": "2026-05-17T15:24:48Z",
+      "event": "task_complete",
+      "task_id": "T65"
+    },
+    {
+      "at": "2026-05-17T15:24:48Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T67"
+    },
+    {
+      "at": "2026-05-17T15:24:48Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T66"
+    },
+    {
+      "at": "2026-05-17T15:43:48Z",
+      "event": "task_complete",
+      "task_id": "T67"
+    },
+    {
+      "at": "2026-05-17T15:50:35Z",
+      "event": "task_complete",
+      "task_id": "T66"
+    },
+    {
+      "at": "2026-05-17T15:50:35Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T68"
+    },
+    {
+      "at": "2026-05-17T16:28:54Z",
+      "event": "task_complete",
+      "task_id": "T68"
+    },
+    {
+      "at": "2026-05-17T16:28:54Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T69"
+    },
+    {
+      "at": "2026-05-17T16:38:07Z",
+      "event": "task_complete",
+      "task_id": "T69"
+    },
+    {
+      "at": "2026-05-17T16:38:07Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R70"
+    },
+    {
+      "at": "2026-05-17T16:52:39Z",
+      "event": "task_complete",
+      "task_id": "R70"
+    },
+    {
+      "at": "2026-05-17T16:52:39Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T71"
+    },
+    {
+      "at": "2026-05-17T17:07:45Z",
+      "event": "task_complete",
+      "task_id": "T71"
+    },
+    {
+      "at": "2026-05-17T17:07:45Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T72"
+    },
+    {
+      "at": "2026-05-17T17:07:45Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T73"
+    },
+    {
+      "at": "2026-05-17T17:07:45Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T74"
+    },
+    {
+      "at": "2026-05-17T17:20:01Z",
+      "event": "task_complete",
+      "task_id": "T72"
+    },
+    {
+      "at": "2026-05-17T17:20:01Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T75"
+    },
+    {
+      "at": "2026-05-17T17:36:33Z",
+      "event": "task_complete",
+      "task_id": "T74"
+    },
+    {
+      "at": "2026-05-17T17:36:33Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T76"
+    },
+    {
+      "at": "2026-05-17T17:40:14Z",
+      "event": "task_complete",
+      "task_id": "T73"
+    },
+    {
+      "at": "2026-05-17T17:44:11Z",
+      "event": "task_complete",
+      "task_id": "T75"
+    },
+    {
+      "at": "2026-05-17T17:51:17Z",
+      "event": "task_complete",
+      "task_id": "T76"
+    },
+    {
+      "at": "2026-05-17T17:51:17Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T77"
+    },
+    {
+      "at": "2026-05-17T18:10:54Z",
+      "error": "command failed (1): cd extension && npm test",
+      "event": "task_verify_failed",
+      "task_id": "T77"
+    },
+    {
+      "at": "2026-05-17T18:11:11Z",
+      "attempt": 2,
+      "event": "task_started",
+      "task_id": "T77"
+    },
+    {
+      "at": "2026-05-17T18:16:39Z",
+      "event": "task_complete",
+      "task_id": "T77"
+    },
+    {
+      "at": "2026-05-17T18:16:39Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R78"
+    },
+    {
+      "at": "2026-05-17T18:28:16Z",
+      "event": "task_complete",
+      "task_id": "R78"
+    },
+    {
+      "at": "2026-05-17T18:28:16Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R79"
+    },
+    {
+      "at": "2026-05-17T18:28:16Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T85"
+    },
+    {
+      "at": "2026-05-17T18:35:16Z",
+      "event": "task_complete",
+      "task_id": "T85"
+    },
+    {
+      "at": "2026-05-17T19:05:48Z",
+      "attempt": 2,
+      "event": "task_started",
+      "task_id": "R79"
+    },
+    {
+      "at": "2026-05-17T19:22:51Z",
+      "event": "task_complete",
+      "task_id": "R79"
+    },
+    {
+      "at": "2026-05-17T19:22:51Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T80"
+    },
+    {
+      "at": "2026-05-17T19:22:51Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T81"
+    },
+    {
+      "at": "2026-05-17T19:22:51Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T82"
+    },
+    {
+      "at": "2026-05-17T19:42:52Z",
+      "event": "task_complete",
+      "task_id": "T81"
+    },
+    {
+      "at": "2026-05-17T19:42:52Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T83"
+    },
+    {
+      "at": "2026-05-17T19:55:31Z",
+      "event": "task_complete",
+      "task_id": "T82"
+    },
+    {
+      "at": "2026-05-17T19:55:31Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T84"
+    },
+    {
+      "at": "2026-05-17T20:10:46Z",
+      "event": "task_complete",
+      "task_id": "T80"
+    },
+    {
+      "at": "2026-05-17T20:12:27Z",
+      "event": "task_complete",
+      "task_id": "T83"
+    },
+    {
+      "at": "2026-05-17T20:24:51Z",
+      "event": "task_complete",
+      "task_id": "T84"
+    },
+    {
+      "at": "2026-05-17T20:24:51Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "T86"
+    },
+    {
+      "at": "2026-05-17T20:30:21Z",
+      "event": "task_complete",
+      "task_id": "T86"
+    },
+    {
+      "at": "2026-05-17T20:30:21Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R87"
+    },
+    {
+      "at": "2026-05-17T21:01:55Z",
+      "event": "task_complete",
+      "task_id": "R87"
+    },
+    {
+      "at": "2026-05-17T21:01:55Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R88"
+    },
+    {
+      "at": "2026-05-17T21:47:29Z",
+      "event": "task_complete",
+      "task_id": "R88"
+    },
+    {
+      "at": "2026-05-17T21:47:29Z",
+      "attempt": 1,
+      "event": "task_started",
+      "task_id": "R89"
+    },
+    {
+      "at": "2026-05-17T22:08:35Z",
+      "event": "task_complete",
+      "task_id": "R89"
+    },
+    {
+      "at": "2026-05-17T22:08:35Z",
+      "event": "tasks_complete"
+    },
+    {
+      "at": "2026-05-17T22:25:20Z",
+      "event": "verify_complete"
+    },
+    {
+      "at": "2026-05-17T22:25:20Z",
+      "error": "backend_standard_commands() missing 1 required positional argument: 'task'",
+      "event": "failed"
+    },
+    {
+      "at": "2026-05-17T22:57:08Z",
+      "event": "tasks_complete"
+    },
+    {
+      "at": "2026-05-17T23:08:19Z",
+      "event": "verify_complete"
+    },
+    {
+      "at": "2026-05-17T23:08:19Z",
+      "event": "standard_gates_complete"
+    }
+  ],
+  "feature": "cognitive-workspace-fork",
+  "phase": "implemented",
+  "spec": "/home/pete/cadres/lattice/docs/plans/2026-05-16-cognitive-workspace-fork-plan.md",
+  "tasks_file": "/home/pete/cadres/lattice/docs/plans/2026-05-16-cognitive-workspace-fork-build/tasks.json",
+  "updated_at": "2026-05-17T23:08:19Z"
+}

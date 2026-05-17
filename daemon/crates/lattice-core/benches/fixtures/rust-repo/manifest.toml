@@ -1,0 +1,11 @@
+name = "rust-repo"
+size_class = "small"
+documentation_style = "moderate"
+benchmark_tasks = ["rust_scheduler_retry_policy", "rust_audit_trait_impact"]
+golden_anchors_path = "../golden_anchors.json"
+
+[expected_event_counts]
+indexed_files = 7
+minimum_symbols = 10
+workflow_tool_calls = 5
+workflow_successes = 2

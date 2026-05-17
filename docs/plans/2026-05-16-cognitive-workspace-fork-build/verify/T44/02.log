@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 9 tests
+test consolidation::review_queue_tests::decision_reason_column_round_trips ... ok
+test consolidation::review_queue_tests::repo_scope_proposal_is_gated_and_stays_pending ... ok
+test consolidation::review_queue_tests::organization_scope_proposal_is_gated_and_stays_pending ... ok
+test consolidation::review_queue_tests::decide_reject_leaves_memory_unchanged_and_records_rejection ... ok
+test consolidation::review_queue_tests::second_decision_is_idempotent ... ok
+test consolidation::review_queue_tests::branch_scope_proposal_is_not_gated_and_auto_applies ... ok
+test consolidation::review_queue_tests::decide_apply_routes_through_proposal_apply_and_records_operator ... ok
+test consolidation::review_queue_tests::list_pending_returns_oldest_first_and_honors_filters ... ok
+test consolidation::review_queue_tests::session_scope_proposal_is_not_gated_and_auto_applies ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 563 filtered out; finished in 0.76s
+

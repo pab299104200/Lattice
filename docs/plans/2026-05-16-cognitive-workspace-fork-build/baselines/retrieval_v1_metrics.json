@@ -1,0 +1,21 @@
+{
+  "corpus_size": 19,
+  "top_1_precision": 1.0,
+  "top_3_precision": 0.7368421052631579,
+  "top_1_recall": 1.0,
+  "top_3_recall": 1.0,
+  "irrelevant_memory_rate": 0.07017543859649122,
+  "mean_rank_of_golden_result": 1.0,
+  "p50_retrieval_latency_ms": 4.760619,
+  "p95_retrieval_latency_ms": 5.207659,
+  "candidates_per_source": {
+    "Embeddings": 114,
+    "EventSimilarity": 9,
+    "ExactPathSymbolLookup": 29,
+    "MemoryLinks": 33,
+    "RecentActiveWorkingMemory": 76,
+    "WorkflowSimilarity": 7
+  },
+  "dedupe_rate": 0.10074626865671643,
+  "truncation_rate": 0.05263157894736842
+}

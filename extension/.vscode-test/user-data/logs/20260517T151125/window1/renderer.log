@@ -1,0 +1,14 @@
+2026-05-17 15:11:35.906 [warning] Creation of workbench contribution 'workbench.contrib.preferencesActions' took 34ms.
+2026-05-17 15:11:36.014 [warning] Creation of workbench contribution 'workbench.contrib.remoteStatusIndicator' took 32ms.
+2026-05-17 15:11:36.165 [warning] Creation of workbench contribution 'workbench.contrib.exploreAgentDefaultModel' took 50ms.
+2026-05-17 15:11:36.293 [warning] Creation of workbench contribution 'workbench.contrib.chatSetup' took 101ms.
+2026-05-17 15:11:36.333 [warning] Creation of workbench contribution 'mcpContextKeys' took 32ms.
+2026-05-17 15:11:36.369 [warning] Creation of workbench contribution 'workbench.contrib.interactiveDocument' took 33ms.
+2026-05-17 15:11:36.416 [warning] Creation of workbench contribution 'workbench.contrib.userDataProfiles' took 29ms.
+2026-05-17 15:11:36.447 [warning] Creation of workbench contribution 'workbench.contrib.localHistoryTimeline' took 22ms.
+2026-05-17 15:11:42.757 [info] Started local extension host with pid 3900113.
+2026-05-17 15:11:43.315 [info] Loading development extension at /home/pete/cadres/lattice/extension
+2026-05-17 15:11:44.813 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-05-17 15:11:50.830 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-05-17 15:11:51.564 [warning] [lifecycle] onWillShutdown is taking a long time, pending operations: join.stopExtensionHosts, join.chatSessionStore, join.chatEditingSession
+2026-05-17 15:11:52.591 [error] [LocalProcessExtensionHost]: Extension host did not start in 10 seconds (debugBrk: false)

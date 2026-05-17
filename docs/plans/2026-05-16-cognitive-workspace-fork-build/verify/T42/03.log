@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test consolidation::llm::llm_tests::well_formed_episode_response_enqueues_proposal_without_mutating_memory ... ok
+test consolidation::llm::llm_tests::driver_error_emits_failure_event_and_no_proposal_for_every_job ... ok
+test consolidation::llm::llm_tests::synchronous_post_task_mode_is_forbidden_before_driver_call_for_every_job ... ok
+test consolidation::llm::llm_tests::malformed_json_emits_failure_event_and_no_proposal_for_every_job ... ok
+test consolidation::llm::llm_tests::structured_outputs_round_trip_into_expected_memory_states ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 1.59s
+

@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 8 tests
+test verification::integration_tests::test_scope_leak_blocked_at_store_boundary_for_all_scopes ... ok
+test verification::integration_tests::test_ranker_excludes_non_verified_from_top_n ... ok
+test verification::integration_tests::test_verifier_emits_explainable_label_reason_for_every_non_verified_state ... ok
+test verification::integration_tests::test_contradicted_memory_never_appears_in_trusted_bundle ... ok
+test verification::integration_tests::test_expired_memory_never_appears_in_trusted_bundle ... ok
+test verification::integration_tests::test_stale_memory_never_appears_in_trusted_bundle ... ok
+test verification::integration_tests::test_invalidated_memory_never_appears_in_trusted_bundle ... ok
+test verification::integration_tests::test_incremental_verification_narrows_to_changed_files_only ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 564 filtered out; finished in 3.75s
+

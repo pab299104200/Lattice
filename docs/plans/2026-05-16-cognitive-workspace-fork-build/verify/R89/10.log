@@ -1,0 +1,5 @@
+
+> lattice@0.1.0 test
+> node ./out/test/runTest.js
+
+Exit code:   0

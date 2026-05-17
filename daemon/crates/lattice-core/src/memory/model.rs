@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::identity::FileId;
+
 /// The type of memory being stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryType {
@@ -33,12 +35,80 @@ impl MemoryType {
     }
 }
 
+/// The primary memory class recorded by the cognitive workspace surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryClass {
+    Observation,
+    Decision,
+    Constraint,
+    Pattern,
+    AntiPattern,
+    WorkflowOutcome,
+    FailurePattern,
+    Procedure,
+    Preference,
+    ArchitectureInvariant,
+    DocsContract,
+    OpenQuestion,
+    CounterMemory,
+}
+
+impl MemoryClass {
+    pub fn as_str(&self) -> &str {
+        match self {
+            MemoryClass::Observation => "observation",
+            MemoryClass::Decision => "decision",
+            MemoryClass::Constraint => "constraint",
+            MemoryClass::Pattern => "pattern",
+            MemoryClass::AntiPattern => "anti_pattern",
+            MemoryClass::WorkflowOutcome => "workflow_outcome",
+            MemoryClass::FailurePattern => "failure_pattern",
+            MemoryClass::Procedure => "procedure",
+            MemoryClass::Preference => "preference",
+            MemoryClass::ArchitectureInvariant => "architecture_invariant",
+            MemoryClass::DocsContract => "docs_contract",
+            MemoryClass::OpenQuestion => "open_question",
+            MemoryClass::CounterMemory => "counter_memory",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "decision" => MemoryClass::Decision,
+            "constraint" => MemoryClass::Constraint,
+            "pattern" => MemoryClass::Pattern,
+            "anti_pattern" => MemoryClass::AntiPattern,
+            "workflow_outcome" => MemoryClass::WorkflowOutcome,
+            "failure_pattern" => MemoryClass::FailurePattern,
+            "procedure" => MemoryClass::Procedure,
+            "preference" => MemoryClass::Preference,
+            "architecture_invariant" => MemoryClass::ArchitectureInvariant,
+            "docs_contract" => MemoryClass::DocsContract,
+            "open_question" => MemoryClass::OpenQuestion,
+            "counter_memory" => MemoryClass::CounterMemory,
+            _ => MemoryClass::Observation,
+        }
+    }
+
+    pub fn from_memory_type(memory_type: &MemoryType) -> Self {
+        match memory_type {
+            MemoryType::Observation => MemoryClass::Observation,
+            MemoryType::Decision => MemoryClass::Decision,
+            MemoryType::Exploration => MemoryClass::OpenQuestion,
+            MemoryType::Pattern => MemoryClass::Pattern,
+            MemoryType::AntiPattern => MemoryClass::AntiPattern,
+        }
+    }
+}
+
 /// The durability scope of a memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryScope {
     Session,
     Branch,
     Repo,
+    Organization,
 }
 
 impl MemoryScope {
@@ -47,6 +117,7 @@ impl MemoryScope {
             MemoryScope::Session => "session",
             MemoryScope::Branch => "branch",
             MemoryScope::Repo => "repo",
+            MemoryScope::Organization => "organization",
         }
     }
 
@@ -54,13 +125,15 @@ impl MemoryScope {
         match s {
             "branch" => MemoryScope::Branch,
             "repo" => MemoryScope::Repo,
+            "organization" => MemoryScope::Organization,
             _ => MemoryScope::Session,
         }
     }
 }
 
 /// The assertion shape represented by a memory row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryAssertionType {
     Observation,
     Decision,
@@ -69,6 +142,12 @@ pub enum MemoryAssertionType {
     AntiPattern,
     WorkflowOutcome,
     Constraint,
+    Hypothesis,
+    Procedure,
+    Outcome,
+    Preference,
+    Question,
+    Counter,
 }
 
 impl MemoryAssertionType {
@@ -81,6 +160,12 @@ impl MemoryAssertionType {
             MemoryAssertionType::AntiPattern => "anti_pattern",
             MemoryAssertionType::WorkflowOutcome => "workflow_outcome",
             MemoryAssertionType::Constraint => "constraint",
+            MemoryAssertionType::Hypothesis => "hypothesis",
+            MemoryAssertionType::Procedure => "procedure",
+            MemoryAssertionType::Outcome => "outcome",
+            MemoryAssertionType::Preference => "preference",
+            MemoryAssertionType::Question => "question",
+            MemoryAssertionType::Counter => "counter",
         }
     }
 
@@ -92,6 +177,12 @@ impl MemoryAssertionType {
             "anti_pattern" => MemoryAssertionType::AntiPattern,
             "workflow_outcome" => MemoryAssertionType::WorkflowOutcome,
             "constraint" => MemoryAssertionType::Constraint,
+            "hypothesis" => MemoryAssertionType::Hypothesis,
+            "procedure" => MemoryAssertionType::Procedure,
+            "outcome" => MemoryAssertionType::Outcome,
+            "preference" => MemoryAssertionType::Preference,
+            "question" => MemoryAssertionType::Question,
+            "counter" => MemoryAssertionType::Counter,
             _ => MemoryAssertionType::Observation,
         }
     }
@@ -108,7 +199,7 @@ impl MemoryAssertionType {
 }
 
 /// Verification lifecycle state for a memory assertion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryVerificationStatus {
     Unverified,
     InReview,
@@ -116,6 +207,8 @@ pub enum MemoryVerificationStatus {
     Stale,
     Contradicted,
     Superseded,
+    Expired,
+    Invalidated,
 }
 
 impl MemoryVerificationStatus {
@@ -127,6 +220,8 @@ impl MemoryVerificationStatus {
             MemoryVerificationStatus::Stale => "stale",
             MemoryVerificationStatus::Contradicted => "contradicted",
             MemoryVerificationStatus::Superseded => "superseded",
+            MemoryVerificationStatus::Expired => "expired",
+            MemoryVerificationStatus::Invalidated => "invalidated",
         }
     }
 
@@ -137,6 +232,8 @@ impl MemoryVerificationStatus {
             "stale" => MemoryVerificationStatus::Stale,
             "contradicted" => MemoryVerificationStatus::Contradicted,
             "superseded" => MemoryVerificationStatus::Superseded,
+            "expired" => MemoryVerificationStatus::Expired,
+            "invalidated" => MemoryVerificationStatus::Invalidated,
             _ => MemoryVerificationStatus::Unverified,
         }
     }
@@ -178,6 +275,7 @@ impl MemoryFreshnessPolicy {
             MemoryScope::Session => MemoryFreshnessPolicy::SessionScoped,
             MemoryScope::Branch => MemoryFreshnessPolicy::BranchScoped,
             MemoryScope::Repo => MemoryFreshnessPolicy::RepoScoped,
+            MemoryScope::Organization => MemoryFreshnessPolicy::RepoScoped,
         }
     }
 
@@ -193,11 +291,83 @@ impl MemoryFreshnessPolicy {
 
 /// Evidence attached to a structured memory assertion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceSpan {
+    pub file_id: FileId,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub line_start: u32,
+    pub line_end: u32,
+}
+
+/// Evidence attached to a structured memory assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEvidence {
     pub kind: String,
     pub reference: Option<String>,
     pub detail: Option<String>,
     pub captured_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<EvidenceSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_content_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScoreKind {
+    UsefulnessPrior,
+    RecentUsefulness,
+    RetrievalAccuracy,
+    RegressionRisk,
+}
+
+impl MemoryScoreKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsefulnessPrior => "usefulness_prior",
+            Self::RecentUsefulness => "recent_usefulness",
+            Self::RetrievalAccuracy => "retrieval_accuracy",
+            Self::RegressionRisk => "regression_risk",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "usefulness_prior" => Self::UsefulnessPrior,
+            "recent_usefulness" => Self::RecentUsefulness,
+            "retrieval_accuracy" => Self::RetrievalAccuracy,
+            "regression_risk" => Self::RegressionRisk,
+            _ => Self::UsefulnessPrior,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAccessRecord {
+    pub access_id: String,
+    pub accessed_at: u64,
+    pub inclusion_reason: String,
+    pub was_used: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryScoreRecord {
+    pub score_kind: MemoryScoreKind,
+    pub value: f32,
+    pub computed_at: u64,
+    pub computed_from_window_secs: u64,
+    pub sample_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLinkRecord {
+    pub link_id: String,
+    pub source_memory_id: String,
+    pub target_memory_id: String,
+    pub link_type: String,
+    pub reason: String,
+    pub created_at: u64,
+    pub verification_status: String,
 }
 
 /// Provenance entry describing where a structured assertion came from.
@@ -212,6 +382,7 @@ pub struct MemoryProvenance {
 /// Structured assertion metadata persisted alongside each memory row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryStructuredFields {
+    pub memory_class: MemoryClass,
     pub assertion_type: MemoryAssertionType,
     pub verification_status: MemoryVerificationStatus,
     pub confidence_reason: Option<String>,
@@ -221,13 +392,19 @@ pub struct MemoryStructuredFields {
     pub contradicted_by_memory_ids: Vec<String>,
     pub freshness_policy: MemoryFreshnessPolicy,
     pub freshness_policy_detail: Option<String>,
+    pub validity_conditions: Vec<String>,
+    pub invalidation_triggers: Vec<String>,
     pub provenance: Vec<MemoryProvenance>,
     pub evidence: Vec<MemoryEvidence>,
+    pub linked_docs: Vec<String>,
+    pub linked_tests: Vec<String>,
+    pub linked_memories: Vec<String>,
 }
 
 impl Default for MemoryStructuredFields {
     fn default() -> Self {
         Self {
+            memory_class: MemoryClass::Observation,
             assertion_type: MemoryAssertionType::Observation,
             verification_status: MemoryVerificationStatus::Unverified,
             confidence_reason: None,
@@ -237,15 +414,20 @@ impl Default for MemoryStructuredFields {
             contradicted_by_memory_ids: Vec::new(),
             freshness_policy: MemoryFreshnessPolicy::SessionScoped,
             freshness_policy_detail: None,
+            validity_conditions: Vec::new(),
+            invalidation_triggers: Vec::new(),
             provenance: Vec::new(),
             evidence: Vec::new(),
+            linked_docs: Vec::new(),
+            linked_tests: Vec::new(),
+            linked_memories: Vec::new(),
         }
     }
 }
 
 /// A session memory — an insight, decision, pattern, or observation recorded
 /// during an AI coding session for later recall.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
     pub id: String,
     pub session_id: String,
@@ -257,6 +439,7 @@ pub struct Memory {
     pub linked_files: Vec<String>,
     pub workspace_id: Option<String>,
     pub branch: Option<String>,
+    pub scope_organization_id: Option<String>,
     pub refresh_key: Option<String>,
     pub source_query: Option<String>,
     pub created_at: u64,
@@ -264,4 +447,5 @@ pub struct Memory {
     pub access_count: u32,
     pub is_stale: bool,
     pub stale_reason: Option<String>,
+    pub verification_status: MemoryVerificationStatus,
 }

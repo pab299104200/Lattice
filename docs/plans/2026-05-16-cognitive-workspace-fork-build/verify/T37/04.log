@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test working_memory::checkpoint_tests::loading_unknown_checkpoint_id_returns_storage_error ... ok
+test working_memory::checkpoint_tests::loading_newer_state_version_is_rejected_clearly ... ok
+test working_memory::checkpoint_tests::loading_checkpoint_restores_selected_excluded_and_budget_together ... ok
+test working_memory::checkpoint_tests::checkpoint_round_trip_is_byte_identical ... ok
+test working_memory::checkpoint_tests::checkpoints_with_same_name_get_distinct_ids_and_round_trip ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.01s
+

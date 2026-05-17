@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test retrieval_v1::intent_tests::test_empty_or_whitespace_input_returns_unknown ... ok
+test retrieval_v1::intent_tests::test_ambiguous_tasks_return_multiple_labels_with_documented_tie_break ... ok
+test retrieval_v1::intent_tests::test_feature_kinds_remain_inspectable ... ok
+test retrieval_v1::intent_tests::test_diagnostics_round_trip_through_serde ... ok
+test retrieval_v1::intent_tests::test_every_label_has_a_canonical_statement ... ok
+test retrieval_v1::intent_tests::test_long_input_truncates_tail_without_losing_leading_verb ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.01s
+

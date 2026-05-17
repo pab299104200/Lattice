@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 9 tests
+test working_memory::operations_tests::expand_appends_new_high_ranked_candidates ... ok
+test working_memory::operations_tests::filter_records_predicate_description ... ok
+test working_memory::operations_tests::checkpoint_name_versions_instead_of_overwriting ... ok
+test working_memory::operations_tests::evict_of_pinned_identity_without_force_is_refused ... ok
+test working_memory::operations_tests::retrieve_populates_selected_and_excluded_memories ... ok
+test working_memory::operations_tests::evict_forced_identity_records_reason_and_absent_count ... ok
+test working_memory::operations_tests::summarize_returns_expected_fields ... ok
+test working_memory::operations_tests::checkpoint_round_trips_state_bytes ... ok
+test working_memory::operations_tests::pin_is_idempotent_and_compress_preserves_pinned_identity ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 563 filtered out; finished in 0.01s
+

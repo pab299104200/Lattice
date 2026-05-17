@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test consolidation::session_tests::session_consolidation_hot_path_stays_under_five_milliseconds_p99 ... ignored, p99 timing assertion; run via --include-ignored so it is not affected by parallel test CPU contention
+test consolidation::session_tests::session_module_forbids_llm_references ... ok
+test consolidation::session_tests::small_task_slice_emits_create_memory_proposal_with_deterministic_summary ... ok
+test consolidation::session_tests::session_consolidation_never_mutates_memories_directly ... ok
+test consolidation::session_tests::oversized_task_slice_redirects_to_background_mode ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 567 filtered out; finished in 0.27s
+

@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test retrieval_v1::shaper_tests::every_bundle_result_has_compact_inclusion_reason ... ok
+test retrieval_v1::shaper_tests::deduplication_merges_signal_scores_and_sources ... ok
+test retrieval_v1::shaper_tests::diagnostic_mode_populates_diagnostics_and_compact_mode_does_not ... ok
+test retrieval_v1::shaper_tests::truncation_flag_is_set_when_results_are_dropped ... ok
+test retrieval_v1::shaper_tests::compression_respects_budget_without_dropping_pinned_results ... ok
+test retrieval_v1::shaper_tests::every_expansion_handle_resolves_back_to_original_identity ... ok
+test retrieval_v1::shaper_tests::serde_round_trip_preserves_schema_for_phase_five_checkpointing ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.00s
+

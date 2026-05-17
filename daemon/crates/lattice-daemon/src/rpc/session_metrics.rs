@@ -80,6 +80,13 @@ pub struct SessionMetricsReport {
     pub suggested_expand_targets: usize,
     pub semantic_fallback_uses: usize,
     pub outcome_memory_reuse_count: usize,
+    pub successful_workflow_calls: usize,
+    pub failed_workflow_calls: usize,
+    pub workflow_success_rate: f64,
+    pub irrelevant_files_opened: usize,
+    pub workflow_tasks_with_plan: usize,
+    pub workflow_success_after_first_plan_count: usize,
+    pub workflow_success_after_first_plan_rate: f64,
     pub tool_counts: BTreeMap<String, usize>,
     pub recent_tools: Vec<SessionToolTrace>,
     pub recent_tasks: Vec<SessionTaskSummary>,
@@ -117,6 +124,11 @@ pub struct SessionMetrics {
     suggested_expand_targets: usize,
     semantic_fallback_uses: usize,
     outcome_memory_reuse_count: usize,
+    successful_workflow_calls: usize,
+    failed_workflow_calls: usize,
+    irrelevant_files_opened: usize,
+    workflow_tasks_with_plan: usize,
+    workflow_success_after_first_plan_count: usize,
     tool_counts: BTreeMap<String, usize>,
     recent_tools: VecDeque<SessionToolTrace>,
     tasks: Vec<SessionTask>,
@@ -137,6 +149,11 @@ impl SessionMetrics {
             suggested_expand_targets: 0,
             semantic_fallback_uses: 0,
             outcome_memory_reuse_count: 0,
+            successful_workflow_calls: 0,
+            failed_workflow_calls: 0,
+            irrelevant_files_opened: 0,
+            workflow_tasks_with_plan: 0,
+            workflow_success_after_first_plan_count: 0,
             tool_counts: BTreeMap::new(),
             recent_tools: VecDeque::new(),
             tasks: Vec::new(),
@@ -210,6 +227,26 @@ impl SessionMetrics {
 
     pub fn record_outcome_pattern_write(&mut self, count: usize) {
         self.outcome_pattern_writes += count;
+    }
+
+    pub fn record_workflow_outcome(
+        &mut self,
+        success: bool,
+        had_plan: bool,
+        irrelevant_files_opened: usize,
+    ) {
+        if success {
+            self.successful_workflow_calls += 1;
+        } else {
+            self.failed_workflow_calls += 1;
+        }
+        self.irrelevant_files_opened += irrelevant_files_opened;
+        if had_plan {
+            self.workflow_tasks_with_plan += 1;
+            if success {
+                self.workflow_success_after_first_plan_count += 1;
+            }
+        }
     }
 
     pub fn snapshot(&self) -> SessionMetricsReport {
@@ -322,6 +359,25 @@ impl SessionMetrics {
             suggested_expand_targets: self.suggested_expand_targets,
             semantic_fallback_uses: self.semantic_fallback_uses,
             outcome_memory_reuse_count: self.outcome_memory_reuse_count,
+            successful_workflow_calls: self.successful_workflow_calls,
+            failed_workflow_calls: self.failed_workflow_calls,
+            workflow_success_rate: if self.successful_workflow_calls + self.failed_workflow_calls
+                == 0
+            {
+                0.0
+            } else {
+                self.successful_workflow_calls as f64
+                    / (self.successful_workflow_calls + self.failed_workflow_calls) as f64
+            },
+            irrelevant_files_opened: self.irrelevant_files_opened,
+            workflow_tasks_with_plan: self.workflow_tasks_with_plan,
+            workflow_success_after_first_plan_count: self.workflow_success_after_first_plan_count,
+            workflow_success_after_first_plan_rate: if self.workflow_tasks_with_plan == 0 {
+                0.0
+            } else {
+                self.workflow_success_after_first_plan_count as f64
+                    / self.workflow_tasks_with_plan as f64
+            },
             tool_counts: self.tool_counts.clone(),
             recent_tools: self.recent_tools.iter().cloned().collect(),
             recent_tasks: self

@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 4 tests
+test events::replay_tests::bootstrap_snapshot_plus_tail_matches_full_state_for_state_neutral_events ... ok
+test events::replay_tests::workspace_and_branch_scopes_do_not_leak_across_neighbors ... ok
+test events::replay_tests::concurrent_appends_keep_event_row_ids_and_event_ids_monotonic ... ok
+test events::replay_tests::stream_returns_task_events_in_monotonic_event_id_order_after_concurrent_writes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 568 filtered out; finished in 12.31s
+

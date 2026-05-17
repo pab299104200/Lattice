@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test hardening::migration_tests::forward_migration_order_matches_policy_and_rejects_out_of_order ... ok
+test hardening::migration_tests::rollback_policy_documents_inverse_for_every_migration ... ok
+test hardening::migration_tests::legacy_memory_with_malformed_json_is_quarantined_without_aborting ... ok
+test hardening::migration_tests::pre_event_log_state_bootstraps_event_schema_and_memory_migration ... ok
+test hardening::migration_tests::legacy_memory_rows_migrate_to_memory_links_and_evidence ... ok
+test hardening::migration_tests::idempotent_migration_second_run_is_noop ... ok
+test hardening::migration_tests::large_legacy_dataset_migrates_without_losing_rows_under_budget has been running for over 60 seconds
+test hardening::migration_tests::large_legacy_dataset_migrates_without_losing_rows_under_budget ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 100.00s
+

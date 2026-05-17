@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 8 tests
+test consolidation::integration_tests::test_llm_malformed_response_leaves_memory_unchanged_and_emits_failure_event ... ok
+test consolidation::integration_tests::test_llm_synchronous_mode_is_forbidden_and_driver_never_called ... ok
+test consolidation::integration_tests::test_llm_episode_job_well_formed_response_emits_proposal_with_provenance ... ok
+test consolidation::integration_tests::test_bounded_queue_overflow_drops_jobs_with_warning_event ... ok
+test consolidation::integration_tests::test_high_scope_proposal_routes_to_manual_review_queue ... ok
+test consolidation::integration_tests::test_synchronous_session_consolidation_emits_proposal_not_silent_write ... ok
+test consolidation::integration_tests::test_deterministic_supersession_proposal_apply_then_reject_round_trip ... ok
+test consolidation::integration_tests::test_replay_from_genesis_reconstructs_memory_state ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 564 filtered out; finished in 1.55s
+

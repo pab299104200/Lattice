@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test events::snapshot_tests::scheduler_shutdown_stops_without_partial_truncation ... ok
+test events::snapshot_tests::content_hash_mismatch_returns_content_hash_mismatch ... ok
+test events::snapshot_tests::format_version_mismatch_returns_unsupported_without_panic ... ok
+test events::snapshot_tests::bootstrap_from_snapshot_and_tail_events_matches_full_replay_count ... ok
+test events::snapshot_tests::snapshot_write_and_read_preserves_graph_and_memory_state ... ok
+test events::snapshot_tests::compaction_is_idempotent_when_no_new_compactable_events_arrive ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.06s
+

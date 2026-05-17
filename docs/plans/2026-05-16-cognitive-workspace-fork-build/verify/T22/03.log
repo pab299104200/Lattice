@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test memory_graph::migration_tests::empty_source_migrates_to_empty_destination ... ok
+test memory_graph::migration_tests::second_run_after_success_is_noop ... ok
+test memory_graph::migration_tests::unmappable_rows_are_reported_and_do_not_halt_migration ... ok
+test memory_graph::migration_tests::curated_legacy_rows_migrate_exactly_once ... ok
+test memory_graph::migration_tests::failed_batch_rolls_back_and_follow_up_run_completes ... ok
+test memory_graph::migration_tests::dry_run_matches_real_report_but_writes_nothing ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.05s
+

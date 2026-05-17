@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test events::tests::compact_summary_enforces_byte_ceiling ... ok
+test events::tests::compact_summary_rejects_oversized_deserialization ... ok
+test events::tests::event_envelope_constructor_rejects_kind_payload_mismatch ... ok
+test events::tests::event_kind_serde_round_trips_with_canonical_wire_names ... ok
+test events::tests::every_payload_serializes_deterministically ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.00s
+

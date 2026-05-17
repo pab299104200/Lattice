@@ -1,0 +1,145 @@
+warning: method `current_parsed_files_snapshot` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:2927:14
+     |
+ 154 | impl McpHandler {
+     | --------------- method in this implementation
+...
+2927 |     async fn current_parsed_files_snapshot(&self) -> HashMap<String, ParsedFile> {
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `select_diff_impact_mode` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5737:4
+     |
+5737 | fn select_diff_impact_mode(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `diff_impact_widen_reason` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5942:4
+     |
+5942 | fn diff_impact_widen_reason(report: &DiffImpactReport) -> Option<&'static str> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_context_capsule` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7621:4
+     |
+7621 | fn seed_from_context_capsule(graph: &CodeGraph, capsule: &ContextCapsule) -> ExpandContextSeed {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_diff_impact` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7650:4
+     |
+7650 | fn seed_from_diff_impact(report: &DiffImpactReport) -> ExpandContextSeed {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `attach_context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7859:4
+     |
+7859 | fn attach_context_capsule_suggested_expand(value: &mut Value, suggested_expand: Option<Value>) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7871:4
+     |
+7871 | fn context_capsule_suggested_expand(capsule: &ContextCapsule, graph: &CodeGraph) -> Option<Value> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_capsule_symbol_handle` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7897:4
+     |
+7897 | fn resolve_capsule_symbol_handle(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RankedMemory` is never constructed
+  --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:24:19
+   |
+24 | pub(crate) struct RankedMemory {
+   |                   ^^^^^^^^^^^^
+
+warning: function `token_budget_limit` is never used
+   --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:171:15
+    |
+171 | pub(crate) fn token_budget_limit(budget_tokens: Option<usize>) -> usize {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: `lattice-daemon` (lib) generated 10 warnings
+warning: constant `DEFAULT_PARSER_VERSION` is never used
+  --> crates/lattice-daemon/src/rpc/identity_payload.rs:12:7
+   |
+12 | const DEFAULT_PARSER_VERSION: i64 = 1;
+   |       ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `DEFAULT_SCHEMA_VERSION` is never used
+  --> crates/lattice-daemon/src/rpc/identity_payload.rs:13:7
+   |
+13 | const DEFAULT_SCHEMA_VERSION: i64 = 1;
+   |       ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decorate_get_context_capsule_payload` is never used
+  --> crates/lattice-daemon/src/rpc/identity_payload.rs:15:8
+   |
+15 | pub fn decorate_get_context_capsule_payload(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decorate_capsule_entries` is never used
+  --> crates/lattice-daemon/src/rpc/identity_payload.rs:42:4
+   |
+42 | fn decorate_capsule_entries(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decorate_seed_symbol_identities` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:100:4
+    |
+100 | fn decorate_seed_symbol_identities(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `exact_symbol_payload` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:126:4
+    |
+126 | fn exact_symbol_payload(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `file_identity` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:148:4
+    |
+148 | fn file_identity(
+    |    ^^^^^^^^^^^^^
+
+warning: function `resolve_symbol_outcome` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:163:4
+    |
+163 | fn resolve_symbol_outcome(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `synthetic_file_index` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:194:4
+    |
+194 | fn synthetic_file_index(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `synthetic_file_index_entry` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:213:4
+    |
+213 | fn synthetic_file_index_entry(file: &str, parsed_file: Option<&ParsedFile>) -> FileIndexEntry {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `stable_content_hash` is never used
+   --> crates/lattice-daemon/src/rpc/identity_payload.rs:229:4
+    |
+229 | fn stable_content_hash(bytes: &[u8]) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: method `current_parsed_files_snapshot` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:2927:14
+     |
+ 154 | impl McpHandler {
+     | --------------- method in this implementation
+...
+2927 |     async fn current_parsed_files_snapshot(&self) -> HashMap<String, ParsedFile> {
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `lattice-daemon` (bin "lattice") generated 21 warnings (9 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.46s

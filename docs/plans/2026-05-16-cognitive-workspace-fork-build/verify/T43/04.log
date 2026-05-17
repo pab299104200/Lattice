@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test consolidation::llm::provenance_tests::budget_overruns_route_to_required_outcomes ... ok
+test consolidation::llm::provenance_tests::successful_job_provenance_records_deterministic_hashes ... ok
+test consolidation::llm::provenance_tests::identical_prompt_and_response_reproduce_hashes ... ok
+test consolidation::llm::provenance_tests::budget_architecture_doc_contains_required_headings ... ok
+test consolidation::llm::provenance_tests::per_kind_queue_overflow_drops_job_and_emits_failure_event ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.01s
+

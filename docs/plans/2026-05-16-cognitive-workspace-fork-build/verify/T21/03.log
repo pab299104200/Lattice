@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 9 tests
+test memory_graph::scope_tests::test_default_policy_matches_expected_defaults ... ok
+test memory_graph::scope_tests::test_classify_stream_mapping_is_exhaustive_over_memory_class ... ok
+test memory_graph::scope_tests::test_enforce_subset_rejects_identity_mismatch ... ok
+test memory_graph::scope_tests::test_enforce_subset_rejects_scope_widening ... ok
+test memory_graph::scope_tests::test_scope_query_without_explicit_scope_returns_underspecified ... ok
+test memory_graph::scope_tests::test_admin_query_path_is_explicit_and_unscoped ... ok
+test memory_graph::scope_tests::test_org_scope_requires_explicit_opt_in ... ok
+test memory_graph::scope_tests::test_user_scope_never_leaks_across_users ... ok
+test memory_graph::scope_tests::test_branch_scope_never_leaks_across_branches ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 563 filtered out; finished in 0.02s
+

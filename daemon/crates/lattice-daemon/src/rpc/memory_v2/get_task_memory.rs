@@ -1,0 +1,322 @@
+use super::{
+    contradiction_state, evidence_strength, expansion_handle, freshness_status, supersession_state,
+    MemoryRecord, TaskMemoryBundle,
+};
+use lattice_core::memory::{Memory, MemoryScoreKind, MemoryScoreRecord, MemoryStore};
+use lattice_core::working_memory::{CheckpointId, WorkingMemoryState};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+/// Arguments for the `get_task_memory` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetTaskMemoryArgs {
+    /// Task id whose active and durable memory should be loaded.
+    pub task_id: String,
+    /// Optional task-specific retrieval hint for durable memory recall.
+    #[serde(default)]
+    pub intent_hint: Option<String>,
+    /// Optional soft token budget for the response payload.
+    #[serde(default)]
+    pub budget_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RankedMemory {
+    pub id: String,
+    pub inclusion_reason: String,
+    pub score_milli: i64,
+}
+
+pub fn tool_definition() -> Value {
+    json!({
+        "name": "get_task_memory",
+        "description": "Read working memory plus relevant durable memory for the current task, with inclusion reasons, verification status, freshness, contradiction state, and expansion handles.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task id resolved through the task identity layer"
+                },
+                "intent_hint": {
+                    "type": "string",
+                    "description": "Optional hint that biases durable memory retrieval toward the current operator intent"
+                },
+                "budget_tokens": {
+                    "type": "integer",
+                    "description": "Optional soft budget for the returned bundle"
+                }
+            },
+            "required": ["task_id"]
+        }
+    })
+}
+
+pub fn parse_args(args: &Value) -> Result<GetTaskMemoryArgs, String> {
+    serde_json::from_value(args.clone())
+        .map_err(|error| format!("Invalid get_task_memory arguments: {error}"))
+}
+
+pub fn build_bundle(
+    store: &MemoryStore,
+    workspace_id: &str,
+    task_id: String,
+    checkpoint_id: Option<CheckpointId>,
+    working_state: &WorkingMemoryState,
+    memories: Vec<(Memory, String, i64)>,
+) -> Result<TaskMemoryBundle, String> {
+    let mut records = Vec::with_capacity(memories.len());
+    for (memory, inclusion_reason, _score) in memories {
+        records.push(build_memory_record(
+            store,
+            workspace_id,
+            &memory,
+            inclusion_reason,
+        )?);
+    }
+    Ok(TaskMemoryBundle {
+        task_id,
+        checkpoint_id,
+        working_memory_verification_status: working_state
+            .verification_status
+            .status
+            .as_str()
+            .to_string(),
+        memories: records,
+    })
+}
+
+fn build_memory_record(
+    store: &MemoryStore,
+    workspace_id: &str,
+    memory: &Memory,
+    inclusion_reason: String,
+) -> Result<MemoryRecord, String> {
+    let fields = store
+        .get_structured_fields(&memory.id)
+        .map_err(|error| format!("Failed to load structured memory fields: {error}"))?
+        .unwrap_or_default();
+    let links = store
+        .list_memory_links_from(&memory.id)
+        .map_err(|error| format!("Failed to load memory links: {error}"))?;
+    let access_history = store
+        .list_memory_accesses(&memory.id)
+        .map_err(|error| format!("Failed to load memory access history: {error}"))?;
+    let usefulness_scores = load_usefulness_scores(store, &memory.id)?;
+    let last_verified_at = store
+        .get_last_verified_at(&memory.id)
+        .map_err(|error| format!("Failed to load last verified timestamp: {error}"))?;
+    let last_verified_graph_snapshot_id = store
+        .get_last_verified_graph_snapshot_id(&memory.id)
+        .map_err(|error| format!("Failed to load last verified graph snapshot id: {error}"))?;
+    let expires_at = store
+        .get_expires_at(&memory.id)
+        .map_err(|error| format!("Failed to load expiry timestamp: {error}"))?;
+    Ok(MemoryRecord {
+        id: memory.id.clone(),
+        expansion_handle: expansion_handle(memory, workspace_id),
+        content: memory.content.clone(),
+        memory_class: fields.memory_class,
+        assertion_type: fields.assertion_type,
+        scope: memory.scope.as_str().to_string(),
+        confidence: memory.confidence,
+        confidence_reason: fields.confidence_reason.clone(),
+        verification_status: fields.verification_status.as_str().to_string(),
+        freshness_status: freshness_status(memory, &fields, expires_at),
+        contradiction_state: contradiction_state(&fields),
+        supersession_state: supersession_state(&fields),
+        inclusion_reason,
+        evidence_strength: evidence_strength(&fields, &usefulness_scores, memory.access_count),
+        linked_files: memory.linked_files.clone(),
+        linked_symbols: memory.linked_symbols.clone(),
+        linked_docs: fields.linked_docs.clone(),
+        linked_tests: fields.linked_tests.clone(),
+        linked_memories: fields.linked_memories.clone(),
+        validity_conditions: fields.validity_conditions.clone(),
+        invalidation_triggers: fields.invalidation_triggers.clone(),
+        provenance: fields.provenance.clone(),
+        evidence: fields.evidence.clone(),
+        links,
+        access_history,
+        usefulness_scores,
+        source_query: memory.source_query.clone(),
+        branch: memory.branch.clone(),
+        refresh_key: memory.refresh_key.clone(),
+        last_verified_at,
+        last_verified_graph_snapshot_id,
+    })
+}
+
+fn load_usefulness_scores(
+    store: &MemoryStore,
+    memory_id: &str,
+) -> Result<Vec<MemoryScoreRecord>, String> {
+    let mut scores = Vec::new();
+    for kind in [
+        MemoryScoreKind::UsefulnessPrior,
+        MemoryScoreKind::RecentUsefulness,
+        MemoryScoreKind::RetrievalAccuracy,
+        MemoryScoreKind::RegressionRisk,
+    ] {
+        if let Some(score) = store
+            .latest_memory_score(memory_id, kind)
+            .map_err(|error| format!("Failed to load memory score: {error}"))?
+        {
+            scores.push(score);
+        }
+    }
+    Ok(scores)
+}
+
+pub(crate) fn token_budget_limit(budget_tokens: Option<usize>) -> usize {
+    match budget_tokens.unwrap_or(1200) {
+        0..=400 => 2,
+        401..=800 => 4,
+        801..=1600 => 6,
+        _ => 8,
+    }
+}
+
+pub(crate) fn approximate_payload_cost(memory: &Memory) -> usize {
+    60 + memory.content.len() / 4 + (memory.linked_files.len() + memory.linked_symbols.len()) * 12
+}
+
+pub(crate) fn clip_to_budget(
+    memories: &[(Memory, String, i64)],
+    budget_tokens: Option<usize>,
+) -> Vec<(Memory, String, i64)> {
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    let cap = budget_tokens.unwrap_or(1200);
+    for item in memories {
+        let next = approximate_payload_cost(&item.0);
+        if !kept.is_empty() && used + next > cap {
+            break;
+        }
+        used += next;
+        kept.push(item.clone());
+    }
+    kept
+}
+
+pub(crate) fn rank_memories(
+    store: &MemoryStore,
+    workspace_id: &str,
+    working_state: &WorkingMemoryState,
+    candidates: Vec<Memory>,
+    intent_hint: Option<&str>,
+    preferred_branch: Option<&str>,
+) -> Result<Vec<(Memory, String, i64)>, String> {
+    let active_file_hints: Vec<&str> = working_state
+        .active_files
+        .iter()
+        .map(|item| item.repo_relative_path.as_str())
+        .collect();
+    let active_symbol_hints: Vec<&str> = working_state
+        .active_symbols
+        .iter()
+        .map(|item| item.qualified_name.as_str())
+        .collect();
+    let query_terms = build_query_terms(&working_state.task_statement, intent_hint);
+    let mut ranked = Vec::new();
+
+    for memory in candidates {
+        let fields = store
+            .get_structured_fields(&memory.id)
+            .map_err(|error| format!("Failed to load structured memory fields: {error}"))?
+            .unwrap_or_default();
+        let mut score = (memory.confidence * 1000.0).round() as i64;
+        let mut reasons = Vec::new();
+
+        if working_state
+            .selected_memories
+            .iter()
+            .any(|item| item.identity.to_string().contains(memory.id.as_str()))
+        {
+            score += 1200;
+            reasons.push("selected in working memory".to_string());
+        }
+
+        for symbol in &memory.linked_symbols {
+            if active_symbol_hints
+                .iter()
+                .any(|hint| symbol.eq_ignore_ascii_case(hint))
+            {
+                score += 650;
+                reasons.push(format!("linked to active symbol `{symbol}`"));
+            }
+        }
+
+        for file in &memory.linked_files {
+            if active_file_hints.iter().any(|hint| file.ends_with(hint)) {
+                score += 500;
+                reasons.push(format!("linked to active file `{file}`"));
+            }
+        }
+
+        let haystack = format!(
+            "{} {} {}",
+            memory.content,
+            memory.linked_symbols.join(" "),
+            memory.linked_files.join(" ")
+        )
+        .to_ascii_lowercase();
+        let mut matched_terms = Vec::new();
+        for term in &query_terms {
+            if haystack.contains(term.as_str()) {
+                score += 180;
+                matched_terms.push(term.clone());
+            }
+        }
+        if !matched_terms.is_empty() {
+            reasons.push(format!("matches task terms: {}", matched_terms.join(", ")));
+        }
+
+        score += match fields.verification_status {
+            lattice_core::memory::MemoryVerificationStatus::Verified => 500,
+            lattice_core::memory::MemoryVerificationStatus::InReview => 350,
+            lattice_core::memory::MemoryVerificationStatus::Unverified => 200,
+            lattice_core::memory::MemoryVerificationStatus::Superseded => -200,
+            lattice_core::memory::MemoryVerificationStatus::Contradicted => -450,
+            lattice_core::memory::MemoryVerificationStatus::Stale => -500,
+            lattice_core::memory::MemoryVerificationStatus::Expired
+            | lattice_core::memory::MemoryVerificationStatus::Invalidated => -700,
+        };
+
+        if memory.workspace_id.as_deref().unwrap_or(workspace_id) == workspace_id {
+            score += 50;
+        }
+        if preferred_branch.is_some() && memory.branch.as_deref() == preferred_branch {
+            score += 90;
+        }
+        score += i64::from(memory.access_count.min(10)) * 8;
+        if reasons.is_empty() {
+            reasons.push("ranked by confidence, scope, and verification state".to_string());
+        }
+        ranked.push((memory, reasons.join("; "), score));
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| right.0.created_at.cmp(&left.0.created_at))
+    });
+    Ok(ranked)
+}
+
+fn build_query_terms(task_statement: &str, intent_hint: Option<&str>) -> Vec<String> {
+    let mut terms = Vec::new();
+    for source in [Some(task_statement), intent_hint] {
+        if let Some(source) = source {
+            for chunk in source.split(|c: char| !c.is_alphanumeric()) {
+                let token = chunk.to_ascii_lowercase();
+                if token.len() >= 3 && !terms.contains(&token) {
+                    terms.push(token);
+                }
+            }
+        }
+    }
+    terms.truncate(8);
+    terms
+}

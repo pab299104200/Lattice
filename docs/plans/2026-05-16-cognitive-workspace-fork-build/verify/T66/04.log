@@ -1,0 +1,41 @@
+    Finished `bench` profile [optimized] target(s) in 0.28s
+     Running benches/cognitive_workspace_benchmark.rs (target/release/deps/cognitive_workspace_benchmark-8c4fb5c1ad2872e4)
+Gnuplot not found, using plotters backend
+Benchmarking cognitive_workspace/rust-repo
+Benchmarking cognitive_workspace/rust-repo: Warming up for 1.0000 s
+Benchmarking cognitive_workspace/rust-repo: Collecting 100 samples in estimated 3.1152 s (900 iterations)
+Benchmarking cognitive_workspace/rust-repo: Analyzing
+cognitive_workspace/rust-repo
+                        time:   [3.1445 ms 3.2099 ms 3.2711 ms]
+                        change: [-29.353% -27.914% -26.571%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 25 outliers among 100 measurements (25.00%)
+  19 (19.00%) low severe
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+
+Benchmarking cognitive_workspace/typescript-repo
+Benchmarking cognitive_workspace/typescript-repo: Warming up for 1.0000 s
+Benchmarking cognitive_workspace/typescript-repo: Collecting 100 samples in estimated 3.0769 s (2100 iterations)
+Benchmarking cognitive_workspace/typescript-repo: Analyzing
+cognitive_workspace/typescript-repo
+                        time:   [2.1901 ms 2.3250 ms 2.4715 ms]
+                        change: [+0.0480% +7.0139% +14.633%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 21 outliers among 100 measurements (21.00%)
+  10 (10.00%) low mild
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+
+Benchmarking cognitive_workspace/python-repo
+Benchmarking cognitive_workspace/python-repo: Warming up for 1.0000 s
+Benchmarking cognitive_workspace/python-repo: Collecting 100 samples in estimated 3.4603 s (700 iterations)
+Benchmarking cognitive_workspace/python-repo: Analyzing
+cognitive_workspace/python-repo
+                        time:   [4.0337 ms 4.2291 ms 4.4564 ms]
+                        change: [+15.728% +21.126% +27.222%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 13 outliers among 100 measurements (13.00%)
+  4 (4.00%) high mild
+  9 (9.00%) high severe
+

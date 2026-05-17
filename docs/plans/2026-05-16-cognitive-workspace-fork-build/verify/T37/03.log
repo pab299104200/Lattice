@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 14 tests
+test working_memory::budget_tests::evict_absent_identity_is_a_documented_no_op ... ok
+test working_memory::budget_tests::evict_refuses_pinned_identity_without_force ... ok
+test working_memory::budget_tests::evict_present_identity_moves_it_to_excluded_with_reason ... ok
+test working_memory::budget_tests::forced_evict_records_force_in_exclusion_reason ... ok
+test working_memory::budget_tests::evict_no_op_emits_no_mutation_or_event ... ok
+test working_memory::budget_tests::budget_changes_only_affect_subsequent_operations ... ok
+test working_memory::budget_tests::retrieve_moves_truncated_results_to_excluded_with_budget_reason ... ok
+test working_memory::budget_tests::evicted_identity_can_be_retrieved_again_in_same_session ... ok
+test working_memory::budget_tests::pin_survives_checkpoint_round_trip ... ok
+test working_memory::budget_tests::retrieve_over_budget_bundle_keeps_truncated_report ... ok
+test working_memory::budget_tests::pin_twice_is_idempotent ... ok
+test working_memory::budget_tests::pin_survives_compress ... ok
+test working_memory::budget_tests::compress_honors_token_budget_and_updates_budget_decisions ... ok
+test working_memory::budget_tests::huge_candidate_set_is_bounded_by_compress ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 558 filtered out; finished in 0.08s
+

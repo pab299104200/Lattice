@@ -6,9 +6,11 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ciborium = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-python = { workspace = true }
@@ -25,3 +27,16 @@ ndarray = { workspace = true }
 tokenizers = { workspace = true }
 ignore = { workspace = true }
 usearch = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "baseline_workflows"
+harness = false
+
+[[bench]]
+name = "cognitive_workspace_benchmark"
+harness = false

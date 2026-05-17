@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test metrics::regression_tests::test_irrelevant_file_reads_at_least_40pct_below_baseline ... ok
+test metrics::regression_tests::test_zero_trusted_display_of_contradicted_memory ... ok
+test metrics::regression_tests::test_discovery_tool_calls_at_least_30pct_below_baseline ... ok
+test metrics::regression_tests::test_memory_inclusion_precision_at_least_80pct ... ok
+test metrics::regression_tests::test_relevant_test_recommendation_at_least_90pct ... ok
+test metrics::regression_tests::test_zero_trusted_display_of_stale_memory_without_label ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 1.03s
+

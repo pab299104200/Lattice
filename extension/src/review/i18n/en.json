@@ -1,0 +1,737 @@
+{
+  "reviewPanel": {
+    "title": "Lattice Review",
+    "subtitle": "Human review and trust surface for durable memory, event history, and workspace health.",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "loading": "Loading review state...",
+    "empty": "No review data is available yet.",
+    "error": "Error loading review data.",
+    "overview": "Overview",
+    "overviewDescription": "Current daemon, memory, metrics, and graph snapshot.",
+    "routePlaceholder": "This view is scaffolded and ready for the Phase 10 subview mount.",
+    "routeUnavailable": "This view is wired in the router, but the daemon does not yet expose a dedicated review payload for it.",
+    "capabilityDirect": "Direct tool support",
+    "capabilityComposed": "Composed from existing tools",
+    "capabilityUnavailable": "Awaiting dedicated daemon contract",
+    "summaryIndexing": "Indexing",
+    "summaryMemories": "Memories",
+    "summaryMetrics": "Metrics",
+    "summaryGraph": "Graph",
+    "statusReady": "Ready",
+    "statusIndexing": "Indexing",
+    "statusError": "Error",
+    "statusUnknown": "Unknown",
+    "route": {
+      "memoryInbox": "Memory Inbox",
+      "promotionQueue": "Promotion Queue",
+      "contradictionQueue": "Contradiction Queue",
+      "staleView": "Stale Memory",
+      "evidenceInspector": "Evidence Inspector",
+      "eventTrace": "Event Trace",
+      "retrievalExplanation": "Retrieval Explanation",
+      "usefulnessMetrics": "Usefulness Metrics",
+      "workspaceGraphHealth": "Workspace Graph Health",
+      "indexingHealth": "Indexing Health",
+      "consolidationQueue": "Consolidation Queue"
+    },
+    "description": {
+      "memoryInbox": "Filter and inspect durable memories by status, class, scope, and verification state.",
+      "promotionQueue": "Review auditable promotion proposals before any durable memory write is applied.",
+      "contradictionQueue": "Inspect contradiction and supersession edges that require a human decision.",
+      "staleView": "Surface stale, contradicted, superseded, expired, and invalidated memories for re-verification.",
+      "evidenceInspector": "Deep-dive into one memory's claim, evidence, provenance, links, and verification history.",
+      "eventTrace": "Inspect task, session, or workspace event history with stable payload references.",
+      "retrievalExplanation": "Explain why retrieval included, excluded, or expanded specific context candidates.",
+      "usefulnessMetrics": "Inspect Phase 9 metrics and evaluation signals with explicit provenance.",
+      "workspaceGraphHealth": "Review node, edge, and broken-reference health for the current workspace graph.",
+      "indexingHealth": "Inspect live index status, language coverage, and indexing progress.",
+      "consolidationQueue": "Track consolidation proposals, queue depth, and background review workload."
+    }
+  },
+  "reviewStatus": {
+    "verified": "Verified",
+    "unverified": "Unverified",
+    "in_review": "In Review",
+    "stale": "Stale",
+    "contradicted": "Contradicted",
+    "superseded": "Superseded",
+    "expired": "Expired",
+    "invalidated": "Invalidated",
+    "pending": "Pending",
+    "applied": "Applied",
+    "rejected": "Rejected",
+    "queued": "Queued",
+    "running": "Running",
+    "proposed": "Proposed",
+    "failed": "Failed",
+    "dropped": "Dropped"
+  },
+  "reviewActions": {
+    "accept": "Accept",
+    "reject": "Reject"
+  },
+  "promotionQueue": {
+    "description": "Review promotion proposals before any durable memory write is applied.",
+    "empty": "No pending promotions.",
+    "columns": {
+      "proposedClass": "Proposed Class",
+      "currentScope": "Current Scope",
+      "targetScope": "Target Scope",
+      "confidence": "Confidence",
+      "evidenceCount": "Evidence Count",
+      "createdAt": "Created At",
+      "status": "Status",
+      "actions": "Actions"
+    },
+    "actions": {
+      "review": "Review",
+      "accept": "Accept",
+      "reject": "Reject"
+    },
+    "messages": {
+      "applySuccess": "Promotion applied.",
+      "rejectSuccess": "Promotion rejected."
+    }
+  },
+  "contradictionQueue": {
+    "description": "Review contradiction and supersession candidates before they invalidate durable memory.",
+    "empty": "No pending contradictions.",
+    "columns": {
+      "memoryA": "Memory A",
+      "memoryB": "Memory B",
+      "linkType": "Link Type",
+      "detectedBy": "Detected By",
+      "createdAt": "Created At",
+      "status": "Status",
+      "actions": "Actions"
+    },
+    "actions": {
+      "review": "Review",
+      "accept": "Accept Resolution",
+      "reject": "Reject Resolution"
+    },
+    "messages": {
+      "applySuccess": "Contradiction resolution applied.",
+      "rejectSuccess": "Contradiction resolution rejected."
+    }
+  },
+  "proposalDialog": {
+    "close": "Close",
+    "cancel": "Cancel",
+    "accept": "Accept and apply",
+    "reject": "Reject",
+    "summaryTitle": "Proposal summary",
+    "evidenceTitle": "Evidence",
+    "provenanceTitle": "LLM provenance",
+    "diffTitle": "Diff preview",
+    "before": "Before",
+    "after": "After",
+    "proposalKind": "Proposal Kind",
+    "status": "Status",
+    "proposedClass": "Proposed Class",
+    "currentScope": "Current Scope",
+    "targetScope": "Target Scope",
+    "confidence": "Confidence",
+    "evidenceCount": "Evidence Count",
+    "createdAt": "Created At",
+    "expectedEffect": "Expected Effect",
+    "model": "Model",
+    "promptHash": "Prompt Hash",
+    "responseHash": "Response Hash",
+    "promptTokens": "Prompt Tokens",
+    "responseTokens": "Response Tokens",
+    "latencyMs": "Latency Ms",
+    "calledAt": "Called At",
+    "noEvidence": "No structured evidence was attached to this proposal.",
+    "noProvenance": "This proposal does not carry model provenance.",
+    "rejectReasonLabel": "Reject reason",
+    "rejectReasonHelp": "Rejecting requires a non-empty reason so the decision is auditable.",
+    "rejectReasonPlaceholder": "Explain why this proposal should not be applied.",
+    "typedConfirmPrompt": "Type {value} to enable acceptance.",
+    "genericError": "The proposal decision failed.",
+    "promotionTitle": "Promotion review: {value}",
+    "contradictionTitle": "Contradiction review",
+    "promotionEffect": "Apply the proposed durable memory update for {value}.",
+    "supersedeEffect": "Mark memory {value} as superseded by the newer memory.",
+    "invalidateEffect": "Invalidate memory {value} because the contradiction was accepted."
+  },
+  "memoryInbox": {
+    "tableLabel": "Memory inbox",
+    "emptyTitle": "Memory inbox",
+    "emptyInitial": "No memories are available yet.",
+    "emptyFiltered": "No memories match the current filters.",
+    "error": "Error loading memory inbox.",
+    "errorBanner": "Memory inbox error: {message}",
+    "loadingHint": "Loading memory inbox...",
+    "lastVerifiedNever": "Never",
+    "noContent": "No content",
+    "pageSizeLabel": "{pageSize}/page",
+    "sortDirection": "Sorted {direction}",
+    "columns": {
+      "status": "Status",
+      "class": "Class",
+      "scope": "Scope",
+      "content": "Content",
+      "lastVerified": "Last Verified",
+      "confidence": "Confidence",
+      "actions": "Actions"
+    },
+    "actions": {
+      "viewEvidence": "View Evidence",
+      "openTrace": "Open Trace",
+      "clearFilters": "Clear Filters"
+    },
+    "pagination": {
+      "showing": "Showing {start}-{end} of {total}",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {page} of {totalPages}"
+    },
+    "filters": {
+      "all": "All",
+      "status": {
+        "title": "Filter memory status",
+        "placeholder": "Choose one or more verification states",
+        "button": "Status ({count})",
+        "summary": "Status: {values}",
+        "detail": "Verification state"
+      },
+      "scope": {
+        "title": "Filter memory scope",
+        "placeholder": "Choose one or more durability scopes",
+        "button": "Scope ({count})",
+        "summary": "Scope: {values}",
+        "detail": "Durability scope"
+      },
+      "memoryClass": {
+        "title": "Filter memory class",
+        "placeholder": "Choose one or more memory classes",
+        "button": "Class ({count})",
+        "summary": "Class: {values}",
+        "detail": "Memory class"
+      }
+    },
+    "scope": {
+      "session": "Session",
+      "branch": "Branch",
+      "repo": "Repo",
+      "user": "User",
+      "organization": "Organization"
+    },
+    "class": {
+      "observation": "Observation",
+      "decision": "Decision",
+      "constraint": "Constraint",
+      "pattern": "Pattern",
+      "anti_pattern": "AntiPattern",
+      "workflow_outcome": "WorkflowOutcome",
+      "failure_pattern": "FailurePattern",
+      "procedure": "Procedure",
+      "preference": "Preference",
+      "architecture_invariant": "ArchitectureInvariant",
+      "docs_contract": "DocsContract",
+      "open_question": "OpenQuestion",
+      "counter_memory": "CounterMemory"
+    }
+  },
+  "staleView": {
+    "title": "Stale Memory",
+    "loadingHint": "Inspect memories whose verification state drifted and re-run verification on demand.",
+    "errorTitle": "Stale memory view error",
+    "filterStatus": "Filter Status",
+    "filterScope": "Filter Scope",
+    "filterStatusPlaceholder": "Choose one or more stale-family statuses",
+    "filterScopePlaceholder": "Choose one or more scopes",
+    "activeStatus": "Status: {value}",
+    "activeScope": "Scope: {value}",
+    "scopeCount": "{count} scopes available",
+    "allStatuses": "All stale-family statuses",
+    "allScopes": "All scopes",
+    "inspectEvidence": "Inspect Evidence",
+    "reverify": "Re-verify",
+    "reverifyLoading": "Re-verifying...",
+    "verifySuccess": "Verification complete: {status}.",
+    "empty": "No stale memories. Verification is up to date.",
+    "emptyFiltered": "No stale memories match the current filters.",
+    "notAvailable": "Not available",
+    "column": {
+      "status": "Status",
+      "class": "Class",
+      "scope": "Scope",
+      "content": "Content",
+      "staleSince": "Stale Since",
+      "reason": "Stale Reason",
+      "actions": "Actions"
+    },
+    "scope": {
+      "session": "Session",
+      "branch": "Branch",
+      "repo": "Repo",
+      "organization": "Organization"
+    },
+    "class": {
+      "observation": "Observation",
+      "decision": "Decision",
+      "constraint": "Constraint",
+      "pattern": "Pattern",
+      "anti_pattern": "AntiPattern",
+      "workflow_outcome": "WorkflowOutcome",
+      "failure_pattern": "FailurePattern",
+      "procedure": "Procedure",
+      "preference": "Preference",
+      "architecture_invariant": "ArchitectureInvariant",
+      "docs_contract": "DocsContract",
+      "open_question": "OpenQuestion",
+      "counter_memory": "CounterMemory"
+    },
+    "statusReason": {
+      "stale": "Verification checks no longer match the workspace.",
+      "contradicted": "Another memory now contradicts this claim.",
+      "superseded": "A newer memory superseded this claim.",
+      "expired": "The time-bound freshness window expired.",
+      "invalidated": "The claim was explicitly invalidated."
+    },
+    "reason": {
+      "linked_file_missing": "Linked file removed",
+      "linked_symbol_missing": "Linked symbol removed",
+      "linked_doc_missing": "Linked doc removed",
+      "linked_test_missing": "Linked test removed",
+      "evidence_span_mismatch": "Evidence span no longer matches",
+      "implementation_mismatch": "Implementation no longer matches claim",
+      "contradiction_state_incoherent": "Contradiction state drifted",
+      "supersession_state_incoherent": "Supersession state drifted",
+      "branch_scope_drift": "Branch scope drift",
+      "time_bound_expired": "Time-bound memory expired"
+    }
+  },
+  "evidenceInspector": {
+    "title": "Evidence Inspector",
+    "subtitle": "Review evidence and provenance for {id}.",
+    "selectPrompt": "Select a memory from the inbox or stale view to inspect its evidence.",
+    "errorTitle": "Evidence inspector error",
+    "openTrace": "Open Trace",
+    "openReference": "Open Reference",
+    "reverify": "Re-verify Now",
+    "reverifyLoading": "Re-verifying...",
+    "verifySuccess": "Verification complete: {status}.",
+    "referenceResolveError": "Could not resolve the selected reference.",
+    "memoryId": "Memory ID",
+    "memoryClass": "Class",
+    "scope": "Scope",
+    "status": "Status",
+    "confidence": "Confidence",
+    "confidenceReason": "Confidence Reason",
+    "lastVerifiedAt": "Last Verified At",
+    "lastVerificationResult": "Last Verification Result",
+    "contentPanel": "Memory Claim",
+    "evidenceList": "Evidence",
+    "provenanceList": "Provenance",
+    "eventHistory": "Event History",
+    "linkList": "Memory Links",
+    "verificationPanel": "Verification",
+    "linkReason": "Reason: {value}",
+    "linkStrength": "Strength: {value}",
+    "notAvailable": "Not available",
+    "noEvidence": "No evidence rows are linked to this memory.",
+    "noProvenance": "No provenance rows are linked to this memory.",
+    "noEvents": "No event-log entries in the current session matched this memory.",
+    "noLinks": "No memory links are attached to this memory.",
+    "noVerificationChecks": "No cached verification checks are available yet."
+  },
+  "eventTraceView": {
+    "title": "Event Trace",
+    "subtitle": "Inspect append-only event history for {scope}.",
+    "selectPrompt": "Choose a session, task, or workspace scope to inspect the event trace.",
+    "errorTitle": "Event trace error",
+    "notAvailable": "Not available",
+    "empty": "No events exist for the selected scope.",
+    "emptyFiltered": "No events match the current filters.",
+    "openPayload": "View Payload",
+    "openRetrievalExplanation": "Open Retrieval Explanation",
+    "payloadDialogTitle": "Payload for {id}",
+    "copyPayload": "Copy to Clipboard",
+    "openInEditor": "Open in Editor",
+    "closeDialog": "Close",
+    "noPayload": "No payload is available for this event.",
+    "copyPayloadSuccess": "Copied payload to the clipboard.",
+    "copyPayloadError": "No payload is available to copy.",
+    "openPayloadError": "No payload is available to open.",
+    "openMemoryReference": "Memory: {value}",
+    "openFileReference": "Open: {value}",
+    "invalidSince": "The start time must be a valid ISO 8601 timestamp.",
+    "invalidUntil": "The end time must be a valid ISO 8601 timestamp.",
+    "invalidWindow": "The start time must be earlier than the end time.",
+    "columns": {
+      "timestamp": "Timestamp",
+      "kind": "Kind",
+      "actor": "Actor",
+      "task": "Task",
+      "session": "Session",
+      "workspace": "Workspace",
+      "references": "References",
+      "summary": "Summary",
+      "payload": "Payload"
+    },
+    "pagination": {
+      "showing": "Showing {start}-{end} of {total}",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {page} of {totalPages}"
+    },
+    "filters": {
+      "all": "All",
+      "kindButton": "Kind ({count})",
+      "actorButton": "Actor ({count})",
+      "sessionButton": "Session",
+      "taskButton": "Task",
+      "workspaceButton": "Workspace",
+      "branchButton": "Branch",
+      "kindTitle": "Filter event kinds",
+      "kindPlaceholder": "Choose one or more event kinds",
+      "actorTitle": "Filter actors",
+      "actorPlaceholder": "Choose one or more actors",
+      "sessionTitle": "Set session scope",
+      "sessionPlaceholder": "Choose a session id",
+      "taskTitle": "Set task scope",
+      "taskPlaceholder": "Choose a task id",
+      "workspaceTitle": "Set workspace scope",
+      "workspacePlaceholder": "Choose a workspace id",
+      "branchTitle": "Filter branch",
+      "branchPlaceholder": "Choose a branch",
+      "since": "Since (ISO 8601)",
+      "until": "Until (ISO 8601)",
+      "isoPlaceholder": "2026-05-16T13:45:00Z",
+      "applyWindow": "Apply Time Window",
+      "clearWindow": "Clear Time Window",
+      "activeKinds": "Kinds: {value}",
+      "activeActors": "Actors: {value}",
+      "activeBranch": "Branch: {value}",
+      "activeMemory": "Memory: {value}"
+    },
+    "scope": {
+      "task": "Task",
+      "session": "Session",
+      "workspace": "Workspace"
+    },
+    "actor": {
+      "assistant": "Assistant",
+      "user": "User",
+      "tool": "Tool",
+      "daemon": "Daemon"
+    },
+    "kind": {
+      "assistant_task_started": "Assistant Task Started",
+      "tool_called": "Tool Called",
+      "tool_result": "Tool Result",
+      "context_bundle_returned": "Context Bundle Returned",
+      "memory_retrieved": "Memory Retrieved",
+      "memory_expanded": "Memory Expanded",
+      "plan_created": "Plan Created",
+      "file_read": "File Read",
+      "patch_applied": "Patch Applied",
+      "test_run_started": "Test Run Started",
+      "test_run_completed": "Test Run Completed",
+      "diagnostic_observed": "Diagnostic Observed",
+      "user_correction": "User Correction",
+      "user_preference_observed": "User Preference Observed",
+      "workflow_succeeded": "Workflow Succeeded",
+      "workflow_failed": "Workflow Failed",
+      "memory_created": "Memory Created",
+      "memory_updated": "Memory Updated",
+      "memory_invalidated": "Memory Invalidated",
+      "memory_consolidated": "Memory Consolidated",
+      "consolidation_failed": "Consolidation Failed",
+      "memory_scope_filtered": "Memory Scope Filtered"
+    }
+  },
+  "retrievalExplanationView": {
+    "title": "Retrieval Explanation",
+    "subtitle": "Inspect the retrieval decision for request {requestId}.",
+    "selectPrompt": "Open a retrieval explanation from a memory-retrieved event to inspect one request.",
+    "errorTitle": "Retrieval explanation error",
+    "unsupportedTitle": "No retrieval explanation payload is available yet.",
+    "empty": "No retrieval candidates are available for this request.",
+    "noExcluded": "No high-scoring excluded candidates were recorded for this request.",
+    "noAnchors": "No anchors were recorded for this request.",
+    "notAvailable": "Not available",
+    "anchorsTitle": "Resolved Anchors",
+    "excludedTitle": "Excluded High-Scoring Candidates",
+    "excludedReason": "Reason: {value}",
+    "excludedScore": "Score: {value}",
+    "fullSignalsTitle": "Full Signal Breakdown",
+    "columns": {
+      "source": "Source",
+      "identity": "Identity",
+      "decision": "Inclusion Decision",
+      "score": "Score",
+      "topSignals": "Top Signals",
+      "reason": "Reason"
+    },
+    "pagination": {
+      "showing": "Showing {start}-{end} of {total}",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {page} of {totalPages}"
+    },
+    "request": {
+      "toolName": "Tool",
+      "intent": "Intent",
+      "timestamp": "Timestamp",
+      "requestId": "Request ID",
+      "taskStatement": "Task Statement"
+    },
+    "decision": {
+      "included": "Included",
+      "excluded": "Excluded",
+      "expanded": "Expanded"
+    },
+    "source": {
+      "exact_path_symbol_lookup": "Exact Path/Symbol",
+      "code_graph_traversal": "Code Graph",
+      "doc_backlinks_outgoing_links": "Docs Links",
+      "fts": "FTS",
+      "embeddings": "Embeddings",
+      "event_similarity": "Event Similarity",
+      "memory_links": "Memory Links",
+      "workflow_similarity": "Workflow Similarity",
+      "recent_active_working_memory": "Recent Working Memory"
+    },
+    "signal": {
+      "task_type_compatibility": "Task-Type Compatibility",
+      "graph_proximity_to_anchors": "Graph Proximity",
+      "exact_identifier_match": "Exact Identifier Match",
+      "semantic_similarity": "Semantic Similarity",
+      "verification_status": "Verification Status",
+      "freshness": "Freshness",
+      "scope": "Scope",
+      "evidence_strength": "Evidence Strength",
+      "contradiction_supersession_state": "Contradiction/Supersession",
+      "past_usefulness": "Past Usefulness",
+      "recent_successful_reuse": "Recent Successful Reuse",
+      "user_preference_compatibility": "User Preference Compatibility",
+      "token_cost": "Token Cost"
+    }
+  },
+  "consolidationQueueView": {
+    "title": "Consolidation Queue",
+    "subtitle": "Inspect recent consolidation jobs, proposal-only outputs, and queue-pressure failures.",
+    "tableLabel": "Consolidation queue",
+    "errorTitle": "Consolidation queue error",
+    "empty": "No queued consolidation jobs.",
+    "emptyFiltered": "No jobs match the current filters.",
+    "notAvailable": "Not available",
+    "retryMissingSession": "This job does not expose a session id for retry.",
+    "retryConfirm": "Retry consolidation for session {value}?",
+    "retrySuccess": "Consolidation retry submitted.",
+    "durationMs": "{value} ms",
+    "durationSeconds": "{value} s",
+    "columns": {
+      "status": "Status",
+      "kind": "Kind",
+      "mode": "Mode",
+      "createdAt": "Created At",
+      "startedAt": "Started At",
+      "completedAt": "Completed At",
+      "duration": "Duration",
+      "llmModel": "LLM Model",
+      "resultSummary": "Result Summary",
+      "actions": "Actions"
+    },
+    "queue": {
+      "currentDepth": "Current Depth",
+      "maxDepth": "Bound",
+      "droppedCount": "Dropped Jobs",
+      "visibleJobs": "Visible Jobs",
+      "droppedTitle": "{count} consolidation jobs were dropped.",
+      "droppedMessage": "Queue-full drops are reconstructed from consolidation failure events."
+    },
+    "actions": {
+      "inspect": "Inspect",
+      "retry": "Retry",
+      "retrying": "Retrying...",
+      "clearFilters": "Clear Filters",
+      "openFailures": "Open Failure Trace"
+    },
+    "pagination": {
+      "showing": "Showing {start}-{end} of {total}",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {page} of {totalPages}"
+    },
+    "filters": {
+      "all": "All",
+      "statusButton": "Status ({count})",
+      "kindButton": "Kind ({count})",
+      "modeButton": "Mode ({count})",
+      "activeStatus": "Status: {value}",
+      "activeKind": "Kind: {value}",
+      "activeMode": "Mode: {value}",
+      "statusTitle": "Filter consolidation status",
+      "kindTitle": "Filter consolidation kind",
+      "modeTitle": "Filter consolidation mode",
+      "statusPlaceholder": "Choose one or more job states",
+      "kindPlaceholder": "Choose one or more consolidation kinds",
+      "modePlaceholder": "Choose one or more consolidation modes"
+    },
+    "status": {
+      "queued": "Queued",
+      "running": "Running",
+      "proposed": "Proposed",
+      "applied": "Applied",
+      "rejected": "Rejected",
+      "failed": "Failed",
+      "dropped": "Dropped"
+    },
+    "kind": {
+      "episode_summary": "Episode Summary",
+      "procedure_extraction": "Procedure Extraction",
+      "failure_pattern_extraction": "Failure-Pattern Extraction",
+      "duplicate_detection": "Duplicate Detection",
+      "contradiction_detection": "Contradiction Detection",
+      "supersession_proposal": "Supersession Proposal",
+      "docs_update_proposal": "Docs Update Proposal",
+      "unknown": "Unknown"
+    },
+    "mode": {
+      "post_task": "Post Task",
+      "background": "Background",
+      "manual_review": "Manual Review",
+      "replay": "Replay",
+      "synchronous_post_task": "Synchronous Post Task"
+    }
+  },
+  "indexingHealthView": {
+    "title": "Indexing Health",
+    "subtitle": "Operational indexing snapshot for {workspace}.",
+    "errorTitle": "Indexing health error",
+    "empty": "Indexing pipeline is up to date.",
+    "notReported": "Not reported",
+    "notesTitle": "Notes",
+    "actions": {
+      "refresh": "Refresh",
+      "refreshing": "Refreshing..."
+    },
+    "summary": {
+      "status": "Status",
+      "nodes": "Nodes",
+      "edges": "Edges",
+      "files": "Files"
+    },
+    "status": {
+      "indexing": "Indexing",
+      "ready": "Ready"
+    },
+    "watcher": {
+      "indexing": "Indexing in progress",
+      "watching": "Watching for changes"
+    },
+    "sections": {
+      "pipeline": "Ingestion Pipeline",
+      "vector": "Vector Index Health",
+      "fts": "FTS Index Health",
+      "eventLog": "Event Log Health"
+    },
+    "pipeline": {
+      "watcherStatus": "Watcher Status",
+      "lastFullRescan": "Last Full Rescan",
+      "tableLabel": "Parser health",
+      "language": "Language",
+      "parsed": "Parsed Files",
+      "failed": "Failed Files",
+      "lastError": "Last Error"
+    },
+    "vector": {
+      "totalEmbeddings": "Total Embeddings",
+      "lastRebuild": "Last Rebuild",
+      "averageFreshness": "Average Freshness",
+      "staleEmbeddings": "Stale Embeddings"
+    },
+    "fts": {
+      "lastRebuild": "Last Rebuild",
+      "orphanRows": "Orphan Rows",
+      "tableLabel": "FTS tables",
+      "tableName": "Table",
+      "rowCount": "Rows",
+      "notes": "Notes"
+    },
+    "eventLog": {
+      "lastHour": "Events Last Hour",
+      "last24Hours": "Events Last 24 Hours",
+      "last7Days": "Events Last 7 Days",
+      "lastCompaction": "Last Compaction Snapshot",
+      "spilloverRows": "Payload Spillover Rows"
+    }
+  },
+  "workspaceGraphHealthView": {
+    "title": "Workspace Graph Health",
+    "subtitle": "Workspace graph snapshot for {workspace}.",
+    "errorTitle": "Workspace graph health error",
+    "notesTitle": "Notes",
+    "notReported": "Not reported",
+    "summary": {
+      "nodes": "Nodes",
+      "edges": "Edges",
+      "files": "Files",
+      "languages": "Languages"
+    },
+    "sections": {
+      "nodeFamilies": "Node Families",
+      "edgeFamilies": "Edge Families",
+      "brokenReferences": "Broken References",
+      "staleEdges": "Stale Edges",
+      "orphanSymbols": "Orphan Symbols"
+    },
+    "actions": {
+      "refresh": "Refresh",
+      "recompute": "Recompute",
+      "refreshing": "Refreshing...",
+      "inspect": "Inspect"
+    },
+    "columns": {
+      "family": "Family",
+      "count": "Count",
+      "notes": "Notes",
+      "identity": "Identity",
+      "reason": "Reason",
+      "detail": "Detail",
+      "actions": "Actions"
+    },
+    "nodes": {
+      "tableLabel": "Node families"
+    },
+    "edges": {
+      "tableLabel": "Edge families"
+    },
+    "brokenReferences": {
+      "tableLabel": "Broken references",
+      "empty": "No broken references were reported by the current daemon snapshot."
+    },
+    "staleEdges": {
+      "tableLabel": "Stale edges",
+      "empty": "No stale edges were reported."
+    },
+    "orphanSymbols": {
+      "tableLabel": "Orphan symbols",
+      "empty": "No orphan symbols were reported by the current daemon snapshot."
+    },
+    "pagination": {
+      "showing": "Showing {start}-{end} of {total}",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {page} of {totalPages}"
+    }
+  },
+  "reviewOverview": {
+    "daemonStatus": "Daemon Status",
+    "memoryCount": "Memory Count",
+    "signalCount": "Metric Signals",
+    "nodeCount": "Node Count",
+    "fileCount": "File Count",
+    "edgeCount": "Edge Count",
+    "languages": "Languages",
+    "none": "None",
+    "unknown": "Unknown",
+    "routeSupport": "Route Support"
+  }
+}

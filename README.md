@@ -11,6 +11,7 @@ Lattice indexes your codebase and repo Markdown into a dependency graph, then se
 - Markdown docs, runbooks, and decisions are first-class graph nodes with backlinks, outgoing links, and code mentions
 - `find_stale_docs` helps catch docs that likely drifted after code or runbook changes
 - `expand_context` reuses a prior handle from `get_context_capsule` or a workflow tool and returns only the next delta
+- workflow bundles now include per-pivot and per-memory retrieval relevance summaries plus item-level relevance detail handles for `expand_context`
 - `plan_edit` adds a patch-oriented planning bundle with likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests
 - `trace_scenario` turns a behavior description into likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and related tests/docs, while keeping confidence separate from coverage
 - Memory is persistent, scoped, refreshable, and stale-aware
@@ -280,6 +281,12 @@ At a high level, assistants should trust verified workflow outcomes and stronger
   Promote a memory from session scope into branch or repo scope.
 - `refresh_memory`
   Refresh a memory in place with new evidence while preserving identity.
+- `consolidate_session`
+  Trigger proposal-only session consolidation and return auditable consolidation proposal ids for later apply or reject decisions.
+- `get_memory_metrics` returns canonical Phase 9 metric snapshots from `lattice_core::metrics`, with explicit `session_metrics` fallback provenance only when the canonical collector returns an honest null
+  Return the current Phase 9 signal surface with per-signal provenance. When the canonical metrics module is not present yet, missing signals stay explicit `null` with a reason instead of fabricated numbers.
+- `get_event_trace`
+  Read a paginated task, session, or workspace event trace with compact, full, or diagnostic rendering for audit and replay workflows.
 - `update_observation`
   Edit stored memory content in place.
 - `delete_observation`
@@ -293,6 +300,8 @@ At a high level, assistants should trust verified workflow outcomes and stronger
   Current indexing progress and graph stats.
 - `get_session_metrics`
   Session-level efficiency metrics: token usage, delivery mix, follow-up avoidance, handle reuse, and outcome-memory reuse.
+- `get_event_trace`
+  Paginated event-log inspection with workspace-boundary enforcement and diagnostic payload hashes for replay and audit work.
 - `get_project_rules`
   Auto-detected repo conventions and recurring patterns.
 - `workspace_setup`

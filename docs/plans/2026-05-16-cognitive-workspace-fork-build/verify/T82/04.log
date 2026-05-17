@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test hardening::corruption_tests::test_truncated_event_log_file_reports_recovery_or_sqlite_error_without_panic ... ok
+test hardening::corruption_tests::test_invalid_event_kind_returns_clear_error_without_panic ... ok
+test hardening::corruption_tests::test_snapshot_version_mismatch_refuses_bootstrap_with_clear_error ... ok
+test hardening::corruption_tests::test_corrupted_payload_quarantines_row_without_panic ... ok
+test hardening::corruption_tests::test_invalid_stable_reference_emits_dangling_reference_signal ... ok
+test hardening::corruption_tests::test_mismatched_payload_hash_logs_corruption_and_continues ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.10s
+

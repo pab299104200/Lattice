@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test verification::existence_tests::verification_schema_round_trips_under_runtime_migration ... ok
+test verification::existence_tests::deleted_test_emits_invalidated_proposal ... ok
+test verification::existence_tests::live_file_evidence_emits_verified_proposal ... ok
+test verification::existence_tests::deleted_symbol_emits_invalidated_proposal ... ok
+test verification::existence_tests::existing_doc_section_emits_verified_proposal ... ok
+test verification::existence_tests::deleting_file_emits_invalidated_proposal ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.48s
+

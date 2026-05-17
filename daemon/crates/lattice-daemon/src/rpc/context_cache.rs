@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lattice_core::identity::ContextHandleId;
 use lattice_core::intelligence::ExpandContextSeed;
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,15 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 20 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedContext {
+    pub handle_id: ContextHandleId,
     pub origin: String,
     pub seed: ExpandContextSeed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleRecord {
+    pub legacy_handle: String,
+    pub handle_id: ContextHandleId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +60,7 @@ impl ContextHandleCache {
     }
 
     #[cfg(test)]
-    fn new_with_limits(capacity: usize, ttl: Duration) -> Self {
+    pub(crate) fn new_with_limits(capacity: usize, ttl: Duration) -> Self {
         Self::new_with_limits_and_persistence(capacity, ttl, None)
     }
 
@@ -74,11 +82,23 @@ impl ContextHandleCache {
         cache
     }
 
-    pub fn insert(&mut self, origin: impl Into<String>, seed: ExpandContextSeed) -> String {
+    pub fn insert(
+        &mut self,
+        origin: impl Into<String>,
+        seed: ExpandContextSeed,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> HandleRecord {
         self.prune_expired();
 
         let handle = self.next_handle();
+        let handle_id = ContextHandleId {
+            workspace_id: workspace_id.to_string(),
+            session_id: session_id.to_string(),
+            ulid: next_ulid(&mut self.sequence),
+        };
         let context = CachedContext {
+            handle_id: handle_id.clone(),
             origin: origin.into(),
             seed,
         };
@@ -93,7 +113,10 @@ impl ContextHandleCache {
         self.order.push_back(handle.clone());
         self.enforce_capacity();
         self.persist_best_effort();
-        handle
+        HandleRecord {
+            legacy_handle: handle,
+            handle_id,
+        }
     }
 
     pub fn get(&mut self, handle: &str) -> Option<CachedContext> {
@@ -107,12 +130,11 @@ impl ContextHandleCache {
     }
 
     fn next_handle(&mut self) -> String {
-        self.sequence = self.sequence.wrapping_add(1);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("ctx-{:x}-{:x}", now, self.sequence)
+        format!("ctx-{:x}-{:x}", now, self.sequence.wrapping_add(1))
     }
 
     fn prune_expired(&mut self) {
@@ -211,6 +233,28 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(format!("{}.tmp", file_name))
 }
 
+const CROCKFORD_BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn next_ulid(sequence: &mut u64) -> String {
+    *sequence = sequence.wrapping_add(1);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let entropy = (millis << 80) | (((*sequence as u128) << 16) | ((*sequence as u128) & 0xffff));
+    encode_crockford_base32(entropy)
+}
+
+fn encode_crockford_base32(mut value: u128) -> String {
+    let mut encoded = ['0'; 26];
+    for slot in encoded.iter_mut().rev() {
+        let index = (value & 0x1f) as usize;
+        *slot = CROCKFORD_BASE32[index] as char;
+        value >>= 5;
+    }
+    encoded.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,24 +282,35 @@ mod tests {
     #[test]
     fn test_cache_round_trip() {
         let mut cache = ContextHandleCache::new_with_limits(4, Duration::from_secs(60));
-        let handle = cache.insert("prepare_change", seed());
+        let handle = cache.insert("prepare_change", seed(), "workspace-a", "session-a");
 
-        let entry = cache.get(&handle).expect("expected cached entry");
+        let entry = cache
+            .get(&handle.legacy_handle)
+            .expect("expected cached entry");
         assert_eq!(entry.origin, "prepare_change");
         assert_eq!(entry.seed.files, vec!["src/auth.ts".to_string()]);
+        assert_eq!(entry.handle_id.workspace_id, "workspace-a");
     }
 
     #[test]
     fn test_cache_evicts_oldest_when_over_capacity() {
         let mut cache = ContextHandleCache::new_with_limits(1, Duration::from_secs(60));
-        let first = cache.insert("prepare_change", seed());
-        let second = cache.insert("get_working_set_context", seed());
+        let first = cache.insert("prepare_change", seed(), "workspace-a", "session-a");
+        let second = cache.insert(
+            "get_working_set_context",
+            seed(),
+            "workspace-a",
+            "session-a",
+        );
 
         assert!(
-            cache.get(&first).is_none(),
+            cache.get(&first.legacy_handle).is_none(),
             "oldest handle should be evicted"
         );
-        assert!(cache.get(&second).is_some(), "newest handle should remain");
+        assert!(
+            cache.get(&second.legacy_handle).is_some(),
+            "newest handle should remain"
+        );
     }
 
     #[test]
@@ -267,7 +322,7 @@ mod tests {
                 Duration::from_secs(60),
                 Some(path.clone()),
             );
-            cache.insert("prepare_change", seed())
+            cache.insert("prepare_change", seed(), "workspace-a", "session-a")
         };
 
         let mut restored = ContextHandleCache::new_with_limits_and_persistence(
@@ -276,10 +331,11 @@ mod tests {
             Some(path.clone()),
         );
         let entry = restored
-            .get(&handle)
+            .get(&handle.legacy_handle)
             .expect("expected persisted handle after restart");
         assert_eq!(entry.origin, "prepare_change");
         assert_eq!(entry.seed.symbols, vec!["loginUser".to_string()]);
+        assert_eq!(entry.handle_id.session_id, "session-a");
 
         let _ = fs::remove_file(path);
     }
@@ -292,6 +348,11 @@ mod tests {
             entries: vec![PersistedContextEntry {
                 handle: "ctx-old".to_string(),
                 context: CachedContext {
+                    handle_id: ContextHandleId {
+                        workspace_id: "workspace-a".to_string(),
+                        session_id: "session-a".to_string(),
+                        ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                    },
                     origin: "prepare_change".to_string(),
                     seed: seed(),
                 },

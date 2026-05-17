@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 3 tests
+test memory_graph::supersession_tests::supersedes_transitions_prior_memory_to_superseded_and_sets_successor ... ok
+test memory_graph::supersession_tests::supersession_chain_is_traversable_and_cycles_are_rejected ... ok
+test memory_graph::supersession_tests::current_claim_walks_to_latest_successor_and_historical_lookup_preserves_prior_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 569 filtered out; finished in 0.57s
+

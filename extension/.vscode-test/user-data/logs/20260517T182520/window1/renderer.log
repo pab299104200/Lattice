@@ -1,0 +1,173 @@
+2026-05-17 18:25:25.384 [info] Started local extension host with pid 99749.
+2026-05-17 18:25:25.569 [info] Loading development extension at /home/pete/cadres/lattice/extension
+2026-05-17 18:25:27.589 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-05-17 18:25:29.835 [info] [0m%s%s[0m  
+2026-05-17 18:25:29.837 [info] [0m%s%s[0m    contract: ReviewRpcBridge ↔ daemon MCP tools
+2026-05-17 18:25:30.584 [info]   [32m  ✔[0m[90m %s[0m list_observations: happy-path returns typed memory list
+2026-05-17 18:25:30.585 [info]   [32m  ✔[0m[90m %s[0m list_observations: invalid limit shape is gracefully clamped
+2026-05-17 18:25:30.591 [info]   [32m  ✔[0m[90m %s[0m list_stale_memories: happy-path returns typed memory list
+2026-05-17 18:25:30.597 [info]   [32m  ✔[0m[90m %s[0m list_stale_memories: oversize limit is clamped to ≤200
+2026-05-17 18:25:30.598 [info]   [32m  ✔[0m[90m %s[0m index_status: happy-path returns typed snapshot
+2026-05-17 18:25:30.599 [info]   [32m  ✔[0m[90m %s[0m get_session_metrics: happy-path returns typed session metrics
+2026-05-17 18:25:30.600 [info]   [32m  ✔[0m[90m %s[0m get_memory_metrics: happy-path returns typed metric snapshot
+2026-05-17 18:25:30.608 [info]   [32m  ✔[0m[90m %s[0m get_memory_metrics: invalid scope rejected by serde
+2026-05-17 18:25:30.614 [info]   [32m  ✔[0m[90m %s[0m get_event_trace: happy-path returns typed paginated page
+2026-05-17 18:25:30.615 [info]   [32m  ✔[0m[90m %s[0m get_event_trace: missing scope is rejected
+2026-05-17 18:25:30.616 [info]   [32m  ✔[0m[90m %s[0m consolidate_session: happy-path returns typed consolidation report
+2026-05-17 18:25:30.628 [info]   [32m  ✔[0m[90m %s[0m consolidate_session: empty session_id is rejected
+2026-05-17 18:25:30.629 [info]   [32m  ✔[0m[90m %s[0m propose_memory_evolution: action=propose returns typed proposal
+2026-05-17 18:25:30.630 [info]   [32m  ✔[0m[90m %s[0m propose_memory_evolution: action=reject closes the proposal
+2026-05-17 18:25:30.638 [info]   [32m  ✔[0m[90m %s[0m propose_memory_evolution: action=apply requires proposal_id
+2026-05-17 18:25:30.639 [info]   [32m  ✔[0m[90m %s[0m[33m (%dms)[0m verify_explain_memory: happy-path returns typed verify-explain response 43
+2026-05-17 18:25:30.640 [info]   [32m  ✔[0m[90m %s[0m verify_explain_memory: unknown memory id is rejected
+2026-05-17 18:25:30.640 [info]   [32m  ✔[0m[90m %s[0m list_memory_conflicts: happy-path on legacy anchor returns typed list
+2026-05-17 18:25:30.642 [info]   [32m  ✔[0m[90m %s[0m list_memory_conflicts: missing anchor is rejected
+2026-05-17 18:25:30.643 [info]   [32m  ✔[0m[90m %s[0m contract transcript captures every covered tool
+2026-05-17 18:25:30.644 [info] [0m%s%s[0m    review panel smoke
+2026-05-17 18:25:30.900 [info] Lattice extension activating...
+2026-05-17 18:25:30.911 [info]   [31m  %d) %s[0m 1 activates the extension and registers lattice.openReviewPanel
+2026-05-17 18:25:31.300 [info]   [32m  ✔[0m[90m %s[0m[31m (%dms)[0m focuses the registered review panel without error 659
+2026-05-17 18:25:31.314 [info]   [32m  ✔[0m[90m %s[0m[31m (%dms)[0m mounts memoryInbox without throwing 177
+2026-05-17 18:25:31.352 [info]   [32m  ✔[0m[90m %s[0m mounts memoryInbox with empty data
+2026-05-17 18:25:31.362 [info]   [31m  %d) %s[0m 2 mounts memoryInbox with bridge error
+2026-05-17 18:25:31.363 [info]   [32m  ✔[0m[90m %s[0m mounts staleView without throwing
+2026-05-17 18:25:31.369 [info]   [32m  ✔[0m[90m %s[0m mounts staleView with empty data
+2026-05-17 18:25:31.370 [info]   [31m  %d) %s[0m 3 mounts staleView with bridge error
+2026-05-17 18:25:31.371 [info]   [32m  ✔[0m[90m %s[0m mounts evidenceInspector without throwing
+2026-05-17 18:25:31.372 [info]   [32m  ✔[0m[90m %s[0m mounts evidenceInspector with empty data
+2026-05-17 18:25:31.372 [info]   [31m  %d) %s[0m 4 mounts evidenceInspector with bridge error
+2026-05-17 18:25:31.373 [info]   [32m  ✔[0m[90m %s[0m mounts eventTrace without throwing
+2026-05-17 18:25:32.621 [info]   [32m  ✔[0m[90m %s[0m mounts eventTrace with empty data
+2026-05-17 18:25:32.632 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false
+2026-05-17 18:25:32.649 [info]   [31m  %d) %s[0m 5 mounts eventTrace with bridge error
+2026-05-17 18:25:32.705 [info]   [32m  ✔[0m[90m %s[0m mounts retrievalExplanation without throwing
+2026-05-17 18:25:32.715 [info]   [32m  ✔[0m[90m %s[0m mounts retrievalExplanation with empty data
+2026-05-17 18:25:32.727 [info]   [31m  %d) %s[0m 6 mounts retrievalExplanation with bridge error
+2026-05-17 18:25:32.733 [info]   [32m  ✔[0m[90m %s[0m mounts consolidationQueue without throwing
+2026-05-17 18:25:32.734 [info]   [32m  ✔[0m[90m %s[0m mounts consolidationQueue with empty data
+2026-05-17 18:25:32.737 [info]   [31m  %d) %s[0m 7 mounts consolidationQueue with bridge error
+2026-05-17 18:25:32.741 [info]   [32m  ✔[0m[90m %s[0m mounts indexingHealth without throwing
+2026-05-17 18:25:32.742 [info]   [32m  ✔[0m[90m %s[0m mounts indexingHealth with empty data
+2026-05-17 18:25:32.747 [info]   [31m  %d) %s[0m 8 mounts indexingHealth with bridge error
+2026-05-17 18:25:32.752 [info]   [32m  ✔[0m[90m %s[0m mounts workspaceGraphHealth without throwing
+2026-05-17 18:25:32.755 [info]   [32m  ✔[0m[90m %s[0m mounts workspaceGraphHealth with empty data
+2026-05-17 18:25:32.768 [info]   [31m  %d) %s[0m 9 mounts workspaceGraphHealth with bridge error
+2026-05-17 18:25:32.771 [info]   [32m  ✔[0m[90m %s[0m mounts promotionQueue without throwing
+2026-05-17 18:25:32.773 [info]   [32m  ✔[0m[90m %s[0m mounts promotionQueue with empty data
+2026-05-17 18:25:32.775 [info]   [31m  %d) %s[0m 10 mounts promotionQueue with bridge error
+2026-05-17 18:25:32.780 [info]   [32m  ✔[0m[90m %s[0m mounts contradictionQueue without throwing
+2026-05-17 18:25:32.781 [info]   [32m  ✔[0m[90m %s[0m mounts contradictionQueue with empty data
+2026-05-17 18:25:32.783 [info]   [31m  %d) %s[0m 11 mounts contradictionQueue with bridge error
+2026-05-17 18:25:32.787 [info] [92m [0m[32m %d passing[0m[90m (%s)[0m 41 3s
+2026-05-17 18:25:32.788 [info] [31m  %d failing[0m 11
+2026-05-17 18:25:32.789 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 1 review panel smoke
+       activates the extension and registers lattice.openReviewPanel AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+
+  assert.ok(extension)
+   	at Context.<anonymous> (out/test/review.test.js:253:16)
+2026-05-17 18:25:32.791 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 2 review panel smoke
+       mounts memoryInbox with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.793 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 3 review panel smoke
+       mounts staleView with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.795 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 4 review panel smoke
+       mounts evidenceInspector with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.797 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 5 review panel smoke
+       mounts eventTrace with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.799 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 6 review panel smoke
+       mounts retrievalExplanation with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.801 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 7 review panel smoke
+       mounts consolidationQueue with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.803 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 8 review panel smoke
+       mounts indexingHealth with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.809 [info] [0m  %s) %s:
+[0m[31m     %s[0m[90m
+%s
+[0m 9 review panel smoke
+       mounts workspaceGraphHealth with bridge error Error: Review bridge failure   	at unwrap (out/test/review.test.js:575:15)
+  	at unwrapAsync (out/test/review.test.js:571:12)
+  	at async StubBridge.getOverview (out/test/review.test.js:70:25)
+  	at async ReviewPanelProvider.buildStateForTests (out/review/reviewPanel.js:263:32)
+  	at async Context.<anonymous> (out/test/review.test.js:283:31)
+2026-05-17 18:25:32.816 [info] [0m  %s) %s:
+%s[0m[90m
+%s
+[0m 10 review panel smoke
+       mounts promotionQueue with bridge error 
+      [31mAssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+
+  assert.ok(html.includes(spec.testId))
+[0m
+      [32m+ expected[0m [31m- actual[0m
+
+      [31m-false[0m
+      [32m+true[0m
+         	at Context.<anonymous> (out/test/review.test.js:311:20)
+2026-05-17 18:25:32.822 [info] [0m  %s) %s:
+%s[0m[90m
+%s
+[0m 11 review panel smoke
+       mounts contradictionQueue with bridge error 
+      [31mAssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+
+  assert.ok(html.includes(spec.testId))
+[0m
+      [32m+ expected[0m [31m- actual[0m
+
+      [31m-false[0m
+      [32m+true[0m
+         	at Context.<anonymous> (out/test/review.test.js:311:20)
+2026-05-17 18:25:32.825 [error] Error: 11 extension smoke tests failed.
+	at /home/pete/cadres/lattice/extension/out/test/suite/index.js:56:24
+	at done (/home/pete/cadres/lattice/extension/node_modules/mocha/lib/mocha.js:1028:7)

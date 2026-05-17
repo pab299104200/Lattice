@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test working_memory::state_tests::excluded_memories_require_exclusion_reason ... ok
+test working_memory::state_tests::default_constructed_state_has_required_fields ... ok
+test working_memory::state_tests::serde_round_trips_state_without_data_loss ... ok
+test working_memory::state_tests::loading_checkpoint_with_unknown_state_version_is_rejected ... ok
+test working_memory::state_tests::save_then_load_checkpoint_returns_byte_identical_state ... ok
+test working_memory::state_tests::state_hash_matches_between_save_and_load ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.01s
+

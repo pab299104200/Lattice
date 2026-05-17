@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 3 tests
+test events::budget_tests::spilled_payload_p99_stays_within_budget ... ok
+test events::budget_tests::prepare_change_payload_p99_stays_within_budget ... ok
+test events::budget_tests::get_context_capsule_payload_p99_stays_within_budget ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 569 filtered out; finished in 8.30s
+

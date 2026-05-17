@@ -1,0 +1,11 @@
+name = "python-repo"
+size_class = "small"
+documentation_style = "rich"
+benchmark_tasks = ["py_invoice_tax_total", "py_payment_failure_diagnosis"]
+golden_anchors_path = "../golden_anchors.json"
+
+[expected_event_counts]
+indexed_files = 7
+minimum_symbols = 10
+workflow_tool_calls = 5
+workflow_successes = 2

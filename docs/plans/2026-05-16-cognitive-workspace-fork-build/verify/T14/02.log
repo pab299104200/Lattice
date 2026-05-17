@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 9 tests
+test events::reader_tests::limit_ceiling_is_enforced ... ok
+test events::reader_tests::missing_scope_returns_unscoped_error ... ok
+test events::reader_tests::session_scoped_query_returns_only_matching_session_events ... ok
+test events::reader_tests::task_scoped_query_returns_only_matching_task_events ... ok
+test events::reader_tests::tail_returns_newest_events_for_task_scope ... ok
+test events::reader_tests::payload_corruption_returns_typed_error ... ok
+test events::reader_tests::tail_returns_newest_events_for_session_scope ... ok
+test events::reader_tests::stream_yields_same_events_as_execute_in_order ... ok
+test events::reader_tests::workspace_branch_query_returns_only_matching_workspace_branch_events ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 563 filtered out; finished in 0.02s
+

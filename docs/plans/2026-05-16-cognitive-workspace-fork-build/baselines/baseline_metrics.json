@@ -1,0 +1,72 @@
+[
+  {
+    "name": "diagnose_failure",
+    "p50_us": 200,
+    "p95_us": 262,
+    "p99_us": 279,
+    "bytes_returned": 1443,
+    "candidate_count": 3,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058663"
+  },
+  {
+    "name": "expand_context",
+    "p50_us": 20,
+    "p95_us": 21,
+    "p99_us": 27,
+    "bytes_returned": 1344,
+    "candidate_count": 2,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058646"
+  },
+  {
+    "name": "find_relevant_tests",
+    "p50_us": 14,
+    "p95_us": 19,
+    "p99_us": 32,
+    "bytes_returned": 218,
+    "candidate_count": 0,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058679"
+  },
+  {
+    "name": "get_context_capsule",
+    "p50_us": 83,
+    "p95_us": 101,
+    "p99_us": 140,
+    "bytes_returned": 420,
+    "candidate_count": 1,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058638"
+  },
+  {
+    "name": "impact_from_diff",
+    "p50_us": 27,
+    "p95_us": 37,
+    "p99_us": 51,
+    "bytes_returned": 1418,
+    "candidate_count": 4,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058654"
+  },
+  {
+    "name": "prepare_change",
+    "p50_us": 279,
+    "p95_us": 310,
+    "p99_us": 341,
+    "bytes_returned": 2196,
+    "candidate_count": 7,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058630"
+  },
+  {
+    "name": "search_symbols",
+    "p50_us": 2,
+    "p95_us": 3,
+    "p99_us": 3,
+    "bytes_returned": 278,
+    "candidate_count": 4,
+    "commit_sha": "b85dee7beb52686c4830b28e6fbd7cc750411641",
+    "recorded_at": "1779058670"
+  }
+]

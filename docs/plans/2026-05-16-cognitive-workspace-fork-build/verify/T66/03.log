@@ -1,0 +1,149 @@
+warning: method `current_parsed_files_snapshot` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:2927:14
+     |
+ 154 | impl McpHandler {
+     | --------------- method in this implementation
+...
+2927 |     async fn current_parsed_files_snapshot(&self) -> HashMap<String, P...
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `select_diff_impact_mode` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5737:4
+     |
+5737 | fn select_diff_impact_mode(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `diff_impact_widen_reason` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:5942:4
+     |
+5942 | fn diff_impact_widen_reason(report: &DiffImpactReport) -> Option<&'sta...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_context_capsule` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7621:4
+     |
+7621 | fn seed_from_context_capsule(graph: &CodeGraph, capsule: &ContextCapsu...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seed_from_diff_impact` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7650:4
+     |
+7650 | fn seed_from_diff_impact(report: &DiffImpactReport) -> ExpandContextSe...
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `attach_context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7859:4
+     |
+7859 | fn attach_context_capsule_suggested_expand(value: &mut Value, suggeste...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `context_capsule_suggested_expand` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7871:4
+     |
+7871 | fn context_capsule_suggested_expand(capsule: &ContextCapsule, graph: &...
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_capsule_symbol_handle` is never used
+    --> crates/lattice-daemon/src/rpc/mcp.rs:7897:4
+     |
+7897 | fn resolve_capsule_symbol_handle(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RankedMemory` is never constructed
+  --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:24:19
+   |
+24 | pub(crate) struct RankedMemory {
+   |                   ^^^^^^^^^^^^
+
+warning: function `token_budget_limit` is never used
+   --> crates/lattice-daemon/src/rpc/memory_v2/get_task_memory.rs:171:15
+    |
+171 | pub(crate) fn token_budget_limit(budget_tokens: Option<usize>) -> usize {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `COMPACT_WORKFLOW_TOKEN_CAP`
+    --> crates/lattice-daemon/src/rpc/mcp.rs:8221:9
+     |
+8221 |         COMPACT_WORKFLOW_TOKEN_CAP, FULL_WORKFLOW_TOKEN_CAP,
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+  --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:93:82
+   |
+93 | ...t, context_cache_path, session_id) =
+   |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:150:82
+    |
+150 | ...t, context_cache_path, session_id) =
+    |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:233:13
+    |
+233 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `session_id`
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:230:82
+    |
+230 | ...t, context_cache_path, session_id) =
+    |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_id`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:361:13
+    |
+361 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/lattice-daemon/src/rpc/memory_v2/memory_tools_tests.rs:391:13
+    |
+391 |         let mut store = memory_store.lock().await;
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: `lattice-daemon` (lib) generated 10 warnings
+warning: `lattice-daemon` (lib test) generated 17 warnings (10 duplicates) (run `cargo fix --lib -p lattice-daemon --tests` to apply 7 suggestions)
+warning: unused imports: `AssertUnwindSafe` and `catch_unwind`
+ --> crates/lattice-core/src/verification/scope_leak_tests.rs:1:18
+  |
+1 | use std::panic::{catch_unwind, AssertUnwindSafe};
+  |                  ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `LabeledMemory`
+ --> crates/lattice-core/src/verification/surfacing_tests.rs:9:37
+  |
+9 |     classify_status, BundleSection, LabeledMemory, SurfacingPipeline,
+  |                                     ^^^^^^^^^^^^^
+
+warning: associated function `enforce_trusted_invariant_for_test` is never used
+   --> crates/lattice-core/src/verification/surfacing.rs:131:19
+    |
+ 68 | impl SurfacingPipeline {
+    | ---------------------- associated function in this implementation
+...
+131 |     pub(crate) fn enforce_trusted_invariant_for_test(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lattice-core` (lib test) generated 3 warnings (run `cargo fix --lib -p lattice-core --tests` to apply 2 suggestions)
+warning: `lattice-daemon` (bin "lattice" test) generated 17 warnings (17 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.34s

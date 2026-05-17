@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test hardening::concurrency_tests::test_compaction_during_write_preserves_snapshot_plus_post_snapshot_log ... ok
+test hardening::concurrency_tests::test_consolidation_replay_proposals_are_deterministic_and_apply_is_idempotent ... ok
+test hardening::concurrency_tests::test_parallel_memory_links_and_accesses_do_not_tear_or_drop_rows ... ok
+test hardening::concurrency_tests::test_parallel_event_writers_do_not_drop_events_or_reorder_each_writer ... ok
+test hardening::concurrency_tests::test_reader_never_observes_partial_or_per_session_time_regressions ... ok
+test hardening::concurrency_tests::test_parallel_sessions_preserve_order_scope_and_unique_event_ids ... ok
+test hardening::concurrency_tests::test_parallel_memory_creates_keep_unique_ids_and_valid_invariants ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 3.40s
+

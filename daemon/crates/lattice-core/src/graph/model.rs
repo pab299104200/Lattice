@@ -37,7 +37,7 @@ impl EdgeKind {
 }
 
 /// A node in the code dependency graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphNode {
     pub id: SymbolId,
     pub kind: SymbolKind,
@@ -59,6 +59,19 @@ pub struct GraphStats {
     pub node_count: usize,
     pub edge_count: usize,
     pub file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphPathStep {
+    pub node: GraphNode,
+    pub edge_kind: EdgeKind,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphTraversalPath {
+    pub target: GraphNode,
+    pub steps: Vec<GraphPathStep>,
 }
 
 /// In-memory dependency graph backed by petgraph.
@@ -214,6 +227,73 @@ impl CodeGraph {
         }
 
         result
+    }
+
+    /// Bounded BFS traversal in both directions with the path that produced each target.
+    pub fn n_hop_neighbor_paths(&self, id: &SymbolId, hops: usize) -> Vec<GraphTraversalPath> {
+        let idx = match self.index.get(id) {
+            Some(&idx) => idx,
+            None => return Vec::new(),
+        };
+
+        let mut visited = HashSet::new();
+        visited.insert(idx);
+        let mut queue = VecDeque::new();
+        queue.push_back((idx, 0usize, Vec::<GraphPathStep>::new()));
+        let mut result = Vec::new();
+
+        while let Some((current, depth, path)) = queue.pop_front() {
+            if depth >= hops {
+                continue;
+            }
+
+            for (neighbor, edge_kind) in self.neighbor_edges(current) {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                let mut next_path = path.clone();
+                next_path.push(GraphPathStep {
+                    node: self.graph[neighbor].clone(),
+                    edge_kind,
+                    depth: depth + 1,
+                });
+                result.push(GraphTraversalPath {
+                    target: self.graph[neighbor].clone(),
+                    steps: next_path.clone(),
+                });
+                queue.push_back((neighbor, depth + 1, next_path));
+            }
+        }
+
+        result
+    }
+
+    fn neighbor_edges(&self, idx: NodeIndex) -> Vec<(NodeIndex, EdgeKind)> {
+        let mut edges = Vec::new();
+        for direction in [Direction::Outgoing, Direction::Incoming] {
+            for neighbor in self.graph.neighbors_directed(idx, direction) {
+                if let Some(edge_kind) = self.edge_kind_between(idx, neighbor, direction) {
+                    edges.push((neighbor, edge_kind));
+                }
+            }
+        }
+        edges
+    }
+
+    fn edge_kind_between(
+        &self,
+        idx: NodeIndex,
+        neighbor: NodeIndex,
+        direction: Direction,
+    ) -> Option<EdgeKind> {
+        let (from, to) = match direction {
+            Direction::Outgoing => (idx, neighbor),
+            Direction::Incoming => (neighbor, idx),
+        };
+        self.graph
+            .edges_connecting(from, to)
+            .next()
+            .map(|edge| *edge.weight())
     }
 
     /// BFS traversal following only incoming edges (dependents) up to `hops` hops.

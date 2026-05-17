@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test verification::spans_tests::evidence_without_span_is_a_verified_no_op ... ok
+test verification::spans_tests::span_validation_never_reads_the_whole_file ... ok
+test verification::spans_tests::truncated_file_below_span_returns_file_shrunk_below_span ... ok
+test verification::spans_tests::modified_content_at_span_returns_stale_content_changed ... ok
+test verification::spans_tests::crlf_flip_is_reported_as_encoding_changed ... ok
+test verification::spans_tests::unchanged_content_at_span_returns_verified ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.00s
+

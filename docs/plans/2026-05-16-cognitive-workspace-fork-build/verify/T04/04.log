@@ -1,0 +1,71 @@
+    Finished `bench` profile [optimized] target(s) in 0.23s
+     Running benches/baseline_workflows.rs (target/release/deps/baseline_workflows-037c09fcd507d44d)
+Gnuplot not found, using plotters backend
+Benchmarking prepare_change
+Benchmarking prepare_change: Warming up for 1.0000 s
+Benchmarking prepare_change: Collecting 100 samples in estimated 3.2093 s (10k iterations)
+Benchmarking prepare_change: Analyzing
+prepare_change          time:   [314.94 µs 329.95 µs 345.80 µs]
+                        change: [-30.549% -27.147% -23.326%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 21 outliers among 100 measurements (21.00%)
+  10 (10.00%) high mild
+  11 (11.00%) high severe
+
+Benchmarking get_context_capsule
+Benchmarking get_context_capsule: Warming up for 1.0000 s
+Benchmarking get_context_capsule: Collecting 100 samples in estimated 3.1526 s (35k iterations)
+Benchmarking get_context_capsule: Analyzing
+get_context_capsule     time:   [82.960 µs 84.639 µs 86.602 µs]
+                        change: [-53.272% -52.251% -51.257%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking expand_context
+Benchmarking expand_context: Warming up for 1.0000 s
+Benchmarking expand_context: Collecting 100 samples in estimated 3.0419 s (293k iterations)
+Benchmarking expand_context: Analyzing
+expand_context          time:   [10.021 µs 10.459 µs 10.929 µs]
+                        change: [-25.316% -22.938% -20.390%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) high mild
+  5 (5.00%) high severe
+
+Benchmarking impact_from_diff
+Benchmarking impact_from_diff: Warming up for 1.0000 s
+Benchmarking impact_from_diff: Collecting 100 samples in estimated 3.0957 s (101k iterations)
+Benchmarking impact_from_diff: Analyzing
+impact_from_diff        time:   [27.089 µs 28.253 µs 29.593 µs]
+                        change: [-49.454% -47.811% -45.923%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+Benchmarking diagnose_failure
+Benchmarking diagnose_failure: Warming up for 1.0000 s
+Benchmarking diagnose_failure: Collecting 100 samples in estimated 3.3256 s (25k iterations)
+Benchmarking diagnose_failure: Analyzing
+diagnose_failure        time:   [122.13 µs 124.44 µs 127.22 µs]
+                        change: [-50.931% -49.610% -48.320%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking search_symbols
+Benchmarking search_symbols: Warming up for 1.0000 s
+Benchmarking search_symbols: Collecting 100 samples in estimated 3.0003 s (1.7M iterations)
+Benchmarking search_symbols: Analyzing
+search_symbols          time:   [1.6460 µs 1.7136 µs 1.7819 µs]
+                        change: [-49.478% -47.822% -46.075%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+Benchmarking find_relevant_tests
+Benchmarking find_relevant_tests: Warming up for 1.0000 s
+Benchmarking find_relevant_tests: Collecting 100 samples in estimated 3.0137 s (207k iterations)
+Benchmarking find_relevant_tests: Analyzing
+find_relevant_tests     time:   [13.890 µs 14.636 µs 15.354 µs]
+                        change: [-28.449% -23.953% -18.811%] (p = 0.00 < 0.05)
+                        Performance has improved.
+

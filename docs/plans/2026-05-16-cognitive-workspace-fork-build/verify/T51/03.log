@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test verification::incremental_tests::expiry_scanner_marks_expired_and_is_idempotent ... ok
+test verification::incremental_tests::deleted_file_invalidates_verified_memory_on_next_delta ... ok
+test verification::incremental_tests::successful_verification_advances_last_verified_graph_snapshot_id ... ok
+test verification::incremental_tests::graph_delta_reverifies_only_impacted_memories ... ok
+test verification::incremental_tests::bounded_work_budget_reenqueues_remaining_memories ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 25.89s
+

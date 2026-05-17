@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test contract_tests::memory_verification_retrieval::test_verification_status_enums_agree_variant_for_variant ... ok
+test contract_tests::memory_verification_retrieval::test_retrieval_api_requires_scope_filter_argument ... ok
+test contract_tests::memory_verification_retrieval::test_scope_filter_round_trip_for_all_scope_kinds ... ok
+test contract_tests::memory_verification_retrieval::test_stale_label_round_trip_retrieval_to_surfaced_bundle ... ok
+test contract_tests::memory_verification_retrieval::end_to_end_memory_verification_retrieval_round_trip_holds_for_all_statuses_and_scopes ... ok
+test contract_tests::memory_verification_retrieval::test_verification_status_round_trip_memory_to_retrieval ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.06s
+

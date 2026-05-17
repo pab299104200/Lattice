@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test metrics::signals_tests::collectors_report_honest_nulls_when_scope_has_no_data ... ok
+test metrics::signals_tests::collectors_return_expected_values_for_handcrafted_fixture ... ok
+test metrics::signals_tests::every_metric_signal_variant_collects_deterministically ... ok
+test metrics::signals_tests::sample_size_bounds_mark_metrics_incomplete ... ok
+test metrics::signals_tests::scope_filters_prevent_cross_scope_leakage ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.00s
+

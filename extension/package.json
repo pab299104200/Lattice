@@ -18,6 +18,10 @@
         "title": "Lattice: Re-index Workspace"
       },
       {
+        "command": "lattice.openReviewPanel",
+        "title": "Lattice: Open Review Panel"
+      },
+      {
         "command": "lattice.showStatus",
         "title": "Lattice: Show Status"
       },
@@ -85,6 +89,26 @@
           "type": "webview",
           "id": "lattice.sidebar",
           "name": "Lattice"
+        },
+        {
+          "type": "webview",
+          "id": "lattice.reviewPanel",
+          "name": "Review Panel",
+          "icon": "resources/review-panel.svg"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "lattice.openReviewPanel",
+          "when": "view == lattice.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "lattice.openReviewPanel",
+          "when": "view == lattice.reviewPanel",
+          "group": "navigation"
         }
       ]
     }
@@ -97,11 +121,14 @@
     "test": "node ./out/test/runTest.js"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.5.2",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.0.0",
+    "mocha": "^10.8.2",
     "typescript": "^5.3.0"
   }
 }

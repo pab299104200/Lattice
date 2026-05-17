@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test metrics::report_tests::threshold_logic_covers_each_initial_target ... ok
+test metrics::report_tests::null_signals_render_as_na_with_reason_never_zero ... ok
+test metrics::report_tests::fail_on_regression_exit_code_is_non_zero_only_when_requested ... ok
+test metrics::report_tests::report_renders_deterministically_in_all_formats ... ok
+test metrics::report_tests::report_computes_baseline_delta_and_reduction ... ok
+test metrics::report_tests::benchmark_evidence_round_trips_to_signal_rows ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.00s
+

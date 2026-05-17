@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 5 tests
+test verification::surfacing_tests::classify_covers_all_verification_status_variants ... ok
+test verification::surfacing_tests::debug_assertion_fires_when_non_trusted_memory_is_injected_into_trusted - should panic ... ok
+test verification::surfacing_tests::verified_memories_land_in_trusted_and_all_other_states_are_advisory ... ok
+test verification::surfacing_tests::label_reason_is_non_empty_and_uses_verifier_reason_scope_file_and_expiry ... ok
+test verification::surfacing_tests::ranker_top_n_excludes_every_non_verified_memory_regardless_of_score ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 567 filtered out; finished in 0.00s
+

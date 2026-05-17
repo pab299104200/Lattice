@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test memory_graph::links_tests::strength_outside_unit_interval_is_rejected ... ok
+test memory_graph::links_tests::score_history_orders_newest_first ... ok
+test memory_graph::links_tests::accesses_can_be_marked_used_after_the_fact ... ok
+test memory_graph::links_tests::evidence_anchors_round_trip_including_file_span_sha256 ... ok
+test memory_graph::links_tests::target_dispatch_round_trips_memory_and_graph_nodes ... ok
+test memory_graph::links_tests::every_link_type_round_trips ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.03s
+

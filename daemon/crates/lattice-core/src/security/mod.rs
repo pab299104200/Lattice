@@ -4,7 +4,8 @@ mod tests;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
 
-/// Manages file exclusions from .gitignore, .lattice_ignore, and default patterns.
+/// Manages file exclusions from `.gitignore`, `.lattice_ignore`, `.latticeignore`,
+/// and default patterns.
 pub struct SecurityFilter {
     gitignore: Option<Gitignore>,
     default_patterns: Vec<String>,
@@ -21,10 +22,15 @@ impl SecurityFilter {
             builder.add(&gitignore_path);
         }
 
-        // Load .lattice_ignore if it exists (adds to .gitignore rules)
-        let lattice_ignore_path = workspace_root.join(".lattice_ignore");
-        if lattice_ignore_path.exists() {
-            builder.add(&lattice_ignore_path);
+        // Load the canonical ignore file plus the no-underscore alias that some
+        // plans and operators already use in the wild.
+        for path in [
+            workspace_root.join(".lattice_ignore"),
+            workspace_root.join(".latticeignore"),
+        ] {
+            if path.exists() {
+                builder.add(&path);
+            }
         }
 
         let gitignore = builder.build().ok();
@@ -90,9 +96,10 @@ impl SecurityFilter {
     }
 
     /// Check if a file should be excluded from indexing.
-    /// Combines .gitignore, .lattice_ignore, excluded dirs, and default security patterns.
+    /// Combines `.gitignore`, `.lattice_ignore`, `.latticeignore`, excluded dirs,
+    /// and default security patterns.
     pub fn is_excluded(&self, rel_path: &str) -> bool {
-        // Check .gitignore + .lattice_ignore
+        // Check .gitignore + Lattice ignore files.
         if let Some(gi) = &self.gitignore {
             if gi.matched(rel_path, false).is_ignore() {
                 return true;

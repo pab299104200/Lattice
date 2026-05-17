@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 4 tests
+test identity::budget_tests::test_resolve_section_p99_within_2ms_budget ... ok
+test identity::budget_tests::test_resolve_path_p99_within_2ms_budget ... ok
+test identity::budget_tests::test_resolve_symbol_p99_within_2ms_budget ... ok
+test identity::budget_tests::test_resolver_does_not_regress_baseline_workflow_p99 ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 568 filtered out; finished in 8.96s
+

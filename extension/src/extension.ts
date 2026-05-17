@@ -5,6 +5,7 @@ import { StatusBarProvider } from './statusbar';
 import { LatticeCodeLensProvider } from './codelens';
 import { LatticeHoverProvider } from './hover';
 import { LatticeSidebarProvider } from './sidebar';
+import { ReviewPanelProvider } from './review/reviewPanel';
 import {
     DocsTargetSelection,
     LatticeDocsWorkbench,
@@ -41,6 +42,7 @@ interface GitChangedFiles {
 
 export async function activate(context: vscode.ExtensionContext) {
     console.log('Lattice extension activating...');
+    const isExtensionTestRun = process.env.LATTICE_EXTENSION_TEST === '1';
 
     // Create daemon manager
     daemon = new DaemonManager(context.extensionPath);
@@ -55,7 +57,17 @@ export async function activate(context: vscode.ExtensionContext) {
         LatticeSidebarProvider.viewType,
         sidebarProvider
     );
-    context.subscriptions.push(sidebarProvider, sidebarRegistration);
+    const reviewPanelProvider = new ReviewPanelProvider(context, daemon);
+    const reviewPanelRegistration = vscode.window.registerWebviewViewProvider(
+        ReviewPanelProvider.viewType,
+        reviewPanelProvider
+    );
+    context.subscriptions.push(
+        sidebarProvider,
+        sidebarRegistration,
+        reviewPanelProvider,
+        reviewPanelRegistration
+    );
 
     const docsWorkbench = new LatticeDocsWorkbench(daemon);
     context.subscriptions.push(docsWorkbench);
@@ -114,10 +126,12 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     // Start daemon (non-blocking)
-    daemon.start().catch((err) => {
-        console.error(`[lattice] failed to start daemon: ${err.message}`);
-        vscode.window.showErrorMessage(`Lattice: Failed to start daemon — ${err.message}`);
-    });
+    if (!isExtensionTestRun) {
+        daemon.start().catch((err) => {
+            console.error(`[lattice] failed to start daemon: ${err.message}`);
+            vscode.window.showErrorMessage(`Lattice: Failed to start daemon — ${err.message}`);
+        });
+    }
 
     // Register commands
     const reindexCmd = vscode.commands.registerCommand('lattice.reindex', async () => {
@@ -166,6 +180,10 @@ export async function activate(context: vscode.ExtensionContext) {
             const msg = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`Lattice: Status request failed — ${msg}`);
         }
+    });
+
+    const openReviewPanelCmd = vscode.commands.registerCommand('lattice.openReviewPanel', async () => {
+        await vscode.commands.executeCommand('lattice.reviewPanel.focus');
     });
 
     // CodeLens provider
@@ -520,6 +538,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         reindexCmd,
+        openReviewPanelCmd,
         statusCmd,
         showDependentsCmd,
         prepareChangeCmd,

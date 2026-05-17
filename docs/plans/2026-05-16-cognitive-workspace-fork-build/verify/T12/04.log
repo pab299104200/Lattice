@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 7 tests
+test events::store_tests::content_addressed_payloads_dedupe_identical_bytes ... ok
+test events::store_tests::payload_spillover_row_ids_round_trip ... ok
+test events::store_tests::schema_applies_on_fresh_database ... ok
+test events::store_tests::events_table_rejects_update_and_delete ... ok
+test events::store_tests::required_indexes_exist ... ok
+test events::store_tests::scoped_queries_are_bounded_and_ordered ... ok
+test events::store_tests::migration_is_idempotent_on_reopen ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 565 filtered out; finished in 0.03s
+

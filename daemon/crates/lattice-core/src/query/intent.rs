@@ -1,61 +1,6 @@
+use crate::retrieval_v1::{classify_intent, IntentLabel};
+
 use super::capsule::QueryIntent;
-
-/// Keywords that indicate a FixBug intent.
-const FIX_BUG_KEYWORDS: &[&str] = &[
-    "fix",
-    "bug",
-    "error",
-    "crash",
-    "fail",
-    "broken",
-    "debug",
-    "issue",
-    "wrong",
-    "exception",
-];
-
-/// Keywords that indicate a Refactor intent.
-const REFACTOR_KEYWORDS: &[&str] = &[
-    "refactor",
-    "clean up",
-    "cleanup",
-    "restructure",
-    "reorganize",
-    "simplify",
-    "improve",
-    "optimize",
-];
-
-/// Keywords that indicate an AddFeature intent.
-const ADD_FEATURE_KEYWORDS: &[&str] = &[
-    "add",
-    "implement",
-    "create",
-    "build",
-    "new",
-    "introduce",
-    "support for",
-];
-
-/// Keywords that indicate an Explore intent.
-/// Includes both question words ("how", "what") and architectural nouns
-/// ("flow", "pipeline") that signal understanding-oriented queries.
-const EXPLORE_KEYWORDS: &[&str] = &[
-    "how",
-    "what",
-    "explain",
-    "describe",
-    "show",
-    "where",
-    "understand",
-    "overview",
-    "flow",
-    "pipeline",
-    "architecture",
-    "trace",
-    "lifecycle",
-    "walkthrough",
-];
 
 /// Per-intent tuning parameters.
 #[derive(Debug, Clone)]
@@ -135,49 +80,19 @@ impl IntentParams {
 /// a long descriptive phrase without action verbs indicates understanding intent.
 /// Only returns Unknown for very short ambiguous queries.
 pub fn detect_intent(query: &str) -> QueryIntent {
-    let lower = query.to_lowercase();
-
-    let scores = [
-        (
-            QueryIntent::FixBug,
-            count_keyword_matches(&lower, FIX_BUG_KEYWORDS),
-        ),
-        (
-            QueryIntent::Refactor,
-            count_keyword_matches(&lower, REFACTOR_KEYWORDS),
-        ),
-        (
-            QueryIntent::AddFeature,
-            count_keyword_matches(&lower, ADD_FEATURE_KEYWORDS),
-        ),
-        (
-            QueryIntent::Explore,
-            count_keyword_matches(&lower, EXPLORE_KEYWORDS),
-        ),
-    ];
-
-    if let Some((intent, _)) = scores
-        .iter()
-        .filter(|(_, count)| *count > 0)
-        .max_by_key(|(_, count)| *count)
-    {
-        return *intent;
-    }
-
-    // Fallback: keyword-heavy queries without action verbs are Explore.
-    // "authentication system JWT login token generation" = understanding intent.
-    let content_words = lower
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 3)
-        .count();
-    if content_words >= 4 {
-        return QueryIntent::Explore;
-    }
-
-    QueryIntent::Unknown
+    let classification = classify_intent(query);
+    map_label_to_query_intent(classification.primary_label)
 }
 
-/// Count how many keywords from the list appear in the query text.
-fn count_keyword_matches(text: &str, keywords: &[&str]) -> usize {
-    keywords.iter().filter(|kw| text.contains(*kw)).count()
+fn map_label_to_query_intent(label: IntentLabel) -> QueryIntent {
+    match label {
+        IntentLabel::Debug
+        | IntentLabel::AddTest
+        | IntentLabel::Migration
+        | IntentLabel::Performance => QueryIntent::FixBug,
+        IntentLabel::Refactor | IntentLabel::Review => QueryIntent::Refactor,
+        IntentLabel::Explain | IntentLabel::UpdateDocs => QueryIntent::Explore,
+        IntentLabel::AddFeature | IntentLabel::ModifyFeature => QueryIntent::AddFeature,
+        IntentLabel::Unknown => QueryIntent::Unknown,
+    }
 }

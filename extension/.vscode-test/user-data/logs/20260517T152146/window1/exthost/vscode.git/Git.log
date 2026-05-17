@@ -1,0 +1,34 @@
+2026-05-17 15:21:57.697 [info] [main] Log level: Info
+2026-05-17 15:21:57.697 [info] [main] Validating found git in: "git"
+2026-05-17 15:21:57.697 [info] [main] Using git "2.43.0" from "git"
+2026-05-17 15:21:57.697 [info] [Model][doInitialScan] Initial repository scan started
+2026-05-17 15:21:57.697 [info] > git rev-parse --show-toplevel [285ms]
+2026-05-17 15:21:57.697 [info] > git rev-parse --git-dir --git-common-dir --show-superproject-working-tree [39ms]
+2026-05-17 15:21:57.831 [info] [Model][openRepository] Opened repository (path): /home/pete/cadres/lattice
+2026-05-17 15:21:57.831 [info] [Model][openRepository] Opened repository (real path): /home/pete/cadres/lattice
+2026-05-17 15:21:57.831 [info] [Model][openRepository] Opened repository (kind): repository
+2026-05-17 15:21:57.884 [info] > git rev-parse --show-toplevel [10ms]
+2026-05-17 15:21:57.885 [info] > git config --get commit.template [23ms]
+2026-05-17 15:21:57.887 [info] > git config --get --local core.virtualfilesystem [38ms]
+2026-05-17 15:21:57.887 [warning] [Git][config] git config failed: Failed to execute git
+2026-05-17 15:21:57.930 [info] > git rev-parse --show-toplevel [32ms]
+2026-05-17 15:21:57.945 [info] > git for-each-ref --format=%(refname)%00%(upstream:short)%00%(objectname)%00%(upstream:track)%00%(upstream:remotename)%00%(upstream:remoteref) refs/heads/master refs/remotes/master [23ms]
+2026-05-17 15:21:57.948 [info] > git rev-parse --show-toplevel [10ms]
+2026-05-17 15:21:58.020 [info] > git rev-parse --show-toplevel [60ms]
+2026-05-17 15:21:58.064 [info] > git for-each-ref --sort -committerdate --format %(refname)%00%(objectname)%00%(*objectname) [56ms]
+2026-05-17 15:21:58.074 [info] > git status -z -uall [89ms]
+2026-05-17 15:21:58.075 [info] > git rev-parse --show-toplevel [19ms]
+2026-05-17 15:21:58.940 [info] > git for-each-ref --format=%(refname)%00%(upstream:short)%00%(objectname)%00%(upstream:track)%00%(upstream:remotename)%00%(upstream:remoteref) refs/heads/master refs/remotes/master [719ms]
+2026-05-17 15:21:59.062 [info] > git config --get --local branch.master.vscode-merge-base [71ms]
+2026-05-17 15:21:59.082 [info] > git config --get commit.template [151ms]
+2026-05-17 15:21:59.082 [info] > git rev-parse --show-toplevel [177ms]
+2026-05-17 15:21:59.138 [info] > git rev-parse --show-toplevel [25ms]
+2026-05-17 15:21:59.139 [info] > git for-each-ref --format=%(refname)%00%(upstream:short)%00%(objectname)%00%(upstream:track)%00%(upstream:remotename)%00%(upstream:remoteref) refs/heads/origin/master refs/remotes/origin/master [57ms]
+2026-05-17 15:21:59.197 [info] > git for-each-ref --format=%(refname)%00%(upstream:short)%00%(objectname)%00%(upstream:track)%00%(upstream:remotename)%00%(upstream:remoteref) refs/heads/master refs/remotes/master [60ms]
+2026-05-17 15:21:59.206 [info] > git rev-parse --show-toplevel [11ms]
+2026-05-17 15:21:59.209 [info] [Model][doInitialScan] Initial repository scan completed - repositories (1), closed repositories (0), parent repositories (0), unsafe repositories (0)
+2026-05-17 15:21:59.210 [info] > git merge-base refs/heads/master refs/remotes/origin/master [37ms]
+2026-05-17 15:21:59.281 [info] > git diff --raw --numstat --diff-filter=ADMR -z --find-renames=50% cb174bba45b707be6933a5a65915b5cf0f2616ca...refs/remotes/origin/master -- [51ms]
+2026-05-17 15:21:59.293 [info] > git for-each-ref --sort -committerdate --format %(refname)%00%(objectname)%00%(*objectname) [13ms]
+2026-05-17 15:21:59.313 [info] > git status -z -uall [53ms]
+2026-05-17 15:22:00.489 [info] > git check-ignore -v -z --stdin [101ms]

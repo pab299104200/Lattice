@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 2 tests
+test identity::ambiguity::tests::display_reports_candidate_count_and_hint ... ok
+test identity::ambiguity::tests::hint_helpers_match_expected_resolution_guidance ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 570 filtered out; finished in 0.00s
+

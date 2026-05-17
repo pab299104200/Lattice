@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/lattice_core-641ea4bda0b91c0b)
+
+running 6 tests
+test hardening::partial_index_tests::test_ignored_import_target_does_not_create_edges_or_trigger_broad_fallback ... ok
+test hardening::partial_index_tests::test_parse_failure_is_reported_per_file_without_dropping_other_results ... ok
+test hardening::partial_index_tests::test_worker_panic_does_not_abort_remaining_batch_and_surviving_graph_is_queryable ... ok
+test hardening::partial_index_tests::test_syntax_error_file_keeps_surviving_symbols_queryable_without_panic ... ok
+test hardening::partial_index_tests::test_partial_batch_report_keeps_cold_start_queries_bounded_and_explicit ... ok
+test hardening::partial_index_tests::test_file_change_marks_memories_stale_with_snapshot_gap_visible_to_queries ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 566 filtered out; finished in 0.03s
+
