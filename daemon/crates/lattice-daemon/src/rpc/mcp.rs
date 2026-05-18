@@ -14,15 +14,15 @@ use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::events::{
     BranchRef, EventPage, EventQuery, EventReader, EventWriter, QueryOrder, SessionId,
 };
-use lattice_core::graph::model::{CodeGraph, GraphNode};
+use lattice_core::graph::model::CodeGraph;
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, find_stale_docs, get_backlinks,
     get_docs_capsule, get_outgoing_links, get_repo_playbook, get_working_set_context,
     impact_from_diff, plan_edit, prepare_change, summarize_subsystem, trace_scenario, BundleMode,
-    DiffImpactReport, DocsTargetKind, ExpandContextSeed, FailureDiagnosis, MemoryHighlight,
-    PlanEditBundle, RepoPlaybook, RulesDetector, ScenarioTraceBundle, SubsystemSummary, TaskBundle,
+    DocsTargetKind, ExpandContextSeed, FailureDiagnosis, MemoryHighlight, PlanEditBundle,
+    RepoPlaybook, RulesDetector, ScenarioTraceBundle, SubsystemSummary, TaskBundle,
     WorkingSetContext,
 };
 use lattice_core::memory::model::MemoryStructuredFields;
@@ -33,7 +33,6 @@ use lattice_core::query::{ContextCapsule, QueryEngine};
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::symbols::stable_file_handle;
-use lattice_core::symbols::ParsedFile;
 use lattice_core::verification::ScopeFilter;
 use lattice_core::watcher::should_index_file;
 use lattice_core::working_memory::{summarize_state, CheckpointScope, WorkingMemoryState};
@@ -246,10 +245,15 @@ impl McpHandler {
 
     async fn lock_query_engine_for_workflow(&self) -> Result<MutexGuard<'_, QueryEngine>, ()> {
         if self.indexing.load(Ordering::Relaxed) {
-            self.engine.try_lock().map_err(|_| ())
-        } else {
-            Ok(self.engine.lock().await)
+            if let Ok(engine) = self.engine.try_lock() {
+                return Ok(engine);
+            }
+            return tokio::time::timeout(std::time::Duration::from_millis(75), self.engine.lock())
+                .await
+                .map_err(|_| ());
         }
+
+        Ok(self.engine.lock().await)
     }
 
     fn promote_live_graph_for_workflow(&self, engine: &mut QueryEngine) -> bool {
@@ -2922,13 +2926,6 @@ impl McpHandler {
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, handle, &cached.origin);
         Ok(wrap_tool_result(value))
-    }
-
-    async fn current_parsed_files_snapshot(&self) -> HashMap<String, ParsedFile> {
-        if let Ok(indexer) = self.indexer.try_lock() {
-            return indexer.parsed_files().clone();
-        }
-        self.indexer.lock().await.parsed_files().clone()
     }
 
     async fn store_context_handle(
@@ -5734,30 +5731,6 @@ fn select_trace_scenario_mode(
     }
 }
 
-fn select_diff_impact_mode(
-    requested: RequestedBundleMode,
-    compact: &DiffImpactReport,
-) -> (BundleMode, String) {
-    match requested {
-        RequestedBundleMode::Compact => (BundleMode::Compact, "requested compact mode".to_string()),
-        RequestedBundleMode::Full => (BundleMode::Full, "requested full mode".to_string()),
-        RequestedBundleMode::Auto => {
-            if let Some(reason) = diff_impact_widen_reason(compact) {
-                (
-                    BundleMode::Full,
-                    format!("widened automatically because {}", reason),
-                )
-            } else {
-                (
-                    BundleMode::Compact,
-                    "kept compact because the diff already mapped to concrete files and symbols"
-                        .to_string(),
-                )
-            }
-        }
-    }
-}
-
 fn select_working_set_mode(
     requested: RequestedBundleMode,
     compact: &WorkingSetContext,
@@ -5934,17 +5907,6 @@ fn trace_scenario_widen_reason(bundle: &ScenarioTraceBundle) -> Option<&'static 
         Some("guard, side-effect, and failure signals were still sparse")
     } else if bundle.tests.is_empty() && bundle.relevant_docs.is_empty() {
         Some("tests and docs guidance were still sparse")
-    } else {
-        None
-    }
-}
-
-fn diff_impact_widen_reason(report: &DiffImpactReport) -> Option<&'static str> {
-    if report.changed_symbols.is_empty() && report.affected_symbols.len() < 2 {
-        Some("the compact diff view did not resolve enough changed or affected symbols")
-    } else if report.tests.is_empty() && report.risks.is_empty() && report.changed_files.len() <= 1
-    {
-        Some("the compact diff view lacked downstream risk or test context")
     } else {
         None
     }
@@ -7618,78 +7580,6 @@ fn seed_from_trace_scenario_bundle(bundle: &ScenarioTraceBundle) -> ExpandContex
     }
 }
 
-fn seed_from_context_capsule(graph: &CodeGraph, capsule: &ContextCapsule) -> ExpandContextSeed {
-    let all_nodes = graph.all_nodes();
-    let mut files = Vec::new();
-    let mut symbols = Vec::new();
-
-    for item in &capsule.pivots {
-        push_seed_file(&mut files, &item.file);
-        let symbol_handle =
-            resolve_capsule_symbol_handle(&all_nodes, &item.file, &item.symbol, item.line);
-        push_seed_symbol(&mut symbols, symbol_handle.as_deref(), Some(&item.symbol));
-    }
-    for item in &capsule.context {
-        push_seed_file(&mut files, &item.file);
-        let symbol_handle =
-            resolve_capsule_symbol_handle(&all_nodes, &item.file, &item.symbol, item.line);
-        push_seed_symbol(&mut symbols, symbol_handle.as_deref(), Some(&item.symbol));
-    }
-    normalize_seed_values(&mut files);
-    normalize_seed_values(&mut symbols);
-
-    ExpandContextSeed {
-        query: Some(capsule.query.clone()),
-        files,
-        symbols,
-        tests: Vec::new(),
-        memories: capsule.memories.clone(),
-    }
-}
-
-fn seed_from_diff_impact(report: &DiffImpactReport) -> ExpandContextSeed {
-    let mut files = Vec::new();
-    for file in report
-        .changed_files
-        .iter()
-        .map(|item| item.file.as_str())
-        .chain(
-            report
-                .affected_symbols
-                .iter()
-                .map(|item| item.file.as_str()),
-        )
-    {
-        push_seed_file(&mut files, file);
-    }
-    normalize_seed_values(&mut files);
-
-    let mut symbols = Vec::new();
-    for symbol in &report.changed_symbols {
-        push_seed_symbol(
-            &mut symbols,
-            symbol.symbol_handle.as_deref(),
-            Some(symbol.symbol.as_str()),
-        );
-    }
-    for symbol in &report.affected_symbols {
-        push_seed_symbol(
-            &mut symbols,
-            symbol.symbol_handle.as_deref(),
-            Some(symbol.symbol.as_str()),
-        );
-    }
-    normalize_seed_values(&mut symbols);
-
-    ExpandContextSeed {
-        query: None,
-        files,
-        symbols,
-        tests: report.tests.iter().map(|item| item.file.clone()).collect(),
-        memories: Vec::new(),
-    }
-}
-
 fn seed_from_working_set_context(report: &WorkingSetContext) -> ExpandContextSeed {
     let mut files = Vec::new();
     for file in report.files.iter().map(|item| item.file.as_str()) {
@@ -7854,70 +7744,6 @@ fn attach_context_handle(value: &mut Value, handle: &str, origin: &str) {
         object.insert("context_handle".to_string(), json!(handle));
         object.insert("context_origin".to_string(), json!(origin));
     }
-}
-
-fn attach_context_capsule_suggested_expand(value: &mut Value, suggested_expand: Option<Value>) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    if object.contains_key("suggested_expand") {
-        return;
-    }
-    if let Some(suggested_expand) = suggested_expand {
-        object.insert("suggested_expand".to_string(), suggested_expand);
-    }
-}
-
-fn context_capsule_suggested_expand(capsule: &ContextCapsule, graph: &CodeGraph) -> Option<Value> {
-    let all_nodes = graph.all_nodes();
-
-    if let Some(pivot) = capsule.pivots.first() {
-        let focus =
-            resolve_capsule_symbol_handle(&all_nodes, &pivot.file, &pivot.symbol, pivot.line)
-                .unwrap_or_else(|| stable_file_focus_value(&pivot.file));
-        return Some(json!({
-            "focus": focus,
-            "reason": "Expand the lead pivot to inspect nearby code and relationships."
-        }));
-    }
-
-    if let Some(context) = capsule.context.first() {
-        let focus =
-            resolve_capsule_symbol_handle(&all_nodes, &context.file, &context.symbol, context.line)
-                .unwrap_or_else(|| stable_file_focus_value(&context.file));
-        return Some(json!({
-            "focus": focus,
-            "reason": "Expand the top supporting symbol to inspect nearby implementation details."
-        }));
-    }
-
-    None
-}
-
-fn resolve_capsule_symbol_handle(
-    nodes: &[&GraphNode],
-    file: &str,
-    symbol: &str,
-    line: usize,
-) -> Option<String> {
-    let exact_line = nodes.iter().copied().find(|node| {
-        is_queryable_workflow_file(&node.file)
-            && node.file == file
-            && node.name == symbol
-            && node.line == line
-    });
-    if let Some(node) = exact_line {
-        return Some(node.id.stable_handle());
-    }
-
-    let mut matches = nodes.iter().copied().filter(|node| {
-        is_queryable_workflow_file(&node.file) && node.file == file && node.name == symbol
-    });
-    let first = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
-    Some(first.id.stable_handle())
 }
 
 fn push_seed_file(files: &mut Vec<String>, file: &str) {
@@ -8218,7 +8044,7 @@ mod tests {
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, wrap_tool_result,
         wrap_workflow_tool_result, McpHandler, RequestHandler, WorkflowRenderMode,
-        COMPACT_WORKFLOW_TOKEN_CAP, FULL_WORKFLOW_TOKEN_CAP,
+        FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -9680,8 +9506,9 @@ export function sendGreeting(): string {
             .as_array()
             .or_else(|| payload["ranked_pivots"].as_array());
         assert!(
-            pivots_array.is_some_and(|items| items.len() <= 3
-                && items.iter().all(|item| item.get("source").is_none())),
+            pivots_array
+                .is_some_and(|items| items.len() <= 3
+                    && items.iter().all(|item| item.get("source").is_none())),
             "expected bounded pivots without full source: {payload:?}"
         );
         assert!(
@@ -9827,9 +9654,9 @@ def detect_agent_version_drift(agent, rollout):
             .as_array()
             .or_else(|| payload["structured_payload"]["primary_files"].as_array());
         assert!(
-            primary_files.is_some_and(|files| files.iter().any(
-                |file| file["file"].as_str() == Some("backend/core/agent_version_drift.py")
-            )),
+            primary_files.is_some_and(|files| files
+                .iter()
+                .any(|file| file["file"].as_str() == Some("backend/core/agent_version_drift.py"))),
             "expected promoted live graph to produce a working set: {payload:?}"
         );
         let context_handle = payload

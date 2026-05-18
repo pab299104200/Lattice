@@ -33,6 +33,8 @@ use crate::memory_graph::{
 };
 use crate::query::QueryEngine;
 use crate::security::SecurityFilter;
+use crate::storage::GraphStore;
+use crate::symbols::{Language, SymbolId, SymbolKind};
 use crate::verification::{ScopeFilter, SpanReader, WorkspaceFileReader};
 use crate::watcher::should_index_file;
 
@@ -512,6 +514,91 @@ fn test_branch_and_session_scoped_memories_do_not_leak() {
 }
 
 #[test]
+fn test_cognitive_workspace_memory_spans_sessions_but_code_graphs_stay_per_workspace() {
+    let memory_store = MemoryStore::open_in_memory().expect("memory store");
+    memory_store
+        .store(scoped_memory(
+            "session-old",
+            MemoryScope::Repo,
+            Some("workspace-a"),
+            None,
+            None,
+            "workspace-a durable pattern from prior session",
+        ))
+        .expect("workspace-a repo memory stores");
+    memory_store
+        .store(scoped_memory(
+            "session-b",
+            MemoryScope::Repo,
+            Some("workspace-b"),
+            None,
+            None,
+            "workspace-b durable pattern",
+        ))
+        .expect("workspace-b repo memory stores");
+    memory_store
+        .store(scoped_memory(
+            "session-old",
+            MemoryScope::Session,
+            None,
+            None,
+            None,
+            "old ephemeral session note",
+        ))
+        .expect("old session memory stores");
+
+    let workspace_a_session = ScopeFilter::new("workspace-a".to_string(), None, None)
+        .for_session("session-new".to_string());
+    let visible_to_new_session = memory_store
+        .list_all_scoped(&workspace_a_session)
+        .expect("workspace-a session-scoped query succeeds");
+    assert!(
+        visible_to_new_session
+            .iter()
+            .any(|memory| memory.content == "workspace-a durable pattern from prior session"),
+        "repo-scoped workspace memory must be reusable across sessions"
+    );
+    assert!(
+        visible_to_new_session
+            .iter()
+            .all(|memory| memory.content != "workspace-b durable pattern"
+                && memory.content != "old ephemeral session note"),
+        "cross-session recall must not leak another workspace or another session's ephemeral memory"
+    );
+
+    let dir = TempDir::new().expect("tempdir");
+    let graph_a_path = dir.path().join("workspace-a-graph.sqlite");
+    let graph_b_path = dir.path().join("workspace-b-graph.sqlite");
+    let graph_a_store = GraphStore::open(&graph_a_path).expect("workspace-a graph store");
+    let graph_b_store = GraphStore::open(&graph_b_path).expect("workspace-b graph store");
+    graph_a_store
+        .save_graph(&single_symbol_graph("src/workspace_a.ts", "workspaceAOnly"))
+        .expect("save workspace-a graph");
+    graph_b_store
+        .save_graph(&single_symbol_graph("src/workspace_b.ts", "workspaceBOnly"))
+        .expect("save workspace-b graph");
+
+    let graph_a = graph_a_store.load_graph().expect("load workspace-a graph");
+    let graph_b = graph_b_store.load_graph().expect("load workspace-b graph");
+    assert_eq!(
+        search_symbols(&graph_a, "workspaceAOnly"),
+        vec!["src/workspace_a.ts"]
+    );
+    assert!(
+        search_symbols(&graph_a, "workspaceBOnly").is_empty(),
+        "workspace-a graph must not include workspace-b symbols"
+    );
+    assert_eq!(
+        search_symbols(&graph_b, "workspaceBOnly"),
+        vec!["src/workspace_b.ts"]
+    );
+    assert!(
+        search_symbols(&graph_b, "workspaceAOnly").is_empty(),
+        "workspace-b graph must not include workspace-a symbols"
+    );
+}
+
+#[test]
 fn test_event_queries_remain_workspace_scoped() {
     let store = Arc::new(EventStore::open_in_memory().expect("event store"));
     let writer_a = EventWriter::new(store.clone(), "workspace-a".to_string(), 4096);
@@ -533,6 +620,27 @@ fn test_event_queries_remain_workspace_scoped() {
 
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].workspace_id, "workspace-b");
+}
+
+fn single_symbol_graph(file: &str, symbol: &str) -> CodeGraph {
+    let mut graph = CodeGraph::new();
+    graph.add_node(
+        SymbolId {
+            file: file.to_string(),
+            name: symbol.to_string(),
+            byte_offset: 0,
+        },
+        SymbolKind::Function,
+        symbol.to_string(),
+        format!("function {symbol}()"),
+        format!("function {symbol}() {{ return true; }}"),
+        file.to_string(),
+        1,
+        1,
+        true,
+        Language::TypeScript,
+    );
+    graph
 }
 
 #[test]

@@ -1074,11 +1074,15 @@
     {
       "at": "2026-05-17T23:08:19Z",
       "event": "standard_gates_complete"
+    },
+    {
+      "at": "2026-05-17T23:08:53Z",
+      "event": "committed"
     }
   ],
   "feature": "cognitive-workspace-fork",
-  "phase": "implemented",
+  "phase": "complete",
   "spec": "/home/pete/cadres/lattice/docs/plans/2026-05-16-cognitive-workspace-fork-plan.md",
   "tasks_file": "/home/pete/cadres/lattice/docs/plans/2026-05-16-cognitive-workspace-fork-build/tasks.json",
-  "updated_at": "2026-05-17T23:08:19Z"
+  "updated_at": "2026-05-17T23:08:53Z"
 }

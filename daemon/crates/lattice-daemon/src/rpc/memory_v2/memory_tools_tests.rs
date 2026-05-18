@@ -90,14 +90,11 @@ fn serde_round_trips_memory_tool_requests_and_responses() {
 
 #[tokio::test]
 async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
-    let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+    let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("get-task-memory");
     {
         let store = memory_store.lock().await;
-        let mut memory = seed_memory(
-            "refresh token must preserve session",
-            MemoryScope::Repo,
-        );
+        let mut memory = seed_memory("refresh token must preserve session", MemoryScope::Repo);
         memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
         let id = store.store(memory).expect("store memory");
         let mut fields = MemoryStructuredFields::default();
@@ -147,7 +144,7 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
 
 #[tokio::test]
 async fn save_memory_defaults_unverified_persists_fields_emits_event_and_queues_verification() {
-    let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+    let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("save-memory");
     let response = handler
         .handle(
@@ -227,10 +224,10 @@ async fn save_memory_defaults_unverified_persists_fields_emits_event_and_queues_
 
 #[tokio::test]
 async fn propose_apply_and_reject_memory_evolution_are_auditable() {
-    let (handler, memory_store, event_store, workspace_root, context_cache_path, session_id) =
+    let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("memory-evolution");
     let memory_id = {
-        let mut store = memory_store.lock().await;
+        let store = memory_store.lock().await;
         let id = store
             .store(seed_memory("refresh behavior old", MemoryScope::Repo))
             .expect("store memory");
@@ -358,7 +355,7 @@ async fn get_task_memory_respects_scope_boundaries() {
     let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("scope-boundary");
     {
-        let mut store = memory_store.lock().await;
+        let store = memory_store.lock().await;
         let mut branch_memory = seed_memory("other branch memory", MemoryScope::Branch);
         branch_memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
         branch_memory.branch = Some("different-branch".to_string());
@@ -388,7 +385,7 @@ async fn apply_memory_evolution_shim_forwards_with_deprecation_warning() {
     let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("apply-shim");
     let memory_id = {
-        let mut store = memory_store.lock().await;
+        let store = memory_store.lock().await;
         store
             .store(seed_memory("shim target", MemoryScope::Repo))
             .expect("store memory")

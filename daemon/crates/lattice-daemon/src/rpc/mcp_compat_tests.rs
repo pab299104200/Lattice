@@ -206,7 +206,11 @@ fn parse_payload(tool: &str, response: &Value) -> Value {
     if let Ok(payload) = serde_json::from_str(text) {
         return payload;
     }
-    if let Some(block) = text.split("```json").nth(1).and_then(|part| part.split("```").next()) {
+    if let Some(block) = text
+        .split("```json")
+        .nth(1)
+        .and_then(|part| part.split("```").next())
+    {
         return serde_json::from_str(block.trim()).unwrap_or_else(|error| {
             panic!("{tool} structured markdown JSON should parse: {error}; block was `{block}`")
         });

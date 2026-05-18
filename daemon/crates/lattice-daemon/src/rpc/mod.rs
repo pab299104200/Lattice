@@ -1,6 +1,7 @@
 pub mod context_cache;
 pub mod event_capture;
 mod event_capture_support;
+#[cfg(test)]
 pub mod identity_payload;
 pub mod mcp;
 pub mod memory_v2;

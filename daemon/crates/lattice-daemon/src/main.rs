@@ -158,6 +158,13 @@ async fn main() -> Result<()> {
 
             let files_indexed = if let Some(wm) = &ws_manager_bg {
                 let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
+                publish_cached_parsed_graph_snapshot(
+                    &parsed_cache,
+                    Some(&indexer_bg),
+                    &engine_bg,
+                    &compaction_graph_bg,
+                )
+                .await;
                 let roots = ws_roots_bg.clone();
                 let incremental = tokio::task::spawn_blocking(move || {
                     build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
@@ -206,6 +213,13 @@ async fn main() -> Result<()> {
             } else {
                 let ws = ws_root.clone();
                 let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
+                publish_cached_parsed_graph_snapshot(
+                    &parsed_cache,
+                    Some(&indexer_bg),
+                    &engine_bg,
+                    &compaction_graph_bg,
+                )
+                .await;
                 let incremental = tokio::task::spawn_blocking(move || {
                     build_incremental_index_for_roots(&[ws], Some(&manifest), parsed_cache)
                 })
@@ -927,6 +941,57 @@ impl IncrementalIndexResult {
             changed_count: 0,
             removed_count: 0,
         }
+    }
+}
+
+async fn publish_cached_parsed_graph_snapshot(
+    parsed_files: &HashMap<String, ParsedFile>,
+    indexer: Option<&Arc<Mutex<Indexer>>>,
+    engine: &Arc<Mutex<QueryEngine>>,
+    compaction_graph: &Arc<std::sync::Mutex<CodeGraph>>,
+) -> bool {
+    if parsed_files.is_empty() {
+        return false;
+    }
+
+    {
+        let engine = engine.lock().await;
+        if engine.graph().stats().node_count > 0 {
+            return false;
+        }
+    }
+
+    let mut cached_indexer = Indexer::new(PathBuf::new());
+    cached_indexer.replace_parsed_files(parsed_files.clone());
+    let cached_graph = cached_indexer.graph().clone();
+    let stats = cached_graph.stats();
+    if stats.node_count == 0 {
+        return false;
+    }
+
+    if let Some(indexer) = indexer {
+        let mut indexer = indexer.lock().await;
+        indexer.replace_parsed_files(parsed_files.clone());
+    }
+
+    if let Ok(mut graph) = compaction_graph.lock() {
+        *graph = cached_graph.clone();
+    } else {
+        tracing::warn!("Failed to publish cached graph to compaction graph snapshot");
+    }
+
+    let mut engine = engine.lock().await;
+    if engine.graph().stats().node_count == 0 {
+        engine.update_graph(cached_graph);
+        tracing::info!(
+            "Warm-published cached graph snapshot: {} nodes, {} edges, {} files",
+            stats.node_count,
+            stats.edge_count,
+            stats.file_count
+        );
+        true
+    } else {
+        false
     }
 }
 

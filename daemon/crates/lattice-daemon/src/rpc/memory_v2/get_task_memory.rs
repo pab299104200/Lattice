@@ -20,13 +20,6 @@ pub struct GetTaskMemoryArgs {
     pub budget_tokens: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RankedMemory {
-    pub id: String,
-    pub inclusion_reason: String,
-    pub score_milli: i64,
-}
-
 pub fn tool_definition() -> Value {
     json!({
         "name": "get_task_memory",
@@ -166,15 +159,6 @@ fn load_usefulness_scores(
         }
     }
     Ok(scores)
-}
-
-pub(crate) fn token_budget_limit(budget_tokens: Option<usize>) -> usize {
-    match budget_tokens.unwrap_or(1200) {
-        0..=400 => 2,
-        401..=800 => 4,
-        801..=1600 => 6,
-        _ => 8,
-    }
 }
 
 pub(crate) fn approximate_payload_cost(memory: &Memory) -> usize {
