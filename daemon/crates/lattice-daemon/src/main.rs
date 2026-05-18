@@ -918,7 +918,7 @@ struct SourceFileRecord {
     indexed_path: String,
     rel_path: String,
     root: PathBuf,
-    content_hash: String,
+    content_hash: Option<String>,
     mtime_ns: i64,
     size_bytes: i64,
 }
@@ -1051,28 +1051,62 @@ fn build_incremental_index_for_roots(
     let now = unix_timestamp_secs();
     for record in records {
         let previous = manifest.get(&record.indexed_path);
-        let unchanged = previous
+        let metadata_unchanged = previous
+            .map(|entry| entry.mtime_ns == record.mtime_ns && entry.size_bytes == record.size_bytes)
+            .unwrap_or(false);
+        let parser_unchanged = previous
             .map(|entry| {
-                entry.content_hash == record.content_hash
-                    && entry.parser_version == FILE_INDEX_PARSER_VERSION
+                entry.parser_version == FILE_INDEX_PARSER_VERSION
                     && entry.schema_version == FILE_INDEX_SCHEMA_VERSION
-                    && parsed_files.contains_key(&record.indexed_path)
             })
             .unwrap_or(false);
+        let unchanged = metadata_unchanged
+            && parser_unchanged
+            && parsed_files.contains_key(&record.indexed_path);
 
         if !unchanged {
             let abs_path = record.root.join(&record.rel_path);
             match fs::read_to_string(&abs_path) {
-                Ok(content) => match parser::parse_file(&record.indexed_path, &content) {
-                    Ok(parsed) => {
-                        parsed_files.insert(record.indexed_path.clone(), parsed);
-                        changed_count += 1;
+                Ok(content) => {
+                    let content_hash = stable_content_hash(content.as_bytes());
+                    if previous
+                        .map(|entry| entry.content_hash == content_hash && parser_unchanged)
+                        .unwrap_or(false)
+                        && parsed_files.contains_key(&record.indexed_path)
+                    {
+                        file_index.push(FileIndexEntry {
+                            file: record.indexed_path,
+                            content_hash,
+                            mtime_ns: record.mtime_ns,
+                            size_bytes: record.size_bytes,
+                            parser_version: FILE_INDEX_PARSER_VERSION,
+                            schema_version: FILE_INDEX_SCHEMA_VERSION,
+                            last_indexed_at: now,
+                        });
+                        continue;
                     }
-                    Err(err) => {
-                        tracing::warn!("Failed to parse {}: {}", record.indexed_path, err);
-                        parsed_files.remove(&record.indexed_path);
+
+                    match parser::parse_file(&record.indexed_path, &content) {
+                        Ok(parsed) => {
+                            parsed_files.insert(record.indexed_path.clone(), parsed);
+                            changed_count += 1;
+                        }
+                        Err(err) => {
+                            tracing::warn!("Failed to parse {}: {}", record.indexed_path, err);
+                            parsed_files.remove(&record.indexed_path);
+                        }
                     }
-                },
+                    file_index.push(FileIndexEntry {
+                        file: record.indexed_path,
+                        content_hash,
+                        mtime_ns: record.mtime_ns,
+                        size_bytes: record.size_bytes,
+                        parser_version: FILE_INDEX_PARSER_VERSION,
+                        schema_version: FILE_INDEX_SCHEMA_VERSION,
+                        last_indexed_at: now,
+                    });
+                    continue;
+                }
                 Err(err) => {
                     tracing::warn!("Failed to read {}: {}", abs_path.display(), err);
                     parsed_files.remove(&record.indexed_path);
@@ -1082,7 +1116,10 @@ fn build_incremental_index_for_roots(
 
         file_index.push(FileIndexEntry {
             file: record.indexed_path,
-            content_hash: record.content_hash,
+            content_hash: record
+                .content_hash
+                .or_else(|| previous.map(|entry| entry.content_hash.clone()))
+                .unwrap_or_default(),
             mtime_ns: record.mtime_ns,
             size_bytes: record.size_bytes,
             parser_version: FILE_INDEX_PARSER_VERSION,
@@ -1121,17 +1158,22 @@ fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
             } else {
                 rel_path.clone()
             };
-            let Ok(content) = fs::read(&path) else {
-                continue;
-            };
             let Ok(metadata) = fs::metadata(&path) else {
                 continue;
             };
+            if metadata.len() > max_index_file_bytes() {
+                tracing::debug!(
+                    file = indexed_path.as_str(),
+                    size_bytes = metadata.len(),
+                    "Skipping oversized index candidate"
+                );
+                continue;
+            }
             records.push(SourceFileRecord {
                 indexed_path,
                 rel_path,
                 root: root.clone(),
-                content_hash: stable_content_hash(&content),
+                content_hash: None,
                 mtime_ns: metadata_mtime_ns(&metadata),
                 size_bytes: metadata.len() as i64,
             });
@@ -1139,6 +1181,13 @@ fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
     }
     records.sort_by(|a, b| a.indexed_path.cmp(&b.indexed_path));
     records
+}
+
+fn max_index_file_bytes() -> u64 {
+    std::env::var("LATTICE_MAX_INDEX_FILE_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
 }
 
 fn stable_content_hash(bytes: &[u8]) -> String {

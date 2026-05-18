@@ -58,21 +58,26 @@ impl FileWatcher {
         info!("File watcher started for: {:?}", self.workspace_root);
 
         let mut changed_paths: Vec<PathBuf> = Vec::new();
-        let mut debounce_timer = Box::pin(tokio::time::sleep(DEBOUNCE_DURATION));
+        let debounce_timer = tokio::time::sleep(DEBOUNCE_DURATION);
+        tokio::pin!(debounce_timer);
 
         loop {
             tokio::select! {
                 Some(event) = rx.recv() => {
                     self.handle_event(event, &mut changed_paths);
-                    debounce_timer = Box::pin(tokio::time::sleep(DEBOUNCE_DURATION));
+                    debounce_timer.as_mut().reset(tokio::time::Instant::now() + DEBOUNCE_DURATION);
                 },
-                _ = &mut debounce_timer => {
+                _ = &mut debounce_timer, if !changed_paths.is_empty() => {
+                    let paths = std::mem::take(&mut changed_paths);
+                    self.process_changes(paths).await;
+                },
+                else => {
                     if !changed_paths.is_empty() {
                         let paths = std::mem::take(&mut changed_paths);
                         self.process_changes(paths).await;
                     }
-                },
-                else => break,
+                    break;
+                }
             }
         }
 
