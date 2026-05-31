@@ -412,6 +412,7 @@ fn task_memory_bundle_and_memory_record_round_trip() {
         },
         workspace_conflict: None,
         workspace_path_diagnostic: None,
+        recheck_commands: vec!["cd daemon && cargo test t".to_string()],
     };
     let bundle = TaskMemoryBundle {
         task_id: "task".to_string(),
@@ -489,6 +490,7 @@ fn save_memory_response_round_trip_includes_full_memory_record() {
             },
             workspace_conflict: None,
             workspace_path_diagnostic: None,
+            recheck_commands: Vec::new(),
         },
         verification_job_id: "verify-1".to_string(),
     };

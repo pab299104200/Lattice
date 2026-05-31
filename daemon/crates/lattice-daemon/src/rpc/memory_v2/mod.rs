@@ -130,6 +130,8 @@ pub struct MemoryRecord {
     /// Path ownership diagnostic for relative links that cannot prove workspace ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path_diagnostic: Option<Value>,
+    /// Bounded commands or command-like probes callers can run to re-check the claim now.
+    pub recheck_commands: Vec<String>,
 }
 
 /// Git checkout state associated with a memory claim.
@@ -291,6 +293,115 @@ pub(crate) fn evidence_strength(
         * 0.12;
     let access_weight = (f64::from(access_count.min(8)) / 8.0) * 0.04;
     (0.1 + evidence_weight + provenance_weight + score_weight + access_weight).min(1.0)
+}
+
+pub(crate) fn memory_recheck_commands(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    for test in &fields.linked_tests {
+        push_unique(&mut commands, command_for_test_ref(test));
+    }
+    for evidence in fields.evidence.iter().filter(|item| item.kind == "test") {
+        if let Some(reference) = evidence.reference.as_deref() {
+            push_unique(&mut commands, command_for_test_ref(reference));
+        }
+    }
+    for file in &memory.linked_files {
+        push_file_recheck(&mut commands, file);
+    }
+    for evidence in fields.evidence.iter().filter(|item| item.kind == "file") {
+        if let Some(reference) = evidence.reference.as_deref() {
+            push_file_recheck(&mut commands, reference);
+        }
+    }
+    for doc in &fields.linked_docs {
+        let path = doc.split_once('#').map_or(doc.as_str(), |item| item.0);
+        if !path.trim().is_empty() {
+            push_unique(
+                &mut commands,
+                format!("rg -n \"TODO|blocked|resolved|verified|stale\" {path}"),
+            );
+        }
+    }
+    for symbol in &memory.linked_symbols {
+        push_unique(
+            &mut commands,
+            format!("rg -n \"{}\"", shell_safe_pattern(symbol)),
+        );
+    }
+    if let Some(refresh_key) = memory.refresh_key.as_deref() {
+        push_unique(
+            &mut commands,
+            format!("rg -n \"{}\" .", shell_safe_pattern(refresh_key)),
+        );
+    }
+    commands.truncate(8);
+    commands
+}
+
+fn command_for_test_ref(reference: &str) -> String {
+    if reference.ends_with(".py") || reference.contains(".py::") {
+        format!("pytest {reference}")
+    } else if reference.ends_with(".rs") || reference.contains(".rs::") {
+        if let Some((_, test_name)) = reference.rsplit_once("::") {
+            format!("cd daemon && cargo test {test_name}")
+        } else {
+            "cd daemon && cargo test --workspace".to_string()
+        }
+    } else if reference.ends_with(".ts")
+        || reference.ends_with(".tsx")
+        || reference.ends_with(".js")
+        || reference.ends_with(".jsx")
+    {
+        format!("npm test -- {reference}")
+    } else {
+        format!("Run targeted test reference {reference}")
+    }
+}
+
+fn push_file_recheck(commands: &mut Vec<String>, file: &str) {
+    let path = file.trim();
+    if path.is_empty() {
+        return;
+    }
+    if path.ends_with(".rs") {
+        if path.starts_with("daemon/crates/lattice-core") {
+            push_unique(
+                commands,
+                "cd daemon && cargo test -p lattice-core".to_string(),
+            );
+        } else if path.starts_with("daemon/crates/lattice-daemon") {
+            push_unique(
+                commands,
+                "cd daemon && cargo test -p lattice-daemon --lib".to_string(),
+            );
+        } else {
+            push_unique(commands, "cd daemon && cargo test --workspace".to_string());
+        }
+    } else if path.ends_with(".py") {
+        push_unique(commands, format!("pytest {path}"));
+    } else if path.ends_with(".ts") || path.ends_with(".tsx") {
+        push_unique(commands, format!("npm test -- {path}"));
+    } else if path.ends_with(".md") {
+        push_unique(
+            commands,
+            format!("rg -n \"TODO|blocked|resolved|verified|stale\" {path}"),
+        );
+    }
+    push_unique(commands, format!("git diff -- {path}"));
+}
+
+fn push_unique(commands: &mut Vec<String>, command: String) {
+    if command.trim().is_empty() || commands.iter().any(|existing| existing == &command) {
+        return;
+    }
+    commands.push(command);
+}
+
+fn shell_safe_pattern(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub(crate) fn memory_trust_status(

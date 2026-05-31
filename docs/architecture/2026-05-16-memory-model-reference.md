@@ -54,8 +54,9 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `usefulness_scores` | metric map | yes | empty map | Retrieval and later-use metrics. |
 | `last_verified_state` | verification report reference | yes | null | Last persisted verification output. |
 | `checkout_state` | object | derived | derived | Response-only recorded/current Git HEAD comparison. New memory writes add `git_head_ref` and `git_head_oid` provenance entries when the workspace is a Git checkout. |
+| `recheck_commands` | string list | derived | empty list | Response-only bounded command suggestions derived from linked tests, files, docs, symbols, and evidence references. |
 
-`trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim.
+`trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim. `recheck_commands` are convenience probes for that confirmation step; they are not verification evidence until executed and reviewed.
 
 ## Memory link types
 

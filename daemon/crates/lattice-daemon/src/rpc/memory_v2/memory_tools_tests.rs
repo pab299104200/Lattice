@@ -252,6 +252,9 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         assert!(memory["checkout_state"]["status"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
+        assert!(memory["recheck_commands"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
     }
 
     let events = read_events(&event_store, &workspace_root);

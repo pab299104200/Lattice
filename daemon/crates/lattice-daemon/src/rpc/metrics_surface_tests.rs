@@ -275,6 +275,7 @@ fn workflow_bundle_fixture() -> WorkflowBundle {
             contradiction_state: "none".to_string(),
             expansion_target: "memory:mem-1".to_string(),
             stale_label: None,
+            recheck_commands: vec!["cd daemon && cargo test auth".to_string()],
             relevance_summary: None,
             relevance_breakdown: None,
             relevance_detail_handle: None,

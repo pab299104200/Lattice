@@ -57,10 +57,18 @@ fn unverified_memories_are_advisory_risks() {
         .expect("fixture includes unverified memory");
     assert_eq!(advisory.trust_status, "advisory");
     assert_eq!(advisory.trust_reason, "unverified");
+    assert!(advisory
+        .recheck_commands
+        .iter()
+        .any(|command| command.contains("auth")));
     assert!(bundle.risks.iter().any(|risk| {
         risk.message
             .contains("Memory is advisory, not proof: unverified")
     }));
+    assert!(bundle
+        .verification_commands
+        .iter()
+        .any(|command| command.contains("auth")));
 }
 
 #[test]
@@ -330,6 +338,7 @@ fn build_capsule() -> ContextCapsule {
                 "scope": "repo",
                 "confidence": 0.7,
                 "verification_status": "unverified",
+                "linked_files": ["src/auth.ts"],
                 "inclusion_reason": "matched auth failure",
             }),
             json!({

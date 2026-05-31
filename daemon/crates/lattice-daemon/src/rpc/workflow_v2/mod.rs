@@ -233,6 +233,8 @@ pub struct MemoryHighlight {
     pub expansion_target: String,
     /// Required warning label for stale or otherwise unsafe statuses.
     pub stale_label: Option<String>,
+    /// Bounded commands or command-like probes callers can run to re-check the claim now.
+    pub recheck_commands: Vec<String>,
     /// Bounded one-line relevance digest for compact render mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relevance_summary: Option<String>,
@@ -468,6 +470,7 @@ fn memory_highlight(
         .get("evidence")
         .and_then(Value::as_array)
         .map_or(true, Vec::is_empty);
+    let recheck_commands = memory_recheck_commands(object);
     Some(MemoryHighlight {
         memory_id: memory_identity(workspace_id, &memory_id),
         content,
@@ -484,11 +487,47 @@ fn memory_highlight(
         contradiction_state: contradiction_state(object, status_kind),
         expansion_target: format!("memory:{memory_id}"),
         stale_label,
+        recheck_commands,
         relevance_summary: None,
         relevance_breakdown: None,
         relevance_detail_handle: None,
         relevance_detail_focus: None,
     })
+}
+
+fn memory_recheck_commands(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut commands = Vec::new();
+    for test in string_array_field(object, "linked_tests") {
+        push_unique(&mut commands, command_for_test_ref(&test));
+    }
+    for file in string_array_field(object, "linked_files") {
+        push_file_recheck(&mut commands, &file);
+    }
+    for doc in string_array_field(object, "linked_docs") {
+        let path = doc.split_once('#').map_or(doc.as_str(), |item| item.0);
+        if !path.trim().is_empty() {
+            push_unique(
+                &mut commands,
+                format!("rg -n \"TODO|blocked|resolved|verified|stale\" {path}"),
+            );
+        }
+    }
+    if let Some(items) = object.get("evidence").and_then(Value::as_array) {
+        for evidence in items.iter().filter_map(Value::as_object) {
+            let kind = string_field(evidence, &["kind"]).unwrap_or_default();
+            let reference = string_field(evidence, &["reference"]).unwrap_or_default();
+            if reference.is_empty() {
+                continue;
+            }
+            match kind.as_str() {
+                "test" => push_unique(&mut commands, command_for_test_ref(&reference)),
+                "file" => push_file_recheck(&mut commands, &reference),
+                _ => {}
+            }
+        }
+    }
+    commands.truncate(8);
+    commands
 }
 
 fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -498,6 +537,81 @@ fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .next()
+}
+
+fn string_array_field(object: &serde_json::Map<String, Value>, key: &str) -> Vec<String> {
+    object
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn command_for_test_ref(reference: &str) -> String {
+    if reference.ends_with(".py") || reference.contains(".py::") {
+        format!("pytest {reference}")
+    } else if reference.ends_with(".rs") || reference.contains(".rs::") {
+        if let Some((_, test_name)) = reference.rsplit_once("::") {
+            format!("cd daemon && cargo test {test_name}")
+        } else {
+            "cd daemon && cargo test --workspace".to_string()
+        }
+    } else if reference.ends_with(".ts")
+        || reference.ends_with(".tsx")
+        || reference.ends_with(".js")
+        || reference.ends_with(".jsx")
+    {
+        format!("npm test -- {reference}")
+    } else {
+        format!("Run targeted test reference {reference}")
+    }
+}
+
+fn push_file_recheck(commands: &mut Vec<String>, file: &str) {
+    let path = file.trim();
+    if path.is_empty() {
+        return;
+    }
+    if path.ends_with(".rs") {
+        if path.starts_with("daemon/crates/lattice-core") {
+            push_unique(
+                commands,
+                "cd daemon && cargo test -p lattice-core".to_string(),
+            );
+        } else if path.starts_with("daemon/crates/lattice-daemon") {
+            push_unique(
+                commands,
+                "cd daemon && cargo test -p lattice-daemon --lib".to_string(),
+            );
+        } else {
+            push_unique(commands, "cd daemon && cargo test --workspace".to_string());
+        }
+    } else if path.ends_with(".py") {
+        push_unique(commands, format!("pytest {path}"));
+    } else if path.ends_with(".ts") || path.ends_with(".tsx") {
+        push_unique(commands, format!("npm test -- {path}"));
+    } else if path.ends_with(".md") {
+        push_unique(
+            commands,
+            format!("rg -n \"TODO|blocked|resolved|verified|stale\" {path}"),
+        );
+    }
+    push_unique(commands, format!("git diff -- {path}"));
+}
+
+fn push_unique(commands: &mut Vec<String>, command: String) {
+    if command.trim().is_empty() || commands.iter().any(|existing| existing == &command) {
+        return;
+    }
+    commands.push(command);
 }
 
 fn evidence_strength(object: &serde_json::Map<String, Value>) -> String {
@@ -698,6 +812,16 @@ pub(crate) fn bundle_from_task(
         .iter()
         .map(|item| item.file.clone())
         .collect::<Vec<_>>();
+    let mut commands = verification_commands(&files, &tests);
+    for memory in &memories {
+        for command in &memory.recheck_commands {
+            if !commands.iter().any(|existing| existing == command) {
+                commands.push(command.clone());
+            }
+        }
+    }
+    commands.sort();
+    commands.dedup();
     WorkflowBundle {
         overview: task.overview.clone(),
         ranked_pivots: task
@@ -745,7 +869,7 @@ pub(crate) fn bundle_from_task(
         stable_handles: stable_handles(&files),
         risks,
         render_choice: render_choice(request),
-        verification_commands: verification_commands(&files, &tests),
+        verification_commands: commands,
         workflow_record: workflow_record("prepare_change", request, &files, &task.rationale),
         structured_payload: serde_json::to_value(task).unwrap_or_else(|_| json!({})),
     }

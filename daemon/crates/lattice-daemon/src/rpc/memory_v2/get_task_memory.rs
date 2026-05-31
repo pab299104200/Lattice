@@ -1,7 +1,8 @@
 use super::{
     checkout_state_for_memory, contradiction_state, evidence_strength, expansion_handle,
-    freshness_status, memory_trust_reason, memory_trust_status, memory_workspace_conflict,
-    memory_workspace_path_diagnostic, supersession_state, MemoryRecord, TaskMemoryBundle,
+    freshness_status, memory_recheck_commands, memory_trust_reason, memory_trust_status,
+    memory_workspace_conflict, memory_workspace_path_diagnostic, supersession_state, MemoryRecord,
+    TaskMemoryBundle,
 };
 use lattice_core::memory::{Memory, MemoryScoreKind, MemoryScoreRecord, MemoryStore};
 use lattice_core::working_memory::{CheckpointId, WorkingMemoryState};
@@ -169,6 +170,7 @@ fn build_memory_record(
         checkout_state,
         workspace_conflict: memory_workspace_conflict(memory),
         workspace_path_diagnostic: memory_workspace_path_diagnostic(memory),
+        recheck_commands: memory_recheck_commands(memory, &fields),
     })
 }
 
