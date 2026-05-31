@@ -58,6 +58,12 @@ fn unverified_memories_are_advisory_risks() {
     assert_eq!(advisory.trust_status, "advisory");
     assert_eq!(advisory.trust_reason, "unverified");
     assert!(advisory
+        .risk_domains
+        .iter()
+        .any(|domain| domain == "security"));
+    assert!(advisory.requires_reverification);
+    assert_eq!(advisory.reverification_reason, "high_risk_unverified");
+    assert!(advisory
         .recheck_commands
         .iter()
         .any(|command| command.contains("auth")));

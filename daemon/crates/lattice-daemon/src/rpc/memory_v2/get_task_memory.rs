@@ -1,8 +1,8 @@
 use super::{
     checkout_state_for_memory, contradiction_state, evidence_strength, expansion_handle,
-    freshness_status, memory_recheck_commands, memory_trust_reason, memory_trust_status,
-    memory_workspace_conflict, memory_workspace_path_diagnostic, supersession_state, MemoryRecord,
-    TaskMemoryBundle,
+    freshness_status, memory_recheck_commands, memory_requires_reverification, memory_risk_domains,
+    memory_trust_reason, memory_trust_status, memory_workspace_conflict,
+    memory_workspace_path_diagnostic, supersession_state, MemoryRecord, TaskMemoryBundle,
 };
 use lattice_core::memory::{Memory, MemoryScoreKind, MemoryScoreRecord, MemoryStore};
 use lattice_core::working_memory::{CheckpointId, WorkingMemoryState};
@@ -133,6 +133,14 @@ fn build_memory_record(
     let checkout_state = checkout_state_for_memory(memory, &fields, workspace_id);
     let trust_status = memory_trust_status(memory, &fields, &checkout_state).to_string();
     let trust_reason = memory_trust_reason(memory, &fields, &checkout_state).to_string();
+    let risk_domains = memory_risk_domains(memory, &fields);
+    let (requires_reverification, reverification_reason) = memory_requires_reverification(
+        memory,
+        &fields,
+        &checkout_state,
+        &risk_domains,
+        last_verified_at,
+    );
     Ok(MemoryRecord {
         id: memory.id.clone(),
         expansion_handle: expansion_handle(memory, workspace_id),
@@ -145,6 +153,9 @@ fn build_memory_record(
         verification_status: fields.verification_status.as_str().to_string(),
         trust_status,
         trust_reason,
+        risk_domains,
+        requires_reverification,
+        reverification_reason,
         freshness_status: freshness_status(memory, &fields, expires_at),
         contradiction_state: contradiction_state(&fields),
         supersession_state: supersession_state(&fields),

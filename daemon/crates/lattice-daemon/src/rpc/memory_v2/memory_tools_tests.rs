@@ -249,6 +249,13 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         assert!(memory["trust_reason"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
+        assert!(memory["risk_domains"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("security"))));
+        assert!(memory["requires_reverification"].as_bool().is_some());
+        assert!(memory["reverification_reason"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert!(memory["checkout_state"]["status"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));

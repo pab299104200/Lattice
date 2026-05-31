@@ -78,6 +78,12 @@ pub struct MemoryRecord {
     pub trust_status: String,
     /// Machine-readable reason for the trust tier.
     pub trust_reason: String,
+    /// High-risk domains inferred from the memory text and links.
+    pub risk_domains: Vec<String>,
+    /// Whether callers should re-check the claim before relying on it.
+    pub requires_reverification: bool,
+    /// Machine-readable reason for the re-verification requirement.
+    pub reverification_reason: String,
     /// Current freshness status for the memory surface.
     pub freshness_status: String,
     /// Contradiction state summary.
@@ -462,6 +468,137 @@ pub(crate) fn memory_trust_reason(
                 "verified"
             }
         }
+    }
+}
+
+pub(crate) fn memory_risk_domains(memory: &Memory, fields: &MemoryStructuredFields) -> Vec<String> {
+    let haystack = format!(
+        "{} {} {} {} {} {} {} {}",
+        memory.content,
+        memory.linked_files.join(" "),
+        memory.linked_symbols.join(" "),
+        fields.linked_docs.join(" "),
+        fields.linked_tests.join(" "),
+        fields.validity_conditions.join(" "),
+        fields.invalidation_triggers.join(" "),
+        fields
+            .evidence
+            .iter()
+            .filter_map(|item| serde_json::to_string(item).ok())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+    .to_ascii_lowercase();
+    classify_risk_domains(&haystack)
+}
+
+pub(crate) fn classify_risk_domains(haystack: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    push_domain_if(
+        &mut domains,
+        "security",
+        haystack,
+        &[
+            "security",
+            "auth",
+            "jwt",
+            "token",
+            "password",
+            "secret",
+            "permission",
+            "authorization",
+            "vulnerability",
+            "cve",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "tenancy",
+        haystack,
+        &[
+            "tenant",
+            "tenancy",
+            "rls",
+            "org isolation",
+            "workspace boundary",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "migration",
+        haystack,
+        &["migration", "schema", "alembic", "diesel", "backfill"],
+    );
+    push_domain_if(
+        &mut domains,
+        "deploy",
+        haystack,
+        &["deploy", "release", "rollout", "rollback", "production"],
+    );
+    push_domain_if(
+        &mut domains,
+        "dependency",
+        haystack,
+        &[
+            "dependency",
+            "dependencies",
+            "pip-audit",
+            "npm audit",
+            "cargo audit",
+            "lockfile",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "test_suite",
+        haystack,
+        &[
+            "full suite",
+            "test suite",
+            "cargo test --workspace",
+            "pytest",
+            "npm test",
+        ],
+    );
+    domains
+}
+
+pub(crate) fn memory_requires_reverification(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+    checkout_state: &MemoryCheckoutState,
+    risk_domains: &[String],
+    last_verified_at: Option<u64>,
+) -> (bool, String) {
+    if risk_domains.is_empty() {
+        return (false, "not_high_risk".to_string());
+    }
+    if memory.is_stale {
+        return (true, "stale_high_risk_memory".to_string());
+    }
+    if fields.verification_status != MemoryVerificationStatus::Verified {
+        return (
+            true,
+            format!("high_risk_{}", fields.verification_status.as_str()),
+        );
+    }
+    if fields.evidence.is_empty() {
+        return (true, "high_risk_missing_evidence".to_string());
+    }
+    if checkout_state.status != "same_head" {
+        return (true, format!("high_risk_{}", checkout_state.status));
+    }
+    if last_verified_at.is_none() {
+        return (true, "high_risk_never_verified".to_string());
+    }
+    (false, "high_risk_verified_current".to_string())
+}
+
+fn push_domain_if(domains: &mut Vec<String>, domain: &str, haystack: &str, needles: &[&str]) {
+    if needles.iter().any(|needle| haystack.contains(needle))
+        && !domains.iter().any(|existing| existing == domain)
+    {
+        domains.push(domain.to_string());
     }
 }
 

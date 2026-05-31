@@ -36,6 +36,9 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `verification_status` | enum | no | `unverified` | See [## Verification status state machine](#verification-status-state-machine). |
 | `trust_status` | enum/string | derived | derived | Response-only trust tier: `trusted`, `advisory`, or `stale`. |
 | `trust_reason` | enum/string | derived | derived | Response-only reason such as `verified`, `unverified`, `verification_in_review`, `missing_evidence`, or `git_head_changed`. |
+| `risk_domains` | string list | derived | empty list | Response-only high-risk tags such as `security`, `tenancy`, `migration`, `deploy`, `dependency`, and `test_suite`. |
+| `requires_reverification` | boolean | derived | false | Response-only flag requiring a current-code re-check before relying on high-risk or stale memory. |
+| `reverification_reason` | enum/string | derived | `not_high_risk` | Response-only reason for the re-verification requirement. |
 | `confidence` | decimal 0.0-1.0 | no | none | Required for durable memory writes. |
 | `confidence_reason` | string | no | none | Explanation for the confidence score. |
 | `freshness_policy` | enum | no | scope-dependent | See [## Freshness policy](#freshness-policy). |
@@ -56,7 +59,7 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `checkout_state` | object | derived | derived | Response-only recorded/current Git HEAD comparison. New memory writes add `git_head_ref` and `git_head_oid` provenance entries when the workspace is a Git checkout. |
 | `recheck_commands` | string list | derived | empty list | Response-only bounded command suggestions derived from linked tests, files, docs, symbols, and evidence references. |
 
-`trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim. `recheck_commands` are convenience probes for that confirmation step; they are not verification evidence until executed and reviewed.
+`trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim. `recheck_commands` are convenience probes for that confirmation step; they are not verification evidence until executed and reviewed. High-risk domains require explicit current-code confirmation unless the memory is verified, evidence-backed, tied to the current checkout, and has a persisted verification timestamp.
 
 ## Memory link types
 

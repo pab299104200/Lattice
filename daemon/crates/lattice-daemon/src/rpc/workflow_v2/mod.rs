@@ -225,6 +225,12 @@ pub struct MemoryHighlight {
     pub trust_status: String,
     /// Machine-readable reason for the trust tier.
     pub trust_reason: String,
+    /// High-risk domains inferred from memory text and links.
+    pub risk_domains: Vec<String>,
+    /// Whether callers should re-check the claim before relying on it.
+    pub requires_reverification: bool,
+    /// Machine-readable reason for the re-verification requirement.
+    pub reverification_reason: String,
     /// Freshness state derived from stale and verification fields.
     pub freshness_status: String,
     /// Contradiction or supersession state.
@@ -471,6 +477,9 @@ fn memory_highlight(
         .and_then(Value::as_array)
         .map_or(true, Vec::is_empty);
     let recheck_commands = memory_recheck_commands(object);
+    let risk_domains = memory_risk_domains(object, &content);
+    let (requires_reverification, reverification_reason) =
+        requires_reverification(status_kind, is_stale, evidence_is_empty, &risk_domains);
     Some(MemoryHighlight {
         memory_id: memory_identity(workspace_id, &memory_id),
         content,
@@ -483,6 +492,9 @@ fn memory_highlight(
         verification_status: status,
         trust_status: trust_status(status_kind, is_stale, evidence_is_empty).to_string(),
         trust_reason: trust_reason(status_kind, is_stale, evidence_is_empty).to_string(),
+        risk_domains,
+        requires_reverification,
+        reverification_reason,
         freshness_status: freshness_status(status_kind, is_stale).to_string(),
         contradiction_state: contradiction_state(object, status_kind),
         expansion_target: format!("memory:{memory_id}"),
@@ -528,6 +540,119 @@ fn memory_recheck_commands(object: &serde_json::Map<String, Value>) -> Vec<Strin
     }
     commands.truncate(8);
     commands
+}
+
+fn memory_risk_domains(object: &serde_json::Map<String, Value>, content: &str) -> Vec<String> {
+    let haystack = format!(
+        "{} {} {} {} {}",
+        content,
+        string_array_field(object, "linked_files").join(" "),
+        string_array_field(object, "linked_symbols").join(" "),
+        string_array_field(object, "linked_docs").join(" "),
+        string_array_field(object, "linked_tests").join(" ")
+    )
+    .to_ascii_lowercase();
+    classify_risk_domains(&haystack)
+}
+
+fn classify_risk_domains(haystack: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    push_domain_if(
+        &mut domains,
+        "security",
+        haystack,
+        &[
+            "security",
+            "auth",
+            "jwt",
+            "token",
+            "password",
+            "secret",
+            "permission",
+            "authorization",
+            "vulnerability",
+            "cve",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "tenancy",
+        haystack,
+        &[
+            "tenant",
+            "tenancy",
+            "rls",
+            "org isolation",
+            "workspace boundary",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "migration",
+        haystack,
+        &["migration", "schema", "alembic", "diesel", "backfill"],
+    );
+    push_domain_if(
+        &mut domains,
+        "deploy",
+        haystack,
+        &["deploy", "release", "rollout", "rollback", "production"],
+    );
+    push_domain_if(
+        &mut domains,
+        "dependency",
+        haystack,
+        &[
+            "dependency",
+            "dependencies",
+            "pip-audit",
+            "npm audit",
+            "cargo audit",
+            "lockfile",
+        ],
+    );
+    push_domain_if(
+        &mut domains,
+        "test_suite",
+        haystack,
+        &[
+            "full suite",
+            "test suite",
+            "cargo test --workspace",
+            "pytest",
+            "npm test",
+        ],
+    );
+    domains
+}
+
+fn requires_reverification(
+    status: MemoryVerificationStatus,
+    is_stale: bool,
+    evidence_is_empty: bool,
+    risk_domains: &[String],
+) -> (bool, String) {
+    if risk_domains.is_empty() {
+        return (false, "not_high_risk".to_string());
+    }
+    if is_stale {
+        return (true, "stale_high_risk_memory".to_string());
+    }
+    if status != MemoryVerificationStatus::Verified {
+        return (true, format!("high_risk_{}", status.as_str()));
+    }
+    if evidence_is_empty {
+        return (true, "high_risk_missing_evidence".to_string());
+    }
+    (false, "high_risk_verified_with_evidence".to_string())
+}
+
+fn push_domain_if(domains: &mut Vec<String>, domain: &str, haystack: &str, needles: &[&str]) {
+    if needles.iter().any(|needle| haystack.contains(needle))
+        && !domains.iter().any(|existing| existing == domain)
+    {
+        domains.push(domain.to_string());
+    }
 }
 
 fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -730,7 +855,18 @@ pub(crate) fn risks_from_memories(memories: &[MemoryHighlight]) -> Vec<RiskNote>
     memories
         .iter()
         .filter_map(|memory| match memory.trust_status.as_str() {
-            "trusted" => None,
+            "trusted" if !memory.requires_reverification => None,
+            "trusted" => Some(RiskNote {
+                severity: "warning".to_string(),
+                identity: Some(StableIdentity::Memory(memory.memory_id.clone())),
+                message: format!(
+                    "High-risk memory needs re-check before use: {}",
+                    memory.reverification_reason
+                ),
+                mitigation:
+                    "Run the memory recheck commands and inspect current code, docs, and tests."
+                        .to_string(),
+            }),
             "stale" => memory.stale_label.as_ref().map(|label| RiskNote {
                 severity: "warning".to_string(),
                 identity: Some(StableIdentity::Memory(memory.memory_id.clone())),
