@@ -168,4 +168,4 @@ The binary is emitted at:
 
 - `daemon/target/release/lattice_report`
 
-If you are installing updated binaries beside the extension-managed daemon binary, copy `lattice_report` explicitly; it is separate from `lattice`.
+If you are installing updated report binaries for operators, copy or package `lattice_report` explicitly; it is separate from `lattice`.

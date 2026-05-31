@@ -29,6 +29,13 @@ fn test_should_not_index_excluded_dirs() {
     assert!(!should_index_file("target/debug/main.rs"));
     assert!(!should_index_file(".claude/worktrees/agent-123/src/app.py"));
     assert!(!should_index_file(".codex/worktrees/task-123/src/app.py"));
+    assert!(!should_index_file(
+        "docs/audit/2026-05-18-remediation-run/worktrees/IU-001/backend/app.py"
+    ));
+    assert!(!should_index_file(".pytest_cache/README.md"));
+    assert!(!should_index_file("backend/.ruff_cache/0.9.0/file.py"));
+    assert!(!should_index_file(".playwright-mcp/session/state.md"));
+    assert!(!should_index_file(".agents/task-notes.md"));
 }
 
 #[test]

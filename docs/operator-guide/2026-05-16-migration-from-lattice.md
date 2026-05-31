@@ -10,15 +10,14 @@ Migration preserves useful Lattice assets while replacing memory retrieval, even
 
 1. Read [Storage Migration Policy](../architecture/2026-05-16-storage-migration-policy.md#policy) and confirm the target version.
 2. Stop active Lattice daemon processes.
-3. Back up the existing workspace `.lattice/` storage directory and installed extension binary.
+3. Back up the existing workspace `.lattice/` storage directory and record the active daemon binary path.
 4. Build the successor daemon with `cd daemon && cargo build --release`.
-5. Compile the extension with `cd extension && npm install && npm run compile`.
-6. Run pre-flight checks from [## Pre-flight checks](#pre-flight-checks).
-7. Run the storage migration command or startup migration path defined by the current daemon release.
-8. Reindex the workspace and confirm `index_status` reports a healthy graph.
-9. Verify MCP compatibility with a representative `get_context_capsule`, `prepare_change`, and `search_memory` call.
-10. Open the review panel and inspect migrated memory, stale state, proposals, event trace, indexing health, and graph health.
-11. Capture post-migration verification evidence in the operator change record.
+5. Run pre-flight checks from [## Pre-flight checks](#pre-flight-checks).
+6. Run the storage migration command or startup migration path defined by the current daemon release.
+7. Reindex the workspace and confirm `index_status` reports a healthy graph.
+8. Verify MCP compatibility with a representative `get_context_capsule`, `prepare_change`, and `search_memory` call.
+9. Inspect migrated memory, stale state, proposals, event trace, indexing health, and graph health through MCP tools.
+10. Capture post-migration verification evidence in the operator change record.
 
 ## Pre-flight checks
 
@@ -27,7 +26,7 @@ Migration preserves useful Lattice assets while replacing memory retrieval, even
 - Existing `.lattice/` storage is backed up.
 - SQLite files are not open by another daemon process.
 - Disk space can hold the original store, migrated store, payload spillover, and a compaction snapshot.
-- Extension and daemon versions are from the same build.
+- MCP clients point at the daemon binary built for the migration.
 - Existing MCP clients can tolerate documented shims from [MCP Compatibility Policy](../architecture/2026-05-16-mcp-compatibility-policy.md#legacy-aliases-and-deadlines).
 
 ## Data preservation guarantees
@@ -43,7 +42,7 @@ Rollback follows [## Rollback](../architecture/2026-05-16-storage-migration-poli
 1. Stop the successor daemon.
 2. Move the migrated store aside without deleting it.
 3. Restore the backed-up `.lattice/` storage directory.
-4. Restore the prior extension binary if required.
+4. Restore the prior daemon binary path in MCP client configuration if required.
 5. Start the prior daemon and confirm legacy MCP calls respond.
 6. Preserve logs and migration diagnostics for analysis.
 
@@ -59,4 +58,4 @@ Run these checks after migration:
 - `search_memory` returns migrated memory with scope and verification labels.
 - `verify_explain_memory` explains a migrated memory state.
 - `get_event_trace` returns scoped events for a recent task or session.
-- Review UI queues render without unsupported data being shown as authoritative.
+- Memory, event, metrics, and health MCP responses do not show unsupported data as authoritative.

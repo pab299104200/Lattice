@@ -43,8 +43,6 @@ The current canonical `tools/list` surface contains 37 tools. Their successor cl
 | `get_impact_graph` | `additive` | Stable name; later phases add event-derived and verification-derived edges. |
 | `search_symbols` | `additive` | Stable name; later phases add typed ids and ranking explanations. |
 | `get_skeleton` | `additive` | Stable name; later phases add typed ids and richer structural metadata. |
-| `save_observation` | `redesigned-with-shim` | Legacy observation-centric write path evolves toward `save_memory` over the broader memory class model. |
-| `get_session_context` | `redesigned-with-shim` | Session-only memory recall evolves toward task-scoped and working-memory-aware retrieval such as `get_task_memory`. |
 | `search_memory` | `additive` | Stable name; remains a required workflow tool but gains typed memory, evidence, and event-aware ranking fields. |
 | `search_logic_flow` | `additive` | Stable name; later phases add typed ids and explainable path reasons. |
 | `submit_lsp_edges` | `stable` | Internal graph enrichment contract stays narrow; no redesign is planned in the cognitive workspace phases. |
@@ -52,12 +50,7 @@ The current canonical `tools/list` surface contains 37 tools. Their successor cl
 | `index_status` | `stable` | Operational status tool remains stable; output may gain optional fields only if needed. |
 | `get_session_metrics` | `additive` | Stable name; later phases add event-log and memory-usefulness metrics. |
 | `get_project_rules` | `stable` | Project-rule summary remains stable; only content freshness changes are expected. |
-| `list_observations` | `redesigned-with-shim` | Observation-centric listing evolves toward typed memory inbox and review surfaces. |
 | `list_stale_memories` | `additive` | Stable name; later phases add verification-job, evidence, and conflict metadata. |
-| `promote_observation` | `redesigned-with-shim` | Promotion stays conceptually valid but will shift to broader typed-memory promotion semantics. |
-| `refresh_memory` | `additive` | Stable name; later phases add explicit verification, evidence, and event provenance fields. |
-| `delete_observation` | `redesigned-with-shim` | Observation-specific delete path evolves toward generalized memory lifecycle operations. |
-| `update_observation` | `redesigned-with-shim` | Observation-specific update path evolves toward generalized memory lifecycle operations. |
 
 The rationale for treating most workflow tools as `additive` is simple: [## MCP Surface](../plans/2026-05-16-cognitive-workspace-fork-plan.md#mcp-surface) keeps the current workflow vocabulary as the successor surface. The architecture changes the backing substrates, not the top-level user intent of those tools.
 
@@ -70,7 +63,6 @@ The current daemon accepts five legacy aliases that do not appear in `tools/list
 | `query_context` | `get_context_capsule` | `deprecated-with-deadline` | Remove no earlier than one full phase cycle after all first-party fixtures and cached seeds move to `get_context_capsule`. |
 | `blast_radius` | `get_impact_graph` | `deprecated-with-deadline` | Remove no earlier than one full phase cycle after all first-party clients move to `get_impact_graph`. |
 | `get_file_context` | `get_skeleton` | `deprecated-with-deadline` | Remove no earlier than one full phase cycle after all first-party clients move to `get_skeleton`. |
-| `store_memory` | `save_observation` | `deprecated-with-deadline` | Remove no earlier than one full phase cycle after the `save_observation` shim or its successor is in place for all maintained clients. |
 | `recall_memories` | `search_memory` | `deprecated-with-deadline` | Remove no earlier than one full phase cycle after all first-party clients move to `search_memory`. |
 
 No new alias may be added casually. Every alias is compatibility debt and must name its canonical target, phase-cycle deadline, and removal test coverage at creation time.

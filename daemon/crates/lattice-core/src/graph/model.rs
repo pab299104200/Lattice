@@ -165,6 +165,17 @@ impl CodeGraph {
         self.index.get(id).map(|&idx| &self.graph[idx])
     }
 
+    /// Fill empty node bodies from a previous snapshot when the symbol id is unchanged.
+    pub fn hydrate_missing_bodies_from(&mut self, previous: &CodeGraph) {
+        for node in self.graph.node_weights_mut() {
+            if node.body.is_empty() {
+                if let Some(previous_node) = previous.get_node(&node.id) {
+                    node.body = previous_node.body.clone();
+                }
+            }
+        }
+    }
+
     /// Get outgoing dependencies of a node (symbols this node depends on).
     pub fn get_dependencies(&self, id: &SymbolId) -> Vec<(&GraphNode, EdgeKind)> {
         let idx = match self.index.get(id) {

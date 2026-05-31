@@ -221,6 +221,10 @@ pub struct MemoryHighlight {
     pub evidence_strength: String,
     /// Verification lifecycle state.
     pub verification_status: String,
+    /// Trust tier callers should use before treating this memory as guidance.
+    pub trust_status: String,
+    /// Machine-readable reason for the trust tier.
+    pub trust_reason: String,
     /// Freshness state derived from stale and verification fields.
     pub freshness_status: String,
     /// Contradiction or supersession state.
@@ -460,6 +464,10 @@ fn memory_highlight(
         string_field(object, &["id", "memory_id"]).unwrap_or_else(|| format!("memory-{index}"));
     let status_kind = MemoryVerificationStatus::from_str(&status);
     let stale_label = stale_label(status_kind, is_stale);
+    let evidence_is_empty = object
+        .get("evidence")
+        .and_then(Value::as_array)
+        .map_or(true, Vec::is_empty);
     Some(MemoryHighlight {
         memory_id: memory_identity(workspace_id, &memory_id),
         content,
@@ -470,6 +478,8 @@ fn memory_highlight(
             .unwrap_or_else(|| fallback_reason.to_string()),
         evidence_strength: evidence_strength(object),
         verification_status: status,
+        trust_status: trust_status(status_kind, is_stale, evidence_is_empty).to_string(),
+        trust_reason: trust_reason(status_kind, is_stale, evidence_is_empty).to_string(),
         freshness_status: freshness_status(status_kind, is_stale).to_string(),
         contradiction_state: contradiction_state(object, status_kind),
         expansion_target: format!("memory:{memory_id}"),
@@ -523,6 +533,55 @@ fn stale_label(status: MemoryVerificationStatus, is_stale: bool) -> Option<Strin
     }
 }
 
+fn trust_status(
+    status: MemoryVerificationStatus,
+    is_stale: bool,
+    evidence_is_empty: bool,
+) -> &'static str {
+    if is_stale
+        || matches!(
+            status,
+            MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+    {
+        "stale"
+    } else if evidence_is_empty
+        || matches!(
+            status,
+            MemoryVerificationStatus::Unverified | MemoryVerificationStatus::InReview
+        )
+    {
+        "advisory"
+    } else {
+        "trusted"
+    }
+}
+
+fn trust_reason(
+    status: MemoryVerificationStatus,
+    is_stale: bool,
+    evidence_is_empty: bool,
+) -> &'static str {
+    if is_stale {
+        return "marked_stale";
+    }
+    match status {
+        MemoryVerificationStatus::Verified if evidence_is_empty => "missing_evidence",
+        MemoryVerificationStatus::Verified => "verified",
+        MemoryVerificationStatus::InReview => "verification_in_review",
+        MemoryVerificationStatus::Unverified => "unverified",
+        MemoryVerificationStatus::Stale => "verification_stale",
+        MemoryVerificationStatus::Contradicted => "contradicted",
+        MemoryVerificationStatus::Superseded => "superseded",
+        MemoryVerificationStatus::Expired => "expired",
+        MemoryVerificationStatus::Invalidated => "invalidated",
+    }
+}
+
 fn freshness_status(status: MemoryVerificationStatus, is_stale: bool) -> &'static str {
     if is_stale || matches!(status, MemoryVerificationStatus::Stale) {
         "stale"
@@ -556,14 +615,23 @@ fn contradiction_state(
 pub(crate) fn risks_from_memories(memories: &[MemoryHighlight]) -> Vec<RiskNote> {
     memories
         .iter()
-        .filter_map(|memory| {
-            memory.stale_label.as_ref().map(|label| RiskNote {
+        .filter_map(|memory| match memory.trust_status.as_str() {
+            "trusted" => None,
+            "stale" => memory.stale_label.as_ref().map(|label| RiskNote {
                 severity: "warning".to_string(),
                 identity: Some(StableIdentity::Memory(memory.memory_id.clone())),
                 message: format!("Memory is not trusted guidance: {label}"),
                 mitigation: "Use it only as historical evidence and verify against current code."
                     .to_string(),
-            })
+            }),
+            _ => Some(RiskNote {
+                severity: "warning".to_string(),
+                identity: Some(StableIdentity::Memory(memory.memory_id.clone())),
+                message: format!("Memory is advisory, not proof: {}", memory.trust_reason),
+                mitigation:
+                    "Verify the claim against current code, docs, and tests before relying on it."
+                        .to_string(),
+            }),
         })
         .collect()
 }

@@ -85,6 +85,8 @@ impl SchemaFixture {
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             Some(event_writer),
+            Vec::new(),
+            Vec::new(),
         );
         SchemaFixture {
             handler,

@@ -219,7 +219,7 @@ const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024;
 
 /// Read a single message from stdin.
 /// Supports both Content-Length framing (for clients that send it) and raw JSON lines.
-fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String>> {
+pub(crate) fn read_message_sync<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<String>> {
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;

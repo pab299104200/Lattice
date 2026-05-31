@@ -1,6 +1,6 @@
 # Lattice
 
-Local AI context engine for MCP-enabled coding assistants, with an optional VS Code UI.
+Local AI context engine for MCP-enabled coding assistants.
 
 Lattice indexes your codebase and repo Markdown into a dependency graph, then serves ranked context, workflow bundles, docs navigation, compact summaries, and persistent memory to assistants like Codex and Claude Code. Instead of sending whole files or relying on broad search, it returns the files, symbols, docs sections, tests, and prior decisions that are most likely to matter.
 
@@ -52,13 +52,6 @@ Compact follow-up targets now prefer stable handles when the graph node identity
 
 ## How You Use Lattice
 
-Lattice works in two complementary ways:
-
-- through MCP-enabled coding assistants and CLIs like Codex and Claude Code, where the assistant calls Lattice tools directly
-- through the VS Code extension, which layers visual navigation, status, and command surfaces on top of the same daemon
-
-### In CLI And MCP Clients
-
 When you run Lattice through an MCP client, you get:
 
 - workflow tools like `prepare_change`, `plan_edit`, `trace_scenario`, `impact_from_diff`, `diagnose_failure`, and `expand_context`
@@ -68,21 +61,6 @@ When you run Lattice through an MCP client, you get:
 - persisted ANN semantic search under `.lattice/` with automatic SQLite exact-search fallback, plus scoped symbol and file-summary vector retrieval
 - SQLite FTS5-backed memory keyword search with automatic backfill for existing memory databases
 - graceful stdio shutdown: the daemon now aborts in-flight requests on client cancellation or disconnect so abandoned sub-agent calls do not linger
-- the same daemon and graph engine that powers the VS Code experience
-
-### In VS Code
-
-When you use the Lattice VS Code extension, you get everything above plus:
-
-- a Lattice activity-bar view with daemon status and index statistics
-- a **Knowledge Freshness** panel with changed-file context and likely stale docs
-- an **Agent Efficiency** panel with session token/efficiency metrics
-- a **Docs Graph** workbench that follows the active editor, can pin a target, and lets you walk backlinks and outgoing links visually
-- Markdown CodeLens actions for `Open Docs Graph`, `Backlinks`, and `Outgoing`
-- maintenance actions in the sidebar: `Re-index Workspace`, `Clear Memory`, and `Open Docs Graph`
-- Command Palette actions for workflow tools like `Prepare Change`, `Analyze Diff Impact`, `Diagnose Failure`, and `Expand Context`
-- Command Palette actions for docs workflows like `Get Docs Capsule`, `Show Backlinks`, `Show Outgoing Links`, `Find Stale Docs`, and `Open Docs Graph`
-- a bundled daemon that starts automatically for the current workspace
 
 ## Local Setup
 
@@ -92,16 +70,31 @@ For local development or GitHub installs:
 git clone https://github.com/pab299104200/Lattice.git
 cd Lattice/daemon
 cargo build --release
-cd ../extension
-npm install
-npm run compile
 ```
 
-Then point your MCP client, coding CLI, or local VS Code extension setup at the built daemon:
+Then point your MCP client or coding CLI at the built binary:
 
 ```text
 daemon/target/release/lattice
 ```
+
+For MCP clients, `lattice --stdio --workspace <path>` is a lightweight proxy. The proxy keeps client stdio dedicated to MCP, connects to the long-lived local Lattice daemon, and starts that daemon if it is not already running. The daemon is one process per user environment and can host multiple workspace shards at the same time; each proxy connection is bound to the workspace path supplied by that MCP client.
+
+The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.
+
+Multi-root proxy requests are represented as logical views over canonical per-root shards instead of as graph-owning combined runtimes. The daemon preserves the existing MCP method and tool schemas, warms the primary requested shard before accepting tool traffic, and prewarms the remaining view shards sequentially in the background so clients do not pay a seven-repo startup latency spike. Graph-backed workflow and dependency-analysis tools fan out across selected shards and return a bounded merged payload with per-shard summaries, source-workspace annotations, `failed_shards`, `incomplete_shards`, and context-handle routing back to the shard that created the handle. The successor direction is documented in [2026-05-20-persistent-daemon-shard-architecture.md](docs/architecture/2026-05-20-persistent-daemon-shard-architecture.md): per-root shard ownership, session-level composed views, and compact structural graphs instead of permanently materialized multi-root mega-runtimes.
+
+The long-lived daemon bounds shard residency instead of keeping every graph forever. Loaded workspace shards are capped by `LATTICE_MAX_LOADED_SHARDS` (default `8`; falls back to the legacy `LATTICE_MAX_LOADED_WORKSPACES` value when set) and idle shards are evicted after `LATTICE_WORKSPACE_IDLE_TTL_SECS` (default `1800`). Multi-root view prewarming is enabled by default and can be disabled with `LATTICE_PREWARM_VIEW_SHARDS=0`; it is bounded by the same loaded-shard cap and stops at the first shard-load failure. Eviction stops that shard's indexing, watcher, memory-maintenance, and compaction tasks before dropping its graph and index handles. Full-graph semantic vector sync is disabled by default because it can be CPU-expensive on large repos; set `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1` to run it during background indexing.
+
+`index_status` includes warm-load diagnostics for each shard entry in a logical view: `warm_load_skipped`, `warm_load_skip_reason`, `persisted_files`, `limit`, `env_var`, `persisted_bytes`, `byte_limit`, `byte_env_var`, and `effective_files`. This distinguishes a first-run cache miss from a persisted graph that was intentionally skipped because it exceeded `LATTICE_MAX_WARM_GRAPH_FILES` or `LATTICE_MAX_WARM_GRAPH_BYTES`.
+
+Within a loaded workspace, the query engine and indexer share immutable graph snapshots instead of retaining separate graph copies. Reindexing and watcher updates publish a new shared snapshot only when the graph changes, while cached parsed files remain in the indexer for incremental rebuilds.
+
+Graph-backed workflow tools also validate lightweight repo and workspace state at request time. If the current workspace branch, detached `HEAD`, Git index, or other substantial workspace state no longer matches the graph snapshot that was last published, those tools return the existing bounded indexing-style response with `"reason": "branch_switch"` or `"reason": "workspace_change"` instead of serving stale graph results. The daemon stamps context handles with a repo epoch and rejects handles created before a later workspace epoch publishes.
+
+Working-memory state is checkpointed automatically. `get_task_memory` writes a bounded checkpoint when active task state changes, the daemon checkpoints active tasks periodically while runtimes stay loaded, and runtime shutdown triggers a final checkpoint plus session consolidation submission so abrupt session endings are less likely to strand working-memory state.
+
+Process lifecycle events for the proxy and the long-lived daemon are appended to `~/.lattice/logs/lifecycle.jsonl` by default. Set `LATTICE_LIFECYCLE_LOG_DIR` to move that log directory.
 
 At runtime Lattice keeps assistant state under the workspace-local `.lattice/` directory:
 
@@ -154,31 +147,6 @@ Practical rule:
 - `get_context_capsule` decides how the code works
 - `get_skeleton` decides whether a file is worth opening
 
-## VS Code Commands
-
-### Workflow Commands
-
-- `Lattice: Prepare Change`
-- `Lattice: Analyze Diff Impact`
-- `Lattice: Get Working Set Context`
-- `Lattice: Diagnose Failure`
-- `Lattice: Expand Context`
-
-### Docs And Knowledge Commands
-
-- `Lattice: Get Docs Capsule`
-- `Lattice: Show Backlinks`
-- `Lattice: Show Outgoing Links`
-- `Lattice: Find Stale Docs`
-- `Lattice: Open Docs Graph`
-
-### Workspace Commands
-
-- `Lattice: Re-index Workspace`
-- `Lattice: Show Status`
-- `Lattice: Show Dependents`
-- `Lattice: Clear Memory`
-
 ## MCP Server Setup
 
 Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any other MCP client:
@@ -194,6 +162,8 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
   }
 }
 ```
+
+The configured command should stay `lattice --stdio --workspace ...`. Do not point MCP clients at `lattice --daemon`; that mode is the long-lived internal server that proxies start or reuse automatically.
 
 ## MCP Tools
 
@@ -264,40 +234,35 @@ Memory payloads now include additive structured assertion metadata alongside the
 - `supersedes_memory_id`, `superseded_by_memory_id`, `contradicts_memory_ids`, and `contradicted_by_memory_ids`
 - `freshness_policy` and `freshness_policy_detail`
 - `provenance` and `evidence`
+- `trust_status`, `trust_reason`, and `checkout_state`
 
-At a high level, assistants should trust verified workflow outcomes and stronger branch/repo-scoped memories ahead of weaker stale, superseded, or contradicted recall. The legacy fields still exist; these structured fields are additive and help explain why one memory is preferred over another.
+At a high level, assistants should trust verified workflow outcomes with evidence and matching checkout state ahead of weaker stale, superseded, contradicted, unverified, or in-review recall. The legacy fields still exist; these structured fields are additive and help explain why one memory is preferred over another. New durable memories record the current Git `HEAD` ref/OID in provenance when the workspace is a Git checkout, and memory responses compare the recorded state with the current checkout.
 
-- `save_observation`
-  Store a decision, pattern, or note for later reuse. Returned memory payloads may include structured assertion and freshness metadata.
-- `get_session_context`
-  Recall current-session plus relevant previous-session memory, with workflow bundles preferring stronger verified durable memories when available.
+- `get_task_memory`
+  Read task-scoped working memory plus relevant durable memory. The daemon seeds missing task state from the task statement or hint, records automatic checkpoints, hard-scopes recall to the active workspace unless a future cross-repo mode explicitly opts in, and requires concrete task evidence such as matched paths, files, symbols, docs, or structured remediation IDs before surfacing a memory. Returned records include advisory/trusted/stale trust diagnostics and checkout-state comparison so unverified, evidence-free, or different-HEAD claims are not mistaken for proof.
 - `search_memory`
-  Search stored memory across sessions. Structured verification and freshness fields help explain why a hit is stronger or weaker.
-- `list_observations`
-  Review stored memories, including structured trust and freshness metadata when present.
+  Search stored memory across sessions within the active workspace. In multi-root logical views, the daemon fans out to every shard and merges results by exact-match score plus cross-shard context coverage so a wrong primary shard or same-ID collision cannot hide the correct workspace memory. The daemon reranks candidates by exact task evidence over memory content, refresh keys, linked files/docs/tests, and evidence; structured IDs such as remediation packet/unit IDs and code identifiers are required anchors, while repo/product-specific query terms break ties across shards. When a query contains structured IDs such as `IU-0031` or `PX-0040`, those IDs are hard anchors: memories that only match generic terms are not returned, and diagnostics report `query_exact_terms`, `matched_exact_terms`, `unmatched_exact_terms`, `durable_exact_term_counts`, `per_shard_exact_term_counts`, and `exact_term_status` so operators can distinguish “absent from durable memory” from a ranking miss. Unverified failure/blocker memories that reference local files changed after the memory was recorded include `freshness_warning`, `trust_status: "advisory"`, and `trust_reason: "freshness_warning"` fields; normal unverified or in-review advisory memories use `trust_reason` values such as `unverified` or `verification_in_review`. Memories whose workspace provenance conflicts with linked absolute file paths include `workspace_conflict` diagnostics; memories with only relative linked paths include `workspace_path_diagnostic` when ownership cannot be cross-checked from paths alone.
 - `list_stale_memories`
   Find memories that likely need refresh.
-- `promote_observation`
-  Promote a memory from session scope into branch or repo scope.
-- `refresh_memory`
-  Refresh a memory in place with new evidence while preserving identity.
+- `save_quick_memory`
+  Capture a lightweight memory using active task state, focus paths, and recent failure context.
+- `save_memory`
+  Create a durable memory with explicit evidence, validity conditions, and invalidation triggers.
 - `consolidate_session`
-  Trigger proposal-only session consolidation and return auditable consolidation proposal ids for later apply or reject decisions.
+  Trigger proposal-only session consolidation and return auditable consolidation proposal ids for later apply or reject decisions. The daemon also submits consolidation automatically on runtime shutdown after checkpointing active task state.
 - `get_memory_metrics` returns canonical Phase 9 metric snapshots from `lattice_core::metrics`, with explicit `session_metrics` fallback provenance only when the canonical collector returns an honest null
   Return the current Phase 9 signal surface with per-signal provenance. When the canonical metrics module is not present yet, missing signals stay explicit `null` with a reason instead of fabricated numbers.
 - `get_event_trace`
   Read a paginated task, session, or workspace event trace with compact, full, or diagnostic rendering for audit and replay workflows.
-- `update_observation`
-  Edit stored memory content in place.
-- `delete_observation`
-  Remove obsolete or incorrect memory.
+- `propose_memory_evolution`
+  Propose, apply, or reject durable memory changes while preserving provenance and prior state.
 - `record_workflow_outcome`
-  Persist successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory.
+  Persist successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory. Outcome recording preserves structured remediation IDs from the task, summary, inherited context handle, and linked files in the durable memory text and refresh key so later exact-ID searches can recover the outcome. Pass `dry_run: true` to compute the outcome content, identifiers, refresh key, scope, and workspace without writing durable memory; use this for live MCP verification probes that should not pollute repo memory. Refresh keys preserve structured IDs and file identity while avoiding arbitrary absolute-path fragments such as `/home` path components.
 
 ### Observability And Workspace Understanding
 
 - `index_status`
-  Current indexing progress and graph stats.
+  Current indexing progress and graph stats. Logical-view responses distinguish `primary_workspace` from query scope and include `workspace_field_meaning`; `request_workspace` is `null` with `request_workspace_available: false` when the stdio client does not provide per-call caller CWD, so operators should use path-bearing tool arguments for request-specific routing.
 - `get_session_metrics`
   Session-level efficiency metrics: token usage, delivery mix, follow-up avoidance, handle reuse, and outcome-memory reuse.
 - `get_event_trace`
@@ -400,15 +365,12 @@ cd daemon
 cargo test --workspace
 cargo test workflow_bench_scorecard -- --ignored --nocapture
 cargo test bench_product_working_set_vs_rg -- --ignored --nocapture
-cd ../extension
-./node_modules/.bin/tsc --noEmit -p ./
 ```
 
 Current test baseline:
 
 - `130` passing core tests
 - `17` passing daemon tests
-- extension TypeScript build passes with `tsc --noEmit`
 
 ## Assistant Memory Instructions
 
@@ -444,9 +406,9 @@ Use these tools when they're the best fit:
 - `get_impact_graph` — before refactoring to understand blast radius
 - `search_symbols` — when looking for a symbol by name
 - `search_logic_flow` — to trace call chains between functions
-- `save_observation` / `get_session_context` / `search_memory` — persist and recall insights across sessions
-- `list_observations` / `list_stale_memories` / `promote_observation` / `refresh_memory` — keep durable memory accurate
-- `update_observation` / `delete_observation` — maintain existing memories
+- `get_task_memory` / `search_memory` — load task working memory and retrieve durable memory
+- `save_quick_memory` / `save_memory` / `propose_memory_evolution` — write or evolve durable memory
+- `list_stale_memories` / `list_memory_conflicts` / `verify_explain_memory` — maintain memory quality
 - `record_workflow_outcome` — store successful outcomes so later sessions can reuse them
 
 For targeted edits to known files, direct Read/Grep/Edit are still fine. If the question is exact literal search, use `rg`; Lattice is intended to find the working set.

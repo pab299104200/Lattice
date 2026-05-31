@@ -8,7 +8,7 @@ use serde_json::json;
 use super::super::server::RequestHandler;
 use super::{call_args, SchemaFixture};
 
-/// The 49 advertised tool names in the order they appear in the reference.
+/// The 50 advertised tool names in the order they appear in the reference.
 pub(crate) const ADVERTISED_TOOLS: &[&str] = &[
     "get_context_capsule",
     "prepare_change",
@@ -32,8 +32,6 @@ pub(crate) const ADVERTISED_TOOLS: &[&str] = &[
     "get_impact_graph",
     "search_symbols",
     "get_skeleton",
-    "save_observation",
-    "get_session_context",
     "search_memory",
     "search_logic_flow",
     "submit_lsp_edges",
@@ -42,16 +40,12 @@ pub(crate) const ADVERTISED_TOOLS: &[&str] = &[
     "get_session_metrics",
     "get_project_rules",
     "inspect_working_memory",
-    "list_observations",
     "list_stale_memories",
-    "promote_observation",
-    "refresh_memory",
-    "delete_observation",
-    "update_observation",
     "consolidate_session",
     "get_memory_metrics",
     "get_event_trace",
     "get_task_memory",
+    "save_quick_memory",
     "save_memory",
     "propose_memory_evolution",
     "apply_memory_evolution",
@@ -66,7 +60,6 @@ pub(crate) const CALLABLE_ALIASES: &[(&str, &str)] = &[
     ("query_context", "get_context_capsule"),
     ("blast_radius", "get_impact_graph"),
     ("get_file_context", "get_skeleton"),
-    ("store_memory", "save_observation"),
     ("recall_memories", "search_memory"),
 ];
 

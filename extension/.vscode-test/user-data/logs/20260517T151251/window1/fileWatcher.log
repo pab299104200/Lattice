@@ -1,2 +1,0 @@
-2026-05-17 15:13:12.034 [error] [File Watcher ('parcel')] Unexpected error: inotify_add_watch on '/home/pete/cadres/lattice/extension/.vscode-test/user-data/logs/20260517T143543' failed: No such file or directory (EUNKNOWN) (path: /home/pete/cadres/lattice)
-2026-05-17 15:13:12.034 [error] [File Watcher (universal)] inotify_add_watch on '/home/pete/cadres/lattice/extension/.vscode-test/user-data/logs/20260517T143543' failed: No such file or directory

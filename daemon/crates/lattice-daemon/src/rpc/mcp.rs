@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
@@ -30,7 +30,6 @@ use lattice_core::memory::{
     Memory, MemoryClass, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus,
 };
 use lattice_core::query::{ContextCapsule, QueryEngine};
-use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::symbols::stable_file_handle;
 use lattice_core::verification::ScopeFilter;
@@ -49,6 +48,13 @@ use super::workflow_v2::{
     self, VecEventSink, WorkflowBundle, WorkflowRenderChoice, WorkflowRequest,
 };
 use super::working_memory_tool;
+use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
+use crate::runtime_support::{
+    background_vector_sync_enabled, build_incremental_index_for_roots,
+    effective_indexable_file_count, load_incremental_cache, max_warm_graph_bytes,
+    max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
+    WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
+};
 
 /// MCP (Model Context Protocol) handler that routes JSON-RPC methods
 /// to the appropriate tool implementations.
@@ -72,8 +78,13 @@ pub struct McpHandler {
     session_consolidator: Option<Arc<StdMutex<SessionConsolidator>>>,
     working_memory_states: Arc<Mutex<HashMap<String, WorkingMemoryState>>>,
     working_memory_snapshots: Arc<Mutex<HashMap<String, WorkingMemoryState>>>,
+    working_memory_checkpoint_hashes: Arc<Mutex<HashMap<String, String>>>,
     verify_explain_reports:
         Arc<Mutex<HashMap<String, memory_v2::verify_explain_memory::ExplainReport>>>,
+    default_focus_files: Vec<String>,
+    default_focus_dirs: Vec<String>,
+    repo_state: Arc<Mutex<RepoStateTracker>>,
+    refresh_running: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +163,7 @@ struct StatusSnapshot {
 
 impl McpHandler {
     /// Create a new McpHandler with all shared state.
+    #[allow(dead_code)]
     pub fn new(
         engine: Arc<Mutex<QueryEngine>>,
         indexer: Arc<Mutex<Indexer>>,
@@ -166,9 +178,58 @@ impl McpHandler {
         workspace_roots: Vec<PathBuf>,
         indexing: Arc<AtomicBool>,
         event_writer: Option<Arc<EventWriter>>,
+        default_focus_files: Vec<String>,
+        default_focus_dirs: Vec<String>,
+    ) -> Self {
+        let repo_state = Arc::new(Mutex::new(RepoStateTracker::new(&workspace_root)));
+        Self::new_with_shared_repo_state(
+            engine,
+            indexer,
+            memory_store,
+            graph_store,
+            embedding_engine,
+            vector_index,
+            workspace_root,
+            context_cache_path,
+            session_id,
+            workspace_manager,
+            workspace_roots,
+            indexing,
+            event_writer,
+            default_focus_files,
+            default_focus_dirs,
+            repo_state,
+        )
+    }
+
+    pub(crate) fn new_with_shared_repo_state(
+        engine: Arc<Mutex<QueryEngine>>,
+        indexer: Arc<Mutex<Indexer>>,
+        memory_store: Arc<Mutex<MemoryStore>>,
+        graph_store: Arc<Mutex<GraphStore>>,
+        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        vector_index: Option<SharedVectorIndex>,
+        workspace_root: PathBuf,
+        context_cache_path: PathBuf,
+        session_id: String,
+        workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
+        workspace_roots: Vec<PathBuf>,
+        indexing: Arc<AtomicBool>,
+        event_writer: Option<Arc<EventWriter>>,
+        default_focus_files: Vec<String>,
+        default_focus_dirs: Vec<String>,
+        repo_state: Arc<Mutex<RepoStateTracker>>,
     ) -> Self {
         let workspace_id = workspace_root.to_string_lossy().to_string();
-        let branch = current_git_branch(&workspace_root).unwrap_or_else(|| "unknown".to_string());
+        let refresh_running = Arc::new(AtomicBool::new(false));
+        let branch = resolve_repo_state(&workspace_root)
+            .and_then(|snapshot| snapshot.head_ref)
+            .and_then(|head_ref| {
+                head_ref
+                    .strip_prefix("refs/heads/")
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
         let event_capture = event_writer.as_ref().and_then(|writer| {
             match EventCapture::new(
                 writer.clone(),
@@ -223,7 +284,12 @@ impl McpHandler {
             session_consolidator,
             working_memory_states: Arc::new(Mutex::new(HashMap::new())),
             working_memory_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            working_memory_checkpoint_hashes: Arc::new(Mutex::new(HashMap::new())),
             verify_explain_reports: Arc::new(Mutex::new(HashMap::new())),
+            default_focus_files,
+            default_focus_dirs,
+            repo_state,
+            refresh_running,
         }
     }
 
@@ -231,6 +297,187 @@ impl McpHandler {
         self.embedding_engine
             .get()
             .and_then(|eng| eng.embed(query).ok())
+    }
+
+    async fn validate_repo_epoch_for_graph_reads(&self) -> ValidationOutcome {
+        let outcome = {
+            let mut repo_state = self.repo_state.lock().await;
+            repo_state.validate(&self.workspace_root)
+        };
+        if outcome != ValidationOutcome::Fresh {
+            self.indexing.store(true, Ordering::Relaxed);
+            self.spawn_workspace_refresh_if_needed();
+        }
+        outcome
+    }
+
+    fn spawn_workspace_refresh_if_needed(&self) {
+        if self
+            .refresh_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let workspace_roots = self.workspace_roots.clone();
+        let engine = Arc::clone(&self.engine);
+        let indexer = Arc::clone(&self.indexer);
+        let graph_store = Arc::clone(&self.graph_store);
+        let workspace_manager = self.workspace_manager.clone();
+        let embedding_engine = Arc::clone(&self.embedding_engine);
+        let vector_index = self.vector_index.clone();
+        let repo_state = Arc::clone(&self.repo_state);
+        let indexing = Arc::clone(&self.indexing);
+        let refresh_running = Arc::clone(&self.refresh_running);
+
+        tokio::spawn(async move {
+            loop {
+                let target_epoch = {
+                    let repo_state = repo_state.lock().await;
+                    repo_state.current_epoch()
+                };
+
+                let (manifest, parsed_cache) = load_incremental_cache(&graph_store).await;
+                let roots = workspace_roots.clone();
+                let incremental = tokio::task::spawn_blocking(move || {
+                    build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("Workspace refresh indexing task failed: {}", error);
+                    IncrementalIndexResult::empty()
+                });
+
+                let new_graph = if let Some(manager) = &workspace_manager {
+                    {
+                        let mut manager = manager.lock().await;
+                        for root in &workspace_roots {
+                            let repo_name = crate::repo_name_for_root(root);
+                            if let Err(error) = manager.add_repo(repo_name.clone(), root.clone()) {
+                                tracing::warn!(
+                                    "Failed to add repo {} during workspace refresh: {}",
+                                    repo_name,
+                                    error
+                                );
+                                continue;
+                            }
+                            let repo_prefix = format!("{}/", repo_name);
+                            let repo_files: HashMap<String, lattice_core::symbols::ParsedFile> =
+                                incremental
+                                    .parsed_files
+                                    .iter()
+                                    .filter(|(file, _)| file.starts_with(&repo_prefix))
+                                    .map(|(file, parsed)| (file.clone(), parsed.clone()))
+                                    .collect();
+                            manager.replace_repo_parsed_files(&repo_name, repo_files);
+                        }
+                        manager.detect_cross_repo_edges();
+                    }
+                    persist_incremental_cache(
+                        &graph_store,
+                        &incremental.graph,
+                        &incremental.file_index,
+                        &incremental.parsed_files,
+                    )
+                    .await;
+                    let manager = manager.lock().await;
+                    Arc::new(manager.unified_graph())
+                } else {
+                    persist_incremental_cache(
+                        &graph_store,
+                        &incremental.graph,
+                        &incremental.file_index,
+                        &incremental.parsed_files,
+                    )
+                    .await;
+                    {
+                        let mut indexer = indexer.lock().await;
+                        indexer.replace_shared_index(
+                            Arc::clone(&incremental.graph),
+                            incremental.parsed_files.clone(),
+                        );
+                    }
+                    Arc::clone(&incremental.graph)
+                };
+
+                let publish_allowed = {
+                    let repo_state = repo_state.lock().await;
+                    repo_state.can_publish_epoch(target_epoch)
+                };
+                if !publish_allowed {
+                    continue;
+                }
+
+                {
+                    let mut engine = engine.lock().await;
+                    engine.update_graph_arc(Arc::clone(&new_graph));
+                }
+
+                {
+                    let store = graph_store.lock().await;
+                    if let Err(error) = store.save_graph(&new_graph) {
+                        tracing::warn!("Failed to persist workspace refresh graph: {}", error);
+                    }
+                }
+
+                if background_vector_sync_enabled() {
+                    if let (Some(embedding_engine), Some(vector_index)) =
+                        (embedding_engine.get(), vector_index.as_ref())
+                    {
+                        if let Err(error) = crate::vector_sync::sync_full_graph_embeddings(
+                            &new_graph,
+                            embedding_engine.as_ref(),
+                            vector_index.as_ref(),
+                        ) {
+                            tracing::warn!(
+                                "Failed to refresh semantic index after workspace refresh: {}",
+                                error
+                            );
+                        }
+                    }
+                }
+
+                {
+                    let mut repo_state = repo_state.lock().await;
+                    repo_state.mark_published_epoch(target_epoch);
+                }
+                indexing.store(false, Ordering::Relaxed);
+                break;
+            }
+            refresh_running.store(false, Ordering::Release);
+            let still_switching = {
+                let repo_state = repo_state.lock().await;
+                repo_state.branch_switching()
+            };
+            if still_switching {
+                indexing.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    async fn workflow_repo_state_placeholder(
+        &self,
+        tool_name: &str,
+        query: &str,
+        render: WorkflowRenderMode,
+    ) -> Option<Value> {
+        match self.validate_repo_epoch_for_graph_reads().await {
+            ValidationOutcome::Fresh => None,
+            ValidationOutcome::BranchSwitch => Some(wrap_workflow_tool_result(
+                indexing_workflow_response(tool_name, query, "branch_switch"),
+                render,
+            )),
+            ValidationOutcome::WorkspaceChange => Some(wrap_workflow_tool_result(
+                indexing_workflow_response(tool_name, query, "workspace_change"),
+                render,
+            )),
+        }
+    }
+
+    async fn current_repo_epoch(&self) -> u64 {
+        let repo_state = self.repo_state.lock().await;
+        repo_state.indexed_epoch()
     }
 
     fn current_memory_scope_filter(&self) -> ScopeFilter {
@@ -928,6 +1175,11 @@ impl McpHandler {
                                 "type": "array",
                                 "description": "Optional tests that verified the outcome",
                                 "items": { "type": "string" }
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "description": "When true, compute the durable memory content, refresh key, identifiers, and scope without writing memory. Use for live MCP verification probes.",
+                                "default": false
                             }
                         },
                         "required": ["task"]
@@ -1079,72 +1331,6 @@ impl McpHandler {
                     }
                 },
                 {
-                    "name": "save_observation",
-                    "description": "Store an observation, decision, or pattern for later recall.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "The memory content to store"
-                            },
-                            "memory_type": {
-                                "type": "string",
-                                "description": "Type of memory: observation, decision, exploration, pattern, or anti_pattern (default: observation)",
-                                "enum": ["observation", "decision", "exploration", "pattern", "anti_pattern"]
-                            },
-                            "linked_symbols": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Symbol names this memory is linked to"
-                            },
-                            "linked_files": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "File paths this memory is linked to"
-                            },
-                            "scope": {
-                                "type": "string",
-                                "description": "Durability scope for the memory (default: session)",
-                                "enum": ["session", "branch", "repo"],
-                                "default": "session"
-                            },
-                            "workspace_id": {
-                                "type": "string",
-                                "description": "Optional workspace identifier; defaults to the current workspace root"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name for branch-scoped memories"
-                            },
-                            "refresh_key": {
-                                "type": "string",
-                                "description": "Optional freshness key used to group and refresh related memories"
-                            }
-                        },
-                        "required": ["content"]
-                    }
-                },
-                {
-                    "name": "get_session_context",
-                    "description": "Get memories from the current session plus relevant memories from previous sessions.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Optional query to filter memories"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of memories to return (default: 20)",
-                                "default": 20
-                            }
-                        },
-                        "required": []
-                    }
-                },
-                {
                     "name": "search_memory",
                     "description": "Search all sessions for memories matching a query.",
                     "inputSchema": {
@@ -1264,25 +1450,6 @@ impl McpHandler {
                 },
                 working_memory_tool::tool_definition(),
                 {
-                    "name": "list_observations",
-                    "description": "List stored observations and memories. Returns all non-invalidated memories, newest first.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": {
-                                "type": "string",
-                                "description": "Optional: filter to memories from this session only"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 50, max: 200)",
-                                "default": 50
-                            }
-                        },
-                        "required": []
-                    }
-                },
-                {
                     "name": "list_stale_memories",
                     "description": "List stale memories that likely need review or refresh.",
                     "inputSchema": {
@@ -1300,132 +1467,6 @@ impl McpHandler {
                         },
                         "required": []
                     }
-                },
-                {
-                    "name": "promote_observation",
-                    "description": "Promote a session memory into longer-lived branch or repo scope and attach durable metadata.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "The memory ID to promote"
-                            },
-                            "scope": {
-                                "type": "string",
-                                "description": "Target durability scope",
-                                "enum": ["branch", "repo"]
-                            },
-                            "linked_files": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Optional replacement linked-file list for the promoted memory"
-                            },
-                            "workspace_id": {
-                                "type": "string",
-                                "description": "Optional workspace identifier; defaults to the current workspace root"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional branch name for branch-scoped memories"
-                            },
-                            "refresh_key": {
-                                "type": "string",
-                                "description": "Optional freshness key used to regroup related memories"
-                            }
-                        },
-                        "required": ["id", "scope"]
-                    }
-                },
-                {
-                    "name": "refresh_memory",
-                    "description": "Refresh an existing memory with fresh evidence and metadata while preserving its ID and clearing stale state.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "The memory ID to refresh"
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Optional replacement content summarizing the refreshed memory"
-                            },
-                            "memory_type": {
-                                "type": "string",
-                                "description": "Optional replacement memory type",
-                                "enum": ["observation", "decision", "exploration", "pattern", "anti_pattern"]
-                            },
-                            "scope": {
-                                "type": "string",
-                                "description": "Optional replacement durability scope",
-                                "enum": ["session", "branch", "repo"]
-                            },
-                            "linked_symbols": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Optional replacement symbol links"
-                            },
-                            "linked_files": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Optional replacement file links"
-                            },
-                            "workspace_id": {
-                                "type": "string",
-                                "description": "Optional replacement workspace identifier"
-                            },
-                            "branch": {
-                                "type": "string",
-                                "description": "Optional replacement branch"
-                            },
-                            "refresh_key": {
-                                "type": "string",
-                                "description": "Optional replacement freshness key"
-                            },
-                            "source_query": {
-                                "type": "string",
-                                "description": "Optional query or note describing the new evidence"
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "description": "Optional replacement confidence between 0.0 and 1.0"
-                            }
-                        },
-                        "required": ["id"]
-                    }
-                },
-                {
-                    "name": "delete_observation",
-                    "description": "Delete a stored observation by ID. The memory will no longer appear in listings or search results.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "The memory ID to delete (from list_observations or save_observation response)"
-                            }
-                        },
-                        "required": ["id"]
-                    }
-                },
-                {
-                    "name": "update_observation",
-                    "description": "Update the content of an existing observation in-place. Clears stale flags.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "The memory ID to update"
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "The new content for this observation"
-                            }
-                        },
-                        "required": ["id", "content"]
-                    }
                 }
             ]
         });
@@ -1435,6 +1476,7 @@ impl McpHandler {
                 memory_v2::get_memory_metrics::tool_definition(),
                 memory_v2::get_event_trace::tool_definition(),
                 memory_v2::get_task_memory::tool_definition(),
+                memory_v2::save_quick_memory::tool_definition(),
                 memory_v2::save_memory::tool_definition(),
                 memory_v2::propose_memory_evolution::tool_definition(),
                 memory_v2::propose_memory_evolution::apply_shim_tool_definition(),
@@ -1479,15 +1521,8 @@ impl McpHandler {
                 "get_impact_graph" | "blast_radius" => self.tool_blast_radius(arguments).await,
                 "search_symbols" => self.tool_search_symbols(arguments).await,
                 "get_skeleton" | "get_file_context" => self.tool_get_file_context(arguments).await,
-                "save_observation" | "store_memory" => self.tool_store_memory(arguments).await,
-                "get_session_context" => self.tool_get_session_context(arguments).await,
                 "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
-                "list_observations" => self.tool_list_observations(arguments).await,
                 "list_stale_memories" => self.tool_list_stale_memories(arguments).await,
-                "promote_observation" => self.tool_promote_observation(arguments).await,
-                "refresh_memory" => self.tool_refresh_memory(arguments).await,
-                "delete_observation" => self.tool_delete_observation(arguments).await,
-                "update_observation" => self.tool_update_observation(arguments).await,
                 "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
                 "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
                 "workspace_setup" => self.tool_workspace_setup(arguments).await,
@@ -1499,6 +1534,7 @@ impl McpHandler {
                 "get_memory_metrics" => self.tool_get_memory_metrics_v2(arguments).await,
                 "get_event_trace" => self.tool_get_event_trace_v2(arguments).await,
                 "get_task_memory" => self.tool_get_task_memory_v2(arguments).await,
+                "save_quick_memory" => self.tool_save_quick_memory_v2(arguments).await,
                 "save_memory" => self.tool_save_memory_v2(arguments).await,
                 "propose_memory_evolution" => {
                     self.tool_propose_memory_evolution_v2(arguments).await
@@ -1616,12 +1652,18 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("get_context_capsule", query, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let mut engine = match self.lock_query_engine_for_workflow().await {
             Ok(engine) => engine,
             Err(()) => {
                 return Ok(wrap_workflow_tool_result(
-                    indexing_workflow_response("get_context_capsule", query),
+                    indexing_workflow_response("get_context_capsule", query, "indexing"),
                     response_options.render,
                 ))
             }
@@ -1631,7 +1673,7 @@ impl McpHandler {
             && !self.promote_live_graph_for_workflow(&mut engine)
         {
             return Ok(wrap_workflow_tool_result(
-                indexing_workflow_response("get_context_capsule", query),
+                indexing_workflow_response("get_context_capsule", query, "indexing"),
                 response_options.render,
             ));
         }
@@ -1687,15 +1729,24 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let requested_mode = parse_requested_bundle_mode(args);
         let response_options = parse_workflow_response_options(args);
-        let entry_files = parse_string_array(args, "entry_files");
+        let entry_files = merge_unique_strings(
+            parse_string_array(args, "entry_files"),
+            self.default_focus_files.clone(),
+        );
         let entry_symbols = parse_string_array(args, "entry_symbols");
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("prepare_change", query, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let (mut capsule, project_rules, semantic_fallback_used) = {
             let mut engine = match self.lock_query_engine_for_workflow().await {
                 Ok(engine) => engine,
                 Err(()) => {
                     return Ok(wrap_workflow_tool_result(
-                        indexing_workflow_response("prepare_change", query),
+                        indexing_workflow_response("prepare_change", query, "indexing"),
                         response_options.render,
                     ))
                 }
@@ -1705,7 +1756,7 @@ impl McpHandler {
                 && !self.promote_live_graph_for_workflow(&mut engine)
             {
                 return Ok(wrap_workflow_tool_result(
-                    indexing_workflow_response("prepare_change", query),
+                    indexing_workflow_response("prepare_change", query, "indexing"),
                     response_options.render,
                 ));
             }
@@ -1829,15 +1880,24 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let requested_mode = parse_requested_bundle_mode(args);
         let response_options = parse_workflow_response_options(args);
-        let entry_files = parse_string_array(args, "entry_files");
+        let entry_files = merge_unique_strings(
+            parse_string_array(args, "entry_files"),
+            self.default_focus_files.clone(),
+        );
         let entry_symbols = parse_string_array(args, "entry_symbols");
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("plan_edit", query, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let (mut capsule, project_rules, semantic_fallback_used) = {
             let mut engine = match self.lock_query_engine_for_workflow().await {
                 Ok(engine) => engine,
                 Err(()) => {
                     return Ok(wrap_workflow_tool_result(
-                        indexing_workflow_response("plan_edit", query),
+                        indexing_workflow_response("plan_edit", query, "indexing"),
                         response_options.render,
                     ))
                 }
@@ -1847,7 +1907,7 @@ impl McpHandler {
                 && !self.promote_live_graph_for_workflow(&mut engine)
             {
                 return Ok(wrap_workflow_tool_result(
-                    indexing_workflow_response("plan_edit", query),
+                    indexing_workflow_response("plan_edit", query, "indexing"),
                     response_options.render,
                 ));
             }
@@ -1975,6 +2035,12 @@ impl McpHandler {
         let response_options = parse_workflow_response_options(args);
         let entry_files = parse_string_array(args, "entry_files");
         let entry_symbols = parse_string_array(args, "entry_symbols");
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("trace_scenario", scenario, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
@@ -2052,12 +2118,25 @@ impl McpHandler {
     }
 
     async fn tool_find_relevant_tests(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let files = parse_string_array(args, "files");
+        let files = merge_unique_strings(
+            parse_string_array(args, "files"),
+            self.default_focus_files.clone(),
+        );
         let symbols = parse_string_array(args, "symbols");
         let diff = args["diff"].as_str();
         let limit = (args["limit"].as_u64().unwrap_or(8) as usize).min(50);
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
+        if let Some(response) = self
+            .workflow_repo_state_placeholder(
+                "find_relevant_tests",
+                diff.unwrap_or("relevant tests"),
+                response_options.render,
+            )
+            .await
+        {
+            return Ok(response);
+        }
 
         let mut bundle = {
             let engine = self.engine.lock().await;
@@ -2119,11 +2198,20 @@ impl McpHandler {
         let diff = args["diff"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: diff".to_string()))?;
-        let files = parse_string_array(args, "files");
+        let files = merge_unique_strings(
+            parse_string_array(args, "files"),
+            self.default_focus_files.clone(),
+        );
         let symbols = parse_string_array(args, "symbols");
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
         let hops = (args["hops"].as_u64().unwrap_or(2) as usize).min(5);
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("impact_from_diff", diff, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
@@ -2195,7 +2283,10 @@ impl McpHandler {
 
     async fn tool_get_working_set_context(&self, args: &Value) -> Result<Value, (i32, String)> {
         let query = args["query"].as_str();
-        let files = parse_string_array(args, "files");
+        let files = merge_unique_strings(
+            parse_string_array(args, "files"),
+            self.default_focus_files.clone(),
+        );
         let symbols = parse_string_array(args, "symbols");
         let requested_mode = parse_requested_bundle_mode(args);
         let response_options = parse_workflow_response_options(args);
@@ -2204,6 +2295,16 @@ impl McpHandler {
         } else {
             5
         };
+        if let Some(response) = self
+            .workflow_repo_state_placeholder(
+                "get_working_set_context",
+                query.unwrap_or("working set"),
+                response_options.render,
+            )
+            .await
+        {
+            return Ok(response);
+        }
         let memory_query = build_memory_query(query, &files, &symbols);
 
         let memories = self
@@ -2288,6 +2389,12 @@ impl McpHandler {
         } else {
             4
         };
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("summarize_subsystem", query, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
         let mut memories = self
             .augment_memory_values_with_playbooks(
                 query,
@@ -2304,7 +2411,7 @@ impl McpHandler {
                 Ok(engine) => engine,
                 Err(()) => {
                     return Ok(wrap_workflow_tool_result(
-                        indexing_workflow_response("summarize_subsystem", query),
+                        indexing_workflow_response("summarize_subsystem", query, "indexing"),
                         response_options.render,
                     ))
                 }
@@ -2314,7 +2421,7 @@ impl McpHandler {
                 && !self.promote_live_graph_for_workflow(&mut engine)
             {
                 return Ok(wrap_workflow_tool_result(
-                    indexing_workflow_response("summarize_subsystem", query),
+                    indexing_workflow_response("summarize_subsystem", query, "indexing"),
                     response_options.render,
                 ));
             }
@@ -2394,7 +2501,7 @@ impl McpHandler {
                 Ok(engine) => engine,
                 Err(()) => {
                     return Ok(wrap_workflow_tool_result(
-                        indexing_workflow_response("summarize_subsystem", query),
+                        indexing_workflow_response("summarize_subsystem", query, "indexing"),
                         response_options.render,
                     ))
                 }
@@ -2470,6 +2577,16 @@ impl McpHandler {
         } else {
             5
         };
+        if let Some(response) = self
+            .workflow_repo_state_placeholder(
+                "get_repo_playbook",
+                "repo playbook",
+                response_options.render,
+            )
+            .await
+        {
+            return Ok(response);
+        }
         let memories = self.load_durable_memory_values(memory_limit).await?;
         let outcome_memory_reuse_count = count_outcome_memory_reuse(&memories);
         let (report, metadata) = {
@@ -2541,6 +2658,12 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(6) as usize).clamp(1, 20);
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
         let response_options = parse_workflow_response_options(args);
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("get_docs_capsule", query, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let mut bundle = {
             let engine = self.engine.lock().await;
@@ -2640,6 +2763,12 @@ impl McpHandler {
         let kind = args["kind"].as_str();
         let requested_mode = parse_requested_bundle_mode(args);
         let response_options = parse_workflow_response_options(args);
+        if let Some(response) = self
+            .workflow_repo_state_placeholder("diagnose_failure", input, response_options.render)
+            .await
+        {
+            return Ok(response);
+        }
 
         let (mut report, metadata_mode_reason) = {
             let engine = self.engine.lock().await;
@@ -2743,6 +2872,7 @@ impl McpHandler {
         let mut symbols = parse_string_array(args, "symbols");
         let mut tests = parse_string_array(args, "tests");
         let context_handle = args["context_handle"].as_str();
+        let dry_run = args["dry_run"].as_bool().unwrap_or(false);
 
         let inherited_query = if let Some(handle) = context_handle {
             let cached = {
@@ -2766,16 +2896,23 @@ impl McpHandler {
         dedupe_string_values(&mut symbols);
         dedupe_string_values(&mut tests);
 
+        let source_query =
+            combined_workflow_source_query(task, summary, inherited_query.as_deref());
+        let mut refresh_inputs = files.clone();
+        if let Some(source_query) = source_query.as_ref() {
+            refresh_inputs.push(source_query.clone());
+        }
         let refresh_key = format!(
             "workflow_outcome::{}",
-            stable_refresh_key(task, &files, &symbols)
+            stable_refresh_key(task, &refresh_inputs, &symbols)
         );
-        let source_query = summary
-            .map(|value| value.to_string())
-            .or(inherited_query)
-            .or_else(|| Some(task.to_string()));
-        let content =
+        let mut content =
             summarize_workflow_outcome_content(task, status, summary, &files, &symbols, &tests);
+        let identifiers =
+            workflow_outcome_identifiers(task, summary, source_query.as_deref(), &files);
+        if !identifiers.is_empty() {
+            content.push_str(&format!(" Identifiers: {}.", identifiers.join(", ")));
+        }
         let workspace_id = self.workspace_root.to_string_lossy().to_string();
         let branch = current_git_branch(&self.workspace_root);
         let scope = if branch.is_some() {
@@ -2783,6 +2920,23 @@ impl McpHandler {
         } else {
             MemoryScope::Repo
         };
+
+        if dry_run {
+            return Ok(wrap_tool_result(json!({
+                "status": "dry_run",
+                "would_store": true,
+                "scope": scope.as_str(),
+                "workspace_id": workspace_id,
+                "branch": branch,
+                "refresh_key": refresh_key,
+                "content": content,
+                "identifiers": identifiers,
+                "files": files,
+                "symbols": symbols,
+                "tests": tests,
+                "source_query": source_query
+            })));
+        }
 
         let store = self.memory_store.lock().await;
         let existing = store
@@ -2902,6 +3056,40 @@ impl McpHandler {
         });
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn auto_checkpoint_active_states(
+        &self,
+        reason: &str,
+    ) -> Result<usize, (i32, String)> {
+        let states = self.working_memory_states.lock().await.clone();
+        let mut checkpointed = 0usize;
+        for (task_id, state) in states {
+            if self
+                .checkpoint_working_memory_state(&task_id, &state, reason, false)
+                .await?
+                .is_some()
+            {
+                checkpointed += 1;
+            }
+        }
+        Ok(checkpointed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn auto_flush_session_state(&self) {
+        let _ = self.auto_checkpoint_active_states("shutdown").await;
+        let task_ids: Vec<String> = self
+            .working_memory_states
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for task_id in task_ids {
+            self.trigger_session_consolidation(&task_id, "success");
+        }
+    }
+
     async fn tool_expand_context(&self, args: &Value) -> Result<Value, (i32, String)> {
         let handle = args["handle"]
             .as_str()
@@ -2919,6 +3107,25 @@ impl McpHandler {
             ))?
         };
 
+        if self.validate_repo_epoch_for_graph_reads().await != ValidationOutcome::Fresh {
+            return Err((
+                -32001,
+                format!(
+                    "Context handle {} is stale because the workspace trust epoch changed; retry the parent workflow after refresh completes.",
+                    handle
+                ),
+            ));
+        }
+        if cached.repo_epoch != self.current_repo_epoch().await {
+            return Err((
+                -32001,
+                format!(
+                    "Context handle {} was created for repo epoch {} and is stale for the current workspace state.",
+                    handle, cached.repo_epoch
+                ),
+            ));
+        }
+
         let engine = self.engine.lock().await;
         let report = expand_context(engine.graph(), &cached.seed, focus, max_tokens);
 
@@ -2933,12 +3140,14 @@ impl McpHandler {
         origin: &str,
         seed: ExpandContextSeed,
     ) -> super::context_cache::HandleRecord {
+        let repo_epoch = self.current_repo_epoch().await;
         let mut cache = self.context_cache.lock().await;
         cache.insert(
             origin,
             seed,
             &self.workspace_root.to_string_lossy(),
             &self.session_id,
+            repo_epoch,
         )
     }
 
@@ -3634,124 +3843,6 @@ impl McpHandler {
         })))
     }
 
-    async fn tool_store_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let content = args["content"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: content".to_string()))?;
-
-        let memory_type_str = args["memory_type"].as_str().unwrap_or("observation");
-        let memory_type = MemoryType::from_str(memory_type_str);
-        let scope =
-            parse_memory_scope(args["scope"].as_str()).map_err(|message| (-32602, message))?;
-
-        let linked_symbols = parse_string_array(args, "linked_symbols");
-        let linked_files = parse_string_array(args, "linked_files");
-        let workspace_id = args["workspace_id"]
-            .as_str()
-            .map(|value| value.to_string())
-            .or_else(|| Some(self.workspace_root.to_string_lossy().to_string()));
-        let branch = args["branch"].as_str().map(|value| value.to_string());
-        let refresh_key = args["refresh_key"].as_str().map(|value| value.to_string());
-
-        let memory = Memory {
-            id: String::new(),
-            session_id: self.session_id.clone(),
-            content: content.to_string(),
-            memory_type: memory_type.clone(),
-            scope: scope.clone(),
-            confidence: 1.0,
-            linked_symbols: linked_symbols.clone(),
-            linked_files: linked_files.clone(),
-            workspace_id: workspace_id.clone(),
-            branch: branch.clone(),
-            scope_organization_id: None,
-            refresh_key: refresh_key.clone(),
-            source_query: None,
-            created_at: 0,
-            last_accessed: 0,
-            access_count: 0,
-            is_stale: false,
-            stale_reason: None,
-            verification_status: MemoryVerificationStatus::Unverified,
-        };
-
-        let store = self.memory_store.lock().await;
-        let id = store
-            .store(memory)
-            .map_err(|e| (-32603, format!("Failed to store memory: {}", e)))?;
-
-        Ok(wrap_tool_result(json!({
-            "status": "stored",
-            "id": id,
-            "memory_type": memory_type.as_str(),
-            "scope": scope.as_str(),
-            "linked_symbols": linked_symbols,
-            "linked_files": linked_files,
-            "workspace_id": workspace_id,
-            "branch": branch,
-            "refresh_key": refresh_key
-        })))
-    }
-
-    async fn tool_get_session_context(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let query = args["query"].as_str();
-        let limit = (args["limit"].as_u64().unwrap_or(20) as usize).min(100);
-
-        let store = self.memory_store.lock().await;
-        let scope_filter = self.current_memory_scope_filter();
-
-        // Current session memories (always included)
-        let scoped_memories = store
-            .list_all_scoped(&scope_filter)
-            .map_err(|e| (-32603, format!("Failed to get scoped memories: {}", e)))?;
-        let current: Vec<_> = scoped_memories
-            .iter()
-            .filter(|memory| memory.session_id == self.session_id)
-            .take(limit)
-            .cloned()
-            .collect();
-
-        // Previous session memories: if query provided, search; otherwise get recent across sessions
-        let remaining = limit.saturating_sub(current.len());
-        let previous = if remaining > 0 {
-            let keyword = query.unwrap_or("");
-            if keyword.is_empty() {
-                scoped_memories
-                    .iter()
-                    .filter(|memory| memory.session_id != self.session_id)
-                    .take(remaining)
-                    .cloned()
-                    .collect()
-            } else {
-                store
-                    .query(Some(keyword), remaining, &scope_filter)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|memory| memory.session_id != self.session_id)
-                    .collect()
-            }
-        } else {
-            vec![]
-        };
-
-        let current_values = serialize_memory_values(&store, &current, false)?;
-        let mut previous_values = serialize_memory_values(&store, &previous, true)?;
-        sort_memory_values_for_recall(
-            &mut previous_values,
-            current_git_branch(&self.workspace_root).as_deref(),
-        );
-
-        Ok(wrap_tool_result(json!({
-            "session_id": self.session_id,
-            "current": current_values,
-            "previous": previous_values,
-            "counts": {
-                "current": current.len(),
-                "previous": previous.len()
-            }
-        })))
-    }
-
     async fn tool_search_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
         let query = args["query"]
             .as_str()
@@ -3760,50 +3851,150 @@ impl McpHandler {
 
         let store = self.memory_store.lock().await;
         let scope_filter = self.current_memory_scope_filter();
-        let memories = store
-            .query(Some(query), limit, &scope_filter)
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let fts_memories = store
+            .query(Some(query), limit.saturating_mul(4).max(20), &scope_filter)
             .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
+        let all_memories = store
+            .list_all_scoped(&scope_filter)
+            .map_err(|e| (-32603, format!("Failed to list scoped memories: {}", e)))?;
+        let exact_terms = memory_v2::get_task_memory::structured_query_terms(query, None);
+        let mut durable_exact_term_counts: HashMap<String, usize> =
+            exact_terms.iter().map(|term| (term.clone(), 0)).collect();
+        let mut candidates_by_id: HashMap<String, Memory> = HashMap::new();
+        for memory in fts_memories.into_iter().chain(all_memories) {
+            if memory
+                .workspace_id
+                .as_deref()
+                .is_some_and(|memory_workspace| memory_workspace != workspace_id)
+            {
+                continue;
+            }
+            candidates_by_id.entry(memory.id.clone()).or_insert(memory);
+        }
 
+        let mut candidate_text_by_id = HashMap::new();
+        for memory in candidates_by_id.values() {
+            let fields = store
+                .get_structured_fields(&memory.id)
+                .map_err(|e| (-32603, format!("Failed to load memory fields: {}", e)))?
+                .unwrap_or_default();
+            let text = memory_v2::get_task_memory::durable_memory_search_text(memory, &fields);
+            for term in &exact_terms {
+                if text.to_ascii_lowercase().contains(term) {
+                    *durable_exact_term_counts.entry(term.clone()).or_insert(0) += 1;
+                }
+            }
+            candidate_text_by_id.insert(memory.id.clone(), (text, fields));
+        }
+
+        let mut ranked = Vec::new();
+        for memory in candidates_by_id.into_values() {
+            let (text, fields) = candidate_text_by_id
+                .remove(&memory.id)
+                .unwrap_or_else(|| (memory.content.clone(), MemoryStructuredFields::default()));
+            let matched_terms = memory_v2::get_task_memory::matching_query_terms(&text, query);
+            if matched_terms.is_empty() {
+                continue;
+            }
+            let matched_exact_terms: Vec<String> = matched_terms
+                .iter()
+                .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
+                .cloned()
+                .collect();
+            if !exact_terms.is_empty() && matched_exact_terms.is_empty() {
+                continue;
+            }
+            let mut score = memory_v2::get_task_memory::search_match_score(&matched_terms)
+                + (memory.confidence * 100.0).round() as i64;
+            if !exact_terms.is_empty() && matched_exact_terms.len() == exact_terms.len() {
+                score += 2500;
+            }
+            score += match fields.verification_status {
+                MemoryVerificationStatus::Verified => 600,
+                MemoryVerificationStatus::InReview => 200,
+                MemoryVerificationStatus::Unverified => 0,
+                MemoryVerificationStatus::Superseded => -2500,
+                MemoryVerificationStatus::Contradicted => -3500,
+                MemoryVerificationStatus::Stale => -3000,
+                MemoryVerificationStatus::Expired | MemoryVerificationStatus::Invalidated => -4000,
+            };
+            if memory.is_stale {
+                score -= 3000;
+            }
+            if memory_current_state_warning(&memory, &self.workspace_root).is_some() {
+                score -= 1800;
+            }
+            ranked.push((memory, matched_terms, score, fields.verification_status));
+        }
+        let matched_exact_terms: Vec<String> = ranked
+            .iter()
+            .flat_map(|(_, matched_terms, _, _)| matched_terms.iter())
+            .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
+            .fold(Vec::new(), |mut terms, term| {
+                if !terms.contains(term) {
+                    terms.push(term.clone());
+                }
+                terms
+            });
+        let unmatched_exact_terms: Vec<String> = exact_terms
+            .iter()
+            .filter(|term| !matched_exact_terms.contains(term))
+            .cloned()
+            .collect();
+        let exact_term_status = if exact_terms.is_empty() {
+            "not_requested"
+        } else if unmatched_exact_terms.is_empty() {
+            "matched"
+        } else if matched_exact_terms.is_empty()
+            && durable_exact_term_counts.values().all(|count| *count == 0)
+        {
+            "absent_from_durable_memory"
+        } else {
+            "partially_matched"
+        };
+        ranked.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| right.0.created_at.cmp(&left.0.created_at))
+        });
+        ranked.truncate(limit);
+        let diagnostics: Vec<Value> = ranked
+            .iter()
+            .map(|(memory, matched_terms, score, verification_status)| {
+                json!({
+                    "memory_id": memory.id,
+                    "workspace": memory.workspace_id,
+                    "matched_terms": matched_terms,
+                    "matched_exact_terms": matched_terms
+                        .iter()
+                        .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
+                        .collect::<Vec<_>>(),
+                    "score": score,
+                    "verification_status": verification_status.as_str(),
+                    "is_stale": memory.is_stale
+                })
+            })
+            .collect();
+        let memories: Vec<Memory> = ranked.into_iter().map(|(memory, _, _, _)| memory).collect();
         let mut memory_values = serialize_memory_values(&store, &memories, true)?;
-        sort_memory_values_for_recall(
-            &mut memory_values,
-            current_git_branch(&self.workspace_root).as_deref(),
-        );
+        annotate_memory_freshness_values(&mut memory_values, &memories, &self.workspace_root);
 
         Ok(wrap_tool_result(json!({
             "query": query,
             "memories": memory_values,
-            "count": memory_values.len()
-        })))
-    }
-
-    async fn tool_list_observations(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let session_id = args["session_id"].as_str();
-        let limit = (args["limit"].as_u64().unwrap_or(50) as usize).min(200);
-
-        let store = self.memory_store.lock().await;
-        let scope_filter = self.current_memory_scope_filter();
-
-        let memories: Vec<Memory> = if let Some(sid) = session_id {
-            store
-                .list_all_scoped(&scope_filter)
-                .map_err(|e| (-32603, format!("Failed to list scoped observations: {}", e)))?
-                .into_iter()
-                .filter(|memory| memory.session_id == sid)
-                .take(limit)
-                .collect()
-        } else {
-            let all = store
-                .list_all_scoped(&scope_filter)
-                .map_err(|e| (-32603, format!("Failed to list scoped observations: {}", e)))?;
-            all.into_iter().take(limit).collect()
-        };
-
-        let entries = serialize_memory_values(&store, &memories, true)?;
-
-        Ok(wrap_tool_result(json!({
-            "count": entries.len(),
-            "memories": entries
+            "count": memory_values.len(),
+            "diagnostics": {
+                "workspace": workspace_id,
+                "exact_term_rerank": true,
+                "query_exact_terms": exact_terms,
+                "matched_exact_terms": matched_exact_terms,
+                "unmatched_exact_terms": unmatched_exact_terms,
+                "durable_exact_term_counts": durable_exact_term_counts,
+                "exact_term_status": exact_term_status,
+                "matches": diagnostics
+            }
         })))
     }
 
@@ -3822,148 +4013,6 @@ impl McpHandler {
             "count": entries.len(),
             "query": query,
             "memories": entries
-        })))
-    }
-
-    async fn tool_promote_observation(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let id = args["id"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
-        let scope =
-            parse_memory_scope(args["scope"].as_str()).map_err(|message| (-32602, message))?;
-        let linked_files = parse_optional_string_array(args, "linked_files");
-        let workspace_id = args["workspace_id"]
-            .as_str()
-            .map(|value| value.to_string())
-            .or_else(|| Some(self.workspace_root.to_string_lossy().to_string()));
-        let branch = args["branch"].as_str().map(|value| value.to_string());
-        let refresh_key = args["refresh_key"].as_str().map(|value| value.to_string());
-
-        let store = self.memory_store.lock().await;
-        store
-            .promote_memory(
-                id,
-                scope.clone(),
-                linked_files.as_deref(),
-                workspace_id.as_deref(),
-                branch.as_deref(),
-                refresh_key.as_deref(),
-            )
-            .map_err(|e| (-32603, format!("Failed to promote observation: {}", e)))?;
-
-        Ok(wrap_tool_result(json!({
-            "status": "promoted",
-            "id": id,
-            "scope": scope.as_str(),
-            "linked_files": linked_files,
-            "workspace_id": workspace_id,
-            "branch": branch,
-            "refresh_key": refresh_key
-        })))
-    }
-
-    async fn tool_refresh_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let id = args["id"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
-        let content = args["content"].as_str();
-        let memory_type = args["memory_type"].as_str().map(MemoryType::from_str);
-        let scope = if args.get("scope").is_some() {
-            Some(parse_memory_scope(args["scope"].as_str()).map_err(|message| (-32602, message))?)
-        } else {
-            None
-        };
-        let linked_symbols = parse_optional_string_array(args, "linked_symbols");
-        let linked_files = parse_optional_string_array(args, "linked_files");
-        let workspace_id = args["workspace_id"].as_str();
-        let branch = args["branch"].as_str();
-        let refresh_key = args["refresh_key"].as_str();
-        let source_query = args["source_query"].as_str();
-        let confidence = args["confidence"].as_f64();
-
-        if let Some(confidence) = confidence {
-            if !(0.0..=1.0).contains(&confidence) {
-                return Err((
-                    -32602,
-                    "Invalid confidence: expected a value between 0.0 and 1.0".to_string(),
-                ));
-            }
-        }
-
-        let has_updates = content.is_some()
-            || memory_type.is_some()
-            || scope.is_some()
-            || linked_symbols.is_some()
-            || linked_files.is_some()
-            || workspace_id.is_some()
-            || branch.is_some()
-            || refresh_key.is_some()
-            || source_query.is_some()
-            || confidence.is_some();
-
-        if !has_updates {
-            return Err((
-                -32602,
-                "refresh_memory requires at least one field to refresh".to_string(),
-            ));
-        }
-
-        let store = self.memory_store.lock().await;
-        let memory = store
-            .refresh_memory(
-                id,
-                content,
-                memory_type,
-                scope,
-                linked_symbols.as_deref(),
-                linked_files.as_deref(),
-                workspace_id,
-                branch,
-                refresh_key,
-                source_query,
-                confidence,
-            )
-            .map_err(|e| (-32603, format!("Failed to refresh memory: {}", e)))?;
-        let value = serialize_memory_value(&store, &memory, true)?;
-
-        Ok(wrap_tool_result(json!({
-            "status": "refreshed",
-            "memory": value
-        })))
-    }
-
-    async fn tool_delete_observation(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let id = args["id"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
-
-        let store = self.memory_store.lock().await;
-        store
-            .invalidate(id)
-            .map_err(|e| (-32603, format!("Failed to delete observation: {}", e)))?;
-
-        Ok(wrap_tool_result(json!({
-            "status": "deleted",
-            "id": id
-        })))
-    }
-
-    async fn tool_update_observation(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let id = args["id"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: id".to_string()))?;
-        let content = args["content"]
-            .as_str()
-            .ok_or((-32602, "Missing required parameter: content".to_string()))?;
-
-        let store = self.memory_store.lock().await;
-        store
-            .update_content(id, content)
-            .map_err(|e| (-32603, format!("Failed to update observation: {}", e)))?;
-
-        Ok(wrap_tool_result(json!({
-            "status": "updated",
-            "id": id
         })))
     }
 
@@ -3989,7 +4038,7 @@ impl McpHandler {
                         &mut skip_reasons,
                     );
                 }
-                engine.graph().clone()
+                std::sync::Arc::new(engine.graph().clone())
             };
 
             let graph_store = self.graph_store.lock().await;
@@ -4006,7 +4055,7 @@ impl McpHandler {
                         &mut skip_reasons,
                     );
                 }
-                indexer.graph().clone()
+                indexer.graph_arc()
             };
 
             {
@@ -4015,7 +4064,7 @@ impl McpHandler {
             }
 
             let mut engine = self.engine.lock().await;
-            engine.update_graph(new_graph);
+            engine.update_graph_arc(new_graph);
         }
 
         Ok(wrap_tool_result(json!({
@@ -4094,16 +4143,58 @@ impl McpHandler {
     async fn tool_index_status(&self, _args: &Value) -> Result<Value, (i32, String)> {
         let is_indexing = self.indexing.load(Ordering::Relaxed);
         let snapshot = self.current_status_snapshot(true).await;
+        let file_limit = max_warm_graph_files();
+        let byte_limit = max_warm_graph_bytes();
+        let (persisted_files, persisted_bytes, warm_load_error) = {
+            let graph_store = self.graph_store.lock().await;
+            let persisted_files = graph_store.persisted_graph_file_count();
+            let persisted_bytes = graph_store.persisted_graph_disk_bytes();
+            match (persisted_files, persisted_bytes) {
+                (Ok(files), Ok(bytes)) => (Some(files), bytes, None),
+                (Err(error), _) => (None, None, Some(error.to_string())),
+                (_, Err(error)) => (None, None, Some(error.to_string())),
+            }
+        };
+        let file_limit_hit = persisted_files.is_some_and(|count| count > file_limit);
+        let byte_limit_hit = persisted_bytes.is_some_and(|bytes| bytes > byte_limit);
+        let warm_load_skipped = warm_load_error.is_some() || file_limit_hit || byte_limit_hit;
+        let warm_load_skip_reason = if warm_load_error.is_some() {
+            Some("validation_error")
+        } else if file_limit_hit {
+            Some("file_limit")
+        } else if byte_limit_hit {
+            Some("byte_limit")
+        } else {
+            None
+        };
+        let effective_files = effective_indexable_file_count(&self.workspace_roots);
 
         let mut result = json!({
             "status": if is_indexing { "indexing" } else { "ready" },
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.workspace_root.to_string_lossy(),
+            "workspace_role": "shard",
+            "workspace_field_meaning": "shard_workspace",
+            "request_workspace": self.workspace_root.to_string_lossy(),
             "nodes": snapshot.stats.node_count,
             "edges": snapshot.stats.edge_count,
             "files": snapshot.stats.file_count,
-            "languages": snapshot.languages.unwrap_or_default()
+            "languages": snapshot.languages.unwrap_or_default(),
+            "warm_load_skipped": warm_load_skipped,
+            "warm_load_skip_reason": warm_load_skip_reason,
+            "persisted_files": persisted_files,
+            "limit": file_limit,
+            "env_var": WARM_GRAPH_FILE_LIMIT_ENV,
+            "persisted_bytes": persisted_bytes,
+            "byte_limit": byte_limit,
+            "byte_env_var": WARM_GRAPH_BYTE_LIMIT_ENV,
+            "effective_files": effective_files
         });
+        if let Some(error) = warm_load_error {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("warm_load_error".to_string(), json!(error));
+            }
+        }
 
         // Add multi-repo info if applicable
         if self.workspace_roots.len() > 1 {
@@ -4232,18 +4323,35 @@ impl McpHandler {
     async fn tool_get_task_memory_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
         let parsed =
             memory_v2::get_task_memory::parse_args(args).map_err(|message| (-32602, message))?;
-        let (state, checkpoint_id) = self
-            .load_working_memory_state(&parsed.task_id)
-            .await?
-            .ok_or_else(|| {
-                (
-                    -32004,
-                    format!(
-                        "No active or checkpointed working memory state exists for task `{}`",
-                        parsed.task_id
-                    ),
-                )
-            })?;
+        let effective_focus_files =
+            merge_unique_strings(parsed.focus_files.clone(), self.default_focus_files.clone());
+        let effective_focus_dirs =
+            merge_unique_strings(parsed.focus_dirs.clone(), self.default_focus_dirs.clone());
+        let (mut state, checkpoint_id) =
+            match self.load_working_memory_state(&parsed.task_id).await? {
+                Some(existing) => existing,
+                None => {
+                    let created = self.build_implicit_working_memory_state(
+                        &parsed.task_id,
+                        parsed.task_statement.as_deref(),
+                        parsed.intent_hint.as_deref(),
+                        &effective_focus_files,
+                    );
+                    self.working_memory_states
+                        .lock()
+                        .await
+                        .insert(parsed.task_id.clone(), created.clone());
+                    (created, None)
+                }
+            };
+        self.apply_task_focus_to_state(&mut state, &effective_focus_files);
+        self.working_memory_states
+            .lock()
+            .await
+            .insert(parsed.task_id.clone(), state.clone());
+        let _ = self
+            .checkpoint_working_memory_state(&parsed.task_id, &state, "access", false)
+            .await?;
         let scope_filter = self.current_memory_scope_filter();
         let store = self.memory_store.lock().await;
         let candidates = store
@@ -4255,6 +4363,8 @@ impl McpHandler {
             &state,
             candidates,
             parsed.intent_hint.as_deref(),
+            &effective_focus_files,
+            &effective_focus_dirs,
             current_git_branch(&self.workspace_root).as_deref(),
         )
         .map_err(|error| (-32603, error))?;
@@ -4287,6 +4397,70 @@ impl McpHandler {
             }
         }
         serde_json::to_value(&bundle)
+            .map(wrap_tool_result)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))
+    }
+
+    async fn tool_save_quick_memory_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let parsed =
+            memory_v2::save_quick_memory::parse_args(args).map_err(|message| (-32602, message))?;
+        memory_v2::save_quick_memory::validate_args(&parsed)
+            .map_err(|message| (-32602, message))?;
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let task_state = if let Some(task_id) = parsed.task_id.as_deref() {
+            self.load_working_memory_state(task_id)
+                .await?
+                .map(|(state, _)| state)
+        } else {
+            None
+        };
+        let save_args = memory_v2::save_quick_memory::build_save_memory_args(
+            parsed,
+            task_state.as_ref(),
+            &workspace_id,
+            &self.default_focus_files,
+            &self.default_focus_dirs,
+        );
+        memory_v2::save_memory::validate_args(&save_args).map_err(|message| (-32602, message))?;
+        let (memory, structured) =
+            memory_v2::save_memory::build_memory(&self.session_id, &workspace_id, &save_args);
+        let store = self.memory_store.lock().await;
+        let memory_id = store
+            .store(memory)
+            .map_err(|error| (-32603, format!("Failed to store memory: {error}")))?;
+        store
+            .update_structured_fields(&memory_id, &structured)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to persist structured memory fields: {error}"),
+                )
+            })?;
+        let verification_job_id = store
+            .enqueue_verification_job(&workspace_id, &memory_id)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to enqueue verification job: {error}"),
+                )
+            })?;
+        let response = memory_v2::save_memory::build_response(
+            &store,
+            &workspace_id,
+            &memory_id,
+            verification_job_id,
+        )
+        .map_err(|error| (-32603, error))?;
+        if let Some(capture) = &self.event_capture {
+            let memory_identity = MemoryId {
+                workspace_id: workspace_id.clone(),
+                ulid: memory_id.clone(),
+            };
+            if let Err(error) = capture.record_memory_created(memory_identity, &[]) {
+                tracing::warn!(tool = "save_quick_memory", %error, "failed to capture memory creation");
+            }
+        }
+        serde_json::to_value(&response)
             .map(wrap_tool_result)
             .map_err(|error| (-32603, format!("Serialization error: {error}")))
     }
@@ -4995,6 +5169,37 @@ impl McpHandler {
         Ok(None)
     }
 
+    fn build_implicit_working_memory_state(
+        &self,
+        task_id: &str,
+        task_statement: Option<&str>,
+        intent_hint: Option<&str>,
+        focus_files: &[String],
+    ) -> WorkingMemoryState {
+        let statement = task_statement
+            .filter(|value| !value.trim().is_empty())
+            .or(intent_hint.filter(|value| !value.trim().is_empty()))
+            .unwrap_or(task_id);
+        let mut state = WorkingMemoryState::new(statement);
+        self.apply_task_focus_to_state(&mut state, focus_files);
+        state
+    }
+
+    fn apply_task_focus_to_state(&self, state: &mut WorkingMemoryState, focus_files: &[String]) {
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        for path in focus_files {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            state.active_files.insert(lattice_core::identity::FileId {
+                workspace_id: workspace_id.clone(),
+                repo_relative_path: trimmed.to_string(),
+                content_hash: "focus".to_string(),
+            });
+        }
+    }
+
     async fn store_working_memory_snapshot(
         &self,
         task_id: &str,
@@ -5017,6 +5222,48 @@ impl McpHandler {
             .await
             .insert(handle.legacy_handle.clone(), state.clone());
         handle.legacy_handle
+    }
+
+    async fn checkpoint_working_memory_state(
+        &self,
+        task_id: &str,
+        state: &WorkingMemoryState,
+        reason: &str,
+        force: bool,
+    ) -> Result<Option<i64>, (i32, String)> {
+        let state_hash = serde_json::to_string(state).map_err(|error| {
+            (
+                -32603,
+                format!("Failed to serialize working memory state: {error}"),
+            )
+        })?;
+        if !force {
+            let hashes = self.working_memory_checkpoint_hashes.lock().await;
+            if hashes.get(task_id) == Some(&state_hash) {
+                return Ok(None);
+            }
+        }
+        let scope = CheckpointScope::new(
+            self.workspace_root.to_string_lossy().to_string(),
+            self.session_id.clone(),
+            task_id.to_string(),
+        );
+        let checkpoint_id = self
+            .memory_store
+            .lock()
+            .await
+            .save_working_memory_checkpoint_for_scope(state, &format!("auto:{reason}"), &scope)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to save working memory checkpoint for `{task_id}`: {error}"),
+                )
+            })?;
+        self.working_memory_checkpoint_hashes
+            .lock()
+            .await
+            .insert(task_id.to_string(), state_hash);
+        Ok(Some(checkpoint_id))
     }
 
     #[cfg(test)]
@@ -5239,116 +5486,42 @@ impl McpHandler {
 
     /// Handle `lattice/reindex` — spawn background re-scan, return immediately.
     async fn handle_reindex(&self) -> Result<Value, (i32, String)> {
-        let workspace_root = self.workspace_root.clone();
         let workspace_roots = self.workspace_roots.clone();
         let indexer = Arc::clone(&self.indexer);
         let engine = Arc::clone(&self.engine);
         let graph_store = Arc::clone(&self.graph_store);
         let indexing = Arc::clone(&self.indexing);
-        let workspace_manager = self.workspace_manager.clone();
         let embedding_engine = Arc::clone(&self.embedding_engine);
         let vector_index = self.vector_index.clone();
 
         indexing.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
-            let mut files_indexed = 0usize;
-            let mut errors = 0usize;
+            let (manifest, parsed_cache) = load_incremental_cache(&graph_store).await;
+            let roots = workspace_roots.clone();
+            let incremental = tokio::task::spawn_blocking(move || {
+                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("Reindex task failed: {}", error);
+                IncrementalIndexResult::empty()
+            });
 
-            let new_graph = if let Some(workspace_manager) = workspace_manager {
-                let mut manager = workspace_manager.lock().await;
-                for root in &workspace_roots {
-                    let repo_name = crate::repo_name_for_root(root);
-                    if let Err(e) = manager.add_repo(repo_name.clone(), root.clone()) {
-                        tracing::warn!("Failed to reset repo {} for reindex: {}", repo_name, e);
-                        errors += 1;
-                        continue;
-                    }
-
-                    let security_filter = SecurityFilter::new(root);
-                    let mut entries = walk_directory_filtered(root, &security_filter);
-                    crate::prioritize_indexable_paths(root, &mut entries);
-                    for entry_path in &entries {
-                        let rel_path = entry_path
-                            .strip_prefix(root)
-                            .unwrap_or(entry_path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
-
-                        if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
-                            continue;
-                        }
-
-                        match std::fs::read_to_string(entry_path) {
-                            Ok(content) => {
-                                if manager.index_file(&repo_name, &rel_path, &content).is_ok() {
-                                    files_indexed += 1;
-                                } else {
-                                    errors += 1;
-                                }
-                            }
-                            Err(_) => {
-                                errors += 1;
-                            }
-                        }
-                    }
-                }
-                manager.detect_cross_repo_edges();
-                manager.unified_graph()
-            } else {
-                let security_filter = SecurityFilter::new(&workspace_root);
-                let mut entries = walk_directory_filtered(&workspace_root, &security_filter);
-                crate::prioritize_indexable_paths(&workspace_root, &mut entries);
-
-                for chunk in entries.chunks(100) {
-                    let mut batch = Vec::new();
-                    for entry_path in chunk {
-                        let rel_path = entry_path
-                            .strip_prefix(&workspace_root)
-                            .unwrap_or(entry_path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
-
-                        if !should_index_file(&rel_path) || security_filter.is_excluded(&rel_path) {
-                            continue;
-                        }
-
-                        match std::fs::read_to_string(entry_path) {
-                            Ok(content) => batch.push((rel_path, content)),
-                            Err(_) => {
-                                errors += 1;
-                            }
-                        }
-                    }
-
-                    if batch.is_empty() {
-                        continue;
-                    }
-
-                    let snapshot = {
-                        let mut idx = indexer.lock().await;
-                        match idx.index_file_batch_contents(batch).await {
-                            Ok(indexed) => {
-                                files_indexed += indexed;
-                            }
-                            Err(_) => {
-                                errors += 1;
-                            }
-                        }
-                        idx.graph().clone()
-                    };
-
-                    {
-                        let gs = graph_store.lock().await;
-                        let _ = gs.save_graph(&snapshot);
-                    }
-
-                    let mut eng = engine.lock().await;
-                    eng.update_graph(snapshot);
-                }
-
-                let idx = indexer.lock().await;
-                idx.graph().clone()
-            };
+            persist_incremental_cache(
+                &graph_store,
+                &incremental.graph,
+                &incremental.file_index,
+                &incremental.parsed_files,
+            )
+            .await;
+            {
+                let mut idx = indexer.lock().await;
+                idx.replace_shared_index(
+                    Arc::clone(&incremental.graph),
+                    incremental.parsed_files.clone(),
+                );
+            }
+            let new_graph = Arc::clone(&incremental.graph);
 
             {
                 let gs = graph_store.lock().await;
@@ -5356,18 +5529,14 @@ impl McpHandler {
             }
 
             let mut eng = engine.lock().await;
-            eng.update_graph(new_graph);
+            eng.update_graph_arc(std::sync::Arc::clone(&new_graph));
             drop(eng);
 
             if let (Some(embedding_engine), Some(vector_index)) =
                 (embedding_engine.get(), vector_index.as_ref())
             {
-                let graph_snapshot = {
-                    let eng = engine.lock().await;
-                    eng.graph().clone()
-                };
                 match crate::vector_sync::sync_full_graph_embeddings(
-                    &graph_snapshot,
+                    &new_graph,
                     embedding_engine.as_ref(),
                     vector_index.as_ref(),
                 ) {
@@ -5394,8 +5563,8 @@ impl McpHandler {
             indexing.store(false, Ordering::Relaxed);
             tracing::info!(
                 "Reindex complete: {} files indexed, {} errors",
-                files_indexed,
-                errors
+                incremental.file_index.len(),
+                0
             );
         });
 
@@ -5421,20 +5590,40 @@ fn status_snapshot_from_graph(graph: &CodeGraph, include_languages: bool) -> Sta
     }
 }
 
-fn indexing_workflow_response(tool_name: &str, query: &str) -> Value {
+fn indexing_workflow_response(tool_name: &str, query: &str, reason: &str) -> Value {
+    let overview = if reason == "branch_switch" {
+        "The workspace branch changed and the graph is being refreshed; retry shortly or use rg for exact literal lookup."
+    } else if reason == "workspace_change" {
+        "The workspace changed substantially and the graph is being refreshed; retry shortly or use rg for exact literal lookup."
+    } else {
+        "Indexing is still in progress and the graph is temporarily busy; retry shortly or use rg for exact literal lookup."
+    };
     json!({
         "query": query,
-        "overview": "Indexing is still in progress and the graph is temporarily busy; retry shortly or use rg for exact literal lookup.",
+        "overview": overview,
         "indexing": true,
+        "reason": reason,
         "primary_files": [],
         "symbols": [],
         "tests": [],
         "rationale": [
-            format!("{tool_name} returned a bounded indexing response instead of waiting on the graph lock.")
+            if reason == "branch_switch" {
+                format!("{tool_name} returned a bounded response because the workspace branch changed and the previous graph may point at the wrong branch.")
+            } else if reason == "workspace_change" {
+                format!("{tool_name} returned a bounded response because the workspace changed substantially and the previous graph may be stale.")
+            } else {
+                format!("{tool_name} returned a bounded indexing response instead of waiting on the graph lock.")
+            }
         ],
         "suggested_expand": {
             "focus": "index_status",
-            "reason": "Check index_status, then retry the workflow once the graph is ready."
+            "reason": if reason == "branch_switch" {
+                "Check index_status, then retry once the branch-refresh publish completes."
+            } else if reason == "workspace_change" {
+                "Check index_status, then retry once the workspace-refresh publish completes."
+            } else {
+                "Check index_status, then retry the workflow once the graph is ready."
+            }
         }
     })
 }
@@ -5601,26 +5790,6 @@ fn parse_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn parse_optional_string_array(args: &Value, key: &str) -> Option<Vec<String>> {
-    if !args.get(key).map(|value| value.is_array()).unwrap_or(false) {
-        return None;
-    }
-
-    Some(parse_string_array(args, key))
-}
-
-fn parse_memory_scope(value: Option<&str>) -> Result<MemoryScope, String> {
-    match value.unwrap_or("session") {
-        "session" => Ok(MemoryScope::Session),
-        "branch" => Ok(MemoryScope::Branch),
-        "repo" => Ok(MemoryScope::Repo),
-        other => Err(format!(
-            "Invalid scope '{}': expected 'session', 'branch', or 'repo'",
-            other
-        )),
-    }
 }
 
 fn parse_requested_bundle_mode(args: &Value) -> RequestedBundleMode {
@@ -5996,6 +6165,20 @@ fn should_try_prepare_change_semantic_fallback(
                 .iter()
                 .any(|symbol| symbol_matches_hint(&pivot.symbol, symbol))
         })
+}
+
+fn merge_unique_strings(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
+    let mut merged = Vec::new();
+    for value in primary.into_iter().chain(secondary) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !merged.iter().any(|existing: &String| existing == trimmed) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    merged
 }
 
 fn prepare_change_capsule_quality(
@@ -7086,20 +7269,57 @@ fn summarize_workflow_outcome_content(
     parts.join(" ")
 }
 
+fn combined_workflow_source_query(
+    task: &str,
+    summary: Option<&str>,
+    inherited_query: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(summary) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(summary.to_string());
+    }
+    if let Some(inherited_query) = inherited_query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(inherited_query.to_string());
+    }
+    if !task.trim().is_empty() {
+        parts.push(task.trim().to_string());
+    }
+    dedupe_string_values(&mut parts);
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn workflow_outcome_identifiers(
+    task: &str,
+    summary: Option<&str>,
+    source_query: Option<&str>,
+    files: &[String],
+) -> Vec<String> {
+    let mut terms = Vec::new();
+    for source in std::iter::once(task)
+        .chain(summary.into_iter())
+        .chain(source_query.into_iter())
+        .chain(files.iter().map(String::as_str))
+    {
+        for term in memory_v2::get_task_memory::structured_query_terms(source, None) {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+    }
+    terms
+}
+
 fn memory_to_value(
     memory: &Memory,
     structured_fields: Option<&MemoryStructuredFields>,
     include_session_id: bool,
 ) -> Value {
-    // The review-UI bridge in `extension/src/review/rpcPayloads.ts ::
-    // normalizeMemory` consumes the canonical Memory V2 wire shape (see
-    // `daemon/crates/lattice-daemon/src/rpc/memory_v2/mod.rs :: MemoryRecord`).
-    // The legacy `list_observations` / `recall_memories` paths predate that
-    // shape and historically only emitted `type`. Emit `memory_class` as the
-    // canonical alias here so the contract gate at
-    // `docs/plans/2026-05-16-cognitive-workspace-fork-build/reviews/R79-contract-extension-daemon.md`
-    // sees a round-trippable payload without forcing a v2 migration of every
-    // legacy memory call site.
+    // Memory retrieval paths historically emitted `type`; keep `memory_class`
+    // as the canonical alias on every serialized record so retrieval callers
+    // can consume one stable typed-memory shape.
     let memory_class = MemoryClass::from_memory_type(&memory.memory_type);
     let mut value = json!({
         "id": memory.id,
@@ -7198,6 +7418,223 @@ fn serialize_memory_values(
         .iter()
         .map(|memory| serialize_memory_value(store, memory, include_session_id))
         .collect()
+}
+
+fn annotate_memory_freshness_values(
+    values: &mut [Value],
+    memories: &[Memory],
+    workspace_root: &Path,
+) {
+    for (value, memory) in values.iter_mut().zip(memories) {
+        let Some(warning) = memory_current_state_warning(memory, workspace_root) else {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "trust_status".to_string(),
+                    json!(memory_trust_status(memory, None)),
+                );
+                object.insert(
+                    "trust_reason".to_string(),
+                    json!(memory_trust_reason(memory, None)),
+                );
+                if let Some(conflict) = memory_workspace_conflict(memory) {
+                    object.insert("workspace_conflict".to_string(), conflict);
+                }
+                if let Some(diagnostic) = memory_workspace_path_diagnostic(memory) {
+                    object.insert("workspace_path_diagnostic".to_string(), diagnostic);
+                }
+            }
+            continue;
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert("freshness_warning".to_string(), warning);
+            object.insert(
+                "trust_status".to_string(),
+                json!(memory_trust_status(memory, Some("freshness_warning"))),
+            );
+            object.insert(
+                "trust_reason".to_string(),
+                json!(memory_trust_reason(memory, Some("freshness_warning"))),
+            );
+            if let Some(conflict) = memory_workspace_conflict(memory) {
+                object.insert("workspace_conflict".to_string(), conflict);
+            }
+            if let Some(diagnostic) = memory_workspace_path_diagnostic(memory) {
+                object.insert("workspace_path_diagnostic".to_string(), diagnostic);
+            }
+        }
+    }
+}
+
+fn memory_trust_status(memory: &Memory, warning: Option<&str>) -> &'static str {
+    if memory.is_stale
+        || matches!(
+            memory.verification_status,
+            MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+    {
+        "stale"
+    } else if warning.is_some()
+        || matches!(
+            memory.verification_status,
+            MemoryVerificationStatus::Unverified | MemoryVerificationStatus::InReview
+        )
+    {
+        "advisory"
+    } else {
+        "trusted"
+    }
+}
+
+fn memory_trust_reason(memory: &Memory, warning: Option<&str>) -> &'static str {
+    if warning.is_some() {
+        "freshness_warning"
+    } else if memory.is_stale {
+        "marked_stale"
+    } else {
+        match memory.verification_status {
+            MemoryVerificationStatus::Verified => "verified",
+            MemoryVerificationStatus::InReview => "verification_in_review",
+            MemoryVerificationStatus::Unverified => "unverified",
+            MemoryVerificationStatus::Stale => "verification_stale",
+            MemoryVerificationStatus::Superseded => "superseded",
+            MemoryVerificationStatus::Contradicted => "contradicted",
+            MemoryVerificationStatus::Expired => "expired",
+            MemoryVerificationStatus::Invalidated => "invalidated",
+        }
+    }
+}
+
+fn memory_workspace_conflict(memory: &Memory) -> Option<Value> {
+    let workspace = memory.workspace_id.as_deref()?;
+    let mut conflicting_paths = Vec::new();
+    for path in memory
+        .linked_files
+        .iter()
+        .filter(|file| file.starts_with('/'))
+    {
+        if !Path::new(path).starts_with(workspace) {
+            conflicting_paths.push(path.clone());
+        }
+    }
+    if conflicting_paths.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "kind": "linked_absolute_path_outside_memory_workspace",
+        "workspace_id": workspace,
+        "conflicting_paths": conflicting_paths.into_iter().take(8).collect::<Vec<_>>(),
+        "reason": "Memory workspace provenance does not contain one or more linked absolute file paths; consider an auditable repair, supersession, or invalidation proposal."
+    }))
+}
+
+fn memory_workspace_path_diagnostic(memory: &Memory) -> Option<Value> {
+    memory.workspace_id.as_deref()?;
+    if memory.linked_files.is_empty()
+        || memory.linked_files.iter().any(|file| file.starts_with('/'))
+    {
+        return None;
+    }
+    Some(json!({
+        "kind": "workspace_unverifiable_from_relative_paths",
+        "relative_paths": memory.linked_files.iter().take(8).collect::<Vec<_>>(),
+        "reason": "Memory provenance cannot be cross-checked against workspace ownership because linked files are relative paths only."
+    }))
+}
+
+fn memory_current_state_warning(memory: &Memory, workspace_root: &Path) -> Option<Value> {
+    if memory.is_stale
+        || matches!(
+            memory.verification_status,
+            MemoryVerificationStatus::Verified
+                | MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+    {
+        return None;
+    }
+
+    let searchable_text = format!(
+        "{} {} {}",
+        memory.content,
+        memory.source_query.as_deref().unwrap_or_default(),
+        memory.refresh_key.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let failure_claim = ["blocked", "failure", "failed", "partial", "remain"]
+        .iter()
+        .any(|term| searchable_text.contains(term));
+    if !failure_claim {
+        return None;
+    }
+
+    let mut paths = Vec::new();
+    for file in &memory.linked_files {
+        let path = PathBuf::from(file);
+        paths.push(if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
+        });
+    }
+    for path in extract_absolute_paths(&memory.content)
+        .into_iter()
+        .chain(extract_absolute_paths(
+            memory.source_query.as_deref().unwrap_or_default(),
+        ))
+    {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+
+    let changed_paths: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let modified = path.metadata().ok()?.modified().ok()?;
+            let modified = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            (modified > memory.created_at).then(|| path.to_string_lossy().to_string())
+        })
+        .take(8)
+        .collect();
+    if changed_paths.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "kind": "referenced_files_changed_after_memory",
+        "reason": "This unverified memory contains failure/blocker language and at least one referenced local file was modified after the memory was recorded; treat it as advisory until verified or superseded.",
+        "changed_paths": changed_paths,
+    }))
+}
+
+fn extract_absolute_paths(text: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '"' | '\''
+            )
+        });
+        if !token.starts_with('/') {
+            continue;
+        }
+        let path = PathBuf::from(token);
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn memory_verification_status_for_recall(value: &Value) -> &str {
@@ -8042,9 +8479,9 @@ mod tests {
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
         memory_seed_values, parse_wrapped_tool_payload, report_memory_highlights,
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
-        stable_refresh_key, summarize_workflow_outcome_content, wrap_tool_result,
-        wrap_workflow_tool_result, McpHandler, RequestHandler, WorkflowRenderMode,
-        FULL_WORKFLOW_TOKEN_CAP,
+        stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
+        wrap_tool_result, wrap_workflow_tool_result, McpHandler, RequestHandler,
+        WorkflowRenderMode, FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -8718,6 +9155,76 @@ mod tests {
         assert!(content.len() < 260);
     }
 
+    #[test]
+    fn workflow_outcome_identity_terms_survive_inherited_context() {
+        let inherited =
+            "Portal remediation /home/pete/cadres/portal/docs/audit/2026-05-17-2248-remediation-run IU-0031 PX-0040";
+        let source_query = super::combined_workflow_source_query(
+            "governance contract remediation",
+            Some("done"),
+            Some(inherited),
+        )
+        .expect("source query");
+        let identifiers = workflow_outcome_identifiers(
+            "governance contract remediation",
+            Some("done"),
+            Some(&source_query),
+            &[],
+        );
+
+        assert_eq!(identifiers, vec!["iu-0031", "px-0040"]);
+        let refresh_key =
+            stable_refresh_key("governance contract remediation", &[source_query], &[]);
+        assert!(refresh_key.contains("iu-0031"));
+        assert!(refresh_key.contains("px-0040"));
+        assert!(
+            !refresh_key.contains("home"),
+            "absolute path fragments must not pollute workflow outcome identity"
+        );
+    }
+
+    #[test]
+    fn memory_conflict_and_trust_status_are_machine_readable() {
+        let memory = Memory {
+            id: "memory-1".to_string(),
+            session_id: "session".to_string(),
+            content: "PX-0033 remains blocked".to_string(),
+            memory_type: MemoryType::Pattern,
+            scope: MemoryScope::Repo,
+            confidence: 0.7,
+            linked_symbols: Vec::new(),
+            linked_files: vec!["/home/pete/cadres/portal/src/file.ts".to_string()],
+            workspace_id: Some("/home/pete/cadres/rmm".to_string()),
+            branch: None,
+            scope_organization_id: None,
+            refresh_key: None,
+            source_query: None,
+            created_at: 0,
+            last_accessed: 0,
+            access_count: 0,
+            is_stale: false,
+            stale_reason: None,
+            verification_status: MemoryVerificationStatus::Unverified,
+        };
+
+        assert_eq!(super::memory_trust_status(&memory, None), "advisory");
+        assert_eq!(super::memory_trust_reason(&memory, None), "unverified");
+        let conflict = super::memory_workspace_conflict(&memory).expect("workspace conflict");
+        assert_eq!(
+            conflict["kind"].as_str(),
+            Some("linked_absolute_path_outside_memory_workspace")
+        );
+
+        let mut relative_memory = memory;
+        relative_memory.linked_files = vec!["docs/audit/remediation.md".to_string()];
+        let diagnostic =
+            super::memory_workspace_path_diagnostic(&relative_memory).expect("path diagnostic");
+        assert_eq!(
+            diagnostic["kind"].as_str(),
+            Some("workspace_unverifiable_from_relative_paths")
+        );
+    }
+
     fn unique_test_path(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8751,6 +9258,8 @@ mod tests {
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         (handler, memory_store, workspace_root)
@@ -8796,6 +9305,21 @@ export function greet(name: string): string {
         assert_eq!(payload["files"].as_u64(), Some(1));
         assert!(payload["nodes"].as_u64().unwrap_or_default() >= 1);
         assert!(payload["edges"].as_u64().is_some());
+        assert_eq!(payload["warm_load_skipped"].as_bool(), Some(false));
+        assert!(payload["warm_load_skip_reason"].is_null());
+        assert_eq!(payload["persisted_files"].as_u64(), Some(0));
+        assert!(payload["limit"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(
+            payload["env_var"].as_str(),
+            Some("LATTICE_MAX_WARM_GRAPH_FILES")
+        );
+        assert!(payload["persisted_bytes"].is_null());
+        assert!(payload["byte_limit"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(
+            payload["byte_env_var"].as_str(),
+            Some("LATTICE_MAX_WARM_GRAPH_BYTES")
+        );
+        assert_eq!(payload["effective_files"].as_u64(), Some(0));
         assert_eq!(
             payload["languages"]["TypeScript"].as_u64(),
             Some(1),
@@ -9356,6 +9880,8 @@ export function sendGreeting(): string {
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let response = RequestHandler::handle(
@@ -9468,6 +9994,8 @@ export function sendGreeting(): string {
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let response = RequestHandler::handle(
@@ -9553,6 +10081,8 @@ export function sendGreeting(): string {
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(true)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let response = RequestHandler::handle(
@@ -9625,6 +10155,8 @@ def detect_agent_version_drift(agent, rollout):
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(true)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let response = RequestHandler::handle(
@@ -9714,6 +10246,8 @@ def detect_agent_version_drift(agent, rollout):
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let response = RequestHandler::handle(
@@ -9820,6 +10354,8 @@ def detect_agent_version_drift(agent, rollout):
             vec![workspace_root.clone()],
             Arc::new(AtomicBool::new(false)),
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let stable_focus = cert_symbol_id.stable_handle();
@@ -9914,9 +10450,19 @@ def detect_agent_version_drift(agent, rollout):
 }
 
 fn stable_refresh_key(query: &str, files: &[String], symbols: &[String]) -> String {
-    let mut terms = extract_search_terms(query, 4);
+    let mut terms = memory_v2::get_task_memory::structured_query_terms(query, None);
+    let query_without_paths = remove_absolute_paths(query);
+    let mut generic_terms = extract_search_terms(&query_without_paths, 4);
+    terms.append(&mut generic_terms);
+    for file in files {
+        terms.extend(memory_v2::get_task_memory::structured_query_terms(
+            file, None,
+        ));
+    }
     for file in files.iter().take(2) {
-        terms.extend(extract_search_terms(file, 1));
+        if let Some(term) = file_identity_term(file) {
+            terms.push(term);
+        }
     }
     for symbol in symbols.iter().take(2) {
         terms.extend(extract_search_terms(symbol, 1));
@@ -9930,25 +10476,38 @@ fn stable_refresh_key(query: &str, files: &[String], symbols: &[String]) -> Stri
     }
 }
 
-fn current_git_branch(workspace_root: &std::path::Path) -> Option<String> {
-    let git_path = workspace_root.join(".git");
-    let head_path = if git_path.is_dir() {
-        git_path.join("HEAD")
-    } else if git_path.is_file() {
-        let gitdir = std::fs::read_to_string(&git_path).ok()?;
-        let relative = gitdir.trim().strip_prefix("gitdir:")?.trim();
-        workspace_root.join(relative).join("HEAD")
-    } else {
-        return None;
-    };
+fn remove_absolute_paths(value: &str) -> String {
+    value
+        .split_whitespace()
+        .filter(|token| {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '"' | '\''
+                )
+            });
+            !trimmed.starts_with('/')
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    let head = std::fs::read_to_string(head_path).ok()?;
-    let trimmed = head.trim();
-    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
-        Some(branch.to_string())
-    } else {
-        None
-    }
+fn file_identity_term(file: &str) -> Option<String> {
+    let path = PathBuf::from(file);
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|value| value.to_str())
+        .and_then(|value| extract_search_terms(value, 1).into_iter().next())
+}
+
+fn current_git_branch(workspace_root: &std::path::Path) -> Option<String> {
+    resolve_repo_state(workspace_root)
+        .and_then(|snapshot| snapshot.head_ref)
+        .and_then(|head_ref| {
+            head_ref
+                .strip_prefix("refs/heads/")
+                .map(ToString::to_string)
+        })
 }
 
 fn detect_project_rules(
@@ -10695,25 +11254,4 @@ fn first_item_symbol(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
-}
-
-/// Recursively walk a directory, collecting all file paths.
-fn walk_directory_filtered(root: &std::path::Path, filter: &SecurityFilter) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if filter.is_excluded_dir(dir_name) {
-                        continue;
-                    }
-                }
-                files.extend(walk_directory_filtered(&path, filter));
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-    files
 }

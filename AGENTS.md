@@ -31,8 +31,9 @@ Use these tools when they're the best fit:
 - `get_impact_graph` — use before refactoring to understand blast radius
 - `search_symbols` — use when looking for a symbol by name across the project
 - `search_logic_flow` — use to trace call chains between functions
-- `save_observation` / `get_session_context` / `search_memory` — use to persist and recall insights across sessions
-- `list_observations` / `list_stale_memories` / `promote_observation` / `refresh_memory` / `update_observation` / `delete_observation` — use to maintain durable memory quality
+- `get_task_memory` / `search_memory` — use to load task working memory and recall durable memory
+- `save_quick_memory` / `save_memory` / `propose_memory_evolution` — use to persist or evolve durable memory
+- `list_stale_memories` / `list_memory_conflicts` / `verify_explain_memory` — use to maintain durable memory quality
 - `record_workflow_outcome` — use to store successful outcomes so later sessions can reuse them
 
 For targeted edits to known files, direct read, grep, and edit operations are fine.
@@ -42,11 +43,11 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 
 - Treat this file as the durable instruction surface for repo-wide Codex behavior.
 - Keep instructions here scoped to behavior, not task-specific notes.
-- Build every daemon, extension, MCP surface, indexing path, ranking flow, memory path, and docs workflow the correct way, not the easy way.
+- Build every daemon, MCP surface, indexing path, ranking flow, memory path, and docs workflow the correct way, not the easy way.
 - Do not optimize for demo shortcuts, toy repos, or temporary operator conveniences. Optimize for trustworthy behavior, durable contracts, and real assistant usage.
 - Solve problems once at the correct layer instead of shipping partial fixes, policy exceptions, or temporary workarounds.
 - Treat the quality bar as production-grade on the first implementation pass, including workflow completeness, failure handling, documentation, and verification.
-- Lattice is an assistant-facing dependency graph, MCP server, and VS Code extension. When internal convenience conflicts with workspace safety, protocol correctness, backward compatibility, or assistant ergonomics, choose correctness and tighten the contract.
+- Lattice is an assistant-facing dependency graph and MCP server. When internal convenience conflicts with workspace safety, protocol correctness, backward compatibility, or assistant ergonomics, choose correctness and tighten the contract.
 
 ## Communication Style
 
@@ -68,14 +69,14 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 - Prefer deterministic, bounded, and explainable behavior over magic heuristics that are hard to reason about.
 - Preserve backwards compatibility intentionally. If a tool schema, wire shape, or workflow contract must change, update docs, tests, and migration expectations together.
 - Never add yourself as a co-author to commits, patches, or generated artifacts.
-- After major updates, add the strongest repo-supported verification that fits the change: Rust unit or integration tests for daemon behavior, TypeScript compile or extension checks for extension changes, and higher-level workflow coverage when the repo has a real harness for it. Do not claim coverage you did not run.
+- After major updates, add the strongest repo-supported verification that fits the change: Rust unit or integration tests for daemon behavior, documentation checks for docs changes, and higher-level workflow coverage when the repo has a real harness for it. Do not claim coverage you did not run.
 - Update documentation in parallel with code changes when public behavior, operator workflow, setup, or architecture changes.
 
 ## Documentation Rules
 
-- Update `README.md` whenever public MCP behavior, setup, workflow guidance, render controls, or extension behavior changes.
+- Update `README.md` whenever public MCP behavior, setup, workflow guidance, or render controls change.
 - Update this file when durable Codex repo rules change.
-- If a change materially affects architecture, daemon-extension boundaries, ranking strategy, memory semantics, context caching, or workflow delivery behavior, add or update the right durable design note under `docs/` instead of leaving the rationale implicit.
+- If a change materially affects architecture, MCP boundaries, ranking strategy, memory semantics, context caching, or workflow delivery behavior, add or update the right durable design note under `docs/` instead of leaving the rationale implicit.
 - Do not leave docs claiming behavior that the code no longer implements. Fix the docs or fix the implementation in the same task.
 
 ## Error Handling
@@ -91,7 +92,7 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 ## Definition Of Done
 
 - A change is not done until success paths, failure paths, documentation, and verification are complete.
-- Do not treat daemon-only completion or extension-only completion as done when the workflow is meant to be end-to-end.
+- Do not treat partial daemon completion as done when the workflow is meant to be end-to-end through MCP.
 - Do not close work with known partial states unless the deferral is explicit, documented, and intentionally accepted.
 - A feature that cannot be trusted, debugged, explained, or recovered in production is not done.
 
@@ -107,7 +108,7 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 ## Observability And Recovery
 
 - Critical workflows must be diagnosable and recoverable.
-- Emit logs, errors, and workflow outputs with enough context to understand ranking misses, handle-expiry issues, indexing failures, memory drift, and extension-daemon mismatches.
+- Emit logs, errors, and workflow outputs with enough context to understand ranking misses, handle-expiry issues, indexing failures, memory drift, and MCP client-daemon mismatches.
 - Think through partial failure, retry behavior, stale cache behavior, replay safety, and operator recovery before calling the workflow done.
 - If a production failure would be hard to trace, explain, or recover from, the implementation is not finished.
 
@@ -120,7 +121,6 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 
 ## Project Structure
 
-- `extension/` — VS Code extension (TypeScript), communicates with the daemon over JSON-RPC stdio
 - `daemon/` — Rust backend with tree-sitter parsing, petgraph dependency graph, SQLite storage, workflow logic, and MCP handling
 - `daemon/crates/lattice-core/` — core library for parser, graph, query engine, indexer, storage, memory, and intelligence flows
 - `daemon/crates/lattice-daemon/` — binary entry point, RPC server, MCP handler, and session metrics
@@ -129,15 +129,14 @@ Lattice adds the most value when you do not already know where to look. `rg` rem
 ## Build
 
 - Daemon: `cd daemon && cargo build --release`
-- Extension: `cd extension && npm install && npm run compile`
 - Tests: `cd daemon && cargo test --workspace`
 
 ## Deploy
 
-After building, update both binary locations:
+After building, stop the long-lived daemon and active lightweight proxies so MCP clients launch the fresh binary:
 
 ```bash
 pkill -f lattice && sleep 2
-cp daemon/target/release/lattice extension/bin/
-cp daemon/target/release/lattice ~/.vscode/extensions/lattice.lattice-0.1.0/bin/
 ```
+
+MCP clients should run `lattice --stdio --workspace <path>`. That process is a lightweight proxy; it starts or reuses the long-lived local daemon automatically.

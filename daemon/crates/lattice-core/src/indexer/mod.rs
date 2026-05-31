@@ -8,7 +8,7 @@ use crate::graph::builder::GraphBuilder;
 use crate::graph::CodeGraph;
 use crate::identity::FileId;
 use crate::parser;
-use crate::symbols::ParsedFile;
+use crate::symbols::{ParsedFile, Symbol};
 use crate::verification::IncrementalVerifier;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 pub struct Indexer {
     #[allow(dead_code)]
     root: PathBuf,
-    graph: CodeGraph,
+    graph: Arc<CodeGraph>,
     graph_snapshot_id: u64,
     parsed_files: HashMap<String, ParsedFile>,
 }
@@ -53,7 +53,7 @@ impl Indexer {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            graph: CodeGraph::new(),
+            graph: Arc::new(CodeGraph::new()),
             graph_snapshot_id: 0,
             parsed_files: HashMap::new(),
         }
@@ -61,12 +61,16 @@ impl Indexer {
 
     /// Access the current code graph.
     pub fn graph(&self) -> &CodeGraph {
-        &self.graph
+        self.graph.as_ref()
+    }
+
+    pub fn graph_arc(&self) -> Arc<CodeGraph> {
+        Arc::clone(&self.graph)
     }
 
     /// Access the code graph mutably (e.g., for adding LSP edges).
     pub fn graph_mut(&mut self) -> &mut CodeGraph {
-        &mut self.graph
+        Arc::make_mut(&mut self.graph)
     }
 
     pub fn parsed_files(&self) -> &HashMap<String, ParsedFile> {
@@ -80,6 +84,27 @@ impl Indexer {
     pub fn replace_parsed_files(&mut self, parsed_files: HashMap<String, ParsedFile>) {
         self.parsed_files = parsed_files;
         self.rebuild_graph();
+    }
+
+    pub fn replace_index(&mut self, graph: CodeGraph, parsed_files: HashMap<String, ParsedFile>) {
+        self.graph = Arc::new(graph);
+        self.parsed_files = parsed_files;
+        self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
+    }
+
+    pub fn replace_shared_index(
+        &mut self,
+        graph: Arc<CodeGraph>,
+        parsed_files: HashMap<String, ParsedFile>,
+    ) {
+        self.graph = graph;
+        self.parsed_files = parsed_files;
+        self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
+    }
+
+    pub fn into_parts(self) -> (CodeGraph, HashMap<String, ParsedFile>) {
+        let graph = Arc::try_unwrap(self.graph).unwrap_or_else(|graph| (*graph).clone());
+        (graph, self.parsed_files)
     }
 
     /// Parse and index a single file by its relative path and content.
@@ -212,11 +237,15 @@ impl Indexer {
 
     /// Rebuild the code graph from all currently parsed files.
     fn rebuild_graph(&mut self) {
+        let previous_graph = Arc::clone(&self.graph);
         let mut builder = GraphBuilder::new();
         for parsed in self.parsed_files.values() {
             builder.add_file(parsed.clone());
         }
-        self.graph = builder.build();
+        let mut graph = builder.build();
+        graph.hydrate_missing_bodies_from(previous_graph.as_ref());
+        self.graph = Arc::new(graph);
+        strip_symbol_bodies(&mut self.parsed_files);
         self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
     }
 
@@ -282,11 +311,7 @@ impl Indexer {
         let had_existing_file = self.parsed_files.contains_key(rel_path);
 
         // Get old symbols for this file
-        let old_symbols = self
-            .parsed_files
-            .get(rel_path)
-            .map(|f| f.symbols.clone())
-            .unwrap_or_default();
+        let old_symbols = self.diffable_symbols_for_file(rel_path);
 
         // Diff
         let changes = crate::diff::diff_symbols(&old_symbols, &new_parsed.symbols);
@@ -353,14 +378,38 @@ impl Indexer {
         content: &str,
     ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
         let new_parsed = crate::parser::parse_file(rel_path, content)?;
-        let old_symbols = self
-            .parsed_files
-            .get(rel_path)
-            .map(|file| file.symbols.clone())
-            .unwrap_or_default();
+        let old_symbols = self.diffable_symbols_for_file(rel_path);
         let changes = crate::diff::diff_symbols(&old_symbols, &new_parsed.symbols);
         self.parsed_files.insert(rel_path.to_string(), new_parsed);
         self.rebuild_graph();
         Ok(changes)
+    }
+
+    fn diffable_symbols_for_file(&self, rel_path: &str) -> Vec<Symbol> {
+        let Some(parsed_file) = self.parsed_files.get(rel_path) else {
+            return Vec::new();
+        };
+
+        parsed_file
+            .symbols
+            .iter()
+            .map(|symbol| {
+                let mut hydrated = symbol.clone();
+                if hydrated.body.is_empty() {
+                    if let Some(node) = self.graph.get_node(&hydrated.id) {
+                        hydrated.body = node.body.to_string();
+                    }
+                }
+                hydrated
+            })
+            .collect()
+    }
+}
+
+fn strip_symbol_bodies(parsed_files: &mut HashMap<String, ParsedFile>) {
+    for parsed_file in parsed_files.values_mut() {
+        for symbol in &mut parsed_file.symbols {
+            symbol.body.clear();
+        }
     }
 }

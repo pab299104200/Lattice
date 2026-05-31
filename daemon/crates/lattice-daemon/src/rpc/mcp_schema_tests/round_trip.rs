@@ -33,11 +33,12 @@ use super::super::memory_v2::{
     },
     propose_memory_evolution::ProposeMemoryEvolutionArgs,
     save_memory::{FreshnessPolicyArg, MemoryScopeArg, SaveMemoryArgs, SaveMemoryResponse},
+    save_quick_memory::SaveQuickMemoryArgs,
     verify_explain_memory::{
         CheckOutcome, CheckResult, MemoryIdInput, VerifyExplainArgs, VerifyExplainMode,
         VerifyExplainRenderMode, VerifyExplainResponse,
     },
-    EvolutionAction, EvolutionProposal, MemoryRecord, TaskMemoryBundle,
+    EvolutionAction, EvolutionProposal, MemoryCheckoutState, MemoryRecord, TaskMemoryBundle,
 };
 use super::super::workflow_v2::{
     Pivot, RenderChoice, RiskNote, StableIdentity, WorkflowBundle, WorkflowRecord,
@@ -79,16 +80,66 @@ fn save_memory_args_round_trip_preserves_snake_case_assertion_type() {
 fn get_task_memory_args_round_trip_with_and_without_optionals() {
     let with_hint = GetTaskMemoryArgs {
         task_id: "task-1".to_string(),
+        task_statement: Some("Tighten memory retrieval".to_string()),
         intent_hint: Some("focus".to_string()),
+        focus_files: vec!["src/auth.rs".to_string()],
+        focus_dirs: vec!["src".to_string()],
         budget_tokens: Some(800),
     };
     let bare = GetTaskMemoryArgs {
         task_id: "task-2".to_string(),
+        task_statement: None,
         intent_hint: None,
+        focus_files: Vec::new(),
+        focus_dirs: Vec::new(),
         budget_tokens: None,
     };
     assert_round_trip(&with_hint);
     assert_round_trip(&bare);
+}
+
+#[test]
+fn save_quick_memory_args_round_trip_with_minimal_and_prefilled_context() {
+    let minimal = SaveQuickMemoryArgs {
+        content: "Observed reusable harness failure".to_string(),
+        task_id: None,
+        task_statement: None,
+        memory_class: None,
+        scope: None,
+        confidence: None,
+        confidence_reason: None,
+        linked_files: Vec::new(),
+        linked_symbols: Vec::new(),
+        linked_docs: Vec::new(),
+        linked_tests: Vec::new(),
+        linked_memories: Vec::new(),
+        validity_conditions: Vec::new(),
+        invalidation_triggers: Vec::new(),
+        source_query: None,
+        refresh_key: None,
+        branch: None,
+    };
+    let contextual = SaveQuickMemoryArgs {
+        content: "Record the MCP stdin invocation rule".to_string(),
+        task_id: Some("task-r06".to_string()),
+        task_statement: Some("Fix Claude MCP invocation".to_string()),
+        memory_class: Some(MemoryClass::Procedure),
+        scope: Some(MemoryScopeArg::Repo),
+        confidence: Some(0.91),
+        confidence_reason: Some("reproduced and fixed".to_string()),
+        linked_files: vec!["runner.py".to_string()],
+        linked_symbols: vec!["run_agent_task".to_string()],
+        linked_docs: Vec::new(),
+        linked_tests: vec!["tests/test_runner.py::test_claude_uses_stdin".to_string()],
+        linked_memories: Vec::new(),
+        validity_conditions: vec!["Claude CLI still accepts stdin".to_string()],
+        invalidation_triggers: vec!["Claude CLI contract changes".to_string()],
+        source_query: Some("Meridian feature-build R06".to_string()),
+        refresh_key: Some("feature-build::claude-stdin".to_string()),
+        branch: None,
+    };
+    assert_round_trip(&minimal);
+    assert_round_trip(&contextual);
 }
 
 #[test]
@@ -328,6 +379,8 @@ fn task_memory_bundle_and_memory_record_round_trip() {
         confidence: 0.81,
         confidence_reason: Some("derived".to_string()),
         verification_status: "verified".to_string(),
+        trust_status: "trusted".to_string(),
+        trust_reason: "verified".to_string(),
         freshness_status: "manual_review".to_string(),
         contradiction_state: "none".to_string(),
         supersession_state: "none".to_string(),
@@ -350,6 +403,15 @@ fn task_memory_bundle_and_memory_record_round_trip() {
         refresh_key: None,
         last_verified_at: None,
         last_verified_graph_snapshot_id: None,
+        checkout_state: MemoryCheckoutState {
+            recorded_head_ref: None,
+            recorded_head_oid: None,
+            current_head_ref: None,
+            current_head_oid: None,
+            status: "recorded_unknown".to_string(),
+        },
+        workspace_conflict: None,
+        workspace_path_diagnostic: None,
     };
     let bundle = TaskMemoryBundle {
         task_id: "task".to_string(),
@@ -394,6 +456,8 @@ fn save_memory_response_round_trip_includes_full_memory_record() {
             confidence: 0.72,
             confidence_reason: Some("derived".to_string()),
             verification_status: "unverified".to_string(),
+            trust_status: "advisory".to_string(),
+            trust_reason: "unverified".to_string(),
             freshness_status: "manual_review".to_string(),
             contradiction_state: "none".to_string(),
             supersession_state: "none".to_string(),
@@ -416,6 +480,15 @@ fn save_memory_response_round_trip_includes_full_memory_record() {
             refresh_key: None,
             last_verified_at: None,
             last_verified_graph_snapshot_id: None,
+            checkout_state: MemoryCheckoutState {
+                recorded_head_ref: None,
+                recorded_head_oid: None,
+                current_head_ref: None,
+                current_head_oid: None,
+                status: "recorded_unknown".to_string(),
+            },
+            workspace_conflict: None,
+            workspace_path_diagnostic: None,
         },
         verification_job_id: "verify-1".to_string(),
     };

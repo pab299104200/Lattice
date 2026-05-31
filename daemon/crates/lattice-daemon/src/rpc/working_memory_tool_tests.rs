@@ -314,6 +314,8 @@ fn build_handler(suffix: &str) -> (McpHandler, Arc<Mutex<MemoryStore>>, PathBuf,
         vec![workspace_root.clone()],
         Arc::new(AtomicBool::new(false)),
         None,
+        Vec::new(),
+        Vec::new(),
     );
     (handler, memory_store, workspace_root, context_cache_path)
 }

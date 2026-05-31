@@ -4,15 +4,18 @@ This is the front-door architecture reference for the cognitive workspace succes
 
 ## Overview
 
-The successor keeps Lattice's Rust daemon, MCP workflow vocabulary, context handles, workspace boundary protections, and VS Code extension integration, but treats memory, event history, ranking, verification, and review as first-class production substrates. The objective from [## Final Target](../plans/2026-05-16-cognitive-workspace-fork-plan.md#final-target) is an assistant-facing dependency graph and cognitive workspace that can be replayed, audited, evaluated, and corrected across repeated real tasks.
+The successor keeps Lattice's Rust daemon, MCP workflow vocabulary, context handles, and workspace boundary protections, but treats memory, event history, ranking, verification, and review as first-class production substrates. The objective from [## Final Target](../plans/2026-05-16-cognitive-workspace-fork-plan.md#final-target) is an assistant-facing dependency graph and cognitive workspace that can be replayed, audited, evaluated, and corrected across repeated real tasks.
 
 The core operator model is:
 
 - MCP workflow tools return compact, explainable bundles with stable expansion handles.
+- MCP clients launch `lattice --stdio --workspace <path>` as a lightweight proxy; the proxy forwards JSON-RPC to one long-lived local daemon that owns multiple workspace graphs.
+- The daemon bounds resident workspace graphs with an idle runtime TTL and a maximum loaded-workspace count; evicting a workspace stops its background indexing, watcher, memory-maintenance, and compaction tasks before dropping graph/index handles.
+- Loaded workspace runtimes share immutable graph snapshots between the indexer and query engine so a graph update publishes one new snapshot instead of retaining parallel hot-path copies.
 - Every meaningful workflow action is correlated through append-only events.
 - Durable memories are typed claims with evidence, scope, verification, and relationship state.
 - Retrieval ranks code, docs, memories, events, and working-memory state through an explainable pipeline.
-- The review UI lets humans inspect memory quality, proposals, stale state, event traces, ranking explanations, and daemon health.
+- MCP review tools let humans inspect memory quality, proposals, stale state, event traces, ranking explanations, and daemon health.
 
 The existing Phase 8 MCP contract is [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list). Compatibility policy is [MCP Compatibility Policy](./2026-05-16-mcp-compatibility-policy.md#backward-compatibility).
 
@@ -48,13 +51,16 @@ Storage invariants:
 
 Assistant read paths should start with high-level MCP workflows from [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list). The normal read path is:
 
-1. Resolve literal anchors into stable identities.
-2. Retrieve graph, doc, memory, event, and working-memory candidates.
-3. Rank candidates with reasons and budget controls.
-4. Return a compact bundle with expansion handles.
-5. Use `expand_context` for focused follow-up instead of broad file dumping.
+1. The lightweight proxy binds the MCP connection to the configured workspace and forwards JSON-RPC unchanged to the daemon.
+2. The daemon resolves literal anchors into stable identities within that workspace graph.
+3. Retrieve graph, doc, memory, event, and working-memory candidates.
+4. Rank candidates with reasons and budget controls.
+5. Return a compact bundle with expansion handles.
+6. Use `expand_context` for focused follow-up instead of broad file dumping.
 
-Operator read paths use the VS Code review UI documented in [Extension Review UI Guide](../operator-guide/2026-05-16-extension-review-ui-guide.md#overview). Review surfaces must show truthful unsupported or not-reported states when the daemon lacks an authoritative payload.
+Proxy connections keep the selected workspace runtime active while requests are in flight. Once the last proxy disconnects, the runtime becomes eligible for idle eviction after `LATTICE_WORKSPACE_IDLE_TTL_SECS`; the daemon refuses to load more than `LATTICE_MAX_LOADED_WORKSPACES` resident runtimes at once.
+
+Operator read paths use MCP tools such as `get_memory_metrics`, `get_event_trace`, `list_stale_memories`, `list_memory_conflicts`, and `verify_explain_memory`. Review responses must show truthful unsupported or not-reported states when the daemon lacks an authoritative payload.
 
 ## Write paths
 

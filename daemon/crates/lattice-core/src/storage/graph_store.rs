@@ -5,7 +5,8 @@ use crate::graph::model::EdgeKind;
 use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const FILE_INDEX_PARSER_VERSION: i64 = 1;
 pub const FILE_INDEX_SCHEMA_VERSION: i64 = 1;
@@ -24,6 +25,7 @@ pub struct FileIndexEntry {
 /// Persistent storage for the code dependency graph backed by SQLite.
 pub struct GraphStore {
     conn: Connection,
+    path: Option<PathBuf>,
 }
 
 impl GraphStore {
@@ -35,7 +37,10 @@ impl GraphStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
 
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            path: Some(path.to_path_buf()),
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -46,7 +51,7 @@ impl GraphStore {
             LatticeError::Storage(format!("Failed to open in-memory database: {}", e))
         })?;
 
-        let store = Self { conn };
+        let store = Self { conn, path: None };
         store.initialize()?;
         Ok(store)
     }
@@ -402,6 +407,42 @@ impl GraphStore {
         }
 
         Ok(graph)
+    }
+
+    /// Count distinct files in the persisted graph without materializing node bodies.
+    pub fn persisted_graph_file_count(&self) -> Result<usize, LatticeError> {
+        self.conn
+            .query_row("SELECT COUNT(DISTINCT file) FROM nodes", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count.max(0) as usize)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to count persisted graph files: {}", e))
+            })
+    }
+
+    /// Sum the SQLite database, WAL, and SHM file sizes for warm-load safety checks.
+    pub fn persisted_graph_disk_bytes(&self) -> Result<Option<u64>, LatticeError> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+
+        let mut total = file_len_if_exists(path)?;
+        total = total.saturating_add(file_len_if_exists(&path.with_extension("db-wal"))?);
+        total = total.saturating_add(file_len_if_exists(&path.with_extension("db-shm"))?);
+        Ok(Some(total))
+    }
+}
+
+fn file_len_if_exists(path: &Path) -> Result<u64, LatticeError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(LatticeError::Storage(format!(
+            "Failed to read persisted graph file size for {}: {}",
+            path.display(),
+            error
+        ))),
     }
 }
 

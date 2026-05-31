@@ -38,6 +38,11 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     ".lattice",
     ".claude",
     ".codex",
+    ".agents",
+    ".playwright-mcp",
+    ".pytest_cache",
+    ".ruff_cache",
+    "worktrees",
 ];
 
 const EXCLUDED_PATTERNS: &[&str] = &[

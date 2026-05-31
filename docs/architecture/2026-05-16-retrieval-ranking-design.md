@@ -69,7 +69,7 @@ Compact mode is the default for repeated assistant usage because token budget is
 
 ## Inclusion reasons and expansion handles
 
-Every returned candidate should explain why it is present: anchor match, graph proximity, verification state, freshness, evidence, workflow similarity, or prior usefulness. Candidates that need more detail should expose stable expansion handles for `expand_context`, memory detail views, event trace pages, or review UI cross-navigation.
+Every returned candidate should explain why it is present: anchor match, graph proximity, verification state, freshness, evidence, workflow similarity, or prior usefulness. Candidates that need more detail should expose stable expansion handles for `expand_context`, memory detail views, or event trace pages.
 
 Handles must expire safely and fail with actionable errors when missing, expired, ambiguous, or outside workspace scope.
 

@@ -1,5 +1,6 @@
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -11,37 +12,49 @@ use lattice_core::query::QueryEngine;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
+use crate::repo_state::RepoStateTracker;
+
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
+const WORKSPACE_INVALIDATION_BATCH_THRESHOLD: usize = 20;
 
 /// File system watcher that triggers incremental indexing on changes.
 pub struct FileWatcher {
     workspace_root: PathBuf,
+    repo_name: Option<String>,
     indexer: Option<Arc<Mutex<Indexer>>>,
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
     graph_store: Arc<Mutex<GraphStore>>,
     query_engine: Arc<Mutex<QueryEngine>>,
     embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
     vector_index: Option<SharedVectorIndex>,
+    repo_state: Arc<Mutex<RepoStateTracker>>,
+    indexing: Arc<AtomicBool>,
 }
 
 impl FileWatcher {
     pub fn new(
         workspace_root: PathBuf,
+        repo_name: Option<String>,
         indexer: Option<Arc<Mutex<Indexer>>>,
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
         graph_store: Arc<Mutex<GraphStore>>,
         query_engine: Arc<Mutex<QueryEngine>>,
         embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
         vector_index: Option<SharedVectorIndex>,
+        repo_state: Arc<Mutex<RepoStateTracker>>,
+        indexing: Arc<AtomicBool>,
     ) -> Self {
         Self {
             workspace_root,
+            repo_name,
             indexer,
             workspace_manager,
             graph_store,
             query_engine,
             embedding_engine,
             vector_index,
+            repo_state,
+            indexing,
         }
     }
 
@@ -100,16 +113,31 @@ impl FileWatcher {
     }
 
     fn should_process(&self, path: &Path) -> bool {
-        // Skip directories and obvious non-code files to reduce noise
         if path.is_dir() {
             return false;
         }
-        // Basic check to ensure we don't index .git or huge binary blobs
-        let s = path.to_string_lossy();
-        !s.contains("/.git/") && !s.contains("/target/") && !s.contains("/node_modules/")
+        let rel = path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if is_git_state_path(&rel) {
+            return true;
+        }
+        !rel.contains("/target/") && !rel.contains("/node_modules/") && !rel.starts_with(".git/")
     }
 
     async fn process_changes(&self, paths: Vec<PathBuf>) {
+        let requires_workspace_invalidation =
+            should_invalidate_workspace(&self.workspace_root, &paths);
+        let target_epoch = if requires_workspace_invalidation {
+            self.indexing.store(true, Ordering::Relaxed);
+            let mut repo_state = self.repo_state.lock().await;
+            Some(repo_state.mark_workspace_change())
+        } else {
+            None
+        };
+
         if let Some(workspace_manager) = &self.workspace_manager {
             let repo_name = crate::repo_name_for_root(&self.workspace_root);
             let mut graph_changed = false;
@@ -121,6 +149,9 @@ impl FileWatcher {
                     Ok(p) => p.to_string_lossy().to_string(),
                     Err(_) => continue,
                 };
+                if is_git_state_path(&rel_path) {
+                    continue;
+                }
                 let graph_path = repo_rel_path(&repo_name, &rel_path);
 
                 if path.exists() {
@@ -147,9 +178,9 @@ impl FileWatcher {
 
             if graph_changed {
                 manager.detect_cross_repo_edges();
-                let new_graph = manager.unified_graph();
+                let new_graph = Arc::new(manager.unified_graph());
                 drop(manager);
-                self.persist_publish_and_sync(new_graph, changed_graph_files)
+                self.persist_publish_and_sync(new_graph, changed_graph_files, target_epoch)
                     .await;
             }
             return;
@@ -161,51 +192,65 @@ impl FileWatcher {
         let mut graph_changed = false;
         let mut changed_graph_files = Vec::new();
         let mut indexer = indexer_handle.lock().await;
+        let repo_name = self.repo_name.as_deref();
 
         for path in paths {
             let rel_path = match path.strip_prefix(&self.workspace_root) {
                 Ok(p) => p.to_string_lossy().to_string(),
                 Err(_) => continue,
             };
+            if is_git_state_path(&rel_path) {
+                continue;
+            }
+            let graph_path = repo_name
+                .map(|repo| repo_rel_path(repo, &rel_path))
+                .unwrap_or_else(|| rel_path.clone());
 
             if path.exists() {
                 // Only re-index the specific file that changed
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    info!("Incremental index update: {}", rel_path);
-                    if let Ok(_) = indexer.index_file_content(&rel_path, &content) {
+                    info!("Incremental index update: {}", graph_path);
+                    if let Ok(_) = indexer.index_file_content(&graph_path, &content) {
                         graph_changed = true;
-                        changed_graph_files.push(rel_path.clone());
+                        changed_graph_files.push(graph_path.clone());
                     }
                 }
             } else {
-                info!("Removing file from index: {}", rel_path);
-                indexer.remove_file(&rel_path);
+                info!("Removing file from index: {}", graph_path);
+                indexer.remove_file(&graph_path);
                 graph_changed = true;
-                changed_graph_files.push(rel_path.clone());
+                changed_graph_files.push(graph_path.clone());
             }
         }
 
         if graph_changed {
-            // This clone is now cheap/instant due to Arc<str> optimization
-            let new_graph = indexer.graph().clone();
+            let new_graph = indexer.graph_arc();
             drop(indexer);
-            self.persist_publish_and_sync(new_graph, changed_graph_files)
+            self.persist_publish_and_sync(new_graph, changed_graph_files, target_epoch)
                 .await;
         }
     }
 
     async fn persist_publish_and_sync(
         &self,
-        new_graph: lattice_core::graph::CodeGraph,
+        new_graph: Arc<lattice_core::graph::CodeGraph>,
         changed_graph_files: Vec<String>,
+        target_epoch: Option<u64>,
     ) {
+        if let Some(epoch) = target_epoch {
+            let repo_state = self.repo_state.lock().await;
+            if !repo_state.can_publish_epoch(epoch) {
+                return;
+            }
+        }
+
         {
             let graph_store = self.graph_store.lock().await;
             let _ = graph_store.save_graph(&new_graph);
         }
 
         let mut engine = self.query_engine.lock().await;
-        engine.update_graph(new_graph.clone());
+        engine.update_graph_arc(Arc::clone(&new_graph));
         drop(engine);
 
         let Some(vector_index) = self.vector_index.as_ref() else {
@@ -246,5 +291,38 @@ impl FileWatcher {
             }
             Err(err) => tracing::warn!("Failed to sync semantic index after file change: {}", err),
         }
+
+        if let Some(epoch) = target_epoch {
+            let mut repo_state = self.repo_state.lock().await;
+            repo_state.mark_published_epoch(epoch);
+            self.indexing.store(false, Ordering::Relaxed);
+        }
     }
+}
+
+fn should_invalidate_workspace(workspace_root: &Path, paths: &[PathBuf]) -> bool {
+    paths.len() >= WORKSPACE_INVALIDATION_BATCH_THRESHOLD
+        || paths.iter().any(|path| {
+            let rel = path
+                .strip_prefix(workspace_root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            is_git_state_path(&rel)
+        })
+}
+
+fn is_git_state_path(rel_path: &str) -> bool {
+    let normalized = rel_path.replace('\\', "/");
+    matches!(
+        normalized.as_str(),
+        ".git/HEAD"
+            | ".git/index"
+            | ".git/ORIG_HEAD"
+            | ".git/MERGE_HEAD"
+            | ".git/REBASE_HEAD"
+            | ".git/packed-refs"
+    ) || normalized.starts_with(".git/rebase-apply/")
+        || normalized.starts_with(".git/rebase-merge/")
+        || normalized.starts_with(".git/refs/heads/")
 }

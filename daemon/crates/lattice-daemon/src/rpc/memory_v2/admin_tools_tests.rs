@@ -335,6 +335,8 @@ fn build_handler(
         vec![workspace_root.clone()],
         Arc::new(AtomicBool::new(false)),
         Some(event_writer),
+        Vec::new(),
+        Vec::new(),
     );
     (
         handler,

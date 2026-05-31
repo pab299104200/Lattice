@@ -11,6 +11,7 @@ use lattice_core::events::{
     ToolCalledPayload,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use super::mcp_schema_tests::tool_list::{ADVERTISED_TOOLS, CALLABLE_ALIASES};
 use super::mcp_schema_tests::{call_args, SchemaFixture};
@@ -103,16 +104,11 @@ async fn additive_tools_accept_legacy_minimal_requests_as_supersets() {
         "search_memory",
         "get_session_metrics",
         "list_stale_memories",
-        "refresh_memory",
     ];
-    let memory_id = save_memory(&fixture, "refresh target").await;
     for tool in tools {
         let response = fixture
             .handler
-            .handle(
-                "tools/call",
-                call_args(tool, additive_args(tool, &memory_id)),
-            )
+            .handle("tools/call", call_args(tool, additive_args(tool)))
             .await
             .unwrap_or_else(|error| panic!("{tool} minimal legacy request failed: {error:?}"));
         let payload = parse_payload(tool, &response);
@@ -171,6 +167,92 @@ async fn stable_context_handle_round_trips_through_expand_context() {
 }
 
 #[tokio::test]
+async fn branch_switch_returns_bounded_placeholder_for_workflow_tools() {
+    let fixture = SchemaFixture::new("compat-branch-switch-placeholder");
+    write_branch_ref(
+        &fixture,
+        "feature",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    call_payload(
+        &fixture,
+        "get_context_capsule",
+        json!({"query": "workspace setup", "render": "json"}),
+    )
+    .await;
+
+    switch_head(&fixture, "feature");
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    let payload = call_payload(
+        &fixture,
+        "prepare_change",
+        json!({"query": "update auth flow", "render": "json"}),
+    )
+    .await;
+    assert_eq!(payload["indexing"].as_bool(), Some(true));
+    assert_eq!(payload["reason"].as_str(), Some("branch_switch"));
+}
+
+#[tokio::test]
+async fn stale_context_handle_is_rejected_after_repo_epoch_changes() {
+    let fixture = SchemaFixture::new("compat-stale-context-handle");
+    write_branch_ref(
+        &fixture,
+        "feature",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    let capsule = call_payload(
+        &fixture,
+        "get_context_capsule",
+        json!({"query": "workspace setup", "render": "json"}),
+    )
+    .await;
+    let handle = capsule["context_handle"]
+        .as_str()
+        .expect("context capsule should return a handle")
+        .to_string();
+    let focus = capsule["suggested_expand"]["focus"]
+        .as_str()
+        .or_else(|| capsule["suggested_expand"].as_str())
+        .unwrap_or("file:Cargo.toml")
+        .to_string();
+
+    switch_head(&fixture, "feature");
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    let branch_switch = call_payload(
+        &fixture,
+        "prepare_change",
+        json!({"query": "warm branch refresh", "render": "json"}),
+    )
+    .await;
+    assert_eq!(branch_switch["reason"].as_str(), Some("branch_switch"));
+
+    wait_for_branch_refresh(&fixture).await;
+
+    let error = fixture
+        .handler
+        .handle(
+            "tools/call",
+            call_args(
+                "expand_context",
+                json!({"handle": handle, "focus": focus, "max_tokens": 800}),
+            ),
+        )
+        .await
+        .expect_err("stale context handle should be rejected");
+    assert_eq!(error.0, -32001);
+    assert!(
+        error.1.contains("repo epoch"),
+        "unexpected error: {}",
+        error.1
+    );
+}
+
+#[tokio::test]
 async fn compat_matrix_extends_mcp_schema_contract_without_changing_tool_list() {
     let fixture = SchemaFixture::new("compat-schema-parity");
     let listed = fixture
@@ -223,7 +305,6 @@ fn legacy_alias_args(alias: &str) -> Value {
         "query_context" => json!({"query": "compat", "render": "json"}),
         "blast_radius" => json!({"name": "main", "file": "src/main.rs", "hops": 1}),
         "get_file_context" => json!({"file": "src/main.rs"}),
-        "store_memory" => json!({"content": "stored by legacy alias"}),
         "recall_memories" => json!({"query": "legacy alias", "limit": 5}),
         other => panic!("missing alias args for {other}"),
     }
@@ -234,13 +315,46 @@ fn assert_legacy_shape(alias: &str, payload: &Value) {
         "query_context" => assert!(payload["overview"].is_string()),
         "blast_radius" => assert!(payload["nodes"].is_array() || payload["error"].is_string()),
         "get_file_context" => assert!(payload["file"].is_string() || payload["error"].is_string()),
-        "store_memory" => assert!(payload["id"].is_string()),
         "recall_memories" => assert!(payload["memories"].is_array() || payload.is_array()),
         other => panic!("missing shape assertion for {other}"),
     }
 }
 
-fn additive_args(tool: &str, memory_id: &str) -> Value {
+fn switch_head(fixture: &SchemaFixture, branch: &str) {
+    std::fs::write(
+        fixture.workspace_root.join(".git").join("HEAD"),
+        format!("ref: refs/heads/{branch}\n"),
+    )
+    .expect("update git head");
+}
+
+fn write_branch_ref(fixture: &SchemaFixture, branch: &str, oid: &str) {
+    let refs_dir = fixture
+        .workspace_root
+        .join(".git")
+        .join("refs")
+        .join("heads");
+    std::fs::create_dir_all(&refs_dir).expect("git refs dir");
+    std::fs::write(refs_dir.join(branch), format!("{oid}\n")).expect("branch ref");
+}
+
+async fn wait_for_branch_refresh(fixture: &SchemaFixture) {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let payload = call_payload(
+            fixture,
+            "prepare_change",
+            json!({"query": "poll branch refresh", "render": "json"}),
+        )
+        .await;
+        if payload["indexing"].as_bool() != Some(true) {
+            return;
+        }
+    }
+    panic!("branch refresh did not converge in time");
+}
+
+fn additive_args(tool: &str) -> Value {
     match tool {
         "get_context_capsule" => json!({"query": "compat", "render": "json"}),
         "prepare_change" | "plan_edit" => json!({"query": "compat", "render": "json"}),
@@ -254,7 +368,6 @@ fn additive_args(tool: &str, memory_id: &str) -> Value {
         "diagnose_failure" => json!({"input": "error[E0000]: compat", "render": "json"}),
         "search_memory" => json!({"query": "compat", "limit": 5}),
         "list_stale_memories" => json!({"limit": 5}),
-        "refresh_memory" => json!({"id": memory_id, "content": "refreshed target"}),
         other => panic!("missing additive args for {other}"),
     }
 }
@@ -274,7 +387,6 @@ fn assert_legacy_superset(tool: &str, payload: &Value) {
         "search_memory" => assert!(payload["memories"].is_array() || payload.is_array()),
         "get_session_metrics" => assert!(payload["total_tool_calls"].is_number()),
         "list_stale_memories" => assert!(payload["memories"].is_array()),
-        "refresh_memory" => assert!(payload["memory"]["id"].is_string()),
         other => panic!("missing additive assertion for {other}"),
     }
 }
@@ -289,7 +401,7 @@ fn assert_array_field(payload: &Value, field: &str) {
 }
 
 fn workflow_args(tool: &str, mode: &str) -> Value {
-    let mut value = additive_args(tool, "unused");
+    let mut value = additive_args(tool);
     if let Some(object) = value.as_object_mut() {
         object.insert("mode".to_string(), json!(mode));
         object.insert("render".to_string(), json!("json"));

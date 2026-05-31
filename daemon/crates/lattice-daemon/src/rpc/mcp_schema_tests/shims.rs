@@ -178,29 +178,6 @@ async fn get_file_context_alias_dispatches_to_get_skeleton() {
 }
 
 #[tokio::test]
-async fn store_memory_alias_dispatches_to_save_observation() {
-    let fixture = SchemaFixture::new("alias-store-memory");
-    let response = fixture
-        .handler
-        .handle(
-            "tools/call",
-            call_args(
-                "store_memory",
-                json!({
-                    "content": "stored via alias",
-                    "memory_type": "observation",
-                }),
-            ),
-        )
-        .await
-        .expect("store_memory alias succeeds");
-    let payload = parse_tool_payload(&response);
-    assert!(payload["id"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
-}
-
-#[tokio::test]
 async fn recall_memories_alias_dispatches_to_search_memory() {
     let fixture = SchemaFixture::new("alias-recall");
     fixture
@@ -208,15 +185,14 @@ async fn recall_memories_alias_dispatches_to_search_memory() {
         .handle(
             "tools/call",
             call_args(
-                "save_observation",
+                "save_quick_memory",
                 json!({
                     "content": "alias seed memory",
-                    "memory_type": "observation",
                 }),
             ),
         )
         .await
-        .expect("seed save_observation");
+        .expect("seed save_quick_memory");
     let response = fixture
         .handler
         .handle(

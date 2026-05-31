@@ -30,10 +30,10 @@ All currently dispatched MCP tools emit the base sequence above, including:
   `get_dependencies`, `get_impact_graph`, `search_symbols`, `get_skeleton`,
   `search_logic_flow`, `submit_lsp_edges`, `workspace_setup`, `index_status`,
   `get_project_rules`.
-- Memory tools: `record_workflow_outcome`, `save_observation`,
-  `get_session_context`, `search_memory`, `list_observations`,
-  `list_stale_memories`, `promote_observation`, `refresh_memory`,
-  `delete_observation`, `update_observation`.
+- Memory tools: `record_workflow_outcome`, `get_task_memory`,
+  `search_memory`, `save_quick_memory`, `save_memory`,
+  `propose_memory_evolution`, `list_stale_memories`,
+  `list_memory_conflicts`, `verify_explain_memory`.
 - Session surface: `get_session_metrics`.
 
 Tools that return a stable context handle additionally emit

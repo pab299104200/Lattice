@@ -149,6 +149,7 @@ fn diagnostic_expansion_handle_dereferences_to_full_breakdown() {
         },
         "workspace-main",
         "session-main",
+        1,
     );
     let cached = cache.get(&handle.legacy_handle).expect("cached seed");
     let expanded = lattice_core::intelligence::expand_context(
@@ -268,6 +269,8 @@ fn workflow_bundle_fixture() -> WorkflowBundle {
             inclusion_reason: "captured prior auth fix".to_string(),
             evidence_strength: "strong".to_string(),
             verification_status: "verified".to_string(),
+            trust_status: "trusted".to_string(),
+            trust_reason: "verified".to_string(),
             freshness_status: "fresh".to_string(),
             contradiction_state: "none".to_string(),
             expansion_target: "memory:mem-1".to_string(),

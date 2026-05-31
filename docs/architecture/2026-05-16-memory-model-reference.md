@@ -34,6 +34,8 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `assertion_type` | enum/string | no | mirrors class when unspecified | Lets tools distinguish observation, decision, procedure, outcome, preference, and counter claims. |
 | `scope` | enum | no | `session` for legacy observation writes | See [## Scope semantics](#scope-semantics). |
 | `verification_status` | enum | no | `unverified` | See [## Verification status state machine](#verification-status-state-machine). |
+| `trust_status` | enum/string | derived | derived | Response-only trust tier: `trusted`, `advisory`, or `stale`. |
+| `trust_reason` | enum/string | derived | derived | Response-only reason such as `verified`, `unverified`, `verification_in_review`, `missing_evidence`, or `git_head_changed`. |
 | `confidence` | decimal 0.0-1.0 | no | none | Required for durable memory writes. |
 | `confidence_reason` | string | no | none | Explanation for the confidence score. |
 | `freshness_policy` | enum | no | scope-dependent | See [## Freshness policy](#freshness-policy). |
@@ -51,6 +53,9 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `access_history` | access event summary | yes | empty list | Read and use history for scoring. |
 | `usefulness_scores` | metric map | yes | empty map | Retrieval and later-use metrics. |
 | `last_verified_state` | verification report reference | yes | null | Last persisted verification output. |
+| `checkout_state` | object | derived | derived | Response-only recorded/current Git HEAD comparison. New memory writes add `git_head_ref` and `git_head_oid` provenance entries when the workspace is a Git checkout. |
+
+`trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim.
 
 ## Memory link types
 

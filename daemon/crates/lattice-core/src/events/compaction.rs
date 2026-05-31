@@ -23,7 +23,7 @@ use crate::graph::CodeGraph;
 use crate::identity::{EventId, MemoryId};
 use crate::memory::MemoryStore;
 
-pub type GraphHandle = Mutex<CodeGraph>;
+pub type GraphHandle = Mutex<Arc<CodeGraph>>;
 pub type MemoryHandle = Mutex<MemoryStore>;
 
 #[derive(Clone, Debug)]
@@ -146,7 +146,7 @@ impl Compactor {
         let handle = {
             let graph = self.graph.lock().map_err(lock_error)?;
             let memory = self.memory.lock().map_err(lock_error)?;
-            Snapshot::write(&snapshot_path, &graph, &memory, latest.row_id)?
+            Snapshot::write(&snapshot_path, graph.as_ref(), &memory, latest.row_id)?
         };
         let verified = Snapshot::read(&handle.path)?;
         if verified.up_to_event_id != latest.row_id {

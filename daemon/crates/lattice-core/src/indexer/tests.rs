@@ -1,5 +1,7 @@
 use super::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[test]
 fn test_index_single_file() {
@@ -95,6 +97,62 @@ export function delta(): void {
 
     // Still only 1 file tracked
     assert_eq!(indexer.file_count(), 1);
+}
+
+#[test]
+fn test_replace_shared_index_reuses_graph_snapshot() {
+    let mut source = Indexer::new(PathBuf::from("/project"));
+    source
+        .index_file_content("src/shared.ts", "export function shared(): void {}")
+        .expect("should parse source");
+    let graph = source.graph_arc();
+
+    let mut target = Indexer::new(PathBuf::from("/project"));
+    target.replace_shared_index(graph.clone(), HashMap::new());
+
+    assert!(Arc::ptr_eq(&graph, &target.graph_arc()));
+    assert!(target
+        .graph()
+        .all_nodes()
+        .iter()
+        .any(|n| n.name == "shared"));
+}
+
+#[test]
+fn test_rebuild_graph_preserves_existing_node_bodies_when_cached_symbols_are_slim() {
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    indexer
+        .index_file_content(
+            "src/shared.ts",
+            "export function shared(): void { return; }",
+        )
+        .expect("should parse source");
+
+    let cached_body_is_stripped = indexer
+        .parsed_files()
+        .get("src/shared.ts")
+        .and_then(|file| file.symbols.iter().find(|symbol| symbol.name == "shared"))
+        .map(|symbol| symbol.body.is_empty())
+        .unwrap_or(false);
+    assert!(cached_body_is_stripped, "parsed-file cache should be slim");
+
+    indexer
+        .index_file_content(
+            "src/other.ts",
+            "export function other(): void { shared(); }",
+        )
+        .expect("should parse second file");
+
+    let shared_node = indexer
+        .graph()
+        .all_nodes()
+        .into_iter()
+        .find(|node| node.name == "shared")
+        .expect("shared node should remain in graph");
+    assert!(
+        !shared_node.body.is_empty(),
+        "graph node body should survive rebuilds even when parsed cache bodies are stripped"
+    );
 }
 
 // ---- Lazy indexer tests ----

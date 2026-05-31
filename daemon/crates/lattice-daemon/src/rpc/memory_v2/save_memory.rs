@@ -1,4 +1,4 @@
-use super::{coarse_memory_type, default_assertion_type, MemoryRecord};
+use super::{coarse_memory_type, default_assertion_type, git_provenance, MemoryRecord};
 use crate::rpc::memory_v2::get_task_memory::build_bundle;
 use lattice_core::memory::model::{MemoryAssertionType, MemoryFreshnessPolicy, MemoryProvenance};
 use lattice_core::memory::{
@@ -243,7 +243,7 @@ pub fn build_memory(
         freshness_policy_detail: None,
         validity_conditions: args.validity_conditions.clone(),
         invalidation_triggers: args.invalidation_triggers.clone(),
-        provenance: build_provenance(args),
+        provenance: build_provenance(args, workspace_id),
         evidence: args.evidence.clone(),
         linked_docs: args.linked_docs.clone(),
         linked_tests: args.linked_tests.clone(),
@@ -253,7 +253,7 @@ pub fn build_memory(
     (memory, structured)
 }
 
-fn build_provenance(args: &SaveMemoryArgs) -> Vec<MemoryProvenance> {
+fn build_provenance(args: &SaveMemoryArgs, workspace_id: &str) -> Vec<MemoryProvenance> {
     let mut provenance: Vec<MemoryProvenance> = args
         .provenance_event_ids
         .iter()
@@ -272,6 +272,7 @@ fn build_provenance(args: &SaveMemoryArgs) -> Vec<MemoryProvenance> {
             note: None,
         });
     }
+    provenance.extend(git_provenance(workspace_id));
     provenance
 }
 

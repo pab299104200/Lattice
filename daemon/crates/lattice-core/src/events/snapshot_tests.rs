@@ -104,7 +104,7 @@ async fn scheduler_shutdown_stops_without_partial_truncation() {
     let compactor = Compactor::new(
         store.clone(),
         writer,
-        Arc::new(Mutex::new(sample_graph())),
+        Arc::new(Mutex::new(Arc::new(sample_graph()))),
         Arc::new(Mutex::new(sample_memory_store())),
         config,
     );
@@ -126,7 +126,7 @@ fn sample_compactor(
     Compactor::new(
         store,
         writer,
-        Arc::new(Mutex::new(sample_graph())),
+        Arc::new(Mutex::new(Arc::new(sample_graph()))),
         Arc::new(Mutex::new(sample_memory_store())),
         config,
     )

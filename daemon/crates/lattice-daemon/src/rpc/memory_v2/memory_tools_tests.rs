@@ -10,8 +10,8 @@ use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::model::MemoryAssertionType;
 use lattice_core::memory::{
-    Memory, MemoryClass, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryType,
-    MemoryVerificationStatus,
+    Memory, MemoryClass, MemoryEvidence, MemoryScope, MemoryStore, MemoryStructuredFields,
+    MemoryType, MemoryVerificationStatus,
 };
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::GraphStore;
@@ -22,7 +22,8 @@ use tokio::sync::Mutex;
 use super::super::mcp::McpHandler;
 use super::super::server::RequestHandler;
 use super::{
-    get_task_memory, propose_memory_evolution, save_memory, EvolutionAction, TaskMemoryBundle,
+    get_task_memory, propose_memory_evolution, save_memory, save_quick_memory, EvolutionAction,
+    TaskMemoryBundle,
 };
 
 const TASK_ID: &str = "task-memory-v2";
@@ -31,10 +32,34 @@ const TASK_ID: &str = "task-memory-v2";
 fn serde_round_trips_memory_tool_requests_and_responses() {
     let get_args = get_task_memory::GetTaskMemoryArgs {
         task_id: TASK_ID.to_string(),
+        task_statement: Some("refresh auth memory".to_string()),
         intent_hint: Some("refresh auth memory".to_string()),
+        focus_files: vec!["src/auth.rs".to_string()],
+        focus_dirs: vec!["src".to_string()],
         budget_tokens: Some(800),
     };
     round_trip(&get_args);
+
+    let quick_args = save_quick_memory::SaveQuickMemoryArgs {
+        content: "remember the auth retry invariant".to_string(),
+        task_id: Some(TASK_ID.to_string()),
+        task_statement: Some("refresh auth memory".to_string()),
+        memory_class: Some(MemoryClass::Procedure),
+        scope: Some(save_memory::MemoryScopeArg::Session),
+        confidence: Some(0.9),
+        confidence_reason: None,
+        linked_files: Vec::new(),
+        linked_symbols: Vec::new(),
+        linked_docs: Vec::new(),
+        linked_tests: Vec::new(),
+        linked_memories: Vec::new(),
+        validity_conditions: Vec::new(),
+        invalidation_triggers: Vec::new(),
+        source_query: None,
+        refresh_key: None,
+        branch: None,
+    };
+    round_trip(&quick_args);
 
     let save_args = save_memory::SaveMemoryArgs {
         content: "Auth refresh invariant".to_string(),
@@ -89,6 +114,83 @@ fn serde_round_trips_memory_tool_requests_and_responses() {
 }
 
 #[tokio::test]
+async fn get_task_memory_builds_implicit_state_from_task_statement_and_focus() {
+    let (handler, _memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("implicit-task-memory");
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "get_task_memory",
+                "arguments": {
+                    "task_id": "task-implicit",
+                    "task_statement": "Investigate auth retry loop",
+                    "focus_files": ["src/auth.rs"],
+                    "focus_dirs": ["src"]
+                }
+            }),
+        )
+        .await
+        .expect("tool succeeds");
+    let payload = parse_tool_payload(&response);
+    assert_eq!(payload["task_id"].as_str(), Some("task-implicit"));
+    assert!(payload["memories"].as_array().is_some());
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn save_quick_memory_prefills_links_and_recent_failures_from_task_context() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("save-quick-memory");
+    let mut state = WorkingMemoryState::new("Debug auth retry");
+    state
+        .active_failures
+        .push(lattice_core::working_memory::FailureRecord {
+            kind: "test".to_string(),
+            message: "retry loop observed".to_string(),
+            observed_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_secs(),
+            evidence_refs: vec!["tests/test_auth.py::test_retry".to_string()],
+        });
+    handler
+        .remember_working_memory_state_for_test("task-quick", state)
+        .await;
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "save_quick_memory",
+                "arguments": {
+                    "content": "Retry loop root cause depends on middleware ordering.",
+                    "task_id": "task-quick",
+                    "linked_files": ["src/auth.rs"]
+                }
+            }),
+        )
+        .await
+        .expect("save_quick_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    let memory_id = payload["memory_id"].as_str().expect("memory id");
+    let store = memory_store.lock().await;
+    let fields = store
+        .get_structured_fields(memory_id)
+        .expect("fields query")
+        .expect("fields exist");
+    assert_eq!(fields.memory_class, MemoryClass::Observation);
+    assert_eq!(fields.evidence.len(), 1);
+    drop(store);
+    assert_eq!(
+        payload["memory"]["linked_files"]
+            .as_array()
+            .map(|items| items.len()),
+        Some(1)
+    );
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
 async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
     let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("get-task-memory");
@@ -102,6 +204,14 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         fields.assertion_type = MemoryAssertionType::Constraint;
         fields.verification_status = MemoryVerificationStatus::Verified;
         fields.linked_docs = vec!["docs/auth.md#Refresh".to_string()];
+        fields.evidence = vec![MemoryEvidence {
+            kind: "test".to_string(),
+            reference: Some("tests/auth.rs::refresh_token".to_string()),
+            detail: Some("targeted refresh-token test".to_string()),
+            captured_at: None,
+            span: None,
+            evidence_content_hash: None,
+        }];
         store
             .update_structured_fields(&id, &fields)
             .expect("update fields");
@@ -131,6 +241,15 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
             .as_str()
             .is_some_and(|value| !value.is_empty()));
         assert!(memory["verification_status"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(memory["trust_status"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(memory["trust_reason"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(memory["checkout_state"]["status"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
     }
@@ -351,6 +470,296 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
 }
 
 #[tokio::test]
+async fn get_task_memory_requires_workspace_and_concrete_task_signal() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("get-task-memory-signal");
+    {
+        let store = memory_store.lock().await;
+        let mut portal_memory = seed_memory(
+            "Portal remediation IU-0030 fixed product-profile launch claims.",
+            MemoryScope::Repo,
+        );
+        portal_memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        portal_memory.linked_files = vec![
+            "docs/audit/2026-05-17-2248-remediation-run/04-final-remediation-review.md".to_string(),
+        ];
+        store.store(portal_memory).expect("store portal memory");
+
+        let mut wrong_workspace = seed_memory(
+            "Portal remediation IU-0030 from the wrong workspace should not leak.",
+            MemoryScope::Repo,
+        );
+        wrong_workspace.workspace_id = Some("/home/pete/cadres/rmm".to_string());
+        wrong_workspace.linked_files = vec![
+            "docs/audit/2026-05-17-2248-remediation-run/04-final-remediation-review.md".to_string(),
+        ];
+        store
+            .store(wrong_workspace)
+            .expect("store wrong workspace memory");
+
+        let mut unrelated = seed_memory("RMM marketplace cutover daemon state.", MemoryScope::Repo);
+        unrelated.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        unrelated.linked_files.clear();
+        unrelated.linked_symbols.clear();
+        unrelated.source_query = None;
+        store.store(unrelated).expect("store unrelated memory");
+    }
+    handler
+        .remember_working_memory_state_for_test(
+            TASK_ID,
+            WorkingMemoryState::new(
+                "Determine current state for /home/pete/cadres/portal/docs/audit/2026-05-17-2248-remediation-run IU-0030 product-profile",
+            ),
+        )
+        .await;
+
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({"name": "get_task_memory", "arguments": {"task_id": TASK_ID}}),
+        )
+        .await
+        .expect("get_task_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    let memories = payload["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 1);
+    assert!(memories[0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("IU-0030")));
+    assert!(memories[0]["inclusion_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("iu-0030")));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn search_memory_falls_back_to_exact_task_ids_under_workspace_scope() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("search-memory-exact-ids");
+    {
+        let store = memory_store.lock().await;
+        let mut portal_memory = seed_memory(
+            "IU-0030 product-profile launch claim remediation was completed.",
+            MemoryScope::Repo,
+        );
+        portal_memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        portal_memory.linked_files = vec![
+            "docs/audit/2026-05-17-2248-remediation-run/04-final-remediation-review.md".to_string(),
+        ];
+        portal_memory.refresh_key = Some("portal-remediation-IU-0030".to_string());
+        store.store(portal_memory).expect("store portal memory");
+
+        let mut wrong_workspace = seed_memory(
+            "IU-0030 product-profile launch claim from RMM.",
+            MemoryScope::Repo,
+        );
+        wrong_workspace.workspace_id = Some("/home/pete/cadres/rmm".to_string());
+        wrong_workspace.confidence = 0.99;
+        store
+            .store(wrong_workspace)
+            .expect("store wrong workspace memory");
+    }
+
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "Portal remediation 2026-05-17 IM-1 IM-2 PX-0039 IU-0030 IU-0022 IU-0004 product-profile",
+                    "limit": 10
+                }
+            }),
+        )
+        .await
+        .expect("search_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    assert_eq!(payload["count"].as_u64(), Some(1));
+    assert_eq!(
+        payload["diagnostics"]["exact_term_rerank"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        payload["diagnostics"]["matched_exact_terms"],
+        json!(["iu-0030"])
+    );
+    let memory = &payload["memories"].as_array().expect("memories")[0];
+    assert!(memory["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("IU-0030")));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn search_memory_exact_ids_do_not_fall_back_to_generic_terms() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("search-memory-exact-id-hard-anchor");
+    {
+        let store = memory_store.lock().await;
+        let mut generic_governance = seed_memory(
+            "IU-0023-S01 governance partial-load remediation was completed.",
+            MemoryScope::Repo,
+        );
+        generic_governance.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        generic_governance.refresh_key = Some("workflow_outcome::0023-governance".to_string());
+        store
+            .store(generic_governance)
+            .expect("store generic governance memory");
+    }
+
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "IU-0031 PX-0040 governance contract Portal remediation",
+                    "limit": 10
+                }
+            }),
+        )
+        .await
+        .expect("search_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    assert_eq!(payload["count"].as_u64(), Some(0));
+    assert_eq!(
+        payload["diagnostics"]["query_exact_terms"],
+        json!(["iu-0031", "px-0040"])
+    );
+    assert_eq!(
+        payload["diagnostics"]["unmatched_exact_terms"],
+        json!(["iu-0031", "px-0040"])
+    );
+    assert_eq!(
+        payload["diagnostics"]["exact_term_status"].as_str(),
+        Some("absent_from_durable_memory")
+    );
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn search_memory_warns_when_unverified_failure_memory_references_changed_file() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("search-memory-freshness-warning");
+    let changed_file = workspace_root.join("docs/claim.md");
+    std::fs::create_dir_all(changed_file.parent().expect("parent")).expect("create parent");
+    std::fs::write(&changed_file, "current claim").expect("write changed file");
+    {
+        let store = memory_store.lock().await;
+        let mut blocked = seed_memory(
+            "PX-0033 product-profile launch claims remain blocked.",
+            MemoryScope::Repo,
+        );
+        blocked.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        blocked.linked_files = vec!["docs/claim.md".to_string()];
+        blocked.source_query = Some(format!(
+            "Blocked shared edit at {}",
+            changed_file.to_string_lossy()
+        ));
+        store.store(blocked).expect("store blocked memory");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::fs::write(&changed_file, "current claim fixed after memory")
+        .expect("rewrite changed file");
+    {
+        let store = memory_store.lock().await;
+        let mut current = seed_memory(
+            "PX-0033 product-profile launch claims are now complete.",
+            MemoryScope::Repo,
+        );
+        current.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        store.store(current).expect("store current memory");
+    }
+
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "PX-0033 product-profile launch claims remediation",
+                    "limit": 2
+                }
+            }),
+        )
+        .await
+        .expect("search_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    let memories = payload["memories"].as_array().expect("memories");
+    assert!(memories[0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("now complete")));
+    let memory = memories
+        .iter()
+        .find(|memory| {
+            memory["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("remain blocked"))
+        })
+        .expect("blocked memory remains visible with warning");
+    assert_eq!(
+        memory["freshness_warning"]["kind"].as_str(),
+        Some("referenced_files_changed_after_memory")
+    );
+    assert_eq!(memory["trust_status"].as_str(), Some("advisory"));
+    assert!(memory["freshness_warning"]["changed_paths"]
+        .as_array()
+        .expect("changed paths")
+        .iter()
+        .any(|path| path.as_str() == Some(changed_file.to_string_lossy().as_ref())));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn search_memory_exact_id_rerank_penalizes_stale_memory() {
+    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("search-memory-stale-penalty");
+    {
+        let store = memory_store.lock().await;
+        let mut current = seed_memory(
+            "PX-0033 product-profile launch claims are now complete.",
+            MemoryScope::Repo,
+        );
+        current.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        current.refresh_key = Some("remediation-PX-0033-current".to_string());
+        store.store(current).expect("store current memory");
+
+        let mut stale = seed_memory(
+            "PX-0033 product-profile launch claims remain blocked.",
+            MemoryScope::Repo,
+        );
+        stale.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        stale.refresh_key = Some("remediation-PX-0033-stale".to_string());
+        stale.confidence = 1.0;
+        stale.is_stale = true;
+        stale.verification_status = MemoryVerificationStatus::Stale;
+        store.store(stale).expect("store stale memory");
+    }
+
+    let response = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "PX-0033 product-profile launch claims remediation",
+                    "limit": 2
+                }
+            }),
+        )
+        .await
+        .expect("search_memory succeeds");
+    let payload = parse_tool_payload(&response);
+    let memories = payload["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 2);
+    assert!(memories[0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("now complete")));
+    assert_eq!(memories[1]["is_stale"].as_bool(), Some(true));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
 async fn get_task_memory_respects_scope_boundaries() {
     let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("scope-boundary");
@@ -477,6 +886,8 @@ fn build_handler(
         vec![workspace_root.clone()],
         Arc::new(AtomicBool::new(false)),
         Some(event_writer),
+        Vec::new(),
+        Vec::new(),
     );
     (
         handler,

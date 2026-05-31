@@ -94,7 +94,7 @@ fn test_event_log_compaction_keeps_hot_path_p99_within_5ms_budget() {
     let compactor = Compactor::new(
         store,
         writer.clone(),
-        Arc::new(Mutex::new(CodeGraph::new())),
+        Arc::new(Mutex::new(Arc::new(CodeGraph::new()))),
         Arc::new(Mutex::new(
             MemoryStore::open_in_memory().expect("memory store opens"),
         )),

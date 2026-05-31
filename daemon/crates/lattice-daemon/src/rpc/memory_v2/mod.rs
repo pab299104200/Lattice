@@ -20,6 +20,8 @@ use lattice_core::memory::{
     MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 pub mod consolidate_session;
 pub mod get_event_trace;
@@ -28,6 +30,7 @@ pub mod get_task_memory;
 pub mod list_memory_conflicts;
 pub mod propose_memory_evolution;
 pub mod save_memory;
+pub mod save_quick_memory;
 pub mod verify_explain_memory;
 
 #[cfg(test)]
@@ -71,6 +74,10 @@ pub struct MemoryRecord {
     pub confidence_reason: Option<String>,
     /// Current verification status.
     pub verification_status: String,
+    /// Trust tier callers should use before treating the memory as guidance.
+    pub trust_status: String,
+    /// Machine-readable reason for the trust tier.
+    pub trust_reason: String,
     /// Current freshness status for the memory surface.
     pub freshness_status: String,
     /// Contradiction state summary.
@@ -115,6 +122,29 @@ pub struct MemoryRecord {
     pub last_verified_at: Option<u64>,
     /// Optional verification graph snapshot id.
     pub last_verified_graph_snapshot_id: Option<u64>,
+    /// Recorded and current git checkout state for the memory workspace.
+    pub checkout_state: MemoryCheckoutState,
+    /// Workspace/path mismatch diagnostic, when linked absolute paths do not belong to the memory workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_conflict: Option<Value>,
+    /// Path ownership diagnostic for relative links that cannot prove workspace ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path_diagnostic: Option<Value>,
+}
+
+/// Git checkout state associated with a memory claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCheckoutState {
+    /// Git ref recorded when the memory was created, when available.
+    pub recorded_head_ref: Option<String>,
+    /// Git object id recorded when the memory was created, when available.
+    pub recorded_head_oid: Option<String>,
+    /// Current git ref for the memory workspace, when available.
+    pub current_head_ref: Option<String>,
+    /// Current git object id for the memory workspace, when available.
+    pub current_head_oid: Option<String>,
+    /// Comparison between recorded and current state.
+    pub status: String,
 }
 
 /// The action accepted by the unified memory evolution tool.
@@ -261,4 +291,235 @@ pub(crate) fn evidence_strength(
         * 0.12;
     let access_weight = (f64::from(access_count.min(8)) / 8.0) * 0.04;
     (0.1 + evidence_weight + provenance_weight + score_weight + access_weight).min(1.0)
+}
+
+pub(crate) fn memory_trust_status(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+    checkout_state: &MemoryCheckoutState,
+) -> &'static str {
+    if memory.is_stale
+        || matches!(
+            fields.verification_status,
+            MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+    {
+        "stale"
+    } else if matches!(
+        fields.verification_status,
+        MemoryVerificationStatus::Unverified | MemoryVerificationStatus::InReview
+    ) || fields.evidence.is_empty()
+        || matches!(
+            checkout_state.status.as_str(),
+            "head_changed" | "recorded_unknown"
+        )
+    {
+        "advisory"
+    } else {
+        "trusted"
+    }
+}
+
+pub(crate) fn memory_trust_reason(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+    checkout_state: &MemoryCheckoutState,
+) -> &'static str {
+    if memory.is_stale {
+        return "marked_stale";
+    }
+    match fields.verification_status {
+        MemoryVerificationStatus::Stale => "verification_stale",
+        MemoryVerificationStatus::Superseded => "superseded",
+        MemoryVerificationStatus::Contradicted => "contradicted",
+        MemoryVerificationStatus::Expired => "expired",
+        MemoryVerificationStatus::Invalidated => "invalidated",
+        MemoryVerificationStatus::Unverified => "unverified",
+        MemoryVerificationStatus::InReview => "verification_in_review",
+        MemoryVerificationStatus::Verified => {
+            if fields.evidence.is_empty() {
+                "missing_evidence"
+            } else if matches!(checkout_state.status.as_str(), "head_changed") {
+                "git_head_changed"
+            } else if matches!(checkout_state.status.as_str(), "recorded_unknown") {
+                "git_recorded_state_missing"
+            } else {
+                "verified"
+            }
+        }
+    }
+}
+
+pub(crate) fn checkout_state_for_memory(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+    fallback_workspace_id: &str,
+) -> MemoryCheckoutState {
+    let recorded_head_ref = provenance_reference(fields, "git_head_ref");
+    let recorded_head_oid = provenance_reference(fields, "git_head_oid");
+    let workspace = memory
+        .workspace_id
+        .as_deref()
+        .unwrap_or(fallback_workspace_id);
+    let current = read_git_state(Path::new(workspace));
+    let current_head_ref = current.as_ref().and_then(|state| state.head_ref.clone());
+    let current_head_oid = current.as_ref().and_then(|state| state.head_oid.clone());
+    let status = if recorded_head_oid.is_none() && recorded_head_ref.is_none() {
+        "recorded_unknown"
+    } else if current.is_none() {
+        "current_unknown"
+    } else if recorded_head_oid.is_some()
+        && current_head_oid.is_some()
+        && recorded_head_oid != current_head_oid
+    {
+        "head_changed"
+    } else if recorded_head_ref.is_some()
+        && current_head_ref.is_some()
+        && recorded_head_ref != current_head_ref
+    {
+        "head_changed"
+    } else {
+        "same_head"
+    };
+    MemoryCheckoutState {
+        recorded_head_ref,
+        recorded_head_oid,
+        current_head_ref,
+        current_head_oid,
+        status: status.to_string(),
+    }
+}
+
+pub(crate) fn git_provenance(workspace_id: &str) -> Vec<MemoryProvenance> {
+    let Some(state) = read_git_state(Path::new(workspace_id)) else {
+        return Vec::new();
+    };
+    let mut provenance = Vec::new();
+    if let Some(head_ref) = state.head_ref {
+        provenance.push(MemoryProvenance {
+            source: "git_head_ref".to_string(),
+            reference: Some(head_ref),
+            captured_at: None,
+            note: Some("recorded_checkout_state".to_string()),
+        });
+    }
+    if let Some(head_oid) = state.head_oid {
+        provenance.push(MemoryProvenance {
+            source: "git_head_oid".to_string(),
+            reference: Some(head_oid),
+            captured_at: None,
+            note: Some("recorded_checkout_state".to_string()),
+        });
+    }
+    provenance
+}
+
+pub(crate) fn memory_workspace_conflict(memory: &Memory) -> Option<Value> {
+    let workspace = memory.workspace_id.as_deref()?;
+    let mut conflicting_paths = Vec::new();
+    for path in memory
+        .linked_files
+        .iter()
+        .filter(|file| file.starts_with('/'))
+    {
+        if !Path::new(path).starts_with(workspace) {
+            conflicting_paths.push(path.clone());
+        }
+    }
+    if conflicting_paths.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "kind": "linked_absolute_path_outside_memory_workspace",
+        "workspace_id": workspace,
+        "conflicting_paths": conflicting_paths.into_iter().take(8).collect::<Vec<_>>(),
+        "reason": "Memory workspace provenance does not contain one or more linked absolute file paths; verify against the current checkout before using the claim."
+    }))
+}
+
+pub(crate) fn memory_workspace_path_diagnostic(memory: &Memory) -> Option<Value> {
+    memory.workspace_id.as_deref()?;
+    if memory.linked_files.is_empty()
+        || memory.linked_files.iter().any(|file| file.starts_with('/'))
+    {
+        return None;
+    }
+    Some(json!({
+        "kind": "relative_paths_require_workspace_context",
+        "reason": "Linked files are relative paths; workspace ownership is inferred from the memory workspace_id and should be rechecked if the claim came from another checkout."
+    }))
+}
+
+fn provenance_reference(fields: &MemoryStructuredFields, source: &str) -> Option<String> {
+    fields
+        .provenance
+        .iter()
+        .find(|item| item.source == source)
+        .and_then(|item| item.reference.clone())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitState {
+    head_ref: Option<String>,
+    head_oid: Option<String>,
+}
+
+fn read_git_state(workspace_root: &Path) -> Option<GitState> {
+    let git_dir = resolve_git_dir(workspace_root)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let trimmed = head.trim();
+    if let Some(head_ref) = trimmed.strip_prefix("ref:").map(str::trim) {
+        Some(GitState {
+            head_ref: Some(head_ref.to_string()),
+            head_oid: resolve_ref_oid(&git_dir, head_ref),
+        })
+    } else if !trimmed.is_empty() {
+        Some(GitState {
+            head_ref: None,
+            head_oid: Some(trimmed.to_string()),
+        })
+    } else {
+        None
+    }
+}
+
+fn resolve_git_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let git_path = workspace_root.join(".git");
+    if git_path.is_dir() {
+        return Some(git_path);
+    }
+    if git_path.is_file() {
+        let gitdir = std::fs::read_to_string(&git_path).ok()?;
+        let relative = gitdir.trim().strip_prefix("gitdir:")?.trim();
+        return Some(workspace_root.join(relative));
+    }
+    None
+}
+
+fn resolve_ref_oid(git_dir: &Path, head_ref: &str) -> Option<String> {
+    let ref_path = git_dir.join(head_ref);
+    if let Ok(contents) = std::fs::read_to_string(ref_path) {
+        let oid = contents.trim();
+        if !oid.is_empty() {
+            return Some(oid.to_string());
+        }
+    }
+    let packed_refs = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    for line in packed_refs.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('^') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let oid = parts.next()?;
+        let packed_ref = parts.next()?;
+        if packed_ref == head_ref {
+            return Some(oid.to_string());
+        }
+    }
+    None
 }

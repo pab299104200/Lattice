@@ -47,6 +47,23 @@ fn stale_memories_are_explicitly_labeled() {
 }
 
 #[test]
+fn unverified_memories_are_advisory_risks() {
+    let fixture = Fixture::new();
+    let bundle = fixture.prepare_bundle();
+    let advisory = bundle
+        .memory_highlights
+        .iter()
+        .find(|memory| memory.verification_status == "unverified")
+        .expect("fixture includes unverified memory");
+    assert_eq!(advisory.trust_status, "advisory");
+    assert_eq!(advisory.trust_reason, "unverified");
+    assert!(bundle.risks.iter().any(|risk| {
+        risk.message
+            .contains("Memory is advisory, not proof: unverified")
+    }));
+}
+
+#[test]
 fn workflow_events_are_emitted_in_order_under_budget() {
     let fixture = Fixture::new();
     let mut sink = VecEventSink::default();
@@ -303,7 +320,17 @@ fn build_capsule() -> ContextCapsule {
                 "scope": "repo",
                 "confidence": 0.91,
                 "verification_status": "verified",
+                "evidence": [{"kind": "test", "reference": "tests/auth.test.ts"}],
                 "inclusion_reason": "linked to loginUser",
+            }),
+            json!({
+                "id": "unverified-pattern",
+                "content": "Suspected auth issue may involve import-time settings pollution.",
+                "memory_type": "observation",
+                "scope": "repo",
+                "confidence": 0.7,
+                "verification_status": "unverified",
+                "inclusion_reason": "matched auth failure",
             }),
             json!({
                 "id": "stale-pattern",

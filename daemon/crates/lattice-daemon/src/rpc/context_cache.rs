@@ -14,6 +14,7 @@ pub struct CachedContext {
     pub handle_id: ContextHandleId,
     pub origin: String,
     pub seed: ExpandContextSeed,
+    pub repo_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +89,7 @@ impl ContextHandleCache {
         seed: ExpandContextSeed,
         workspace_id: &str,
         session_id: &str,
+        repo_epoch: u64,
     ) -> HandleRecord {
         self.prune_expired();
 
@@ -101,6 +103,7 @@ impl ContextHandleCache {
             handle_id: handle_id.clone(),
             origin: origin.into(),
             seed,
+            repo_epoch,
         };
         let expires_at_epoch_secs = now_epoch_secs().saturating_add(self.ttl.as_secs().max(1));
         self.entries.insert(
@@ -282,7 +285,7 @@ mod tests {
     #[test]
     fn test_cache_round_trip() {
         let mut cache = ContextHandleCache::new_with_limits(4, Duration::from_secs(60));
-        let handle = cache.insert("prepare_change", seed(), "workspace-a", "session-a");
+        let handle = cache.insert("prepare_change", seed(), "workspace-a", "session-a", 7);
 
         let entry = cache
             .get(&handle.legacy_handle)
@@ -295,12 +298,13 @@ mod tests {
     #[test]
     fn test_cache_evicts_oldest_when_over_capacity() {
         let mut cache = ContextHandleCache::new_with_limits(1, Duration::from_secs(60));
-        let first = cache.insert("prepare_change", seed(), "workspace-a", "session-a");
+        let first = cache.insert("prepare_change", seed(), "workspace-a", "session-a", 7);
         let second = cache.insert(
             "get_working_set_context",
             seed(),
             "workspace-a",
             "session-a",
+            7,
         );
 
         assert!(
@@ -322,7 +326,7 @@ mod tests {
                 Duration::from_secs(60),
                 Some(path.clone()),
             );
-            cache.insert("prepare_change", seed(), "workspace-a", "session-a")
+            cache.insert("prepare_change", seed(), "workspace-a", "session-a", 7)
         };
 
         let mut restored = ContextHandleCache::new_with_limits_and_persistence(
@@ -355,6 +359,7 @@ mod tests {
                     },
                     origin: "prepare_change".to_string(),
                     seed: seed(),
+                    repo_epoch: 7,
                 },
                 expires_at_epoch_secs: now_epoch_secs().saturating_sub(5),
             }],

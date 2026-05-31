@@ -118,6 +118,30 @@ fn test_excluded_dirs() {
         ".codex assistant worktrees should be excluded"
     );
     assert!(
+        filter.is_excluded(".codex-home/.tmp/plugins/plugins/figma/SKILL.md"),
+        ".codex-home scratch plugin cache should be excluded"
+    );
+    assert!(
+        filter.is_excluded("docs/audit/2026-05-18-remediation-run/worktrees/IU-001/backend/app.py"),
+        "generated remediation worktrees should be excluded"
+    );
+    assert!(
+        filter.is_excluded(".pytest_cache/README.md"),
+        "pytest cache should be excluded"
+    );
+    assert!(
+        filter.is_excluded("backend/.ruff_cache/0.9.0/file.py"),
+        "ruff cache should be excluded"
+    );
+    assert!(
+        filter.is_excluded(".playwright-mcp/session/state.md"),
+        "playwright mcp cache should be excluded"
+    );
+    assert!(
+        filter.is_excluded(".agents/task-notes.md"),
+        "agent scratch directories should be excluded"
+    );
+    assert!(
         filter.is_excluded("src/target/release/binary"),
         "target should be excluded"
     );
@@ -135,6 +159,12 @@ fn test_is_excluded_dir() {
     assert!(filter.is_excluded_dir(".git"));
     assert!(filter.is_excluded_dir(".claude"));
     assert!(filter.is_excluded_dir(".codex"));
+    assert!(filter.is_excluded_dir(".codex-home"));
+    assert!(filter.is_excluded_dir(".agents"));
+    assert!(filter.is_excluded_dir(".playwright-mcp"));
+    assert!(filter.is_excluded_dir(".pytest_cache"));
+    assert!(filter.is_excluded_dir(".ruff_cache"));
+    assert!(filter.is_excluded_dir("worktrees"));
     assert!(filter.is_excluded_dir("target"));
     assert!(filter.is_excluded_dir("__pycache__"));
     assert!(!filter.is_excluded_dir("src"));

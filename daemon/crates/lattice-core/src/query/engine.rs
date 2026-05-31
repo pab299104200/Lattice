@@ -72,7 +72,7 @@ struct ScoredCandidate<'a> {
 /// The query engine orchestrates intent detection, search, graph traversal,
 /// ranking, and budget allocation to produce Context Capsules.
 pub struct QueryEngine {
-    graph: CodeGraph,
+    graph: Arc<CodeGraph>,
     vector_index: Option<SharedVectorIndex>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
     query_history: HashMap<String, usize>,
@@ -83,6 +83,19 @@ impl QueryEngine {
     /// and optional memory store.
     pub fn new(
         graph: CodeGraph,
+        vector_index: Option<SharedVectorIndex>,
+        memory_store: Option<Arc<Mutex<MemoryStore>>>,
+    ) -> Self {
+        Self {
+            graph: Arc::new(graph),
+            vector_index,
+            memory_store,
+            query_history: HashMap::new(),
+        }
+    }
+
+    pub fn new_shared(
+        graph: Arc<CodeGraph>,
         vector_index: Option<SharedVectorIndex>,
         memory_store: Option<Arc<Mutex<MemoryStore>>>,
     ) -> Self {
@@ -1106,12 +1119,12 @@ impl QueryEngine {
 
     /// Get the underlying graph for direct operations.
     pub fn graph(&self) -> &CodeGraph {
-        &self.graph
+        self.graph.as_ref()
     }
 
     /// Get the underlying graph mutably for direct updates.
     pub fn graph_mut(&mut self) -> &mut CodeGraph {
-        &mut self.graph
+        Arc::make_mut(&mut self.graph)
     }
 
     /// Get a reference to the vector store (if available).
@@ -1135,6 +1148,10 @@ impl QueryEngine {
 
     /// Replace the code graph with a new one.
     pub fn update_graph(&mut self, graph: CodeGraph) {
+        self.graph = Arc::new(graph);
+    }
+
+    pub fn update_graph_arc(&mut self, graph: Arc<CodeGraph>) {
         self.graph = graph;
     }
 

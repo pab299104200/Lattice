@@ -1,6 +1,11 @@
 #![recursion_limit = "256"]
 
+mod lifecycle_log;
+mod proxy;
+mod repo_state;
 mod rpc;
+mod runtime_support;
+mod socket_server;
 mod vector_sync;
 mod watcher;
 
@@ -11,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
 use lattice_core::embeddings::EmbeddingEngine;
@@ -45,11 +51,84 @@ async fn main() -> Result<()> {
         return run_memory_migrate_cli();
     }
 
+    if has_arg("--daemon") {
+        tracing::info!("Lattice global daemon starting...");
+        lifecycle_log::log_event(
+            "daemon",
+            "process_start",
+            &[(
+                "argv",
+                serde_json::json!(std::env::args().collect::<Vec<_>>()),
+            )],
+        );
+        let result = socket_server::run_global_daemon().await;
+        match &result {
+            Ok(()) => lifecycle_log::log_event(
+                "daemon",
+                "process_exit",
+                &[("status", serde_json::json!("ok"))],
+            ),
+            Err(error) => lifecycle_log::log_event(
+                "daemon",
+                "process_exit",
+                &[
+                    ("status", serde_json::json!("error")),
+                    ("error", serde_json::json!(error.to_string())),
+                ],
+            ),
+        }
+        return result;
+    }
+
+    if has_arg("--stdio") {
+        let workspace_roots = parse_workspace_roots();
+        let workspace_root = workspace_roots[0].clone();
+        let default_focus = parse_focus_args(&workspace_root);
+        let hello = proxy::ProxyHello {
+            workspace_roots: workspace_roots
+                .iter()
+                .map(|root| root.to_string_lossy().to_string())
+                .collect(),
+            focus_files: default_focus.files,
+            focus_dirs: default_focus.dirs,
+        };
+        tracing::info!("Starting lightweight stdio proxy");
+        lifecycle_log::log_event(
+            "proxy",
+            "process_start",
+            &[
+                (
+                    "workspace_roots",
+                    serde_json::json!(hello.workspace_roots.clone()),
+                ),
+                ("daemon_addr", serde_json::json!(proxy::daemon_addr())),
+            ],
+        );
+        let result = proxy::run_stdio_proxy(hello).await;
+        match &result {
+            Ok(()) => lifecycle_log::log_event(
+                "proxy",
+                "process_exit",
+                &[("status", serde_json::json!("ok"))],
+            ),
+            Err(error) => lifecycle_log::log_event(
+                "proxy",
+                "process_exit",
+                &[
+                    ("status", serde_json::json!("error")),
+                    ("error", serde_json::json!(error.to_string())),
+                ],
+            ),
+        }
+        return result;
+    }
+
     tracing::info!("Lattice daemon starting...");
 
     // ── Parse workspace roots ────────────────────────────────────────
     let workspace_roots = parse_workspace_roots();
     let workspace_root = workspace_roots[0].clone();
+    let default_focus = parse_focus_args(&workspace_root);
     let is_multi_repo = workspace_roots.len() > 1;
     if is_multi_repo {
         tracing::info!("Multi-repo mode: {} workspaces", workspace_roots.len());
@@ -88,28 +167,31 @@ async fn main() -> Result<()> {
             GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
         }
     };
-    let graph = match graph_store.load_graph() {
-        Ok(loaded) => {
-            let stats = loaded.stats();
-            if stats.node_count > 0 {
-                tracing::info!(
-                    "Warm-loaded persisted graph: {} nodes, {} edges, {} files",
-                    stats.node_count,
-                    stats.edge_count,
-                    stats.file_count
-                );
+    let graph = match should_warm_load_graph(&graph_store, &workspace_root) {
+        false => CodeGraph::new(),
+        true => match graph_store.load_graph() {
+            Ok(loaded) => {
+                let stats = loaded.stats();
+                if stats.node_count > 0 {
+                    tracing::info!(
+                        "Warm-loaded persisted graph: {} nodes, {} edges, {} files",
+                        stats.node_count,
+                        stats.edge_count,
+                        stats.file_count
+                    );
+                }
+                loaded
             }
-            loaded
-        }
-        Err(e) => {
-            tracing::warn!("Failed to load persisted graph: {}", e);
-            CodeGraph::new()
-        }
+            Err(e) => {
+                tracing::warn!("Failed to load persisted graph: {}", e);
+                CodeGraph::new()
+            }
+        },
     };
-    let compaction_graph = Arc::new(std::sync::Mutex::new(graph.clone()));
-
-    let engine = QueryEngine::new(
-        graph,
+    let graph = Arc::new(graph);
+    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
+    let engine = QueryEngine::new_shared(
+        Arc::clone(&graph),
         vector_index.clone(),
         Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
     );
@@ -126,17 +208,16 @@ async fn main() -> Result<()> {
     );
 
     // Multi-repo workspace manager (only used when multiple workspaces)
-    let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = if is_multi_repo {
-        Some(Arc::new(Mutex::new(WorkspaceManager::new())))
-    } else {
-        None
-    };
+    let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
 
     // OnceLock for EmbeddingEngine — populated in background once model loads
     let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
 
     // Shared indexing state flag
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
+        &workspace_root,
+    )));
 
     // ── Spawn background indexing task ────────────────────────────────
     {
@@ -146,7 +227,6 @@ async fn main() -> Result<()> {
         let compaction_graph_bg = Arc::clone(&compaction_graph);
         let embedding_engine_bg = Arc::clone(&embedding_engine);
         let indexing_bg = Arc::clone(&indexing);
-        let ws_manager_bg = workspace_manager.clone();
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
         let lattice_dir_bg = ws_root.join(".lattice");
@@ -156,109 +236,56 @@ async fn main() -> Result<()> {
             tracing::info!("Background indexing starting...");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
-            let files_indexed = if let Some(wm) = &ws_manager_bg {
-                let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
-                publish_cached_parsed_graph_snapshot(
-                    &parsed_cache,
-                    Some(&indexer_bg),
-                    &engine_bg,
-                    &compaction_graph_bg,
-                )
-                .await;
-                let roots = ws_roots_bg.clone();
-                let incremental = tokio::task::spawn_blocking(move || {
-                    build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!("Incremental multi-repo indexing task failed: {}", err);
-                    IncrementalIndexResult::empty()
-                });
-
-                {
-                    let mut wm = wm.lock().await;
-                    for root in &ws_roots_bg {
-                        let repo_name = repo_name_for_root(root);
-                        if let Err(e) = wm.add_repo(repo_name.clone(), root.clone()) {
-                            tracing::warn!("Failed to add repo {}: {}", repo_name, e);
-                            continue;
-                        }
-                        let repo_prefix = format!("{}/", repo_name);
-                        let repo_files: HashMap<String, ParsedFile> = incremental
-                            .parsed_files
-                            .iter()
-                            .filter(|(file, _)| file.starts_with(&repo_prefix))
-                            .map(|(file, parsed)| (file.clone(), parsed.clone()))
-                            .collect();
-                        wm.replace_repo_parsed_files(&repo_name, repo_files);
-                    }
-                    wm.detect_cross_repo_edges();
-                    tracing::info!("Detected {} cross-repo edges", wm.cross_repo_edges().len());
-                }
-
-                persist_incremental_cache(
-                    &graph_store_bg,
-                    &incremental.graph,
-                    &incremental.file_index,
-                    &incremental.parsed_files,
-                )
-                .await;
-                tracing::info!(
-                    "Incremental multi-repo indexing: {} current files, {} parsed/updated, {} removed",
-                    incremental.file_index.len(),
-                    incremental.changed_count,
-                    incremental.removed_count
-                );
-                incremental.changed_count
+            let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
+            publish_cached_parsed_graph_snapshot(
+                &parsed_cache,
+                Some(&indexer_bg),
+                &engine_bg,
+                &compaction_graph_bg,
+            )
+            .await;
+            let roots = if is_multi_repo {
+                ws_roots_bg.clone()
             } else {
-                let ws = ws_root.clone();
-                let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
-                publish_cached_parsed_graph_snapshot(
-                    &parsed_cache,
-                    Some(&indexer_bg),
-                    &engine_bg,
-                    &compaction_graph_bg,
-                )
-                .await;
-                let incremental = tokio::task::spawn_blocking(move || {
-                    build_incremental_index_for_roots(&[ws], Some(&manifest), parsed_cache)
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!("Incremental indexing task failed: {}", err);
-                    IncrementalIndexResult::empty()
-                });
-
-                {
-                    let mut idx = indexer_bg.lock().await;
-                    idx.replace_parsed_files(incremental.parsed_files.clone());
-                }
-
-                persist_incremental_cache(
-                    &graph_store_bg,
-                    &incremental.graph,
-                    &incremental.file_index,
-                    &incremental.parsed_files,
-                )
-                .await;
-                tracing::info!(
-                    "Incremental indexing: {} current files, {} parsed/updated, {} removed",
-                    incremental.file_index.len(),
-                    incremental.changed_count,
-                    incremental.removed_count
-                );
-                incremental.changed_count
+                vec![ws_root.clone()]
             };
+            let incremental = tokio::task::spawn_blocking(move || {
+                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!("Incremental indexing task failed: {}", err);
+                IncrementalIndexResult::empty()
+            });
+
+            persist_incremental_cache(
+                &graph_store_bg,
+                &incremental.graph,
+                &incremental.file_index,
+                &incremental.parsed_files,
+            )
+            .await;
+            {
+                let mut idx = indexer_bg.lock().await;
+                idx.replace_shared_index(
+                    Arc::clone(&incremental.graph),
+                    incremental.parsed_files.clone(),
+                );
+            }
+            tracing::info!(
+                "Incremental indexing: {} current files, {} parsed/updated, {} removed",
+                incremental.file_index.len(),
+                incremental.changed_count,
+                incremental.removed_count
+            );
+            let files_indexed = incremental.changed_count;
             tracing::info!("Indexed {} files total", files_indexed);
 
             // Final save to graph store
             {
-                let new_graph = if let Some(wm) = &ws_manager_bg {
-                    let wm = wm.lock().await;
-                    wm.unified_graph()
-                } else {
+                let new_graph = {
                     let idx = indexer_bg.lock().await;
-                    idx.graph().clone()
+                    idx.graph_arc()
                 };
 
                 let stats = new_graph.stats();
@@ -276,13 +303,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 if let Ok(mut graph) = compaction_graph_bg.lock() {
-                    *graph = new_graph.clone();
+                    *graph = Arc::clone(&new_graph);
                 } else {
                     tracing::warn!("Failed to refresh compaction graph snapshot handle");
                 }
 
                 let mut eng = engine_bg.lock().await;
-                eng.update_graph(new_graph);
+                eng.update_graph_arc(new_graph);
             }
 
             // Try to load ONNX embedding model
@@ -294,38 +321,47 @@ async fn main() -> Result<()> {
                         let emb = Arc::new(emb_engine);
                         let _ = embedding_engine_bg.set(Arc::clone(&emb));
 
-                        let graph_snapshot = {
-                            let eng = engine_bg.lock().await;
-                            eng.graph().clone()
-                        };
-                        if let Some(index) = vector_index_bg.as_ref() {
-                            match crate::vector_sync::sync_full_graph_embeddings(
-                                &graph_snapshot,
-                                emb.as_ref(),
-                                index.as_ref(),
-                            ) {
-                                Ok(stats) => {
-                                    tracing::info!(
-                                        mode = stats.mode,
-                                        implementation = stats.implementation,
-                                        graph_nodes = stats.graph_nodes,
-                                        nodes_considered = stats.nodes_considered,
-                                        embedded_nodes = stats.embedded_nodes,
-                                        failed_nodes = stats.failed_nodes,
-                                        payload_chars_total = stats.payload_chars_total,
-                                        payload_chars_avg = stats.payload_chars_avg,
-                                        payload_chars_max = stats.payload_chars_max,
-                                        elapsed_ms = stats.elapsed_ms as u64,
-                                        throughput_nodes_per_sec = stats.throughput_nodes_per_sec(),
-                                        "Background semantic sync complete"
-                                    );
+                        if background_vector_sync_enabled() {
+                            let graph_snapshot = {
+                                let eng = engine_bg.lock().await;
+                                eng.graph().clone()
+                            };
+                            if let Some(index) = vector_index_bg.as_ref() {
+                                match crate::vector_sync::sync_full_graph_embeddings(
+                                    &graph_snapshot,
+                                    emb.as_ref(),
+                                    index.as_ref(),
+                                ) {
+                                    Ok(stats) => {
+                                        tracing::info!(
+                                            mode = stats.mode,
+                                            implementation = stats.implementation,
+                                            graph_nodes = stats.graph_nodes,
+                                            nodes_considered = stats.nodes_considered,
+                                            embedded_nodes = stats.embedded_nodes,
+                                            failed_nodes = stats.failed_nodes,
+                                            payload_chars_total = stats.payload_chars_total,
+                                            payload_chars_avg = stats.payload_chars_avg,
+                                            payload_chars_max = stats.payload_chars_max,
+                                            elapsed_ms = stats.elapsed_ms as u64,
+                                            throughput_nodes_per_sec =
+                                                stats.throughput_nodes_per_sec(),
+                                            "Background semantic sync complete"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to sync semantic index: {}", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Failed to sync semantic index: {}", e);
-                                }
+                            } else {
+                                tracing::info!(
+                                    "No vector index configured, semantic search disabled"
+                                );
                             }
                         } else {
-                            tracing::info!("No vector index configured, semantic search disabled");
+                            tracing::info!(
+                                "Background semantic sync disabled; set LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1 to enable"
+                            );
                         }
                     }
                     Err(e) => {
@@ -349,17 +385,22 @@ async fn main() -> Result<()> {
         let workspace_roots = workspace_roots.clone();
         let embedding_engine = Arc::clone(&embedding_engine);
         let vector_index = vector_index.clone();
+        let repo_state = Arc::clone(&repo_state);
+        let indexing_state = Arc::clone(&indexing);
 
         tokio::spawn(async move {
             for root in workspace_roots {
                 let watcher = crate::watcher::FileWatcher::new(
                     root.clone(),
+                    is_multi_repo.then(|| repo_name_for_root(&root)),
                     Some(Arc::clone(&indexer)),
                     workspace_manager.clone(),
                     Arc::clone(&graph_store),
                     Arc::clone(&engine),
                     Arc::clone(&embedding_engine),
                     vector_index.clone(),
+                    Arc::clone(&repo_state),
+                    Arc::clone(&indexing_state),
                 );
 
                 tokio::spawn(async move {
@@ -392,7 +433,7 @@ async fn main() -> Result<()> {
     let session_id = generate_session_id();
     let context_cache_path = lattice_dir.join("context_handles.json");
     tracing::info!("Creating MCP handler (session: {})", session_id);
-    let handler = Arc::new(McpHandler::new(
+    let handler = Arc::new(McpHandler::new_with_shared_repo_state(
         engine,
         indexer,
         memory_store,
@@ -406,6 +447,9 @@ async fn main() -> Result<()> {
         workspace_roots,
         indexing,
         Some(event_writer),
+        default_focus.files,
+        default_focus.dirs,
+        repo_state,
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
@@ -418,13 +462,339 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct WorkspaceRuntime {
+    pub(crate) handler: Arc<McpHandler>,
+    background_tasks: Vec<JoinHandle<()>>,
+    compaction_scheduler: Option<SchedulerHandle>,
+}
+
+impl WorkspaceRuntime {
+    pub(crate) async fn shutdown(mut self) {
+        self.handler.auto_flush_session_state().await;
+        for task in self.background_tasks.drain(..) {
+            task.abort();
+        }
+        if let Some(scheduler) = self.compaction_scheduler.take() {
+            scheduler.shutdown().await;
+        }
+    }
+}
+
+pub(crate) async fn build_workspace_runtime(
+    workspace_roots: Vec<PathBuf>,
+    default_focus_files: Vec<String>,
+    default_focus_dirs: Vec<String>,
+) -> Result<WorkspaceRuntime> {
+    let workspace_root = workspace_roots[0].clone();
+    let is_multi_repo = workspace_roots.len() > 1;
+    if is_multi_repo {
+        tracing::info!(
+            "Registering multi-repo workspace: {} roots",
+            workspace_roots.len()
+        );
+        for r in &workspace_roots {
+            tracing::info!("  - {}", r.display());
+        }
+    }
+
+    let lattice_dir = workspace_root.join(".lattice");
+    let _ = std::fs::create_dir_all(&lattice_dir);
+
+    let memories_path = lattice_dir.join("memories.db");
+    let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
+    let vector_index = open_vector_index(&lattice_dir);
+    let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
+    let event_writer = Arc::new(
+        EventWriter::new(
+            event_store.clone(),
+            workspace_root.to_string_lossy().to_string(),
+            4096,
+        )
+        .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
+    );
+
+    let graph_path = lattice_dir.join("graph.db");
+    let graph_store = match GraphStore::open(&graph_path) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to open persistent graph store at {}: {}. Falling back to memory-only graph store.",
+                graph_path.display(),
+                e
+            );
+            GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
+        }
+    };
+    let graph = match should_warm_load_graph(&graph_store, &workspace_root) {
+        false => CodeGraph::new(),
+        true => match graph_store.load_graph() {
+            Ok(loaded) => {
+                let stats = loaded.stats();
+                if stats.node_count > 0 {
+                    tracing::info!(
+                        "Warm-loaded persisted graph for {}: {} nodes, {} edges, {} files",
+                        workspace_root.display(),
+                        stats.node_count,
+                        stats.edge_count,
+                        stats.file_count
+                    );
+                }
+                loaded
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load persisted graph: {}", e);
+                CodeGraph::new()
+            }
+        },
+    };
+    let graph = Arc::new(graph);
+    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
+    let engine = QueryEngine::new_shared(
+        Arc::clone(&graph),
+        vector_index.clone(),
+        Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
+    );
+    let engine = Arc::new(Mutex::new(engine));
+    let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
+    let graph_store = Arc::new(Mutex::new(graph_store));
+    let compaction_scheduler = start_event_compaction_scheduler(
+        &lattice_dir,
+        memory_mode,
+        &memories_path,
+        Arc::clone(&event_store),
+        Arc::clone(&event_writer),
+        Arc::clone(&compaction_graph),
+    );
+    let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
+    let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
+    let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
+        &workspace_root,
+    )));
+
+    {
+        let engine_bg = Arc::clone(&engine);
+        let indexer_bg = Arc::clone(&indexer);
+        let graph_store_bg = Arc::clone(&graph_store);
+        let compaction_graph_bg = Arc::clone(&compaction_graph);
+        let embedding_engine_bg = Arc::clone(&embedding_engine);
+        let indexing_bg = Arc::clone(&indexing);
+        let ws_roots_bg = workspace_roots.clone();
+        let ws_root = workspace_root.clone();
+        let lattice_dir_bg = ws_root.join(".lattice");
+        let vector_index_bg = vector_index.clone();
+
+        let task = tokio::spawn(async move {
+            tracing::info!("Background indexing starting for {}...", ws_root.display());
+            let _ = std::fs::create_dir_all(&lattice_dir_bg);
+
+            let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
+            publish_cached_parsed_graph_snapshot(
+                &parsed_cache,
+                Some(&indexer_bg),
+                &engine_bg,
+                &compaction_graph_bg,
+            )
+            .await;
+            let roots = if is_multi_repo {
+                ws_roots_bg.clone()
+            } else {
+                vec![ws_root.clone()]
+            };
+            let incremental = tokio::task::spawn_blocking(move || {
+                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!("Incremental indexing task failed: {}", err);
+                IncrementalIndexResult::empty()
+            });
+
+            persist_incremental_cache(
+                &graph_store_bg,
+                &incremental.graph,
+                &incremental.file_index,
+                &incremental.parsed_files,
+            )
+            .await;
+            {
+                let mut idx = indexer_bg.lock().await;
+                idx.replace_shared_index(
+                    Arc::clone(&incremental.graph),
+                    incremental.parsed_files.clone(),
+                );
+            }
+            let files_indexed = incremental.changed_count;
+            tracing::info!("Indexed {} files total", files_indexed);
+
+            {
+                let new_graph = {
+                    let idx = indexer_bg.lock().await;
+                    idx.graph_arc()
+                };
+                let stats = new_graph.stats();
+                tracing::info!(
+                    "Graph ready for {}: {} nodes, {} edges, {} files",
+                    ws_root.display(),
+                    stats.node_count,
+                    stats.edge_count,
+                    stats.file_count
+                );
+                {
+                    let gs = graph_store_bg.lock().await;
+                    if let Err(e) = gs.save_graph(&new_graph) {
+                        tracing::warn!("Failed to save graph: {}", e);
+                    }
+                }
+                if let Ok(mut graph) = compaction_graph_bg.lock() {
+                    *graph = Arc::clone(&new_graph);
+                }
+                let mut eng = engine_bg.lock().await;
+                eng.update_graph_arc(new_graph);
+            }
+
+            let model_path = lattice_dir_bg.join("models").join("model.onnx");
+            if model_path.exists() {
+                match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
+                    Ok(emb_engine) => {
+                        tracing::info!("ONNX embedding model loaded");
+                        let emb = Arc::new(emb_engine);
+                        let _ = embedding_engine_bg.set(Arc::clone(&emb));
+                        if background_vector_sync_enabled() {
+                            let graph_snapshot = {
+                                let eng = engine_bg.lock().await;
+                                eng.graph().clone()
+                            };
+                            if let Some(index) = vector_index_bg.as_ref() {
+                                if let Err(e) = crate::vector_sync::sync_full_graph_embeddings(
+                                    &graph_snapshot,
+                                    emb.as_ref(),
+                                    index.as_ref(),
+                                ) {
+                                    tracing::warn!("Failed to sync semantic index: {}", e);
+                                }
+                            } else {
+                                tracing::info!(
+                                    "No vector index configured, semantic search disabled"
+                                );
+                            }
+                        } else {
+                            tracing::info!(
+                                "Background semantic sync disabled for {}; set LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1 to enable",
+                                ws_root.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::info!("No ONNX model: {}", e),
+                }
+            }
+
+            indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("Background indexing complete for {}", ws_root.display());
+        });
+        background_tasks.push(task);
+    }
+
+    {
+        let engine = Arc::clone(&engine);
+        let indexer = Arc::clone(&indexer);
+        let graph_store = Arc::clone(&graph_store);
+        let workspace_manager = workspace_manager.clone();
+        let workspace_roots = workspace_roots.clone();
+        let embedding_engine = Arc::clone(&embedding_engine);
+        let vector_index = vector_index.clone();
+
+        for root in workspace_roots {
+            let watcher = crate::watcher::FileWatcher::new(
+                root.clone(),
+                is_multi_repo.then(|| repo_name_for_root(&root)),
+                Some(Arc::clone(&indexer)),
+                workspace_manager.clone(),
+                Arc::clone(&graph_store),
+                Arc::clone(&engine),
+                Arc::clone(&embedding_engine),
+                vector_index.clone(),
+                Arc::clone(&repo_state),
+                Arc::clone(&indexing),
+            );
+            let task = tokio::spawn(async move {
+                if let Err(e) = watcher.run().await {
+                    tracing::error!("File watcher failed for {:?}: {}", root, e);
+                }
+            });
+            background_tasks.push(task);
+        }
+    }
+
+    {
+        let memory_store_decay = Arc::clone(&memory_store);
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let ms = memory_store_decay.lock().await;
+                let decayed = ms.decay_old_memories(7, 0.1).unwrap_or(0);
+                let pruned = ms.prune_old_memories(0.2, 30).unwrap_or(0);
+                if decayed > 0 || pruned > 0 {
+                    tracing::info!("Memory maintenance: decayed {}, pruned {}", decayed, pruned);
+                }
+            }
+        });
+        background_tasks.push(task);
+    }
+
+    let session_id = generate_session_id();
+    let context_cache_path = lattice_dir.join("context_handles.json");
+    tracing::info!(
+        "Creating MCP handler for {} (session: {})",
+        workspace_root.display(),
+        session_id
+    );
+    let handler = Arc::new(McpHandler::new_with_shared_repo_state(
+        engine,
+        indexer,
+        memory_store,
+        graph_store,
+        embedding_engine,
+        vector_index,
+        workspace_root,
+        context_cache_path,
+        session_id,
+        workspace_manager,
+        workspace_roots,
+        indexing,
+        Some(event_writer),
+        default_focus_files,
+        default_focus_dirs,
+        repo_state,
+    ));
+    {
+        let handler = Arc::clone(&handler);
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let _ = handler.auto_checkpoint_active_states("interval").await;
+            }
+        });
+        background_tasks.push(task);
+    }
+    Ok(WorkspaceRuntime {
+        handler,
+        background_tasks,
+        compaction_scheduler,
+    })
+}
+
 fn start_event_compaction_scheduler(
     lattice_dir: &Path,
     memory_mode: MemoryStoreMode,
     memories_path: &Path,
     event_store: Arc<EventStore>,
     event_writer: Arc<EventWriter>,
-    graph: Arc<std::sync::Mutex<CodeGraph>>,
+    graph: Arc<std::sync::Mutex<Arc<CodeGraph>>>,
 ) -> Option<SchedulerHandle> {
     if memory_mode == MemoryStoreMode::InMemoryFallback {
         tracing::warn!(
@@ -490,6 +860,81 @@ fn env_usize(name: &str, fallback: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
+}
+
+pub(crate) fn background_vector_sync_enabled() -> bool {
+    matches!(
+        std::env::var("LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+const WARM_GRAPH_FILE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_FILES";
+const WARM_GRAPH_BYTE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_BYTES";
+const DEFAULT_MAX_WARM_GRAPH_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn should_warm_load_graph(graph_store: &GraphStore, workspace_root: &Path) -> bool {
+    let max_files = max_warm_graph_files();
+    let max_bytes = max_warm_graph_bytes();
+    match graph_store.persisted_graph_file_count() {
+        Ok(file_count) if file_count > max_files => {
+            tracing::warn!(
+                workspace = %workspace_root.display(),
+                persisted_files = file_count,
+                max_files,
+                env_var = WARM_GRAPH_FILE_LIMIT_ENV,
+                "Skipping persisted graph warm-load because it exceeds the safety limit"
+            );
+            false
+        }
+        Ok(_) => match graph_store.persisted_graph_disk_bytes() {
+            Ok(Some(byte_count)) if byte_count > max_bytes => {
+                tracing::warn!(
+                    workspace = %workspace_root.display(),
+                    persisted_bytes = byte_count,
+                    max_bytes,
+                    env_var = WARM_GRAPH_BYTE_LIMIT_ENV,
+                    "Skipping persisted graph warm-load because on-disk graph size exceeds the safety limit"
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace_root.display(),
+                    %error,
+                    "Skipping persisted graph warm-load because persisted graph disk size could not be validated"
+                );
+                false
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                workspace = %workspace_root.display(),
+                %error,
+                "Skipping persisted graph warm-load because persisted graph size could not be validated"
+            );
+            false
+        }
+    }
+}
+
+fn max_warm_graph_files() -> usize {
+    std::env::var(WARM_GRAPH_FILE_LIMIT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50_000)
+}
+
+fn max_warm_graph_bytes() -> u64 {
+    std::env::var(WARM_GRAPH_BYTE_LIMIT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_WARM_GRAPH_BYTES)
 }
 
 fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
@@ -746,8 +1191,95 @@ fn parse_workspace_roots() -> Vec<PathBuf> {
         roots.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     }
 
-    // Anti-double-indexing: remove any root that is a subdirectory of another
-    deduplicate_roots(roots)
+    // Anti-double-indexing: remove any root that is a subdirectory of another.
+    let roots = deduplicate_roots(roots);
+    let current_dir = std::env::current_dir().ok();
+    prefer_current_dir_root(roots, current_dir.as_deref())
+}
+
+fn prefer_current_dir_root(mut roots: Vec<PathBuf>, current_dir: Option<&Path>) -> Vec<PathBuf> {
+    let Some(current_dir) = current_dir else {
+        return roots;
+    };
+    let current_dir = current_dir
+        .canonicalize()
+        .unwrap_or_else(|_| current_dir.to_path_buf());
+    if let Some(position) = roots.iter().position(|root| current_dir.starts_with(root)) {
+        if position != 0 {
+            let active_root = roots.remove(position);
+            roots.insert(0, active_root);
+        }
+    }
+    roots
+}
+
+#[derive(Debug, Default, Clone)]
+struct SessionFocus {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+fn parse_focus_args(workspace_root: &Path) -> SessionFocus {
+    let args: Vec<String> = std::env::args().collect();
+    let mut focus = SessionFocus::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--focus-file" => {
+                if let Some(value) = args.get(i + 1) {
+                    if let Some(normalized) = normalize_focus_path(workspace_root, value) {
+                        push_unique(&mut focus.files, normalized);
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            "--focus-dir" => {
+                if let Some(value) = args.get(i + 1) {
+                    if let Some(normalized) = normalize_focus_path(workspace_root, value) {
+                        push_unique(
+                            &mut focus.dirs,
+                            normalized.trim_end_matches('/').to_string(),
+                        );
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    focus
+}
+
+fn normalize_focus_path(workspace_root: &Path, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        let canonical = candidate.canonicalize().unwrap_or(candidate);
+        if let Ok(relative) = canonical.strip_prefix(workspace_root) {
+            let text = relative.to_string_lossy().replace('\\', "/");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        return Some(canonical.to_string_lossy().replace('\\', "/"));
+    }
+    Some(trimmed.trim_start_matches("./").replace('\\', "/"))
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|existing| existing == &value) {
+        items.push(value);
+    }
+}
+
+fn has_arg(name: &str) -> bool {
+    std::env::args().any(|arg| arg == name)
 }
 
 fn is_memory_migrate_command() -> bool {
@@ -924,8 +1456,8 @@ struct SourceFileRecord {
 }
 
 #[derive(Clone)]
-struct IncrementalIndexResult {
-    graph: CodeGraph,
+pub(crate) struct IncrementalIndexResult {
+    graph: Arc<CodeGraph>,
     parsed_files: HashMap<String, ParsedFile>,
     file_index: Vec<FileIndexEntry>,
     changed_count: usize,
@@ -935,7 +1467,7 @@ struct IncrementalIndexResult {
 impl IncrementalIndexResult {
     fn empty() -> Self {
         Self {
-            graph: CodeGraph::new(),
+            graph: Arc::new(CodeGraph::new()),
             parsed_files: HashMap::new(),
             file_index: Vec::new(),
             changed_count: 0,
@@ -948,7 +1480,7 @@ async fn publish_cached_parsed_graph_snapshot(
     parsed_files: &HashMap<String, ParsedFile>,
     indexer: Option<&Arc<Mutex<Indexer>>>,
     engine: &Arc<Mutex<QueryEngine>>,
-    compaction_graph: &Arc<std::sync::Mutex<CodeGraph>>,
+    compaction_graph: &Arc<std::sync::Mutex<Arc<CodeGraph>>>,
 ) -> bool {
     if parsed_files.is_empty() {
         return false;
@@ -963,7 +1495,8 @@ async fn publish_cached_parsed_graph_snapshot(
 
     let mut cached_indexer = Indexer::new(PathBuf::new());
     cached_indexer.replace_parsed_files(parsed_files.clone());
-    let cached_graph = cached_indexer.graph().clone();
+    let (cached_graph, cached_parsed_files) = cached_indexer.into_parts();
+    let cached_graph = Arc::new(cached_graph);
     let stats = cached_graph.stats();
     if stats.node_count == 0 {
         return false;
@@ -971,18 +1504,18 @@ async fn publish_cached_parsed_graph_snapshot(
 
     if let Some(indexer) = indexer {
         let mut indexer = indexer.lock().await;
-        indexer.replace_parsed_files(parsed_files.clone());
+        indexer.replace_shared_index(Arc::clone(&cached_graph), cached_parsed_files);
     }
 
     if let Ok(mut graph) = compaction_graph.lock() {
-        *graph = cached_graph.clone();
+        *graph = Arc::clone(&cached_graph);
     } else {
         tracing::warn!("Failed to publish cached graph to compaction graph snapshot");
     }
 
     let mut engine = engine.lock().await;
     if engine.graph().stats().node_count == 0 {
-        engine.update_graph(cached_graph);
+        engine.update_graph_arc(cached_graph);
         tracing::info!(
             "Warm-published cached graph snapshot: {} nodes, {} edges, {} files",
             stats.node_count,
@@ -995,7 +1528,7 @@ async fn publish_cached_parsed_graph_snapshot(
     }
 }
 
-async fn load_incremental_cache(
+pub(crate) async fn load_incremental_cache(
     graph_store: &Arc<Mutex<GraphStore>>,
 ) -> (HashMap<String, FileIndexEntry>, HashMap<String, ParsedFile>) {
     let store = graph_store.lock().await;
@@ -1003,6 +1536,15 @@ async fn load_incremental_cache(
         tracing::warn!("Failed to load file index manifest: {}", err);
         HashMap::new()
     });
+    let max_cached_files = max_cached_parsed_files();
+    if manifest.len() > max_cached_files {
+        tracing::warn!(
+            cached_files = manifest.len(),
+            max_cached_files,
+            "Skipping persisted parsed-file cache because it exceeds the safety limit"
+        );
+        return (HashMap::new(), HashMap::new());
+    }
     let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
         tracing::warn!("Failed to load cached parsed files: {}", err);
         HashMap::new()
@@ -1010,7 +1552,7 @@ async fn load_incremental_cache(
     (manifest, parsed_files)
 }
 
-async fn persist_incremental_cache(
+pub(crate) async fn persist_incremental_cache(
     graph_store: &Arc<Mutex<GraphStore>>,
     graph: &CodeGraph,
     file_index: &[FileIndexEntry],
@@ -1028,7 +1570,7 @@ async fn persist_incremental_cache(
     }
 }
 
-fn build_incremental_index_for_roots(
+pub(crate) fn build_incremental_index_for_roots(
     roots: &[PathBuf],
     manifest: Option<&HashMap<String, FileIndexEntry>>,
     mut parsed_files: HashMap<String, ParsedFile>,
@@ -1129,9 +1671,10 @@ fn build_incremental_index_for_roots(
     }
 
     let mut indexer = Indexer::new(PathBuf::new());
-    indexer.replace_parsed_files(parsed_files.clone());
+    indexer.replace_parsed_files(parsed_files);
+    let (graph, parsed_files) = indexer.into_parts();
     IncrementalIndexResult {
-        graph: indexer.graph().clone(),
+        graph: Arc::new(graph),
         parsed_files,
         file_index,
         changed_count,
@@ -1188,6 +1731,14 @@ fn max_index_file_bytes() -> u64 {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(1_000_000)
+}
+
+fn max_cached_parsed_files() -> usize {
+    std::env::var("LATTICE_MAX_CACHED_PARSED_FILES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50_000)
 }
 
 fn stable_content_hash(bytes: &[u8]) -> String {
@@ -1353,6 +1904,20 @@ mod tests {
             stale_reason: None,
             verification_status: MemoryVerificationStatus::Unverified,
         }
+    }
+
+    #[test]
+    fn prefer_current_dir_root_moves_matching_workspace_first_without_project_hints() {
+        let root_a = PathBuf::from("/work/lattice");
+        let root_b = PathBuf::from("/work/portal");
+        let roots = vec![root_a.clone(), root_b.clone()];
+
+        let reordered = super::prefer_current_dir_root(
+            roots,
+            Some(PathBuf::from("/work/portal/docs/audit").as_path()),
+        );
+
+        assert_eq!(reordered, vec![root_b, root_a]);
     }
 
     #[test]

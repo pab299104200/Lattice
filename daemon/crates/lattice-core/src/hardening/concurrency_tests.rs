@@ -238,7 +238,7 @@ impl EventFixture {
         let compactor = crate::events::Compactor::new(
             self.store.clone(),
             self.writer.clone(),
-            Arc::new(std::sync::Mutex::new(CodeGraph::new())),
+            Arc::new(std::sync::Mutex::new(Arc::new(CodeGraph::new()))),
             Arc::new(std::sync::Mutex::new(
                 MemoryStore::open_in_memory().unwrap(),
             )),

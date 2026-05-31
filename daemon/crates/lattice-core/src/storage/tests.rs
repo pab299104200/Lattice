@@ -123,6 +123,37 @@ fn test_save_replaces_previous() {
 }
 
 #[test]
+fn test_persisted_graph_file_count_counts_distinct_files() {
+    let store = GraphStore::open_in_memory().expect("Failed to open in-memory store");
+    let graph = build_sample_graph();
+
+    store.save_graph(&graph).expect("Failed to save graph");
+
+    assert_eq!(store.persisted_graph_file_count().unwrap(), 2);
+}
+
+#[test]
+fn test_persisted_graph_disk_bytes_reports_file_backed_size() {
+    let dir = unique_temp_dir("graph-disk-bytes");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let db_path = dir.join("graph.db");
+    let store = GraphStore::open(&db_path).expect("open file-backed store");
+
+    store
+        .save_graph(&build_sample_graph())
+        .expect("Failed to save graph");
+
+    let bytes = store
+        .persisted_graph_disk_bytes()
+        .expect("read persisted graph disk bytes")
+        .expect("file-backed graph store should report disk bytes");
+    assert!(bytes > 0, "expected non-zero graph disk bytes");
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn test_file_index_and_parsed_files_round_trip() {
     let store = GraphStore::open_in_memory().expect("Failed to open in-memory store");
     let entry = FileIndexEntry {
