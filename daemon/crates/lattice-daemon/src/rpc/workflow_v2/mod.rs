@@ -241,6 +241,9 @@ pub struct MemoryHighlight {
     pub stale_label: Option<String>,
     /// Bounded commands or command-like probes callers can run to re-check the claim now.
     pub recheck_commands: Vec<String>,
+    /// Conflicting status claims found across linked docs or artifacts.
+    #[serde(default)]
+    pub artifact_conflicts: Vec<Value>,
     /// Bounded one-line relevance digest for compact render mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relevance_summary: Option<String>,
@@ -477,6 +480,11 @@ fn memory_highlight(
         .and_then(Value::as_array)
         .map_or(true, Vec::is_empty);
     let recheck_commands = memory_recheck_commands(object);
+    let artifact_conflicts = object
+        .get("artifact_conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let risk_domains = memory_risk_domains(object, &content);
     let (requires_reverification, reverification_reason) =
         requires_reverification(status_kind, is_stale, evidence_is_empty, &risk_domains);
@@ -500,6 +508,7 @@ fn memory_highlight(
         expansion_target: format!("memory:{memory_id}"),
         stale_label,
         recheck_commands,
+        artifact_conflicts,
         relevance_summary: None,
         relevance_breakdown: None,
         relevance_detail_handle: None,
@@ -855,6 +864,13 @@ pub(crate) fn risks_from_memories(memories: &[MemoryHighlight]) -> Vec<RiskNote>
     memories
         .iter()
         .filter_map(|memory| match memory.trust_status.as_str() {
+            _ if !memory.artifact_conflicts.is_empty() => Some(RiskNote {
+                severity: "warning".to_string(),
+                identity: Some(StableIdentity::Memory(memory.memory_id.clone())),
+                message: "Linked artifacts contain conflicting status claims".to_string(),
+                mitigation: "Inspect the conflicting docs/artifacts and run recheck commands before relying on this memory."
+                    .to_string(),
+            }),
             "trusted" if !memory.requires_reverification => None,
             "trusted" => Some(RiskNote {
                 severity: "warning".to_string(),

@@ -2,7 +2,7 @@ use super::diagnose_failure;
 use super::plan_edit;
 use super::prepare_change;
 use super::trace_scenario;
-use super::{VecEventSink, WorkflowBundle, WorkflowRequest};
+use super::{StableIdentity, VecEventSink, WorkflowBundle, WorkflowRequest};
 use lattice_core::events::EventKind;
 use lattice_core::graph::model::{CodeGraph, EdgeKind};
 use lattice_core::intelligence::{self, BundleMode, RulesDetector};
@@ -75,6 +75,30 @@ fn unverified_memories_are_advisory_risks() {
         .verification_commands
         .iter()
         .any(|command| command.contains("auth")));
+}
+
+#[test]
+fn artifact_conflicts_are_workflow_risks_even_when_memory_is_verified() {
+    let fixture = Fixture::new();
+    let bundle = fixture.prepare_bundle();
+    let conflict = bundle
+        .memory_highlights
+        .iter()
+        .find(|memory| memory.memory_id.ulid == "artifact-conflict-pattern")
+        .expect("fixture includes artifact-conflict memory");
+    assert_eq!(conflict.trust_status, "trusted");
+    assert!(!conflict.artifact_conflicts.is_empty());
+    assert!(bundle.risks.iter().any(|risk| {
+        risk.identity.as_ref().is_some_and(|identity| {
+            matches!(
+                identity,
+                StableIdentity::Memory(memory_id)
+                    if memory_id.ulid == "artifact-conflict-pattern"
+            )
+        }) && risk
+            .message
+            .contains("Linked artifacts contain conflicting status claims")
+    }));
 }
 
 #[test]
@@ -336,6 +360,24 @@ fn build_capsule() -> ContextCapsule {
                 "verification_status": "verified",
                 "evidence": [{"kind": "test", "reference": "tests/auth.test.ts"}],
                 "inclusion_reason": "linked to loginUser",
+            }),
+            json!({
+                "id": "artifact-conflict-pattern",
+                "content": "Auth route split was resolved.",
+                "memory_type": "workflow_outcome",
+                "scope": "repo",
+                "confidence": 0.92,
+                "verification_status": "verified",
+                "evidence": [{"kind": "test", "reference": "tests/auth.test.ts"}],
+                "inclusion_reason": "linked to loginUser",
+                "artifact_conflicts": [{
+                    "key": "PX-0027-S01",
+                    "positive_status": "resolved",
+                    "negative_status": "blocked",
+                    "positive_refs": ["docs/PX-0027-S01.md"],
+                    "negative_refs": ["docs/verify-PX-0027-S01.md"],
+                    "reason": "linked artifacts contain conflicting resolved/blocked style status terms"
+                }]
             }),
             json!({
                 "id": "unverified-pattern",

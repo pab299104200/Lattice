@@ -21,7 +21,7 @@ use lattice_core::memory::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub mod consolidate_session;
 pub mod get_event_trace;
@@ -138,6 +138,26 @@ pub struct MemoryRecord {
     pub workspace_path_diagnostic: Option<Value>,
     /// Bounded commands or command-like probes callers can run to re-check the claim now.
     pub recheck_commands: Vec<String>,
+    /// Conflicting status claims found across linked docs or artifacts.
+    #[serde(default)]
+    pub artifact_conflicts: Vec<ArtifactConflict>,
+}
+
+/// Status conflict detected between linked docs or artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactConflict {
+    /// Shared status key, such as a remediation id, or `linked_docs` fallback.
+    pub key: String,
+    /// Positive status found in one or more artifacts.
+    pub positive_status: String,
+    /// Negative status found in one or more artifacts.
+    pub negative_status: String,
+    /// Artifacts carrying the positive status.
+    pub positive_refs: Vec<String>,
+    /// Artifacts carrying the negative status.
+    pub negative_refs: Vec<String>,
+    /// Why this should be treated as a contradiction candidate.
+    pub reason: String,
 }
 
 /// Git checkout state associated with a memory claim.
@@ -345,6 +365,188 @@ pub(crate) fn memory_recheck_commands(
     }
     commands.truncate(8);
     commands
+}
+
+pub(crate) fn detect_artifact_conflicts(
+    workspace_id: &str,
+    fields: &MemoryStructuredFields,
+) -> Vec<ArtifactConflict> {
+    let mut observations = Vec::new();
+    for doc in &fields.linked_docs {
+        let content = read_linked_doc_excerpt(workspace_id, doc);
+        let text = format!("{doc}\n{content}");
+        let Some(status) = artifact_status(&text) else {
+            continue;
+        };
+        let mut keys = structured_status_keys(&text);
+        if keys.is_empty() {
+            keys.push("linked_docs".to_string());
+        }
+        for key in keys {
+            observations.push(ArtifactStatusObservation {
+                key,
+                reference: doc.clone(),
+                status: status.clone(),
+            });
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    let mut keys = observations
+        .iter()
+        .map(|item| item.key.clone())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let matching = observations
+            .iter()
+            .filter(|item| item.key == key)
+            .collect::<Vec<_>>();
+        let positive = matching
+            .iter()
+            .filter(|item| item.status.polarity == StatusPolarity::Positive)
+            .collect::<Vec<_>>();
+        let negative = matching
+            .iter()
+            .filter(|item| item.status.polarity == StatusPolarity::Negative)
+            .collect::<Vec<_>>();
+        if positive.is_empty() || negative.is_empty() {
+            continue;
+        }
+        let mut positive_refs = positive
+            .iter()
+            .map(|item| item.reference.clone())
+            .collect::<Vec<_>>();
+        positive_refs.sort();
+        positive_refs.dedup();
+        let mut negative_refs = negative
+            .iter()
+            .map(|item| item.reference.clone())
+            .collect::<Vec<_>>();
+        negative_refs.sort();
+        negative_refs.dedup();
+        conflicts.push(ArtifactConflict {
+            key,
+            positive_status: positive[0].status.label.clone(),
+            negative_status: negative[0].status.label.clone(),
+            positive_refs,
+            negative_refs,
+            reason: "linked artifacts contain conflicting resolved/blocked style status terms"
+                .to_string(),
+        });
+    }
+    conflicts
+}
+
+fn read_linked_doc_excerpt(workspace_id: &str, doc: &str) -> String {
+    let path = doc.split_once('#').map_or(doc, |item| item.0);
+    let linked_path = Path::new(path);
+    if linked_path.is_absolute()
+        || linked_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
+    {
+        return String::new();
+    }
+    std::fs::read_to_string(Path::new(workspace_id).join(linked_path))
+        .unwrap_or_default()
+        .chars()
+        .take(32_000)
+        .collect::<String>()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactStatusObservation {
+    key: String,
+    reference: String,
+    status: ArtifactStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactStatus {
+    label: String,
+    polarity: StatusPolarity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPolarity {
+    Positive,
+    Negative,
+}
+
+fn artifact_status(text: &str) -> Option<ArtifactStatus> {
+    let normalized = text.to_ascii_lowercase();
+    let positive = [
+        "resolved",
+        "verified",
+        "complete",
+        "completed",
+        "fixed",
+        "passing",
+    ];
+    let negative = [
+        "blocked",
+        "failing",
+        "failed",
+        "stale",
+        "unresolved",
+        "incomplete",
+    ];
+    let positive_hit = positive
+        .iter()
+        .find(|needle| normalized.contains(**needle))
+        .map(|value| ArtifactStatus {
+            label: (*value).to_string(),
+            polarity: StatusPolarity::Positive,
+        });
+    let negative_hit = negative
+        .iter()
+        .find(|needle| normalized.contains(**needle))
+        .map(|value| ArtifactStatus {
+            label: (*value).to_string(),
+            polarity: StatusPolarity::Negative,
+        });
+    negative_hit.or(positive_hit)
+}
+
+fn structured_status_keys(text: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for raw in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-')) {
+        let token = raw
+            .trim_matches('-')
+            .trim_matches(|ch: char| matches!(ch, '.' | '_' | ':' | ';' | ',' | ')' | '('))
+            .to_ascii_uppercase();
+        if is_status_key(&token) && !keys.iter().any(|existing| existing == &token) {
+            keys.push(token);
+        }
+    }
+    keys
+}
+
+fn is_status_key(token: &str) -> bool {
+    let mut parts = token.split('-');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    if !matches!(prefix, "PX" | "IU" | "IM" | "U") {
+        return false;
+    }
+    let Some(number) = parts.next() else {
+        return false;
+    };
+    if number.len() < 2 || !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    parts.all(|part| {
+        part.len() >= 2
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    })
 }
 
 fn command_for_test_ref(reference: &str) -> String {

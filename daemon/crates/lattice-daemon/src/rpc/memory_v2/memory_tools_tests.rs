@@ -194,6 +194,17 @@ async fn save_quick_memory_prefills_links_and_recent_failures_from_task_context(
 async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
     let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("get-task-memory");
+    std::fs::create_dir_all(workspace_root.join("docs")).expect("docs dir");
+    std::fs::write(
+        workspace_root.join("docs/PX-0027-S01.md"),
+        "PX-0027-S01 status: resolved and verified",
+    )
+    .expect("write resolved artifact");
+    std::fs::write(
+        workspace_root.join("docs/verify-PX-0027-S01.md"),
+        "PX-0027-S01 status: blocked on current verification",
+    )
+    .expect("write blocked artifact");
     {
         let store = memory_store.lock().await;
         let mut memory = seed_memory("refresh token must preserve session", MemoryScope::Repo);
@@ -203,7 +214,10 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         fields.memory_class = MemoryClass::Constraint;
         fields.assertion_type = MemoryAssertionType::Constraint;
         fields.verification_status = MemoryVerificationStatus::Verified;
-        fields.linked_docs = vec!["docs/auth.md#Refresh".to_string()];
+        fields.linked_docs = vec![
+            "docs/PX-0027-S01.md".to_string(),
+            "docs/verify-PX-0027-S01.md".to_string(),
+        ];
         fields.evidence = vec![MemoryEvidence {
             kind: "test".to_string(),
             reference: Some("tests/auth.rs::refresh_token".to_string()),
@@ -262,6 +276,21 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         assert!(memory["recheck_commands"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));
+        let artifact_conflicts = memory["artifact_conflicts"]
+            .as_array()
+            .expect("artifact conflicts array");
+        assert!(!artifact_conflicts.is_empty());
+        assert_eq!(artifact_conflicts[0]["key"].as_str(), Some("PX-0027-S01"));
+        assert!(artifact_conflicts[0]["positive_refs"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item.as_str() == Some("docs/PX-0027-S01.md"))));
+        assert!(artifact_conflicts[0]["negative_refs"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item.as_str() == Some("docs/verify-PX-0027-S01.md"))));
     }
 
     let events = read_events(&event_store, &workspace_root);

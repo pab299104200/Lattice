@@ -58,8 +58,11 @@ Every record must carry the fields below. Type names describe the persisted cont
 | `last_verified_state` | verification report reference | yes | null | Last persisted verification output. |
 | `checkout_state` | object | derived | derived | Response-only recorded/current Git HEAD comparison. New memory writes add `git_head_ref` and `git_head_oid` provenance entries when the workspace is a Git checkout. |
 | `recheck_commands` | string list | derived | empty list | Response-only bounded command suggestions derived from linked tests, files, docs, symbols, and evidence references. |
+| `artifact_conflicts` | object list | derived | empty list | Response-only contradiction candidates found by scanning linked docs/artifacts for conflicting resolved/blocked style status claims keyed by structured remediation IDs when present. |
 
 `trust_status` is intentionally louder than `verification_status`. A memory can be `verified` but still advisory when it has no evidence or when its recorded Git HEAD no longer matches the current checkout. Assistants must treat advisory memory as a hypothesis or historical clue until current code, docs, and tests confirm the claim. `recheck_commands` are convenience probes for that confirmation step; they are not verification evidence until executed and reviewed. High-risk domains require explicit current-code confirmation unless the memory is verified, evidence-backed, tied to the current checkout, and has a persisted verification timestamp.
+
+`artifact_conflicts` is a bounded drift detector, not proof of a contradiction by itself. The daemon reads linked docs inside the active workspace, samples status terms such as resolved, verified, blocked, failing, stale, unresolved, or incomplete, and groups observations by structured IDs such as `PX-0027-S01` or `IU-0025-S01`. Workflow tools surface those conflicts as risks even when the underlying memory is otherwise trusted so assistants inspect the artifacts before relying on the claim.
 
 ## Memory link types
 
