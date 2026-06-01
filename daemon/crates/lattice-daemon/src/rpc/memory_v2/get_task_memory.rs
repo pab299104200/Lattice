@@ -1,8 +1,9 @@
 use super::{
     checkout_state_for_memory, contradiction_state, detect_artifact_conflicts, evidence_strength,
-    expansion_handle, freshness_status, memory_recheck_commands, memory_requires_reverification,
-    memory_risk_domains, memory_trust_reason, memory_trust_status, memory_workspace_conflict,
-    memory_workspace_path_diagnostic, supersession_state, MemoryRecord, TaskMemoryBundle,
+    expansion_handle, freshness_status, memory_evidence_links, memory_recheck_commands,
+    memory_requires_reverification, memory_risk_domains, memory_trust_reason, memory_trust_status,
+    memory_workspace_conflict, memory_workspace_path_diagnostic, supersession_state, MemoryRecord,
+    TaskMemoryBundle,
 };
 use lattice_core::memory::{Memory, MemoryScoreKind, MemoryScoreRecord, MemoryStore};
 use lattice_core::working_memory::{CheckpointId, WorkingMemoryState};
@@ -170,6 +171,7 @@ fn build_memory_record(
         invalidation_triggers: fields.invalidation_triggers.clone(),
         provenance: fields.provenance.clone(),
         evidence: fields.evidence.clone(),
+        evidence_links: memory_evidence_links(memory, &fields),
         links,
         access_history,
         usefulness_scores,

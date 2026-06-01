@@ -8,7 +8,7 @@ use lattice_core::events::{
 };
 use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
-use lattice_core::memory::model::MemoryAssertionType;
+use lattice_core::memory::model::{MemoryAssertionType, MemoryProvenance};
 use lattice_core::memory::{
     Memory, MemoryClass, MemoryEvidence, MemoryScope, MemoryStore, MemoryStructuredFields,
     MemoryType, MemoryVerificationStatus,
@@ -226,6 +226,12 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
             span: None,
             evidence_content_hash: None,
         }];
+        fields.provenance = vec![MemoryProvenance {
+            source: "git_head_oid".to_string(),
+            reference: Some("abc1234".to_string()),
+            captured_at: Some(42),
+            note: Some("recorded checkout".to_string()),
+        }];
         store
             .update_structured_fields(&id, &fields)
             .expect("update fields");
@@ -276,6 +282,23 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         assert!(memory["recheck_commands"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));
+        let evidence_links = memory["evidence_links"]
+            .as_array()
+            .expect("evidence links array");
+        assert!(evidence_links.iter().any(|link| {
+            link["kind"].as_str() == Some("test")
+                && link["reference"].as_str() == Some("tests/auth.rs::refresh_token")
+                && link["recheck_command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("refresh_token"))
+        }));
+        assert!(evidence_links.iter().any(|link| {
+            link["kind"].as_str() == Some("commit")
+                && link["reference"].as_str() == Some("abc1234")
+                && link["recheck_command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("git show --stat abc1234"))
+        }));
         let artifact_conflicts = memory["artifact_conflicts"]
             .as_array()
             .expect("artifact conflicts array");

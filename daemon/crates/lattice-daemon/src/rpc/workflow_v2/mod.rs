@@ -241,6 +241,9 @@ pub struct MemoryHighlight {
     pub stale_label: Option<String>,
     /// Bounded commands or command-like probes callers can run to re-check the claim now.
     pub recheck_commands: Vec<String>,
+    /// First-class evidence/provenance links relevant to trust and re-checks.
+    #[serde(default)]
+    pub evidence_links: Vec<Value>,
     /// Conflicting status claims found across linked docs or artifacts.
     #[serde(default)]
     pub artifact_conflicts: Vec<Value>,
@@ -480,6 +483,7 @@ fn memory_highlight(
         .and_then(Value::as_array)
         .map_or(true, Vec::is_empty);
     let recheck_commands = memory_recheck_commands(object);
+    let evidence_links = memory_evidence_links(object);
     let artifact_conflicts = object
         .get("artifact_conflicts")
         .and_then(Value::as_array)
@@ -508,6 +512,7 @@ fn memory_highlight(
         expansion_target: format!("memory:{memory_id}"),
         stale_label,
         recheck_commands,
+        evidence_links,
         artifact_conflicts,
         relevance_summary: None,
         relevance_breakdown: None,
@@ -549,6 +554,127 @@ fn memory_recheck_commands(object: &serde_json::Map<String, Value>) -> Vec<Strin
     }
     commands.truncate(8);
     commands
+}
+
+fn memory_evidence_links(object: &serde_json::Map<String, Value>) -> Vec<Value> {
+    if let Some(items) = object.get("evidence_links").and_then(Value::as_array) {
+        return items.clone();
+    }
+
+    let mut links = Vec::new();
+    if let Some(items) = object.get("evidence").and_then(Value::as_array) {
+        for evidence in items.iter().filter_map(Value::as_object) {
+            let kind = string_field(evidence, &["kind"]).unwrap_or_else(|| "evidence".to_string());
+            let Some(reference) = string_field(evidence, &["reference"]) else {
+                continue;
+            };
+            let mut link = json!({
+                "kind": kind,
+                "reference": reference,
+                "role": "recorded_evidence",
+            });
+            if let Some(detail) = string_field(evidence, &["detail"]) {
+                link["detail"] = json!(detail);
+            }
+            if let Some(captured_at) = evidence.get("captured_at").and_then(Value::as_u64) {
+                link["captured_at"] = json!(captured_at);
+            }
+            if let Some(command) =
+                recheck_command_for_kind(link["kind"].as_str().unwrap_or_default(), &reference)
+            {
+                link["recheck_command"] = json!(command);
+            }
+            push_evidence_link(&mut links, link);
+        }
+    }
+    for test in string_array_field(object, "linked_tests") {
+        push_evidence_link(
+            &mut links,
+            json!({
+                "kind": "test",
+                "reference": test,
+                "role": "linked_test",
+                "recheck_command": command_for_test_ref(&test),
+            }),
+        );
+    }
+    for doc in string_array_field(object, "linked_docs") {
+        let mut link = json!({
+            "kind": "doc",
+            "reference": doc,
+            "role": "linked_doc",
+        });
+        if let Some(command) = doc_recheck_command(&doc) {
+            link["recheck_command"] = json!(command);
+        }
+        push_evidence_link(&mut links, link);
+    }
+    for file in string_array_field(object, "linked_files") {
+        let mut link = json!({
+            "kind": "file",
+            "reference": file,
+            "role": "linked_file",
+        });
+        if let Some(command) = file_recheck_command(&file) {
+            link["recheck_command"] = json!(command);
+        }
+        push_evidence_link(&mut links, link);
+    }
+    for symbol in string_array_field(object, "linked_symbols") {
+        push_evidence_link(
+            &mut links,
+            json!({
+                "kind": "symbol",
+                "reference": symbol,
+                "role": "linked_symbol",
+                "recheck_command": format!("rg -n \"{}\"", shell_safe_pattern(&symbol)),
+            }),
+        );
+    }
+    if let Some(items) = object.get("provenance").and_then(Value::as_array) {
+        for provenance in items.iter().filter_map(Value::as_object) {
+            if string_field(provenance, &["source"]).as_deref() != Some("git_head_oid") {
+                continue;
+            }
+            let Some(reference) = string_field(provenance, &["reference"]) else {
+                continue;
+            };
+            let mut link = json!({
+                "kind": "commit",
+                "reference": reference,
+                "role": "git_provenance",
+                "recheck_command": format!("git show --stat {reference}"),
+            });
+            if let Some(note) = string_field(provenance, &["note"]) {
+                link["detail"] = json!(note);
+            }
+            if let Some(captured_at) = provenance.get("captured_at").and_then(Value::as_u64) {
+                link["captured_at"] = json!(captured_at);
+            }
+            push_evidence_link(&mut links, link);
+        }
+    }
+    links.truncate(12);
+    links
+}
+
+fn push_evidence_link(links: &mut Vec<Value>, link: Value) {
+    let Some(reference) = link.get("reference").and_then(Value::as_str) else {
+        return;
+    };
+    if reference.trim().is_empty() {
+        return;
+    }
+    let kind = link.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let role = link.get("role").and_then(Value::as_str).unwrap_or_default();
+    if links.iter().any(|existing| {
+        existing.get("kind").and_then(Value::as_str) == Some(kind)
+            && existing.get("reference").and_then(Value::as_str) == Some(reference)
+            && existing.get("role").and_then(Value::as_str) == Some(role)
+    }) {
+        return;
+    }
+    links.push(link);
 }
 
 fn memory_risk_domains(object: &serde_json::Map<String, Value>, content: &str) -> Vec<String> {
@@ -689,6 +815,34 @@ fn string_array_field(object: &serde_json::Map<String, Value>, key: &str) -> Vec
         .unwrap_or_default()
 }
 
+fn recheck_command_for_kind(kind: &str, reference: &str) -> Option<String> {
+    match kind {
+        "test" => Some(command_for_test_ref(reference)),
+        "file" => file_recheck_command(reference),
+        "doc" => doc_recheck_command(reference),
+        "symbol" => Some(format!("rg -n \"{}\"", shell_safe_pattern(reference))),
+        "commit" => Some(format!("git show --stat {reference}")),
+        _ => None,
+    }
+}
+
+fn file_recheck_command(file: &str) -> Option<String> {
+    let mut commands = Vec::new();
+    push_file_recheck(&mut commands, file);
+    commands.into_iter().next()
+}
+
+fn doc_recheck_command(doc: &str) -> Option<String> {
+    let path = doc.split_once('#').map_or(doc, |item| item.0).trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "rg -n \"TODO|blocked|resolved|verified|stale\" {path}"
+        ))
+    }
+}
+
 fn command_for_test_ref(reference: &str) -> String {
     if reference.ends_with(".py") || reference.contains(".py::") {
         format!("pytest {reference}")
@@ -746,6 +900,10 @@ fn push_unique(commands: &mut Vec<String>, command: String) {
         return;
     }
     commands.push(command);
+}
+
+fn shell_safe_pattern(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn evidence_strength(object: &serde_json::Map<String, Value>) -> String {

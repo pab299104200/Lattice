@@ -279,6 +279,7 @@ fn workflow_bundle_fixture() -> WorkflowBundle {
             expansion_target: "memory:mem-1".to_string(),
             stale_label: None,
             recheck_commands: vec!["cd daemon && cargo test auth".to_string()],
+            evidence_links: Vec::new(),
             artifact_conflicts: Vec::new(),
             relevance_summary: None,
             relevance_breakdown: None,

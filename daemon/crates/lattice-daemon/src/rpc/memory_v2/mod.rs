@@ -14,7 +14,9 @@
 //! contract."
 
 use lattice_core::identity::{encode_identity, Identity, MemoryId};
-use lattice_core::memory::model::{MemoryAssertionType, MemoryFreshnessPolicy, MemoryProvenance};
+use lattice_core::memory::model::{
+    EvidenceSpan, MemoryAssertionType, MemoryFreshnessPolicy, MemoryProvenance,
+};
 use lattice_core::memory::{
     Memory, MemoryAccessRecord, MemoryClass, MemoryEvidence, MemoryLinkRecord, MemoryScoreRecord,
     MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
@@ -112,6 +114,9 @@ pub struct MemoryRecord {
     pub provenance: Vec<MemoryProvenance>,
     /// Structured evidence entries.
     pub evidence: Vec<MemoryEvidence>,
+    /// First-class actionable links derived from evidence, linked artifacts, and provenance.
+    #[serde(default)]
+    pub evidence_links: Vec<EvidenceLink>,
     /// Memory-to-memory links.
     pub links: Vec<MemoryLinkRecord>,
     /// Access history rows for the memory.
@@ -141,6 +146,32 @@ pub struct MemoryRecord {
     /// Conflicting status claims found across linked docs or artifacts.
     #[serde(default)]
     pub artifact_conflicts: Vec<ArtifactConflict>,
+}
+
+/// Actionable evidence reference surfaced with memory trust diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceLink {
+    /// Evidence class, such as `test`, `file`, `doc`, `symbol`, or `commit`.
+    pub kind: String,
+    /// Exact evidence target.
+    pub reference: String,
+    /// Why the reference is attached to the memory.
+    pub role: String,
+    /// Optional human-readable evidence detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional timestamp captured with the evidence or provenance entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<u64>,
+    /// Optional current-code command that can re-check this evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck_command: Option<String>,
+    /// Optional precise source span for file-backed evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<EvidenceSpan>,
+    /// Optional content hash rendered as lowercase hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_content_hash: Option<String>,
 }
 
 /// Status conflict detected between linked docs or artifacts.
@@ -365,6 +396,159 @@ pub(crate) fn memory_recheck_commands(
     }
     commands.truncate(8);
     commands
+}
+
+pub(crate) fn memory_evidence_links(
+    memory: &Memory,
+    fields: &MemoryStructuredFields,
+) -> Vec<EvidenceLink> {
+    let mut links = Vec::new();
+    for evidence in &fields.evidence {
+        let Some(reference) = evidence.reference.as_deref() else {
+            continue;
+        };
+        push_evidence_link(
+            &mut links,
+            EvidenceLink {
+                kind: evidence.kind.clone(),
+                reference: reference.to_string(),
+                role: "recorded_evidence".to_string(),
+                detail: evidence.detail.clone(),
+                captured_at: evidence.captured_at,
+                recheck_command: recheck_command_for_kind(&evidence.kind, reference),
+                span: evidence.span.clone(),
+                evidence_content_hash: evidence.evidence_content_hash.map(hex_hash),
+            },
+        );
+    }
+    for test in &fields.linked_tests {
+        push_evidence_link(
+            &mut links,
+            EvidenceLink {
+                kind: "test".to_string(),
+                reference: test.clone(),
+                role: "linked_test".to_string(),
+                detail: None,
+                captured_at: None,
+                recheck_command: Some(command_for_test_ref(test)),
+                span: None,
+                evidence_content_hash: None,
+            },
+        );
+    }
+    for doc in &fields.linked_docs {
+        push_evidence_link(
+            &mut links,
+            EvidenceLink {
+                kind: "doc".to_string(),
+                reference: doc.clone(),
+                role: "linked_doc".to_string(),
+                detail: None,
+                captured_at: None,
+                recheck_command: doc_recheck_command(doc),
+                span: None,
+                evidence_content_hash: None,
+            },
+        );
+    }
+    for file in &memory.linked_files {
+        push_evidence_link(
+            &mut links,
+            EvidenceLink {
+                kind: "file".to_string(),
+                reference: file.clone(),
+                role: "linked_file".to_string(),
+                detail: None,
+                captured_at: None,
+                recheck_command: file_recheck_command(file),
+                span: None,
+                evidence_content_hash: None,
+            },
+        );
+    }
+    for symbol in &memory.linked_symbols {
+        push_evidence_link(
+            &mut links,
+            EvidenceLink {
+                kind: "symbol".to_string(),
+                reference: symbol.clone(),
+                role: "linked_symbol".to_string(),
+                detail: None,
+                captured_at: None,
+                recheck_command: Some(format!("rg -n \"{}\"", shell_safe_pattern(symbol))),
+                span: None,
+                evidence_content_hash: None,
+            },
+        );
+    }
+    for provenance in &fields.provenance {
+        if provenance.source == "git_head_oid" {
+            if let Some(reference) = provenance.reference.as_deref() {
+                push_evidence_link(
+                    &mut links,
+                    EvidenceLink {
+                        kind: "commit".to_string(),
+                        reference: reference.to_string(),
+                        role: "git_provenance".to_string(),
+                        detail: provenance.note.clone(),
+                        captured_at: provenance.captured_at,
+                        recheck_command: Some(format!("git show --stat {reference}")),
+                        span: None,
+                        evidence_content_hash: None,
+                    },
+                );
+            }
+        }
+    }
+    links.truncate(12);
+    links
+}
+
+fn push_evidence_link(links: &mut Vec<EvidenceLink>, link: EvidenceLink) {
+    if link.reference.trim().is_empty()
+        || links.iter().any(|existing| {
+            existing.kind == link.kind
+                && existing.reference == link.reference
+                && existing.role == link.role
+        })
+    {
+        return;
+    }
+    links.push(link);
+}
+
+fn recheck_command_for_kind(kind: &str, reference: &str) -> Option<String> {
+    match kind {
+        "test" => Some(command_for_test_ref(reference)),
+        "file" => file_recheck_command(reference),
+        "doc" => doc_recheck_command(reference),
+        "symbol" => Some(format!("rg -n \"{}\"", shell_safe_pattern(reference))),
+        "commit" => Some(format!("git show --stat {reference}")),
+        _ => None,
+    }
+}
+
+fn file_recheck_command(file: &str) -> Option<String> {
+    let mut commands = Vec::new();
+    push_file_recheck(&mut commands, file);
+    commands.into_iter().next()
+}
+
+fn doc_recheck_command(doc: &str) -> Option<String> {
+    let path = doc.split_once('#').map_or(doc, |item| item.0).trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "rg -n \"TODO|blocked|resolved|verified|stale\" {path}"
+        ))
+    }
+}
+
+fn hex_hash(hash: [u8; 32]) -> String {
+    hash.iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 pub(crate) fn detect_artifact_conflicts(

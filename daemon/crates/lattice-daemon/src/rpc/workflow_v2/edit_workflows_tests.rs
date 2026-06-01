@@ -67,6 +67,13 @@ fn unverified_memories_are_advisory_risks() {
         .recheck_commands
         .iter()
         .any(|command| command.contains("auth")));
+    assert!(advisory.evidence_links.iter().any(|link| {
+        link["kind"].as_str() == Some("file")
+            && link["reference"].as_str() == Some("src/auth.ts")
+            && link["recheck_command"]
+                .as_str()
+                .is_some_and(|command| command.contains("src/auth.ts"))
+    }));
     assert!(bundle.risks.iter().any(|risk| {
         risk.message
             .contains("Memory is advisory, not proof: unverified")
