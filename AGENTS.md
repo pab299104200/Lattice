@@ -36,6 +36,11 @@ Use these tools when they're the best fit:
 - `list_stale_memories` / `list_memory_conflicts` / `verify_explain_memory` — use to maintain durable memory quality
 - `record_workflow_outcome` — use to store successful outcomes so later sessions can reuse them
 
+Memory is recall, not proof. Treat retrieved memory as a hypothesis until current code, docs, and tests confirm it.
+Prefer memories with `trust_status: "trusted"`, matching `checkout_state`, concrete `evidence_links`, and useful `recheck_commands`.
+Do not rely on memories that are `advisory`, `stale`, unverified, from a different checkout, missing evidence, high-risk with `requires_reverification`, or carrying `artifact_conflicts` until you inspect the linked evidence and rerun the suggested checks.
+When saving memory, separate hypotheses from verified outcomes and attach evidence links, linked files/docs/tests, validity conditions, invalidation triggers, and the verification command that proved the claim.
+
 For targeted edits to known files, direct read, grep, and edit operations are fine.
 Lattice adds the most value when you do not already know where to look. `rg` remains the right first tool for exact strings, config keys, error text, and exhaustive textual occurrences.
 
