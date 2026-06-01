@@ -242,6 +242,15 @@ Memory payloads now include additive structured assertion metadata alongside the
 
 At a high level, assistants should trust verified workflow outcomes with evidence and matching checkout state ahead of weaker stale, superseded, contradicted, unverified, or in-review recall. The legacy fields still exist; these structured fields are additive and help explain why one memory is preferred over another. New durable memories record the current Git `HEAD` ref/OID in provenance when the workspace is a Git checkout, and memory responses compare the recorded state with the current checkout. `evidence_links` lift tests, docs, files, symbols, commits, and recorded evidence into actionable references with optional recheck commands. Recheck commands are suggestions for current-code verification; they are not proof until the caller runs them and inspects the result. Security, tenancy, migration, deploy, dependency, and test-suite memories are tagged as high risk and may require re-verification even when they are relevant.
 
+Memory trust diagnostics are deliberately response-level and current-checkout-aware:
+
+- `trust_status` is the caller-facing tier: `trusted`, `advisory`, or `stale`.
+- `checkout_state` compares the memory's recorded Git state with the active workspace checkout.
+- `requires_reverification` is raised for high-risk domains until the memory is verified, evidence-backed, tied to the current checkout, and has a persisted verification timestamp.
+- `evidence_links` make the supporting artifacts inspectable without digging through raw structured metadata.
+- `artifact_conflicts` flag linked docs or artifacts that contain conflicting resolved/blocked style status claims for the same structured ID.
+- Workflow bundles propagate memory trust fields, evidence links, recheck commands, and artifact-conflict risks so prior memory is treated as a hypothesis until current code, docs, and tests confirm it.
+
 - `get_task_memory`
   Read task-scoped working memory plus relevant durable memory. The daemon seeds missing task state from the task statement or hint, records automatic checkpoints, hard-scopes recall to the active workspace unless a future cross-repo mode explicitly opts in, and requires concrete task evidence such as matched paths, files, symbols, docs, or structured remediation IDs before surfacing a memory. Returned records include advisory/trusted/stale trust diagnostics, first-class `evidence_links`, high-risk domain tags, checkout-state comparison, bounded `recheck_commands`, and `artifact_conflicts` from linked docs so unverified, evidence-free, high-risk, different-HEAD, or docs-drifted claims are not mistaken for proof.
 - `search_memory`
