@@ -1,8 +1,10 @@
 # Lattice
 
-Local AI context engine for MCP-enabled coding assistants.
+Local AI context, workflow, and memory engine for MCP-enabled coding assistants.
 
-Lattice indexes your codebase and repo Markdown into a dependency graph, then serves ranked context, workflow bundles, docs navigation, compact summaries, and persistent memory to assistants like Codex and Claude Code. Instead of sending whole files or relying on broad search, it returns the files, symbols, docs sections, tests, and prior decisions that are most likely to matter.
+Lattice indexes your codebase and repo Markdown into a dependency graph, then serves ranked context, workflow bundles, docs navigation, compact summaries, and persistent memory to assistants like Codex and Claude Code. Instead of sending whole files or relying on broad search, it returns the files, symbols, docs sections, tests, prior decisions, and current-checkout memory diagnostics that are most likely to matter.
+
+Memory is treated as recall, not proof. Lattice stores durable observations and workflow outcomes, but every retrieved memory carries trust diagnostics: verification state, evidence links, Git checkout comparison, high-risk recheck flags, suggested verification commands, and linked-artifact conflict warnings. That lets assistants reuse prior work without silently trusting stale, unverified, cross-checkout, or docs-drifted claims.
 
 ## Why Lattice
 
@@ -14,12 +16,13 @@ Lattice indexes your codebase and repo Markdown into a dependency graph, then se
 - workflow bundles now include per-pivot and per-memory retrieval relevance summaries plus item-level relevance detail handles for `expand_context`
 - `plan_edit` adds a patch-oriented planning bundle with likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests
 - `trace_scenario` turns a behavior description into likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and related tests/docs, while keeping confidence separate from coverage
-- Memory is persistent, scoped, refreshable, and stale-aware
+- Memory is persistent, scoped, refreshable, stale-aware, and evidence-linked
+- Memory trust diagnostics make unverified, stale, high-risk, different-checkout, or docs-conflicted claims explicit before an assistant relies on them
 - Compact workflow shaping now defaults to small assistant-friendly responses instead of large generic payloads
 
 ## Current Measured Results
 
-Current guidance from internal evaluation:
+Current guidance from local evaluation:
 
 - Broad codebase exploration: about `60-80%` fewer tokens
 - Deep discovery tasks: about `35-55%` fewer tokens
@@ -82,7 +85,7 @@ For MCP clients, `lattice --stdio --workspace <path>` is a lightweight proxy. Th
 
 The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.
 
-Multi-root proxy requests are represented as logical views over canonical per-root shards instead of as graph-owning combined runtimes. The daemon preserves the existing MCP method and tool schemas, warms the primary requested shard before accepting tool traffic, and prewarms the remaining view shards sequentially in the background so clients do not pay a seven-repo startup latency spike. Graph-backed workflow and dependency-analysis tools fan out across selected shards and return a bounded merged payload with per-shard summaries, source-workspace annotations, `failed_shards`, `incomplete_shards`, and context-handle routing back to the shard that created the handle. The successor direction is documented in [2026-05-20-persistent-daemon-shard-architecture.md](docs/architecture/2026-05-20-persistent-daemon-shard-architecture.md): per-root shard ownership, session-level composed views, and compact structural graphs instead of permanently materialized multi-root mega-runtimes.
+Multi-root proxy requests are represented as logical views over canonical per-root shards instead of as graph-owning combined runtimes. The daemon preserves the existing MCP method and tool schemas, warms the primary requested shard before accepting tool traffic, and prewarms the remaining view shards sequentially in the background so clients do not pay a seven-repo startup latency spike. Graph-backed workflow and dependency-analysis tools fan out across selected shards and return a bounded merged payload with per-shard summaries, source-workspace annotations, `failed_shards`, `incomplete_shards`, and context-handle routing back to the shard that created the handle. The architecture favors per-root shard ownership, session-level composed views, and compact structural graphs instead of permanently materialized multi-root mega-runtimes.
 
 The long-lived daemon bounds shard residency instead of keeping every graph forever. Loaded workspace shards are capped by `LATTICE_MAX_LOADED_SHARDS` (default `8`; falls back to the legacy `LATTICE_MAX_LOADED_WORKSPACES` value when set) and idle shards are evicted after `LATTICE_WORKSPACE_IDLE_TTL_SECS` (default `1800`). Multi-root view prewarming is enabled by default and can be disabled with `LATTICE_PREWARM_VIEW_SHARDS=0`; it is bounded by the same loaded-shard cap and stops at the first shard-load failure. Eviction stops that shard's indexing, watcher, memory-maintenance, and compaction tasks before dropping its graph and index handles. Full-graph semantic vector sync is disabled by default because it can be CPU-expensive on large repos; set `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1` to run it during background indexing.
 
