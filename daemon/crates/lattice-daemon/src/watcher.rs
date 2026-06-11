@@ -1,8 +1,9 @@
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
@@ -13,9 +14,11 @@ use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
 use crate::repo_state::RepoStateTracker;
+use crate::watcher_health::WatcherHealth;
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 const WORKSPACE_INVALIDATION_BATCH_THRESHOLD: usize = 20;
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// File system watcher that triggers incremental indexing on changes.
 pub struct FileWatcher {
@@ -29,6 +32,9 @@ pub struct FileWatcher {
     vector_index: Option<SharedVectorIndex>,
     repo_state: Arc<Mutex<RepoStateTracker>>,
     indexing: Arc<AtomicBool>,
+    watcher_health: Arc<WatcherHealth>,
+    #[cfg(test)]
+    forced_watch_failure: Option<String>,
 }
 
 impl FileWatcher {
@@ -43,6 +49,7 @@ impl FileWatcher {
         vector_index: Option<SharedVectorIndex>,
         repo_state: Arc<Mutex<RepoStateTracker>>,
         indexing: Arc<AtomicBool>,
+        watcher_health: Arc<WatcherHealth>,
     ) -> Self {
         Self {
             workspace_root,
@@ -55,10 +62,41 @@ impl FileWatcher {
             vector_index,
             repo_state,
             indexing,
+            watcher_health,
+            #[cfg(test)]
+            forced_watch_failure: None,
         }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        if let Err(error) = self.run_notify().await {
+            let reason = error.to_string();
+            let interval = poll_interval();
+            tracing::warn!(
+                workspace = %self.workspace_root.display(),
+                reason = %reason,
+                interval_secs = interval.as_secs(),
+                "File watcher degraded; falling back to polling"
+            );
+            self.watcher_health
+                .mark_degraded(reason, interval.as_secs());
+            return self.run_polling(interval).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_forced_watch_failure(mut self, reason: impl Into<String>) -> Self {
+        self.forced_watch_failure = Some(reason.into());
+        self
+    }
+
+    async fn run_notify(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(reason) = &self.forced_watch_failure {
+            anyhow::bail!("{}", reason);
+        }
+
         let (tx, mut rx) = mpsc::channel(100);
 
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
@@ -68,6 +106,7 @@ impl FileWatcher {
         })?;
 
         watcher.watch(&self.workspace_root, RecursiveMode::Recursive)?;
+        self.watcher_health.mark_healthy();
         info!("File watcher started for: {:?}", self.workspace_root);
 
         let mut changed_paths: Vec<PathBuf> = Vec::new();
@@ -95,6 +134,76 @@ impl FileWatcher {
         }
 
         Ok(())
+    }
+
+    async fn run_polling(&self, interval: Duration) -> anyhow::Result<()> {
+        let mut previous = self.poll_snapshot();
+        self.watcher_health.mark_poll();
+        let mut ticker = tokio::time::interval(interval);
+
+        loop {
+            ticker.tick().await;
+            let current = self.poll_snapshot();
+            let mut changed = Vec::new();
+            for (path, state) in &current {
+                if previous.get(path) != Some(state) {
+                    changed.push(path.clone());
+                }
+            }
+            for path in previous.keys() {
+                if !current.contains_key(path) {
+                    changed.push(path.clone());
+                }
+            }
+            self.watcher_health.mark_poll();
+            if !changed.is_empty() {
+                self.process_changes(changed).await;
+            }
+            previous = current;
+        }
+    }
+
+    fn poll_snapshot(&self) -> HashMap<PathBuf, PollFileState> {
+        let mut snapshot = HashMap::new();
+        self.collect_poll_snapshot(&self.workspace_root, &mut snapshot);
+        snapshot
+    }
+
+    fn collect_poll_snapshot(&self, dir: &Path, snapshot: &mut HashMap<PathBuf, PollFileState>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
+                    if matches!(
+                        dir_name,
+                        ".git" | "target" | "node_modules" | ".venv" | "venv" | "__pycache__"
+                    ) {
+                        continue;
+                    }
+                }
+                self.collect_poll_snapshot(&path, snapshot);
+            } else if path.is_file() && self.should_process(&path) {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    let modified_ns = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or_default();
+                    snapshot.insert(
+                        path,
+                        PollFileState {
+                            modified_ns,
+                            size_bytes: metadata.len(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     fn handle_event(&self, event: Event, changed_paths: &mut Vec<PathBuf>) {
@@ -300,6 +409,21 @@ impl FileWatcher {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollFileState {
+    modified_ns: u128,
+    size_bytes: u64,
+}
+
+fn poll_interval() -> Duration {
+    std::env::var("LATTICE_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_POLL_INTERVAL)
+}
+
 fn should_invalidate_workspace(workspace_root: &Path, paths: &[PathBuf]) -> bool {
     paths.len() >= WORKSPACE_INVALIDATION_BATCH_THRESHOLD
         || paths.iter().any(|path| {
@@ -325,4 +449,73 @@ fn is_git_state_path(rel_path: &str) -> bool {
     ) || normalized.starts_with(".git/rebase-apply/")
         || normalized.starts_with(".git/rebase-merge/")
         || normalized.starts_with(".git/refs/heads/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_core::graph::CodeGraph;
+    use lattice_core::memory::MemoryStore;
+
+    #[tokio::test]
+    async fn forced_watch_failure_enters_degraded_polling_mode() {
+        let root = unique_test_root("watch-degraded");
+        std::fs::write(root.join("src.rs"), "fn main() {}\n").expect("write source");
+        let graph = Arc::new(CodeGraph::new());
+        let memory_store = Arc::new(std::sync::Mutex::new(
+            MemoryStore::open_in_memory().expect("memory store"),
+        ));
+        let engine = Arc::new(Mutex::new(QueryEngine::new_shared(
+            graph,
+            None,
+            Some(memory_store),
+        )));
+        let indexer = Arc::new(Mutex::new(Indexer::new(root.clone())));
+        let graph_store = Arc::new(Mutex::new(
+            GraphStore::open_in_memory().expect("graph store"),
+        ));
+        let repo_state = Arc::new(Mutex::new(RepoStateTracker::new(&root)));
+        let indexing = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(WatcherHealth::default());
+        let watcher = FileWatcher::new(
+            root.clone(),
+            None,
+            Some(indexer),
+            None,
+            graph_store,
+            engine,
+            Arc::new(OnceLock::new()),
+            None,
+            repo_state,
+            indexing,
+            Arc::clone(&health),
+        )
+        .with_forced_watch_failure("forced notify setup failure");
+
+        let task = tokio::spawn(async move { watcher.run().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = health.snapshot();
+        task.abort();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(snapshot.watch_degraded);
+        assert_eq!(
+            snapshot.reason.as_deref(),
+            Some("forced notify setup failure")
+        );
+        assert_eq!(snapshot.polling_interval_secs, Some(30));
+        assert!(snapshot.last_poll_epoch_secs.is_some());
+    }
+
+    fn unique_test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "lattice-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create test root");
+        path
+    }
 }

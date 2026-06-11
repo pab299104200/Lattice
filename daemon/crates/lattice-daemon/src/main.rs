@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod doctor;
 mod lifecycle_log;
 mod proxy;
 mod repo_state;
@@ -8,6 +9,7 @@ mod runtime_support;
 mod socket_server;
 mod vector_sync;
 mod watcher;
+mod watcher_health;
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -39,6 +41,7 @@ use lattice_core::watcher as core_watcher;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
+use watcher_health::WatcherHealth;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,6 +52,15 @@ async fn main() -> Result<()> {
 
     if is_memory_migrate_command() {
         return run_memory_migrate_cli();
+    }
+
+    if is_doctor_command() {
+        let workspace_roots = parse_workspace_roots()?;
+        let ok = doctor::run(workspace_roots).await?;
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     if has_arg("--daemon") {
@@ -215,6 +227,7 @@ async fn main() -> Result<()> {
 
     // Shared indexing state flag
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let watcher_health = Arc::new(WatcherHealth::default());
     let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
         &workspace_root,
     )));
@@ -387,6 +400,7 @@ async fn main() -> Result<()> {
         let vector_index = vector_index.clone();
         let repo_state = Arc::clone(&repo_state);
         let indexing_state = Arc::clone(&indexing);
+        let watcher_health = Arc::clone(&watcher_health);
 
         tokio::spawn(async move {
             for root in workspace_roots {
@@ -401,6 +415,7 @@ async fn main() -> Result<()> {
                     vector_index.clone(),
                     Arc::clone(&repo_state),
                     Arc::clone(&indexing_state),
+                    Arc::clone(&watcher_health),
                 );
 
                 tokio::spawn(async move {
@@ -450,6 +465,7 @@ async fn main() -> Result<()> {
         default_focus.files,
         default_focus.dirs,
         repo_state,
+        watcher_health,
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
@@ -570,6 +586,7 @@ pub(crate) async fn build_workspace_runtime(
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
     let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let watcher_health = Arc::new(WatcherHealth::default());
     let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
         &workspace_root,
     )));
@@ -705,6 +722,7 @@ pub(crate) async fn build_workspace_runtime(
         let workspace_roots = workspace_roots.clone();
         let embedding_engine = Arc::clone(&embedding_engine);
         let vector_index = vector_index.clone();
+        let watcher_health = Arc::clone(&watcher_health);
 
         for root in workspace_roots {
             let watcher = crate::watcher::FileWatcher::new(
@@ -718,6 +736,7 @@ pub(crate) async fn build_workspace_runtime(
                 vector_index.clone(),
                 Arc::clone(&repo_state),
                 Arc::clone(&indexing),
+                Arc::clone(&watcher_health),
             );
             let task = tokio::spawn(async move {
                 if let Err(e) = watcher.run().await {
@@ -769,6 +788,7 @@ pub(crate) async fn build_workspace_runtime(
         default_focus_files,
         default_focus_dirs,
         repo_state,
+        watcher_health,
     ));
     {
         let handler = Arc::clone(&handler);
@@ -1317,6 +1337,10 @@ fn has_arg(name: &str) -> bool {
 
 fn is_memory_migrate_command() -> bool {
     std::env::args().nth(1).as_deref() == Some("memory-migrate")
+}
+
+fn is_doctor_command() -> bool {
+    std::env::args().nth(1).as_deref() == Some("doctor")
 }
 
 fn run_memory_migrate_cli() -> Result<()> {

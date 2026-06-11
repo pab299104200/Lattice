@@ -55,6 +55,7 @@ use crate::runtime_support::{
     max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
     WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
 };
+use crate::watcher_health::WatcherHealth;
 
 /// MCP (Model Context Protocol) handler that routes JSON-RPC methods
 /// to the appropriate tool implementations.
@@ -85,6 +86,7 @@ pub struct McpHandler {
     default_focus_dirs: Vec<String>,
     repo_state: Arc<Mutex<RepoStateTracker>>,
     refresh_running: Arc<AtomicBool>,
+    watcher_health: Arc<WatcherHealth>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +201,7 @@ impl McpHandler {
             default_focus_files,
             default_focus_dirs,
             repo_state,
+            Arc::new(WatcherHealth::default()),
         )
     }
 
@@ -219,6 +222,7 @@ impl McpHandler {
         default_focus_files: Vec<String>,
         default_focus_dirs: Vec<String>,
         repo_state: Arc<Mutex<RepoStateTracker>>,
+        watcher_health: Arc<WatcherHealth>,
     ) -> Self {
         let workspace_id = workspace_root.to_string_lossy().to_string();
         let refresh_running = Arc::new(AtomicBool::new(false));
@@ -290,6 +294,7 @@ impl McpHandler {
             default_focus_dirs,
             repo_state,
             refresh_running,
+            watcher_health,
         }
     }
 
@@ -4168,6 +4173,7 @@ impl McpHandler {
             None
         };
         let effective_files = effective_indexable_file_count(&self.workspace_roots);
+        let watcher_health = self.watcher_health.snapshot();
 
         let mut result = json!({
             "status": if is_indexing { "indexing" } else { "ready" },
@@ -4188,7 +4194,11 @@ impl McpHandler {
             "persisted_bytes": persisted_bytes,
             "byte_limit": byte_limit,
             "byte_env_var": WARM_GRAPH_BYTE_LIMIT_ENV,
-            "effective_files": effective_files
+            "effective_files": effective_files,
+            "watch_degraded": watcher_health.watch_degraded,
+            "watch_degraded_reason": watcher_health.reason,
+            "watch_poll_interval_secs": watcher_health.polling_interval_secs,
+            "watch_last_poll_epoch_secs": watcher_health.last_poll_epoch_secs
         });
         if let Some(error) = warm_load_error {
             if let Some(obj) = result.as_object_mut() {
@@ -9320,11 +9330,48 @@ export function greet(name: string): string {
             Some("LATTICE_MAX_WARM_GRAPH_BYTES")
         );
         assert_eq!(payload["effective_files"].as_u64(), Some(0));
+        assert_eq!(payload["watch_degraded"].as_bool(), Some(false));
         assert_eq!(
             payload["languages"]["TypeScript"].as_u64(),
             Some(1),
             "expected language counts to come from live indexer snapshot: {payload:?}"
         );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn test_index_status_reports_degraded_watcher_health() {
+        let (handler, _memory_store, workspace_root) =
+            build_memory_test_handler("session-index-status-watch-degraded");
+        handler
+            .watcher_health
+            .mark_degraded("forced watch setup failure", 30);
+        handler.watcher_health.mark_poll();
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "index_status",
+                "arguments": {}
+            }),
+        )
+        .await
+        .expect("index_status tools/call should succeed");
+
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("expected wrapped index_status response text");
+        let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
+
+        assert_eq!(payload["watch_degraded"].as_bool(), Some(true));
+        assert_eq!(
+            payload["watch_degraded_reason"].as_str(),
+            Some("forced watch setup failure")
+        );
+        assert_eq!(payload["watch_poll_interval_secs"].as_u64(), Some(30));
+        assert!(payload["watch_last_poll_epoch_secs"].as_u64().is_some());
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }

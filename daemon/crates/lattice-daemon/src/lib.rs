@@ -4,6 +4,8 @@ pub(crate) mod lifecycle_log;
 pub(crate) mod repo_state;
 pub mod rpc;
 pub(crate) mod runtime_support;
+#[allow(dead_code)]
+pub(crate) mod watcher_health;
 // The lib target exposes RPC for tests; the binary uses the incremental sync entry points.
 #[allow(dead_code)]
 pub mod vector_sync;
