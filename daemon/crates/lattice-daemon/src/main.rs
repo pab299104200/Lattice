@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     }
 
     if has_arg("--stdio") {
-        let workspace_roots = parse_workspace_roots();
+        let workspace_roots = parse_workspace_roots()?;
         let workspace_root = workspace_roots[0].clone();
         let default_focus = parse_focus_args(&workspace_root);
         let hello = proxy::ProxyHello {
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     tracing::info!("Lattice daemon starting...");
 
     // ── Parse workspace roots ────────────────────────────────────────
-    let workspace_roots = parse_workspace_roots();
+    let workspace_roots = parse_workspace_roots()?;
     let workspace_root = workspace_roots[0].clone();
     let default_focus = parse_focus_args(&workspace_root);
     let is_multi_repo = workspace_roots.len() > 1;
@@ -1163,7 +1163,7 @@ fn open_sqlite_vector_fallback(path: &Path) -> Option<SharedVectorIndex> {
 /// Parse workspace roots from command-line args.
 /// Supports multiple `--workspace <path>` flags. Defaults to current directory.
 /// Applies anti-double-indexing: if root A is a parent of root B, B is dropped.
-fn parse_workspace_roots() -> Vec<PathBuf> {
+fn parse_workspace_roots() -> Result<Vec<PathBuf>> {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
 
@@ -1193,8 +1193,41 @@ fn parse_workspace_roots() -> Vec<PathBuf> {
 
     // Anti-double-indexing: remove any root that is a subdirectory of another.
     let roots = deduplicate_roots(roots);
+    validate_workspace_roots(&roots)?;
     let current_dir = std::env::current_dir().ok();
-    prefer_current_dir_root(roots, current_dir.as_deref())
+    Ok(prefer_current_dir_root(roots, current_dir.as_deref()))
+}
+
+fn validate_workspace_roots(roots: &[PathBuf]) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|path| path.canonicalize().ok());
+    for root in roots {
+        validate_workspace_root(root, home.as_deref())?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_root(root: &Path, home: Option<&Path>) -> Result<()> {
+    if is_filesystem_root(root) {
+        anyhow::bail!(
+            "refusing workspace root `{}`: filesystem root is not a valid Lattice workspace",
+            root.display()
+        );
+    }
+    if let Some(home) = home {
+        if root == home {
+            anyhow::bail!(
+                "refusing workspace root `{}`: the user's home directory is not a valid Lattice workspace; choose a project directory instead",
+                root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none()
 }
 
 fn prefer_current_dir_root(mut roots: Vec<PathBuf>, current_dir: Option<&Path>) -> Vec<PathBuf> {
@@ -1341,7 +1374,7 @@ fn parse_memory_migrate_options() -> Result<MemoryMigrateOptions> {
     if dry_run == apply {
         anyhow::bail!("memory-migrate requires exactly one of --dry-run or --apply");
     }
-    let workspace = parse_workspace_roots().remove(0);
+    let workspace = parse_workspace_roots()?.remove(0);
     let lattice_dir = workspace.join(".lattice");
     Ok(MemoryMigrateOptions {
         source_path: source_path.unwrap_or_else(|| lattice_dir.join("memories.db")),
@@ -1577,6 +1610,7 @@ pub(crate) fn build_incremental_index_for_roots(
 ) -> IncrementalIndexResult {
     let manifest = manifest.cloned().unwrap_or_default();
     let records = collect_indexable_file_records(roots);
+    warn_if_indexable_file_count_exceeds_warm_limit(roots, records.len());
     let current_files: HashSet<String> = records
         .iter()
         .map(|record| record.indexed_path.clone())
@@ -1680,6 +1714,25 @@ pub(crate) fn build_incremental_index_for_roots(
         changed_count,
         removed_count,
     }
+}
+
+fn warn_if_indexable_file_count_exceeds_warm_limit(roots: &[PathBuf], candidate_files: usize) {
+    let max_files = max_warm_graph_files();
+    if candidate_files <= max_files {
+        return;
+    }
+    let root_list = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(
+        workspace_roots = %root_list,
+        candidate_files,
+        max_files,
+        env_var = WARM_GRAPH_FILE_LIMIT_ENV,
+        "Workspace contains more candidate files than the warm graph safety limit"
+    );
 }
 
 fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
@@ -1918,6 +1971,23 @@ mod tests {
         );
 
         assert_eq!(reordered, vec![root_b, root_a]);
+    }
+
+    #[test]
+    fn validate_workspace_root_rejects_filesystem_root() {
+        let err = super::validate_workspace_root(PathBuf::from("/").as_path(), None)
+            .expect_err("filesystem root must be rejected");
+
+        assert!(err.to_string().contains("filesystem root"));
+    }
+
+    #[test]
+    fn validate_workspace_root_rejects_home_directory() {
+        let home = PathBuf::from("/home/tester");
+        let err = super::validate_workspace_root(home.as_path(), Some(home.as_path()))
+            .expect_err("home directory must be rejected");
+
+        assert!(err.to_string().contains("home directory"));
     }
 
     #[test]

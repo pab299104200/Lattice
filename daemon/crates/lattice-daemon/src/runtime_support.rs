@@ -129,6 +129,7 @@ pub(crate) fn build_incremental_index_for_roots(
 ) -> IncrementalIndexResult {
     let manifest = manifest.cloned().unwrap_or_default();
     let records = collect_indexable_file_records(roots);
+    warn_if_indexable_file_count_exceeds_warm_limit(roots, records.len());
     let current_files: HashSet<String> = records
         .iter()
         .map(|record| record.indexed_path.clone())
@@ -232,6 +233,25 @@ pub(crate) fn build_incremental_index_for_roots(
         changed_count,
         removed_count,
     }
+}
+
+fn warn_if_indexable_file_count_exceeds_warm_limit(roots: &[PathBuf], candidate_files: usize) {
+    let max_files = max_warm_graph_files();
+    if candidate_files <= max_files {
+        return;
+    }
+    let root_list = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(
+        workspace_roots = %root_list,
+        candidate_files,
+        max_files,
+        env_var = WARM_GRAPH_FILE_LIMIT_ENV,
+        "Workspace contains more candidate files than the warm graph safety limit"
+    );
 }
 
 fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
