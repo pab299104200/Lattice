@@ -119,7 +119,7 @@ async fn get_task_memory_builds_implicit_state_from_task_statement_and_focus() {
         build_handler("implicit-task-memory");
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_task_memory",
                 "arguments": {
@@ -159,7 +159,7 @@ async fn save_quick_memory_prefills_links_and_recent_failures_from_task_context(
         .await;
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "save_quick_memory",
                 "arguments": {
@@ -244,8 +244,7 @@ async fn get_task_memory_surfaces_inclusion_reason_and_verification_status() {
         .await;
 
     let response = handler
-        .handle(
-            "tools/call",
+        .handle("lattice/tool_call",
             json!({"name": "get_task_memory", "arguments": {"task_id": TASK_ID, "intent_hint": "refresh token"}}),
         )
         .await
@@ -329,7 +328,7 @@ async fn save_memory_defaults_unverified_persists_fields_emits_event_and_queues_
         build_handler("save-memory");
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "save_memory",
                 "arguments": {
@@ -422,7 +421,7 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
 
     let propose = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -464,7 +463,7 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
 
     let apply = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -489,7 +488,7 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
 
     let reject_proposal = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -509,7 +508,7 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
         .to_string();
     let reject = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -577,7 +576,7 @@ async fn get_task_memory_requires_workspace_and_concrete_task_signal() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({"name": "get_task_memory", "arguments": {"task_id": TASK_ID}}),
         )
         .await
@@ -623,8 +622,7 @@ async fn search_memory_falls_back_to_exact_task_ids_under_workspace_scope() {
     }
 
     let response = handler
-        .handle(
-            "tools/call",
+        .handle("lattice/tool_call",
             json!({
                 "name": "search_memory",
                 "arguments": {
@@ -671,7 +669,7 @@ async fn search_memory_exact_ids_do_not_fall_back_to_generic_terms() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "search_memory",
                 "arguments": {
@@ -735,7 +733,7 @@ async fn search_memory_warns_when_unverified_failure_memory_references_changed_f
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "search_memory",
                 "arguments": {
@@ -800,7 +798,7 @@ async fn search_memory_exact_id_rerank_penalizes_stale_memory() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "search_memory",
                 "arguments": {
@@ -838,7 +836,7 @@ async fn get_task_memory_respects_scope_boundaries() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({"name": "get_task_memory", "arguments": {"task_id": TASK_ID}}),
         )
         .await
@@ -848,52 +846,6 @@ async fn get_task_memory_respects_scope_boundaries() {
     assert!(memories
         .iter()
         .all(|memory| memory["content"].as_str() != Some("other branch memory")));
-    cleanup_paths(&workspace_root, &context_cache_path);
-}
-
-#[tokio::test]
-async fn apply_memory_evolution_shim_forwards_with_deprecation_warning() {
-    let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
-        build_handler("apply-shim");
-    let memory_id = {
-        let store = memory_store.lock().await;
-        store
-            .store(seed_memory("shim target", MemoryScope::Repo))
-            .expect("store memory")
-    };
-    let propose = handler
-        .handle(
-            "tools/call",
-            json!({
-                "name": "propose_memory_evolution",
-                "arguments": {
-                    "action": "propose",
-                    "memory_id": memory_id,
-                    "content": "shim target updated"
-                }
-            }),
-        )
-        .await
-        .expect("propose succeeds");
-    let proposal_id = parse_tool_payload(&propose)["proposal_id"]
-        .as_str()
-        .expect("proposal id")
-        .to_string();
-    let shim = handler
-        .handle(
-            "tools/call",
-            json!({
-                "name": "apply_memory_evolution",
-                "arguments": {
-                    "proposal_id": proposal_id
-                }
-            }),
-        )
-        .await
-        .expect("shim succeeds");
-    let payload = parse_tool_payload(&shim);
-    assert_eq!(payload["decision"].as_str(), Some("applied"));
-    assert!(payload["deprecation_warning"].as_str().is_some());
     cleanup_paths(&workspace_root, &context_cache_path);
 }
 

@@ -3,20 +3,15 @@
 //! Implements the contract gate from
 //! `docs/plans/2026-05-16-cognitive-workspace-fork-build/tasks/R64.md`.
 //! It binds the daemon's advertised tool list, request/response schemas,
-//! render modes, and deprecation shims to the canonical tool reference at
-//! `docs/architecture/2026-05-16-mcp-tool-reference.md` and the compatibility
-//! rules at `docs/architecture/2026-05-16-mcp-compatibility-policy.md`.
+//! render modes to the canonical 8-verb tool reference.
 //!
-//! Cited spec headings: `## MCP Surface`, `## MCP Tool Contract Principles`,
-//! and `## Non-Negotiable Product Properties` from
-//! `docs/plans/2026-05-16-cognitive-workspace-fork-plan.md`.
+//! Cited spec heading: `## Phase 2 — Consolidate the agent-facing tool surface
+//! to 8 verbs` from `docs/plans/2026-06-11-agent-adoption-overhaul.md`.
 
 #![cfg(test)]
 
-mod backward_compat;
 mod render_modes;
 mod round_trip;
-mod shims;
 pub(crate) mod tool_list;
 
 use std::path::PathBuf;

@@ -596,6 +596,365 @@ impl McpHandler {
         status_snapshot_from_graph(engine.graph(), include_languages)
     }
 
+    fn handle_agent_tools_list(&self) -> Value {
+        json!({
+            "tools": [
+                {
+                    "name": "context",
+                    "description": "Finds the relevant code, docs, rules, or prior handle for a task before you know exact strings — the working set grep cannot rank. Do not use for exact literal lookup.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Natural language query for retrieval modes." },
+                            "mode": {
+                                "type": "string",
+                                "description": "Context mode.",
+                                "enum": ["auto", "focused", "subsystem", "docs", "skeleton", "working_set", "rules", "expand", "repo"],
+                                "default": "auto"
+                            },
+                            "files": { "type": "array", "items": { "type": "string" } },
+                            "symbols": { "type": "array", "items": { "type": "string" } },
+                            "file": { "type": "string", "description": "File for skeleton mode." },
+                            "handle": { "type": "string", "description": "Context handle for expand mode." },
+                            "focus": { "type": "string", "description": "Expansion focus for expand mode." },
+                            "max_tokens": { "type": "integer" },
+                            "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
+                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "wire_format": { "type": "string", "enum": ["standard", "dense"] }
+                        }
+                    }
+                },
+                {
+                    "name": "prepare_change",
+                    "description": "Builds the edit plan, likely files, tests, risks, and memory for a change — the implementation map grep cannot assemble. Call before non-trivial fixes, features, or refactors.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task": { "type": "string", "description": "Natural language task." },
+                            "query": { "type": "string", "description": "Alias for task." },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["prepare", "plan_edit", "trace", "auto", "compact", "full"],
+                                "default": "prepare"
+                            },
+                            "entry_files": { "type": "array", "items": { "type": "string" } },
+                            "entry_symbols": { "type": "array", "items": { "type": "string" } },
+                            "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
+                            "max_tokens": { "type": "integer" },
+                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "wire_format": { "type": "string", "enum": ["standard", "dense"] }
+                        },
+                        "required": ["task"]
+                    }
+                },
+                {
+                    "name": "impact",
+                    "description": "Returns every symbol, file, and test affected by changing a target — the blast radius grep cannot compute. Call before multi-file or non-obvious changes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "target": { "description": "Symbol/file/diff target. May be a string or object.", "oneOf": [{ "type": "string" }, { "type": "object" }] },
+                            "direction": { "type": "string", "enum": ["dependents", "dependencies", "both", "diff", "tests"], "default": "dependents" },
+                            "include_tests": { "type": "boolean", "default": true },
+                            "name": { "type": "string" },
+                            "file": { "type": "string" },
+                            "diff": { "type": "string" },
+                            "files": { "type": "array", "items": { "type": "string" } },
+                            "symbols": { "type": "array", "items": { "type": "string" } },
+                            "hops": { "type": "integer", "default": 3 },
+                            "limit": { "type": "integer", "default": 8 },
+                            "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
+                            "max_tokens": { "type": "integer" },
+                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "wire_format": { "type": "string", "enum": ["standard", "dense"] }
+                        }
+                    }
+                },
+                {
+                    "name": "diagnose",
+                    "description": "Maps compiler, test, and runtime failure text to likely culprit code and tests — the failure path grep cannot infer. Call before opening files from a stack trace.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "failure_text": { "type": "string" },
+                            "input": { "type": "string", "description": "Alias for failure_text." },
+                            "context_files": { "type": "array", "items": { "type": "string" } },
+                            "kind": { "type": "string" },
+                            "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
+                            "mode": { "type": "string", "enum": ["auto", "compact", "full"], "default": "auto" },
+                            "max_tokens": { "type": "integer" },
+                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "wire_format": { "type": "string", "enum": ["standard", "dense"] }
+                        },
+                        "required": ["failure_text"]
+                    }
+                },
+                {
+                    "name": "search",
+                    "description": "Searches symbols, call paths, and docs links using graph identity — the structural match grep cannot provide. Use rg for exact text.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "kind": { "type": "string", "enum": ["symbol", "flow", "links", "symbol_detail"], "default": "symbol" },
+                            "name": { "type": "string" },
+                            "file": { "type": "string" },
+                            "from": { "type": "string" },
+                            "to": { "type": "string" },
+                            "from_file": { "type": "string" },
+                            "to_file": { "type": "string" },
+                            "target": { "type": "string" },
+                            "direction": { "type": "string", "enum": ["backlinks", "outgoing"], "default": "backlinks" },
+                            "limit": { "type": "integer" },
+                            "detail": { "type": "string", "enum": ["summary", "full"] },
+                            "max_depth": { "type": "integer" }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "remember",
+                    "description": "Stores durable task memory or workflow outcomes for future sessions — the cross-session recall grep cannot create. Use only for claims worth reusing.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+                            "kind": { "type": "string", "enum": ["quick", "durable", "outcome"], "default": "quick" },
+                            "task": { "type": "string" },
+                            "summary": { "type": "string" },
+                            "status": { "type": "string", "enum": ["success", "failure"] },
+                            "scope": { "type": "string" },
+                            "confidence": { "type": "number" },
+                            "confidence_reason": { "type": "string" },
+                            "freshness_policy": { "type": "string" },
+                            "memory_class": { "type": "string" },
+                            "linked_files": { "type": "array", "items": { "type": "string" } },
+                            "linked_symbols": { "type": "array", "items": { "type": "string" } },
+                            "linked_docs": { "type": "array", "items": { "type": "string" } },
+                            "linked_tests": { "type": "array", "items": { "type": "string" } },
+                            "files": { "type": "array", "items": { "type": "string" } },
+                            "symbols": { "type": "array", "items": { "type": "string" } },
+                            "tests": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["content"]
+                    }
+                },
+                {
+                    "name": "recall",
+                    "description": "Retrieves and verifies prior task memory with trust signals — the historical context grep cannot recover. Treat retrieved memory as recall until verified.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "mode": { "type": "string", "enum": ["search", "task", "verify"], "default": "search" },
+                            "task_id": { "type": "string" },
+                            "task_statement": { "type": "string" },
+                            "memory_id": {},
+                            "limit": { "type": "integer" },
+                            "budget_tokens": { "type": "integer" },
+                            "focus_files": { "type": "array", "items": { "type": "string" } },
+                            "focus_dirs": { "type": "array", "items": { "type": "string" } },
+                            "intent_hint": { "type": "string" },
+                            "render_mode": { "type": "string", "enum": ["compact", "full", "diagnostic"] }
+                        }
+                    }
+                },
+                {
+                    "name": "status",
+                    "description": "Reports indexing, stale-doc, stale-memory, and conflict health — the operational state grep cannot see. Call when results look incomplete or memory may be stale.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts"], "default": "index" },
+                            "query": { "type": "string" },
+                            "files": { "type": "array", "items": { "type": "string" } },
+                            "symbols": { "type": "array", "items": { "type": "string" } },
+                            "anchor": {},
+                            "limit": { "type": "integer" },
+                            "cursor": { "type": "integer" },
+                            "render_mode": { "type": "string", "enum": ["compact", "full", "diagnostic"] }
+                        }
+                    }
+                }
+            ]
+        })
+    }
+
+    async fn handle_agent_tools_call(&self, params: &Value) -> Result<Value, (i32, String)> {
+        let tool_name = params["name"]
+            .as_str()
+            .ok_or((-32602, "Missing tool name".to_string()))?;
+        let arguments = &params["arguments"];
+        let span = tracing::info_span!("tool", name = tool_name);
+        let tool_called_event = self.capture_tool_called(tool_name, arguments);
+
+        let result = async {
+            match tool_name {
+                "context" => self.tool_agent_context(arguments).await,
+                "prepare_change" => self.tool_agent_prepare_change(arguments).await,
+                "impact" => self.tool_agent_impact(arguments).await,
+                "diagnose" => self.tool_agent_diagnose(arguments).await,
+                "search" => self.tool_agent_search(arguments).await,
+                "remember" => self.tool_agent_remember(arguments).await,
+                "recall" => self.tool_agent_recall(arguments).await,
+                "status" => self.tool_agent_status(arguments).await,
+                _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
+            }
+        }
+        .instrument(span)
+        .await;
+
+        if let Ok(ref value) = result {
+            self.record_tool_metrics(tool_name, value).await;
+        }
+        self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
+            .await;
+
+        result
+    }
+
+    async fn tool_agent_context(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let mode = args["mode"].as_str().unwrap_or("auto");
+        let mut routed = clone_object_value(args);
+        match mode {
+            "focused" => {
+                set_string(&mut routed, "mode", "focused");
+                self.tool_query_context(&routed).await
+            }
+            "subsystem" => self.tool_summarize_subsystem(&routed).await,
+            "docs" => self.tool_get_docs_capsule(&routed).await,
+            "skeleton" => {
+                if routed.get("file").is_none() {
+                    if let Some(file) = first_string(args, &["target", "query"]) {
+                        set_value(&mut routed, "file", Value::String(file));
+                    }
+                }
+                self.tool_get_file_context(&routed).await
+            }
+            "working_set" => self.tool_get_working_set_context(&routed).await,
+            "rules" => self.tool_get_project_rules(&routed).await,
+            "expand" => self.tool_expand_context(&routed).await,
+            "repo" | "playbook" => self.tool_get_repo_playbook(&routed).await,
+            "auto" | _ => {
+                set_string(&mut routed, "mode", "full");
+                self.tool_query_context(&routed).await
+            }
+        }
+    }
+
+    async fn tool_agent_prepare_change(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let route_mode = args["mode"].as_str().unwrap_or("prepare");
+        let mut routed = clone_object_value(args);
+        copy_first_string(&mut routed, args, &["query", "task"], "query");
+        match route_mode {
+            "plan_edit" => self.tool_plan_edit(&routed).await,
+            "trace" => {
+                copy_first_string(
+                    &mut routed,
+                    args,
+                    &["scenario", "task", "query"],
+                    "scenario",
+                );
+                self.tool_trace_scenario(&routed).await
+            }
+            "compact" | "full" => {
+                set_string(&mut routed, "mode", route_mode);
+                self.tool_prepare_change(&routed).await
+            }
+            "prepare" | "auto" | _ => {
+                remove_key(&mut routed, "mode");
+                self.tool_prepare_change(&routed).await
+            }
+        }
+    }
+
+    async fn tool_agent_impact(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let mut routed = clone_object_value(args);
+        normalize_target_fields(&mut routed, args);
+        let direction = args["direction"].as_str().unwrap_or("dependents");
+        if routed.get("diff").and_then(Value::as_str).is_some() || direction == "diff" {
+            return self.tool_impact_from_diff(&routed).await;
+        }
+        if direction == "tests" {
+            return self.tool_find_relevant_tests(&routed).await;
+        }
+
+        let impact = match direction {
+            "dependencies" => self.tool_get_dependencies(&routed).await?,
+            "both" => json!({
+                "dependents": self.tool_get_dependents(&routed).await?,
+                "dependencies": self.tool_get_dependencies(&routed).await?
+            }),
+            _ => self.tool_blast_radius(&routed).await?,
+        };
+        if args["include_tests"].as_bool().unwrap_or(true) {
+            let tests = self.tool_find_relevant_tests(&routed).await?;
+            Ok(wrap_tool_result(json!({
+                "impact": unwrap_tool_text_json(&impact).unwrap_or(impact),
+                "tests": unwrap_tool_text_json(&tests).unwrap_or(tests)
+            })))
+        } else {
+            Ok(impact)
+        }
+    }
+
+    async fn tool_agent_diagnose(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let mut routed = clone_object_value(args);
+        copy_first_string(&mut routed, args, &["input", "failure_text"], "input");
+        self.tool_diagnose_failure(&routed).await
+    }
+
+    async fn tool_agent_search(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let kind = args["kind"].as_str().unwrap_or("symbol");
+        let mut routed = clone_object_value(args);
+        match kind {
+            "flow" => self.tool_search_logic_flow(&routed).await,
+            "links" => {
+                if routed.get("target").is_none() {
+                    copy_first_string(&mut routed, args, &["target", "query"], "target");
+                }
+                if args["direction"].as_str() == Some("outgoing") {
+                    self.tool_get_outgoing_links(&routed).await
+                } else {
+                    self.tool_get_backlinks(&routed).await
+                }
+            }
+            "symbol_detail" => {
+                copy_first_string(&mut routed, args, &["name", "query"], "name");
+                self.tool_get_symbol(&routed).await
+            }
+            "symbol" | _ => {
+                copy_first_string(&mut routed, args, &["pattern", "query"], "pattern");
+                self.tool_search_symbols(&routed).await
+            }
+        }
+    }
+
+    async fn tool_agent_remember(&self, args: &Value) -> Result<Value, (i32, String)> {
+        match args["kind"].as_str().unwrap_or("quick") {
+            "durable" => self.tool_save_memory_v2(args).await,
+            "outcome" => self.tool_record_workflow_outcome(args).await,
+            "quick" | _ => self.tool_save_quick_memory_v2(args).await,
+        }
+    }
+
+    async fn tool_agent_recall(&self, args: &Value) -> Result<Value, (i32, String)> {
+        match args["mode"].as_str().unwrap_or("search") {
+            "task" => self.tool_get_task_memory_v2(args).await,
+            "verify" => self.tool_verify_explain_memory(args).await,
+            "search" | _ => self.tool_search_memory(args).await,
+        }
+    }
+
+    async fn tool_agent_status(&self, args: &Value) -> Result<Value, (i32, String)> {
+        match args["scope"].as_str().unwrap_or("index") {
+            "docs" => self.tool_find_stale_docs(args).await,
+            "memory" => self.tool_list_stale_memories(args).await,
+            "conflicts" => self.tool_list_memory_conflicts(args).await,
+            "index" | _ => self.tool_index_status(args).await,
+        }
+    }
+
     fn handle_tools_list(&self) -> Value {
         let mut result = json!({
             "tools": [
@@ -1484,10 +1843,7 @@ impl McpHandler {
                 memory_v2::save_quick_memory::tool_definition(),
                 memory_v2::save_memory::tool_definition(),
                 memory_v2::propose_memory_evolution::tool_definition(),
-                memory_v2::propose_memory_evolution::apply_shim_tool_definition(),
                 memory_v2::verify_explain_memory::tool_definition(),
-                memory_v2::verify_explain_memory::verify_shim_tool_definition(),
-                memory_v2::verify_explain_memory::explain_shim_tool_definition(),
                 memory_v2::list_memory_conflicts::tool_definition(),
             ]);
         }
@@ -1504,7 +1860,7 @@ impl McpHandler {
 
         let result = async {
             match tool_name {
-                "get_context_capsule" | "query_context" => self.tool_query_context(arguments).await,
+                "get_context_capsule" => self.tool_query_context(arguments).await,
                 "prepare_change" => self.tool_prepare_change(arguments).await,
                 "plan_edit" => self.tool_plan_edit(arguments).await,
                 "trace_scenario" => self.tool_trace_scenario(arguments).await,
@@ -1523,10 +1879,10 @@ impl McpHandler {
                 "get_symbol" => self.tool_get_symbol(arguments).await,
                 "get_dependents" => self.tool_get_dependents(arguments).await,
                 "get_dependencies" => self.tool_get_dependencies(arguments).await,
-                "get_impact_graph" | "blast_radius" => self.tool_blast_radius(arguments).await,
+                "get_impact_graph" => self.tool_blast_radius(arguments).await,
                 "search_symbols" => self.tool_search_symbols(arguments).await,
-                "get_skeleton" | "get_file_context" => self.tool_get_file_context(arguments).await,
-                "search_memory" | "recall_memories" => self.tool_search_memory(arguments).await,
+                "get_skeleton" => self.tool_get_file_context(arguments).await,
+                "search_memory" => self.tool_search_memory(arguments).await,
                 "list_stale_memories" => self.tool_list_stale_memories(arguments).await,
                 "search_logic_flow" => self.tool_search_logic_flow(arguments).await,
                 "submit_lsp_edges" => self.tool_submit_lsp_edges(arguments).await,
@@ -1544,28 +1900,7 @@ impl McpHandler {
                 "propose_memory_evolution" => {
                     self.tool_propose_memory_evolution_v2(arguments).await
                 }
-                "apply_memory_evolution" => self.tool_apply_memory_evolution_v2(arguments).await,
-                "verify_explain_memory" => self.tool_verify_explain_memory(arguments, None).await,
-                "verify_memory" => {
-                    self.tool_verify_memory(
-                        arguments,
-                        Some(
-                            "verify_memory is deprecated; use verify_explain_memory(mode=verify). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
-                                .to_string(),
-                        ),
-                    )
-                    .await
-                }
-                "explain_memory" => {
-                    self.tool_explain_memory(
-                        arguments,
-                        Some(
-                            "explain_memory is deprecated; use verify_explain_memory(mode=explain). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
-                                .to_string(),
-                        ),
-                    )
-                    .await
-                }
+                "verify_explain_memory" => self.tool_verify_explain_memory(arguments).await,
                 "list_memory_conflicts" => self.tool_list_memory_conflicts(arguments).await,
                 _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
             }
@@ -4563,7 +4898,6 @@ impl McpHandler {
                     decision: "pending".to_string(),
                     prior_state,
                     proposed_state,
-                    deprecation_warning: None,
                 };
                 serde_json::to_value(&response)
                     .map(wrap_tool_result)
@@ -4638,36 +4972,12 @@ impl McpHandler {
                     decision: record.decision.as_str().to_string(),
                     prior_state: record.prior_state.clone(),
                     proposed_state: record.proposed_state.clone(),
-                    deprecation_warning: None,
                 };
                 serde_json::to_value(&response)
                     .map(wrap_tool_result)
                     .map_err(|error| (-32603, format!("Serialization error: {error}")))
             }
         }
-    }
-
-    async fn tool_apply_memory_evolution_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let parsed = memory_v2::propose_memory_evolution::parse_apply_shim_args(args)
-            .map_err(|message| (-32602, message))?;
-        let response = self
-            .tool_propose_memory_evolution_v2(&serde_json::to_value(&parsed).map_err(|error| {
-                (
-                    -32603,
-                    format!("Failed to serialize shim arguments: {error}"),
-                )
-            })?)
-            .await?;
-        let mut payload: Value = serde_json::from_str(
-            response["content"][0]["text"]
-                .as_str()
-                .ok_or((-32603, "Missing tool payload text".to_string()))?,
-        )
-        .map_err(|error| (-32603, format!("Failed to parse shim payload: {error}")))?;
-        payload["deprecation_warning"] = json!(
-            "apply_memory_evolution is deprecated; use propose_memory_evolution(action=apply). Removal deadline: no earlier than one full phase cycle after maintained clients migrate."
-        );
-        Ok(wrap_tool_result(payload))
     }
 
     async fn tool_consolidate_session_v2(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -4997,11 +5307,7 @@ impl McpHandler {
         }
     }
 
-    async fn tool_verify_explain_memory(
-        &self,
-        args: &Value,
-        deprecation_warning: Option<String>,
-    ) -> Result<Value, (i32, String)> {
+    async fn tool_verify_explain_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
         let parsed = memory_v2::verify_explain_memory::parse_args(args)
             .map_err(|message| (-32602, message))?;
         let scope_filter = self.current_memory_scope_filter();
@@ -5031,7 +5337,6 @@ impl McpHandler {
             &execution.report,
             parsed.render_mode,
             handle.legacy_handle,
-            deprecation_warning,
         );
         tracing::info!(
             tool = "verify_explain_memory",
@@ -5071,44 +5376,6 @@ impl McpHandler {
         serde_json::to_value(&response)
             .map(wrap_tool_result)
             .map_err(|error| (-32603, format!("Serialization error: {error}")))
-    }
-
-    async fn tool_explain_memory(
-        &self,
-        args: &Value,
-        deprecation_warning: Option<String>,
-    ) -> Result<Value, (i32, String)> {
-        let parsed = memory_v2::verify_explain_memory::parse_explain_shim_args(args)
-            .map_err(|message| (-32602, message))?;
-        self.tool_verify_explain_memory(
-            &serde_json::to_value(&parsed).map_err(|error| {
-                (
-                    -32603,
-                    format!("Failed to serialize explain shim arguments: {error}"),
-                )
-            })?,
-            deprecation_warning,
-        )
-        .await
-    }
-
-    async fn tool_verify_memory(
-        &self,
-        args: &Value,
-        deprecation_warning: Option<String>,
-    ) -> Result<Value, (i32, String)> {
-        let parsed = memory_v2::verify_explain_memory::parse_verify_shim_args(args)
-            .map_err(|message| (-32602, message))?;
-        self.tool_verify_explain_memory(
-            &serde_json::to_value(&parsed).map_err(|error| {
-                (
-                    -32603,
-                    format!("Failed to serialize verify shim arguments: {error}"),
-                )
-            })?,
-            deprecation_warning,
-        )
-        .await
     }
 
     async fn tool_list_memory_conflicts(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -5713,8 +5980,10 @@ impl RequestHandler for McpHandler {
     ) -> Result<serde_json::Value, (i32, String)> {
         match method {
             "initialize" => Ok(self.handle_initialize()),
-            "tools/list" => Ok(self.handle_tools_list()),
-            "tools/call" => self.handle_tools_call(&params).await,
+            "tools/list" => Ok(self.handle_agent_tools_list()),
+            "tools/call" => self.handle_agent_tools_call(&params).await,
+            "lattice/tools/list_all" => Ok(self.handle_tools_list()),
+            "lattice/tool_call" | "lattice/tools/call" => self.handle_tools_call(&params).await,
             "ping" => Ok(json!({})),
             "lattice/status" => {
                 let is_indexing = self.indexing.load(Ordering::Relaxed);
@@ -5800,6 +6069,99 @@ fn parse_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn clone_object_value(value: &Value) -> Value {
+    value
+        .as_object()
+        .map(|object| Value::Object(object.clone()))
+        .unwrap_or_else(|| json!({}))
+}
+
+fn set_value(value: &mut Value, key: &str, item: Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(key.to_string(), item);
+    }
+}
+
+fn set_string(value: &mut Value, key: &str, item: &str) {
+    set_value(value, key, Value::String(item.to_string()));
+}
+
+fn remove_key(value: &mut Value, key: &str) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove(key);
+    }
+}
+
+fn first_string(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| args[*key].as_str().map(ToString::to_string))
+}
+
+fn copy_first_string(value: &mut Value, args: &Value, keys: &[&str], destination: &str) {
+    if value[destination].as_str().is_some() {
+        return;
+    }
+    if let Some(item) = first_string(args, keys) {
+        set_string(value, destination, &item);
+    }
+}
+
+fn normalize_target_fields(value: &mut Value, args: &Value) {
+    match &args["target"] {
+        Value::Object(target) => {
+            for key in ["name", "file", "diff"] {
+                if value[key].is_null() {
+                    if let Some(item) = target.get(key).cloned() {
+                        set_value(value, key, item);
+                    }
+                }
+            }
+            if value["files"].is_null() {
+                if let Some(item) = target.get("files").cloned() {
+                    set_value(value, "files", item);
+                }
+            }
+            if value["symbols"].is_null() {
+                if let Some(item) = target.get("symbols").cloned() {
+                    set_value(value, "symbols", item);
+                }
+            }
+        }
+        Value::String(target) => {
+            if value["name"].is_null() && !target.contains('\n') && !target.contains("diff --git") {
+                set_string(value, "name", target);
+                if value["symbols"].is_null() {
+                    set_value(value, "symbols", json!([target]));
+                }
+            }
+            if value["diff"].is_null() && (target.contains('\n') || target.contains("diff --git")) {
+                set_string(value, "diff", target);
+            }
+        }
+        _ => {}
+    }
+    if !value["file"].is_null() && value["files"].is_null() {
+        if let Some(file) = value["file"].as_str() {
+            set_value(value, "files", json!([file]));
+        }
+    }
+    if !value["name"].is_null() && value["symbols"].is_null() {
+        if let Some(name) = value["name"].as_str() {
+            set_value(value, "symbols", json!([name]));
+        }
+    }
+}
+
+fn unwrap_tool_text_json(value: &Value) -> Option<Value> {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str(text).ok())
 }
 
 fn parse_requested_bundle_mode(args: &Value) -> RequestedBundleMode {
@@ -9297,7 +9659,7 @@ export function greet(name: string): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "index_status",
                 "arguments": {}
@@ -9351,7 +9713,7 @@ export function greet(name: string): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "index_status",
                 "arguments": {}
@@ -9787,7 +10149,7 @@ export function sendGreeting(): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "search_memory",
                 "arguments": {
@@ -9933,7 +10295,7 @@ export function sendGreeting(): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "plan_edit",
                 "arguments": {
@@ -10047,7 +10409,7 @@ export function sendGreeting(): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_context_capsule",
                 "arguments": {
@@ -10134,7 +10496,7 @@ export function sendGreeting(): string {
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "prepare_change",
                 "arguments": {
@@ -10208,7 +10570,7 @@ def detect_agent_version_drift(agent, rollout):
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "prepare_change",
                 "arguments": {
@@ -10299,7 +10661,7 @@ def detect_agent_version_drift(agent, rollout):
 
         let response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "trace_scenario",
                 "arguments": {
@@ -10423,7 +10785,7 @@ def detect_agent_version_drift(agent, rollout):
 
         let stable_response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "expand_context",
                 "arguments": {
@@ -10456,7 +10818,7 @@ def detect_agent_version_drift(agent, rollout):
 
         let legacy_response = RequestHandler::handle(
             &handler,
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "expand_context",
                 "arguments": {

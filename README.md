@@ -8,14 +8,13 @@ Memory is treated as recall, not proof. Lattice stores durable observations and 
 
 ## Why Lattice
 
-- `get_skeleton` and `get_context_capsule` cut discovery cost before an assistant starts reading source
-- Workflow tools like `prepare_change`, `plan_edit`, `trace_scenario`, `impact_from_diff`, and `diagnose_failure` collapse multi-step coding tasks into one or two calls
-- Markdown docs, runbooks, and decisions are first-class graph nodes with backlinks, outgoing links, and code mentions
-- `find_stale_docs` helps catch docs that likely drifted after code or runbook changes
-- `expand_context` reuses a prior handle from `get_context_capsule` or a workflow tool and returns only the next delta
-- workflow bundles now include per-pivot and per-memory retrieval relevance summaries plus item-level relevance detail handles for `expand_context`
-- `plan_edit` adds a patch-oriented planning bundle with likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests
-- `trace_scenario` turns a behavior description into likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and related tests/docs, while keeping confidence separate from coverage
+- `context` cuts discovery cost before an assistant starts reading source, docs, rules, or file skeletons
+- `prepare_change` collapses implementation prep, patch planning, and scenario tracing into one verb
+- `impact` computes dependency blast radius and relevant tests before multi-file changes
+- `diagnose` maps compiler, test, and runtime failures to likely culprit code
+- `search` uses graph identity for symbols, call paths, backlinks, and outgoing links
+- `remember` and `recall` provide cross-session memory with trust diagnostics
+- `status` makes indexing, stale docs, stale memory, and conflict health visible
 - Memory is persistent, scoped, refreshable, stale-aware, and evidence-linked
 - Memory trust diagnostics make unverified, stale, high-risk, different-checkout, or docs-conflicted claims explicit before an assistant relies on them
 - Compact workflow shaping now defaults to small assistant-friendly responses instead of large generic payloads
@@ -49,17 +48,16 @@ Compact follow-up targets now prefer stable handles when the graph node identity
 
 - stable symbol follow-up targets use `symbol_id:{...}` and are derived from the graph identity already carried by `SymbolId` (`file`, `name`, and `byte_offset`)
 - stable file follow-up targets use `file_id:...`
-- `expand_context` resolves `symbol_id:` and `file_id:` first, then falls back to legacy `symbol:` and `file:` targets for compatibility
-- compact follow-up suggestions and cached seeds preserve stable handles when available in `get_context_capsule`, `prepare_change`, `impact_from_diff`, `get_working_set_context`, `summarize_subsystem`, `get_repo_playbook`, and `diagnose_failure`
-- `plan_edit` also preserves stable handles where the graph node is known and prefers the top candidate edit span for `suggested_expand`
+- `context` with `mode=expand` resolves `symbol_id:` and `file_id:` follow-up targets first
+- compact follow-up suggestions and cached seeds preserve stable handles behind the 8 public verbs
+- `context` with `mode=expand` reuses a prior `context_handle` and returns only the next delta
 
 ## How You Use Lattice
 
 When you run Lattice through an MCP client, you get:
 
-- workflow tools like `prepare_change`, `plan_edit`, `trace_scenario`, `impact_from_diff`, `diagnose_failure`, and `expand_context`
-- docs tools like `get_docs_capsule`, `get_backlinks`, `get_outgoing_links`, and `find_stale_docs`
-- graph-backed code retrieval, project rules, test discovery, and workspace setup guidance
+- 8 MCP verbs: `context`, `prepare_change`, `impact`, `diagnose`, `search`, `remember`, `recall`, and `status`
+- docs, graph, workflow, memory, and operator checks routed through those verbs
 - persistent memory and workflow outcome reuse across sessions
 - persisted ANN semantic search under `.lattice/` with automatic SQLite exact-search fallback, plus scoped symbol and file-summary vector retrieval
 - SQLite FTS5-backed memory keyword search with automatic backfill for existing memory databases
@@ -114,41 +112,20 @@ If the USearch index cannot be opened or synchronized, the daemon falls back to 
 
 ## Which Tool First?
 
-If you are not sure which tool to call, choose one of these five first-call tools:
+If you are not sure which tool to call, choose one of these public verbs:
 
-1. `diagnose_failure`
+1. `diagnose`
    Use for failing tests, stack traces, compiler errors, or runtime failures.
-2. `trace_scenario`
-   Use for behavior-level debugging when you have a scenario description and want likely versus plausible entrypoints, execution-path segments, guards, side effects, failure branches, and follow-up targets before editing.
-3. `prepare_change`
-   Use for fix/add/refactor tasks once the likely change area is known.
-4. `plan_edit`
-   Use when you want a patch plan with edit spans, affected callers and dependencies, docs guidance, and tests in one bundle.
-5. `get_context_capsule`
-   Use for unfamiliar subsystems, broad architecture questions, or "how does X work?" It is a bounded first-pass working-set finder, not a source dump.
+2. `prepare_change`
+   Use for fix/add/refactor tasks. Set `mode=plan_edit` for patch spans and `mode=trace` for behavior-level debugging.
+3. `context`
+   Use for unfamiliar subsystems, docs questions, repo rules, file skeletons, working-set compression, or handle expansion.
+4. `impact`
+   Use before multi-file or non-obvious changes to compute dependents, dependencies, diff impact, and relevant tests.
+5. `recall`
+   Use when prior task memory or durable memory could change the plan.
 
-Then use `expand_context` when one of those results returns a `context_handle` or `suggested_expand`.
-
-Use these helpers only when they match the situation more closely:
-
-- `get_working_set_context` is best when the assistant already has a few open files and wants them compressed into one bundle
-- `get_repo_playbook` is best for quickly refreshing repo-wide conventions and architecture patterns
-- `summarize_subsystem` is best when you explicitly want a summary-first map instead of ranked pivots
-- `get_skeleton` is best before opening a large file when structure matters more than retrieval
-- `impact_from_diff` is best when you already have a diff or local edits and want downstream impact plus tests
-- `find_relevant_tests` is best when test selection is the main question
-- `get_docs_capsule` is best when the answer is more likely to be in Markdown docs, runbooks, or design notes
-- `get_backlinks` and `get_outgoing_links` are best for walking the local docs graph around a known symbol, file, document, or section
-- `find_stale_docs` is best after a diff or active edit when you want to see what docs may now be out of date
-- memory hygiene tools matter most in long-running or repeated assistant sessions where observations and outcomes are actually being written
-
-Practical rule:
-
-- `diagnose_failure` decides where the failure is coming from
-- `prepare_change` decides what to edit
-- `plan_edit` decides how to patch it
-- `get_context_capsule` decides how the code works
-- `get_skeleton` decides whether a file is worth opening
+Use `search` for symbols, call paths, backlinks, and outgoing links. Use `remember` only for reusable memory or workflow outcomes. Use `status` when indexing, stale docs, stale memory, or memory conflicts may explain incomplete results.
 
 ## MCP Server Setup
 
@@ -170,64 +147,28 @@ The configured command should stay `lattice --stdio --workspace ...`. Do not poi
 
 ## MCP Tools
 
-### Summary-First Discovery And Planning
+`tools/list` advertises exactly these 8 agent-facing tools:
 
-- `get_skeleton`
-  Fast file map: symbols, kinds, and structure before loading source.
-- `get_context_capsule`
-  Broad discovery tool for unfamiliar subsystems or architectural questions. Returns bounded ranked pivots plus a reusable `context_handle` and `suggested_expand`; compact first-pass responses strip pivot source bodies and expect `expand_context` for the next delta.
-  When the graph node is known, `suggested_expand` uses stable `symbol_id:` or `file_id:` follow-up targets.
-  For implementation-oriented queries, it favors source files over Markdown docs; use `get_docs_capsule` for doc-first questions.
-- `summarize_subsystem`
-  Summary-first subsystem map: key files, key symbols, tests, and memories in a compact bundle.
-  For code-oriented queries, Markdown/meta file hints do not outrank real code anchors; use `get_docs_capsule` for doc-first questions.
-- `get_repo_playbook`
-  Repo-wide architecture and convention summary for fast session startup.
-- `prepare_change`
-  Change-oriented bundle: likely edit files, symbols, tests, memory, and risks. Bundled memory items keep the same legacy-plus-structured payload shape described below. Compact responses prefer stable follow-up handles when symbol identity is available.
-- `plan_edit`
-  Patch-oriented planning bundle: likely edit files, candidate edit spans, affected callers and dependencies, relevant docs, and recommended tests. Compact responses prefer the top candidate edit span handle when one is available.
-- `trace_scenario`
-  Scenario-focused debugging bundle: given a behavior description, it surfaces likely entrypoints, plausible alternatives, execution-path segments, guards, side effects, failure branches, relevant docs/tests, and confidence-separated signals. Compact responses seed a `context_handle` and `suggested_expand` toward the most likely path focus.
-- `impact_from_diff`
-  Diff review bundle: changed symbols, affected code, review checklist, and tests. Compact responses prefer stable follow-up handles when symbol identity is available.
-- `diagnose_failure`
-  Failure triage bundle: likely culprit symbols, tests, likely causes, and next steps. Compact responses prefer stable follow-up handles when symbol identity is available.
-- `expand_context`
-  Focused delta expansion from a prior `context_handle`, including one returned by `get_context_capsule`.
-  Accepts `symbol_id:`, `file_id:`, `symbol:`, `file:`, `test:`, and `memory:` focuses, with stable handles taking precedence.
+| Tool | Routes To |
+|---|---|
+| `context` | code/docs context, subsystem summaries, file skeletons, repo rules, working sets, and handle expansion |
+| `prepare_change` | change prep, patch planning, and scenario tracing |
+| `impact` | impact graph, dependents, dependencies, diff impact, and relevant-test selection |
+| `diagnose` | failure diagnosis from compiler, test, stack trace, or runtime output |
+| `search` | symbol search, symbol detail, call-flow search, backlinks, and outgoing links |
+| `remember` | quick memory, durable memory, and workflow outcome capture |
+| `recall` | memory search, task memory retrieval, and memory verification/explanation |
+| `status` | index status, stale docs, stale memories, and memory conflicts |
 
-### Tests, Working Set, And Refactoring
-
-- `find_relevant_tests`
-  Rank tests from files, symbols, or diff text.
-- `get_working_set_context`
-  Compress active files, nearby symbols, tests, and memory into one bundle. Returned memory items preserve the same additive structured fields when present.
-- `get_symbol`
-  Full symbol details: source, signature, dependencies, and dependents.
-- `get_dependencies`
-  Outbound dependencies for a symbol.
-- `get_dependents`
-  Inbound dependents for a symbol.
-- `get_impact_graph`
-  Transitive blast radius before refactoring.
-- `search_symbols`
-  Symbol lookup by name pattern.
-- `search_logic_flow`
-  Call-chain tracing between two functions or symbols.
-- `submit_lsp_edges`
-  Add high-confidence LSP edges to enrich the graph.
+Lower-level tool names remain daemon-internal for first-party CLI/runtime use and are not accepted through public MCP `tools/call`. The removed aliases `query_context`, `blast_radius`, `get_file_context`, and `recall_memories`, plus the removed shims `verify_memory`, `explain_memory`, and `apply_memory_evolution`, return the standard unknown-tool error.
 
 ### Docs, Decisions, And Runbooks
 
-- `get_docs_capsule`
-  Return the most relevant Markdown documents and sections for a natural-language query, plus related code symbols mentioned from those docs.
-- `get_backlinks`
-  Return inbound Markdown references to a symbol, file, document, or section.
-- `get_outgoing_links`
-  Return outgoing Markdown links and code mentions from a document, section, or file target.
-- `find_stale_docs`
-  Flag docs and sections that likely need review because they mention changed symbols, changed files, or changed docs.
+Docs graph capabilities are reached through the public verbs:
+
+- `context` with `mode=docs` returns the most relevant Markdown documents and sections for a natural-language query, plus related code symbols mentioned from those docs.
+- `search` with `kind=links` returns inbound or outgoing Markdown references for a symbol, file, document, or section.
+- `status` with `scope=docs` flags docs and sections that likely need review because they mention changed symbols, changed files, or changed docs.
 
 ### Memory, Outcomes, And Long-Running Context
 
@@ -254,43 +195,23 @@ Memory trust diagnostics are deliberately response-level and current-checkout-aw
 - `artifact_conflicts` flag linked docs or artifacts that contain conflicting resolved/blocked style status claims for the same structured ID.
 - Workflow bundles propagate memory trust fields, evidence links, recheck commands, and artifact-conflict risks so prior memory is treated as a hypothesis until current code, docs, and tests confirm it.
 
-- `get_task_memory`
-  Read task-scoped working memory plus relevant durable memory. The daemon seeds missing task state from the task statement or hint, records automatic checkpoints, hard-scopes recall to the active workspace unless a future cross-repo mode explicitly opts in, and requires concrete task evidence such as matched paths, files, symbols, docs, or structured remediation IDs before surfacing a memory. Returned records include advisory/trusted/stale trust diagnostics, first-class `evidence_links`, high-risk domain tags, checkout-state comparison, bounded `recheck_commands`, and `artifact_conflicts` from linked docs so unverified, evidence-free, high-risk, different-HEAD, or docs-drifted claims are not mistaken for proof.
-- `search_memory`
-  Search stored memory across sessions within the active workspace. In multi-root logical views, the daemon fans out to every shard and merges results by exact-match score plus cross-shard context coverage so a wrong primary shard or same-ID collision cannot hide the correct workspace memory. The daemon reranks candidates by exact task evidence over memory content, refresh keys, linked files/docs/tests, and evidence; structured IDs such as remediation packet/unit IDs and code identifiers are required anchors, while repo/product-specific query terms break ties across shards. When a query contains structured IDs such as `IU-0031` or `PX-0040`, those IDs are hard anchors: memories that only match generic terms are not returned, and diagnostics report `query_exact_terms`, `matched_exact_terms`, `unmatched_exact_terms`, `durable_exact_term_counts`, `per_shard_exact_term_counts`, and `exact_term_status` so operators can distinguish “absent from durable memory” from a ranking miss. Unverified failure/blocker memories that reference local files changed after the memory was recorded include `freshness_warning`, `trust_status: "advisory"`, and `trust_reason: "freshness_warning"` fields; normal unverified or in-review advisory memories use `trust_reason` values such as `unverified` or `verification_in_review`. Memories whose workspace provenance conflicts with linked absolute file paths include `workspace_conflict` diagnostics; memories with only relative linked paths include `workspace_path_diagnostic` when ownership cannot be cross-checked from paths alone.
-- `list_stale_memories`
-  Find memories that likely need refresh.
-- `save_quick_memory`
-  Capture a lightweight memory using active task state, focus paths, and recent failure context.
-- `save_memory`
-  Create a durable memory with explicit evidence, validity conditions, and invalidation triggers.
-- `consolidate_session`
-  Trigger proposal-only session consolidation and return auditable consolidation proposal ids for later apply or reject decisions. The daemon also submits consolidation automatically on runtime shutdown after checkpointing active task state.
-- `get_memory_metrics` returns canonical Phase 9 metric snapshots from `lattice_core::metrics`, with explicit `session_metrics` fallback provenance only when the canonical collector returns an honest null
-  Return the current Phase 9 signal surface with per-signal provenance. When the canonical metrics module is not present yet, missing signals stay explicit `null` with a reason instead of fabricated numbers.
-- `get_event_trace`
-  Read a paginated task, session, or workspace event trace with compact, full, or diagnostic rendering for audit and replay workflows.
-- `propose_memory_evolution`
-  Propose, apply, or reject durable memory changes while preserving provenance and prior state.
-- `record_workflow_outcome`
-  Persist successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory. Outcome recording preserves structured remediation IDs from the task, summary, inherited context handle, and linked files in the durable memory text and refresh key so later exact-ID searches can recover the outcome. Pass `dry_run: true` to compute the outcome content, identifiers, refresh key, scope, and workspace without writing durable memory; use this for live MCP verification probes that should not pollute repo memory. Refresh keys preserve structured IDs and file identity while avoiding arbitrary absolute-path fragments such as `/home` path components.
+- `recall` with `mode=task` reads task-scoped working memory plus relevant durable memory. The daemon seeds missing task state from the task statement or hint, records automatic checkpoints, and returns trust diagnostics so unverified, evidence-free, high-risk, different-HEAD, or docs-drifted claims are not mistaken for proof.
+- `recall` with `mode=search` searches stored memory across sessions within the active workspace. In multi-root logical views, the daemon fans out to every shard and merges results by exact-match score plus cross-shard context coverage so a wrong primary shard or same-ID collision cannot hide the correct workspace memory.
+- `recall` with `mode=verify` verifies or explains a memory before callers rely on it.
+- `remember` with `kind=quick` captures lightweight memory using active task state, focus paths, and recent failure context. In a multi-root logical view, path-bearing memory arguments route the write to the uniquely matching shard; ambiguous relative paths fail instead of falling back to the primary shard.
+- `remember` with `kind=durable` creates durable memory with explicit evidence, validity conditions, and invalidation triggers.
+- `remember` with `kind=outcome` persists successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory.
+- `status` with `scope=memory` or `scope=conflicts` finds stale memories and contradiction/supersession conflicts.
 
 ### Observability And Workspace Understanding
 
-- `index_status`
-  Current indexing progress and graph stats. Logical-view responses distinguish `primary_workspace` from query scope and include `workspace_field_meaning`; `request_workspace` is `null` with `request_workspace_available: false` when the stdio client does not provide per-call caller CWD, so operators should use path-bearing tool arguments for request-specific routing.
-- `get_session_metrics`
-  Session-level efficiency metrics: token usage, delivery mix, follow-up avoidance, handle reuse, and outcome-memory reuse.
-- `get_event_trace`
-  Paginated event-log inspection with workspace-boundary enforcement and diagnostic payload hashes for replay and audit work.
-- `get_project_rules`
-  Auto-detected repo conventions and recurring patterns.
-- `workspace_setup`
-  Workspace conventions, language breakdown, and recommended setup.
+- `status` with `scope=index` returns current indexing progress, graph stats, and watcher health. Logical-view responses distinguish `primary_workspace` from query scope and include `workspace_field_meaning`.
+- `status` with `scope=docs`, `scope=memory`, or `scope=conflicts` exposes drift and memory quality queues.
+- `context` with `mode=rules` returns auto-detected repo conventions and recurring patterns.
 
 ## Workflow Response Controls
 
-Workflow tools, plus `get_context_capsule`, support assistant-oriented response shaping where documented:
+The public verbs support assistant-oriented response shaping where documented:
 
 - `mode`
   Existing high-level mode selection (`auto`, `compact`, `full`)
@@ -310,27 +231,19 @@ What this means in practice:
 - workflow responses include an `agent_retrieval_contract` that states what the result is best for, why it is useful instead of `rg`, when to use `rg`, and the next recommended action
 - workflow responses include budget metadata (`budget`, `budget_max_tokens`, `approx_tokens`, `truncated`) and apply default caps for `tiny`, `compact`, and `full`
 - high-confidence results may collapse to a single anchor plus `suggested_expand`
-- `get_context_capsule` and workflow responses can include a `context_handle` and a `suggested_expand` target
+- `context`, `prepare_change`, `impact`, and `diagnose` responses can include a `context_handle` and a `suggested_expand` target
 - compact `prepare_change` results keep bounded ranking evidence and state when the bundle is useful as a working-set finder versus when `rg` is the better literal-search tool
-- `expand_context` handles persist across daemon restarts
-- `get_session_metrics` exposes how often tiny/dense/single-anchor paths are actually being used
+- `context` expansion handles persist across daemon restarts
+- later metrics surfaces expose how often tiny/dense/single-anchor paths are actually being used
 
 ## Docs Graph Workflow
 
-Use this flow when you want to navigate repo docs the way people use Obsidian-style vault graphs, but grounded in code and assistant workflows:
+Use `context` and `search` when you want to navigate repo docs the way people use Obsidian-style vault graphs, but grounded in code and assistant workflows:
 
-1. Open a Markdown file or place the cursor on a symbol.
-2. Use `Lattice: Open Docs Graph` or the Markdown CodeLens `Lattice: Open Docs Graph`.
-3. In the graph panel, follow the active editor automatically or pin the current target.
-4. Click `Focus` on incoming or outgoing nodes to walk the local graph.
-5. Click `Open` to jump straight to the linked file or section.
-
-Use these shortcuts when you do not need the full panel:
-
-- `Lattice: Get Docs Capsule` for a natural-language docs query like "how does auth login work?"
-- `Lattice: Show Backlinks` to see which docs mention the current symbol or section
-- `Lattice: Show Outgoing Links` to inspect what a document points to
-- `Lattice: Find Stale Docs` after a staged diff, working tree change, or active edit
+- `context` with `mode=docs` for a natural-language docs query like "how does auth login work?"
+- `search` with `kind=links` and `direction=backlinks` to see which docs mention a symbol, file, document, or section
+- `search` with `kind=links` and `direction=outgoing` to inspect what a document points to
+- `status` with `scope=docs` after a staged diff, working tree change, or active edit
 
 What Lattice indexes in the docs graph:
 
@@ -348,11 +261,11 @@ What Lattice indexes in the docs graph:
 3. **Ranks context**
    keyword scoring, graph traversal, hub dampening, and query-intent heuristics identify high-signal symbols and docs.
 4. **Shapes workflow and docs bundles**
-   task, diff, failure, working-set, docs, and summary tools build compact assistant-facing payloads on top of the graph.
+   the 8 public verbs build compact assistant-facing payloads on top of the graph.
 5. **Remembers across sessions**
    SQLite-backed memories, playbooks, outcomes, stale-memory tracking, and stale-doc workflows preserve useful context without blindly replaying old notes.
 
-The workflow layer is built on top of the core discovery primitives. `get_skeleton` and `get_context_capsule` remain foundational.
+The workflow layer is built on top of the core discovery primitives, but public MCP callers use the 8 consolidated verbs.
 
 ## Supported Languages
 
@@ -397,35 +310,22 @@ Add this to your assistant's project memory (`CLAUDE.md`, `AGENTS.md`, Codex ins
 
 Lattice provides a dependency graph and context engine for this codebase.
 Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
-If you would otherwise open 3 or more unfamiliar files, call `get_context_capsule`, `prepare_change`, or `summarize_subsystem` first.
-If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
-If you have raw failure text, pass it to `diagnose_failure` before grep-driven triage.
-If you're unsure which tool to use, default to `prepare_change` for implementation tasks and `get_context_capsule` for understanding tasks.
-If the task starts from a failing test, stack trace, or compiler error, start with `diagnose_failure` and use `prepare_change` after it narrows the likely culprit.
+If you would otherwise open 3 or more unfamiliar files, call `context`, `prepare_change`, or `diagnose` first.
+If a response returns a `context_handle` or `suggested_expand`, prefer `context` with `mode=expand` before starting a fresh broad search.
+If you have raw failure text, pass it to `diagnose` before grep-driven triage.
+If you're unsure which tool to use, default to `prepare_change` for implementation tasks and `context` for understanding tasks.
+If the task starts from a failing test, stack trace, or compiler error, start with `diagnose` and use `prepare_change` after it narrows the likely culprit.
 
 Use these tools when they're the best fit:
 
-- `prepare_change` — first choice for "fix/add/refactor X" once you know the area to change
-- `plan_edit` — first choice for patch-oriented planning when you want edit files, spans, callers, docs, and tests in one bundle
-- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it returns a bounded first-pass working set and can hand off directly to `expand_context`
-- `get_docs_capsule` — first choice for "what docs or runbooks explain this?" questions
-- `get_skeleton` — use before opening a large file
-- `summarize_subsystem` — use for a summary-first subsystem map
-- `get_repo_playbook` — use to refresh repo-wide conventions and architecture
-- `impact_from_diff` — use when reviewing a diff or local change
-- `find_relevant_tests` — use when deciding what tests to run
-- `diagnose_failure` — first choice when a fix starts from a failing test or error
-- `expand_context` — use when a prior `get_context_capsule` or workflow call returned a handle and you want the next delta
-- `get_backlinks` / `get_outgoing_links` — walk the local docs graph around a known section, file, or symbol
-- `find_stale_docs` — check docs after code changes or before a release
-- `get_working_set_context` — only when batching several already-known open files is cheaper than reading them one by one; not as a first discovery call
-- `get_impact_graph` — before refactoring to understand blast radius
-- `search_symbols` — when looking for a symbol by name
-- `search_logic_flow` — to trace call chains between functions
-- `get_task_memory` / `search_memory` — load task working memory and retrieve durable memory
-- `save_quick_memory` / `save_memory` / `propose_memory_evolution` — write or evolve durable memory
-- `list_stale_memories` / `list_memory_conflicts` / `verify_explain_memory` — maintain memory quality
-- `record_workflow_outcome` — store successful outcomes so later sessions can reuse them
+- `context` — first choice for unfamiliar subsystems, docs, repo rules, file skeletons, working sets, or handle expansion
+- `prepare_change` — first choice for fix/add/refactor work; use `mode=plan_edit` for patch spans or `mode=trace` for scenario debugging
+- `impact` — check blast radius, dependencies, dependents, diffs, and relevant tests
+- `diagnose` — first choice when a fix starts from a failing test or error
+- `search` — use for symbols, call paths, backlinks, and outgoing links
+- `remember` — save quick memory, durable memory, or workflow outcomes
+- `recall` — retrieve task memory, search durable memory, or verify/explain a memory
+- `status` — inspect indexing health, stale docs, stale memories, or memory conflicts
 
 Memory is recall, not proof. Treat retrieved memory as a hypothesis until current code, docs, and tests confirm it. Prefer memories with `trust_status: "trusted"`, matching `checkout_state`, concrete `evidence_links`, and useful `recheck_commands`. Do not rely on memories that are `advisory`, `stale`, unverified, from a different checkout, missing evidence, high-risk with `requires_reverification`, or carrying `artifact_conflicts` until you inspect the linked evidence and rerun the suggested checks. When saving memory, separate hypotheses from verified outcomes and attach evidence links, linked files/docs/tests, validity conditions, invalidation triggers, and the verification command that proved the claim.
 

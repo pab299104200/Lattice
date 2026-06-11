@@ -261,7 +261,7 @@ Phase 2 implemented behavior:
 - shard fan-out classifies reachable indexing placeholders as `incomplete_shards` with `retry: "wait_and_retry"` instead of treating them as successful results; hard errors are reported separately in `failed_shards`
 - cross-shard `search_memory` merges aggregate and per-shard exact-term counts so structured-ID misses can be diagnosed as absent from a shard, absent from the whole durable corpus, or present but lower ranked
 - cross-shard memory ranking treats structured IDs as required anchors but uses repo/product-specific query context to break same-ID collisions across repositories
-- dependency-style graph tools (`get_dependencies`, `get_dependents`, `get_impact_graph`/`blast_radius`, and `search_logic_flow`) are authoritative logical-view fan-out tools rather than primary-shard-only lookups
+- dependency-style graph routes behind `impact` and `search` are authoritative logical-view fan-out paths rather than primary-shard-only lookups
 - context handles discovered from non-primary shard responses are recorded by the logical view, so `expand_context` follow-ups route back to the shard that created the handle
 
 Remaining work:

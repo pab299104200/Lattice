@@ -1074,12 +1074,6 @@ pub(crate) fn verification_commands(files: &[String], tests: &[String]) -> Vec<S
     {
         commands.push("cd daemon && cargo test -p lattice-daemon --lib".to_string());
     }
-    if files
-        .iter()
-        .any(|file| file.ends_with(".ts") || file.ends_with(".tsx"))
-    {
-        commands.push("cd extension && npm run compile".to_string());
-    }
     commands.extend(tests.iter().map(|file| {
         if file.ends_with(".rs") {
             format!("cd daemon && cargo test {}", file.replace('/', "::"))

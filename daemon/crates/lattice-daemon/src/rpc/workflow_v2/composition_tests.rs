@@ -40,7 +40,7 @@ async fn prepare_plan_patch_and_manual_outcome_emit_expected_sequence() {
     ) = build_handler("prepare-plan");
     let prepare = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "prepare_change",
                 "arguments": {
@@ -55,7 +55,7 @@ async fn prepare_plan_patch_and_manual_outcome_emit_expected_sequence() {
     let prepare_payload = parse_tool_payload(&prepare);
     let plan = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "plan_edit",
                 "arguments": {
@@ -75,8 +75,7 @@ async fn prepare_plan_patch_and_manual_outcome_emit_expected_sequence() {
         "session-test-prepare-plan:default",
     );
     handler
-        .handle(
-            "tools/call",
+        .handle("lattice/tool_call",
             json!({
                 "name": "record_workflow_outcome",
                 "arguments": {
@@ -123,7 +122,7 @@ async fn get_context_capsule_and_expand_context_backlink_to_origin_without_redun
     ) = build_handler("expand-context");
     let capsule = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_context_capsule",
                 "arguments": {
@@ -138,8 +137,7 @@ async fn get_context_capsule_and_expand_context_backlink_to_origin_without_redun
         .as_str()
         .unwrap_or("symbol:loginUser");
     let expand = handler
-        .handle(
-            "tools/call",
+        .handle("lattice/tool_call",
             json!({
                 "name": "expand_context",
                 "arguments": {
@@ -192,7 +190,7 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
     ) = build_handler("diagnose-prepare");
     let diagnose = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "diagnose_failure",
                 "arguments": {
@@ -210,7 +208,7 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
         .unwrap_or("src/auth.ts");
     let prepare = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "prepare_change",
                 "arguments": {
@@ -259,7 +257,7 @@ async fn save_memory_and_verify_explain_emit_linked_outcomes_and_verified_status
     .await;
     let save = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                     "name": "save_memory",
                     "arguments": {
@@ -283,7 +281,7 @@ async fn save_memory_and_verify_explain_emit_linked_outcomes_and_verified_status
     let save_payload = parse_tool_payload(&save);
     let verify = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {
@@ -327,7 +325,7 @@ async fn consolidate_session_apply_chain_and_scope_protection_survive_recorder()
     );
     let consolidate = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "consolidate_session",
                 "arguments": {
@@ -344,7 +342,7 @@ async fn consolidate_session_apply_chain_and_scope_protection_survive_recorder()
         .to_string();
     let apply = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -361,7 +359,7 @@ async fn consolidate_session_apply_chain_and_scope_protection_survive_recorder()
     );
     let denied = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {

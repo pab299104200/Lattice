@@ -46,7 +46,7 @@ Deterministic approximations may mark a memory stale or create a low-confidence 
 
 ## Proposal apply and reject flow
 
-Proposals are first-class review items. The canonical MCP action is `propose_memory_evolution` from [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list). Apply and reject operations must record actor, timestamp, reason, source proposal, previous memory state, and resulting memory state.
+Proposals are first-class review items. Agent-facing callers reach proposal actions through `remember` from [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools); daemon-internal callers use `propose_memory_evolution` through the raw tool-call path. Apply and reject operations must record actor, timestamp, reason, source proposal, previous memory state, and resulting memory state.
 
 Apply flow:
 

@@ -8,11 +8,7 @@
 //!
 //! "Tool surface discipline: ten new memory tools is a meaningful cognitive
 //! load for clients. Before shipping Phase 8, audit whether
-//! `propose_memory_evolution` + `apply_memory_evolution` can collapse into a
-//! single tool with an `action` parameter, and whether `verify_memory` +
-//! `explain_memory` can be unified. The goal is the smallest surface that
-//! covers all assistant workflows. Consolidate before stabilizing the MCP
-//! contract."
+//! The older verify/explain split is consolidated into this canonical handler.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -151,9 +147,6 @@ pub struct VerifyExplainResponse {
     /// Full diagnostic trace when `render_mode=diagnostic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic_trace: Option<Vec<String>>,
-    /// Optional deprecation warning attached by shimmed tool names.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deprecation_warning: Option<String>,
 }
 
 /// Internal execution bundle returned before the caller attaches a context handle.
@@ -208,37 +201,9 @@ pub fn tool_definition() -> Value {
     })
 }
 
-pub fn verify_shim_tool_definition() -> Value {
-    json!({
-        "name": "verify_memory",
-        "description": "Deprecated shim for verify_explain_memory(mode=verify). Returns a deprecation warning while forwarding to the unified tool.",
-        "inputSchema": tool_definition()["inputSchema"].clone()
-    })
-}
-
-pub fn explain_shim_tool_definition() -> Value {
-    json!({
-        "name": "explain_memory",
-        "description": "Deprecated shim for verify_explain_memory(mode=explain). Returns a deprecation warning while forwarding to the unified tool.",
-        "inputSchema": tool_definition()["inputSchema"].clone()
-    })
-}
-
 pub fn parse_args(args: &Value) -> Result<VerifyExplainArgs, String> {
     serde_json::from_value(args.clone())
         .map_err(|error| format!("Invalid verify_explain_memory arguments: {error}"))
-}
-
-pub fn parse_verify_shim_args(args: &Value) -> Result<VerifyExplainArgs, String> {
-    let mut parsed = parse_args(args)?;
-    parsed.mode = VerifyExplainMode::Verify;
-    Ok(parsed)
-}
-
-pub fn parse_explain_shim_args(args: &Value) -> Result<VerifyExplainArgs, String> {
-    let mut parsed = parse_args(args)?;
-    parsed.mode = VerifyExplainMode::Explain;
-    Ok(parsed)
 }
 
 pub fn execute(
@@ -272,7 +237,6 @@ pub fn render_response(
     report: &ExplainReport,
     render_mode: VerifyExplainRenderMode,
     expansion_handle: String,
-    deprecation_warning: Option<String>,
 ) -> VerifyExplainResponse {
     let checks = match render_mode {
         VerifyExplainRenderMode::Compact => compact_checks(&report.checks),
@@ -289,7 +253,6 @@ pub fn render_response(
         render_mode,
         diagnostic_trace: matches!(render_mode, VerifyExplainRenderMode::Diagnostic)
             .then_some(report.diagnostic_trace.clone()),
-        deprecation_warning,
     }
 }
 

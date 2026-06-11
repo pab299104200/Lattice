@@ -56,7 +56,9 @@ The rationale for treating most workflow tools as `additive` is simple: [## MCP 
 
 ## Legacy aliases and deadlines
 
-The current daemon accepts five legacy aliases that do not appear in `tools/list` but are part of the callable surface. They are already compatibility shims and therefore classified separately from canonical names.
+> Superseded for public MCP: the 2026-06-11 agent adoption overhaul removed these legacy aliases from `tools/call`. The current contract is [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools).
+
+The Phase 8 daemon accepted legacy aliases that did not appear in `tools/list` but were part of the callable surface. The 2026-06-11 agent adoption overhaul removed those public MCP aliases.
 
 | Legacy alias | Canonical tool | Status | Deadline |
 |---|---|---|---|

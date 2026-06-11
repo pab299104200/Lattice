@@ -15,22 +15,22 @@ After building, use the canonical restart procedure in [Operator Runbook](./2026
 ## Initial setup
 
 1. Configure an MCP client to launch `daemon/target/release/lattice --stdio --workspace <workspace>`.
-2. Confirm the lightweight proxy starts or reuses the local daemon and that `index_status` reports the intended workspace.
-3. Run `get_repo_playbook` for a compact architecture and convention summary.
-4. Run `get_context_capsule` or `prepare_change` for the first real task instead of opening broad source sets manually.
-5. Use `get_memory_metrics`, `get_event_trace`, `list_stale_memories`, `list_memory_conflicts`, and `verify_explain_memory` for operator review.
+2. Confirm the lightweight proxy starts or reuses the local daemon and that `status` with `scope=index` reports the intended workspace.
+3. Run `context` with `mode=repo` for a compact architecture and convention summary.
+4. Run `context` or `prepare_change` for the first real task instead of opening broad source sets manually.
+5. Use `status`, `recall`, and `remember` for operator review until the phase-5 `lattice metrics` CLI lands.
 
-The MCP contract and tool list are in [MCP Tool Reference](../architecture/2026-05-16-mcp-tool-reference.md#final-tool-list). Tool compatibility rules are in [MCP Compatibility Policy](../architecture/2026-05-16-mcp-compatibility-policy.md#backward-compatibility).
+The MCP contract and tool list are in [MCP Tool Reference](../architecture/2026-06-11-mcp-tool-reference.md#public-mcp-tools).
 
 ## Daily operations
 
 Use high-level workflow tools for assistant tasks:
 
-- `get_context_capsule` for unfamiliar areas.
+- `context` for unfamiliar areas, docs, rules, skeletons, working sets, and handle expansion.
 - `prepare_change` for implementation work once the area is known.
-- `diagnose_failure` for stack traces, compiler diagnostics, and failing tests.
-- `find_relevant_tests` and `impact_from_diff` before verification and review.
-- `record_workflow_outcome` after successful or failed work worth preserving.
+- `diagnose` for stack traces, compiler diagnostics, and failing tests.
+- `impact` before verification and review.
+- `remember` after successful or failed work worth preserving.
 
 Operational rules:
 
@@ -39,18 +39,18 @@ Operational rules:
 - Bound resident daemon memory with `LATTICE_MAX_LOADED_WORKSPACES` and `LATTICE_WORKSPACE_IDLE_TTL_SECS`; defaults are `8` loaded runtimes and `1800` seconds idle TTL.
 - Leave `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC` unset unless the operator explicitly wants full-graph semantic embedding sync during background indexing.
 - Prefer compact responses first; use diagnostic modes to investigate misses.
-- Use `expand_context` for focused follow-up from returned handles.
+- Use `context` with `mode=expand` for focused follow-up from returned handles.
 - Treat stale, contradicted, superseded, expired, and invalidated memory labels as trust boundaries.
 - Review high-scope memory proposals before applying them.
-- Check `get_event_trace` when a workflow outcome, proposal, or retrieval result is difficult to explain.
+- Check `status` and, after phase 5, `lattice metrics` when workflow usage or retrieval behavior is difficult to explain.
 
 ## Review Surfaces
 
-Operator review happens through MCP tools. Use `get_memory_metrics` for signal health, `get_event_trace` for workflow provenance, `list_stale_memories` and `list_memory_conflicts` for memory quality queues, and `verify_explain_memory` before trusting high-scope or recently changed memory.
+Operator review happens through MCP tools and CLI diagnostics. Use `status` for index/docs/memory health, `recall` for memory retrieval and verification, and `lattice doctor` for daemon/config checks.
 
 ## Metrics dashboard
 
-Metrics are available through `get_memory_metrics` and the Phase 9 reports described in [Metrics Report Architecture](../architecture/2026-05-16-metrics-report.md#architecture). Use the dashboard or report output to watch:
+Metrics are exposed by the phase-5 `lattice metrics` CLI and the Phase 9 reports described in [Metrics Report Architecture](../architecture/2026-05-16-metrics-report.md#architecture). Use the dashboard or report output to watch:
 
 - tool calls per successful task
 - irrelevant files opened per task
@@ -68,12 +68,12 @@ Benchmark operation is covered in [Benchmark Evaluation Guide](./2026-05-16-benc
 
 Use this order for common failures:
 
-1. Daemon not responding: confirm the MCP client command points at `daemon/target/release/lattice --stdio --workspace <workspace>`, stop stale `lattice` processes, restart the client, then run `index_status`.
+1. Daemon not responding: confirm the MCP client command points at `daemon/target/release/lattice --stdio --workspace <workspace>`, stop stale `lattice` processes, restart the client, then run `lattice doctor`.
 2. High daemon memory: lower `LATTICE_WORKSPACE_IDLE_TTL_SECS`, lower `LATTICE_MAX_LOADED_WORKSPACES`, close idle MCP clients, and confirm logs show idle workspace eviction.
 3. High daemon CPU: check whether initial indexing is still running; keep `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC` unset unless full semantic sync is intentionally scheduled.
-4. Missing context: run `get_context_capsule` in diagnostic or focused mode and inspect excluded candidates.
-5. Stale or wrong memory: run `list_stale_memories` or `verify_explain_memory` and inspect the returned evidence.
-6. Proposal confusion: inspect memory-evolution results and open the event trace for the proposal source session.
+4. Missing context: run `context` with focused or diagnostic options and inspect excluded candidates.
+5. Stale or wrong memory: run `status` with `scope=memory` or `recall` with `mode=verify` and inspect the returned evidence.
+6. Proposal confusion: inspect memory-evolution results through `remember`/`recall` and the daemon-internal event trace if needed.
 7. Retrieval miss: use diagnostic render modes and compare anchor resolution, candidate sources, ranking signals, and token-cost choices.
 8. Scope concern: check workspace id, branch, memory scope, and event trace filters before trusting a result.
 

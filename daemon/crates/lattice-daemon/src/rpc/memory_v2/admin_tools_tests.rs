@@ -75,7 +75,7 @@ async fn consolidate_session_emits_proposals_without_direct_writes_and_proposals
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "consolidate_session",
                 "arguments": {
@@ -128,7 +128,7 @@ async fn consolidate_session_emits_proposals_without_direct_writes_and_proposals
 
     let apply = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "propose_memory_evolution",
                 "arguments": {
@@ -169,7 +169,7 @@ async fn get_memory_metrics_returns_every_required_signal_or_honest_null() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_memory_metrics",
                 "arguments": {
@@ -218,7 +218,7 @@ async fn get_event_trace_enforces_workspace_boundary_and_has_stable_pagination()
 
     let boundary_error = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_event_trace",
                 "arguments": {
@@ -232,7 +232,7 @@ async fn get_event_trace_enforces_workspace_boundary_and_has_stable_pagination()
 
     let first_page = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_event_trace",
                 "arguments": {
@@ -255,7 +255,7 @@ async fn get_event_trace_enforces_workspace_boundary_and_has_stable_pagination()
 
     let second_page = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "get_event_trace",
                 "arguments": {

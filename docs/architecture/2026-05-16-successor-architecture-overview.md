@@ -17,7 +17,7 @@ The core operator model is:
 - Retrieval ranks code, docs, memories, events, and working-memory state through an explainable pipeline.
 - MCP review tools let humans inspect memory quality, proposals, stale state, event traces, ranking explanations, and daemon health.
 
-The existing Phase 8 MCP contract is [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list). Compatibility policy is [MCP Compatibility Policy](./2026-05-16-mcp-compatibility-policy.md#backward-compatibility).
+The current agent-facing MCP contract is the 2026-06-11 8-verb surface in [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools).
 
 ## Three substrates
 
@@ -49,25 +49,25 @@ Storage invariants:
 
 ## Read paths
 
-Assistant read paths should start with high-level MCP workflows from [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list). The normal read path is:
+Assistant read paths should start with the 8 high-level MCP verbs from [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools). The normal read path is:
 
 1. The lightweight proxy binds the MCP connection to the configured workspace and forwards JSON-RPC unchanged to the daemon.
 2. The daemon resolves literal anchors into stable identities within that workspace graph.
 3. Retrieve graph, doc, memory, event, and working-memory candidates.
 4. Rank candidates with reasons and budget controls.
 5. Return a compact bundle with expansion handles.
-6. Use `expand_context` for focused follow-up instead of broad file dumping.
+6. Use `context` with `mode=expand` for focused follow-up instead of broad file dumping.
 
 Proxy connections keep the selected workspace runtime active while requests are in flight. Once the last proxy disconnects, the runtime becomes eligible for idle eviction after `LATTICE_WORKSPACE_IDLE_TTL_SECS`; the daemon refuses to load more than `LATTICE_MAX_LOADED_WORKSPACES` resident runtimes at once.
 
-Operator read paths use MCP tools such as `get_memory_metrics`, `get_event_trace`, `list_stale_memories`, `list_memory_conflicts`, and `verify_explain_memory`. Review responses must show truthful unsupported or not-reported states when the daemon lacks an authoritative payload.
+Operator read paths use `status`, `recall`, `lattice doctor`, and the phase-5 `lattice metrics` CLI. Review responses must show truthful unsupported or not-reported states when the daemon lacks an authoritative payload.
 
 ## Write paths
 
 Write paths are event-backed and scope-aware:
 
 - Tool calls and workflow results append events before their results are used for metrics or consolidation.
-- `save_memory` creates durable memory with evidence, validity conditions, invalidation triggers, and verification metadata.
+- `remember` creates durable memory with evidence, validity conditions, invalidation triggers, and verification metadata.
 - Consolidation creates proposals for LLM-driven or high-scope changes; apply/reject records preserve prior state.
 - Verification jobs update memory state when graph, doc, branch, workspace, or time-bound evidence changes.
 

@@ -24,10 +24,10 @@ async fn dispatch_success_records_task_tool_result_and_workflow_events() {
     let response = RequestHandler::handle(
         &fixture.handler,
         "tools/call",
-        json!({"name": "index_status", "arguments": {}}),
+        json!({"name": "status", "arguments": {"scope": "index"}}),
     )
     .await
-    .expect("index_status succeeds");
+    .expect("status succeeds");
 
     assert!(response["content"].is_array());
     let events = fixture.events();

@@ -1,66 +1,34 @@
 //! Asserts the advertised tool list matches the canonical reference.
 //!
-//! Source of truth: `docs/architecture/2026-05-16-mcp-tool-reference.md`
-//! `## Final tool list` and `## Callable deprecated aliases`.
+//! Source of truth: `docs/plans/2026-06-11-agent-adoption-overhaul.md`
+//! `## Phase 2 — Consolidate the agent-facing tool surface to 8 verbs`.
 
 use serde_json::json;
 
 use super::super::server::RequestHandler;
 use super::{call_args, SchemaFixture};
 
-/// The 50 advertised tool names in the order they appear in the reference.
+/// The 8 advertised agent-facing tool names in the order they appear in the reference.
 pub(crate) const ADVERTISED_TOOLS: &[&str] = &[
-    "get_context_capsule",
+    "context",
     "prepare_change",
-    "plan_edit",
-    "trace_scenario",
-    "find_relevant_tests",
-    "impact_from_diff",
-    "get_working_set_context",
-    "summarize_subsystem",
-    "get_repo_playbook",
-    "get_docs_capsule",
-    "get_backlinks",
-    "get_outgoing_links",
-    "find_stale_docs",
-    "diagnose_failure",
-    "record_workflow_outcome",
-    "expand_context",
-    "get_symbol",
-    "get_dependents",
-    "get_dependencies",
-    "get_impact_graph",
-    "search_symbols",
-    "get_skeleton",
-    "search_memory",
-    "search_logic_flow",
-    "submit_lsp_edges",
-    "workspace_setup",
-    "index_status",
-    "get_session_metrics",
-    "get_project_rules",
-    "inspect_working_memory",
-    "list_stale_memories",
-    "consolidate_session",
-    "get_memory_metrics",
-    "get_event_trace",
-    "get_task_memory",
-    "save_quick_memory",
-    "save_memory",
-    "propose_memory_evolution",
-    "apply_memory_evolution",
-    "verify_explain_memory",
-    "verify_memory",
-    "explain_memory",
-    "list_memory_conflicts",
+    "impact",
+    "diagnose",
+    "search",
+    "remember",
+    "recall",
+    "status",
 ];
 
-/// The five callable-only legacy aliases that are not advertised but accepted.
-pub(crate) const CALLABLE_ALIASES: &[(&str, &str)] = &[
-    ("query_context", "get_context_capsule"),
-    ("blast_radius", "get_impact_graph"),
-    ("get_file_context", "get_skeleton"),
-    ("recall_memories", "search_memory"),
+/// Names explicitly deleted by Phase 2 instead of kept as shims or aliases.
+pub(crate) const REMOVED_TOOL_NAMES: &[&str] = &[
+    "query_context",
+    "blast_radius",
+    "get_file_context",
+    "recall_memories",
+    "verify_memory",
+    "explain_memory",
+    "apply_memory_evolution",
 ];
 
 #[tokio::test]
@@ -124,8 +92,8 @@ async fn every_advertised_tool_carries_name_description_and_input_schema() {
 }
 
 #[tokio::test]
-async fn callable_aliases_dispatch_without_being_advertised() {
-    let fixture = SchemaFixture::new("aliases");
+async fn removed_tool_names_are_rejected() {
+    let fixture = SchemaFixture::new("removed-names");
     let response = fixture
         .handler
         .handle("tools/list", json!({}))
@@ -138,10 +106,20 @@ async fn callable_aliases_dispatch_without_being_advertised() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name").to_string())
         .collect();
-    for (alias, _canonical) in CALLABLE_ALIASES {
+    for removed_name in REMOVED_TOOL_NAMES {
         assert!(
-            !names.contains(*alias),
-            "alias `{alias}` must not appear in the advertised list (compatibility policy ## Legacy aliases and deadlines)"
+            !names.contains(*removed_name),
+            "removed tool `{removed_name}` must not appear in the advertised list"
+        );
+        let result = fixture
+            .handler
+            .handle("tools/call", call_args(removed_name, json!({})))
+            .await;
+        let (code, message) = result.expect_err("removed tool should be rejected");
+        assert_eq!(code, -32602);
+        assert!(
+            message.contains(*removed_name),
+            "unknown-tool error should name `{removed_name}`: {message}"
         );
     }
 }

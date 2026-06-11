@@ -30,7 +30,7 @@ async fn consolidate_session_renders_compact_full_and_diagnostic() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "consolidate_session",
                     json!({
@@ -59,7 +59,7 @@ async fn get_event_trace_renders_compact_full_and_diagnostic_with_handles() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "get_event_trace",
                     json!({
@@ -97,7 +97,7 @@ async fn get_memory_metrics_renders_each_mode_with_honest_nulls() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "get_memory_metrics",
                     json!({
@@ -126,7 +126,7 @@ async fn verify_explain_memory_renders_compact_full_and_diagnostic() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "verify_explain_memory",
                     json!({
@@ -157,7 +157,7 @@ async fn list_memory_conflicts_renders_each_mode_for_legacy_memory_anchor() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "list_memory_conflicts",
                     json!({
@@ -188,7 +188,7 @@ async fn inspect_working_memory_supports_compact_and_diagnostic_modes() {
         let response = fixture
             .handler
             .handle(
-                "tools/call",
+                "lattice/tool_call",
                 call_args(
                     "inspect_working_memory",
                     json!({"task_id": "task-inspect", "mode": mode}),
@@ -215,7 +215,7 @@ async fn get_task_memory_emits_expansion_handles_per_memory() {
     let response = fixture
         .handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             call_args(
                 "get_task_memory",
                 json!({"task_id": "task-refresh", "intent_hint": "refresh"}),
@@ -246,7 +246,7 @@ async fn save_repo_memory(fixture: &SchemaFixture, content: &str) -> String {
     let response = fixture
         .handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             call_args(
                 "save_memory",
                 json!({

@@ -81,55 +81,9 @@ pub fn tool_definition() -> Value {
     })
 }
 
-pub fn apply_shim_tool_definition() -> Value {
-    json!({
-        "name": "apply_memory_evolution",
-        "description": "Deprecated shim for propose_memory_evolution(action=apply). Returns a deprecation warning while forwarding to the unified tool.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "proposal_id": {"type": "string"},
-                "reason": {"type": "string"},
-                "decided_by": {"type": "string"}
-            },
-            "required": ["proposal_id"]
-        }
-    })
-}
-
 pub fn parse_args(args: &Value) -> Result<ProposeMemoryEvolutionArgs, String> {
     serde_json::from_value(args.clone())
         .map_err(|error| format!("Invalid propose_memory_evolution arguments: {error}"))
-}
-
-pub fn parse_apply_shim_args(args: &Value) -> Result<ProposeMemoryEvolutionArgs, String> {
-    let proposal_id = args
-        .get("proposal_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "apply_memory_evolution requires proposal_id".to_string())?;
-    Ok(ProposeMemoryEvolutionArgs {
-        action: EvolutionAction::Apply,
-        proposal_id: Some(proposal_id.to_string()),
-        memory_id: None,
-        content: None,
-        linked_files: Vec::new(),
-        linked_symbols: Vec::new(),
-        linked_docs: Vec::new(),
-        linked_tests: Vec::new(),
-        linked_memories: Vec::new(),
-        validity_conditions: Vec::new(),
-        invalidation_triggers: Vec::new(),
-        superseded_by_memory_id: None,
-        invalidate_reason: None,
-        reason: args
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        decided_by: args
-            .get("decided_by")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    })
 }
 
 pub fn validate_args(args: &ProposeMemoryEvolutionArgs) -> Result<(), String> {

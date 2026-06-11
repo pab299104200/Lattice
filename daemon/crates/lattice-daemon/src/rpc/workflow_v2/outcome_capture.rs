@@ -75,10 +75,7 @@ impl WorkflowOutcomeRecorder {
                 | "get_task_memory"
                 | "save_memory"
                 | "propose_memory_evolution"
-                | "apply_memory_evolution"
                 | "verify_explain_memory"
-                | "verify_memory"
-                | "explain_memory"
                 | "list_memory_conflicts"
                 | "consolidate_session"
                 | "get_memory_metrics"
@@ -339,7 +336,7 @@ fn collect_selected_candidates(tool: &str, payload: Option<&Value>) -> Vec<Strin
             .and_then(Value::as_str)
             .map(|value| vec![format!("memory:{value}")])
             .unwrap_or_default(),
-        "verify_explain_memory" | "verify_memory" | "explain_memory" => payload
+        "verify_explain_memory" => payload
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
             .map(|value| vec![format!("verification:{value}")])

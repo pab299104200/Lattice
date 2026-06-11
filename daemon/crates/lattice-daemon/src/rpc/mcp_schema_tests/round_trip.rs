@@ -318,7 +318,6 @@ fn verify_explain_response_round_trip_includes_optional_diagnostic_trace() {
         summary_lines: vec!["passed".to_string()],
         render_mode: VerifyExplainRenderMode::Diagnostic,
         diagnostic_trace: Some(vec!["trace".to_string()]),
-        deprecation_warning: None,
     };
     assert_round_trip(&response);
 }
@@ -429,8 +428,8 @@ fn task_memory_bundle_and_memory_record_round_trip() {
 }
 
 #[test]
-fn evolution_proposal_round_trip_keeps_deprecation_field_optional() {
-    let with_warning = EvolutionProposal {
+fn evolution_proposal_round_trip_preserves_canonical_fields() {
+    let proposal = EvolutionProposal {
         proposal_id: "p".to_string(),
         action: EvolutionAction::Apply,
         source_memory_id: Some("mem".to_string()),
@@ -438,14 +437,8 @@ fn evolution_proposal_round_trip_keeps_deprecation_field_optional() {
         decision: "applied".to_string(),
         prior_state: serde_json::json!({}),
         proposed_state: serde_json::json!({}),
-        deprecation_warning: Some("shim".to_string()),
     };
-    let without_warning = EvolutionProposal {
-        deprecation_warning: None,
-        ..with_warning.clone()
-    };
-    assert_round_trip(&with_warning);
-    assert_round_trip(&without_warning);
+    assert_round_trip(&proposal);
 }
 
 #[test]

@@ -17,7 +17,7 @@ The retrieval pipeline is the ten-step sequence from [## Retrieval Engine](../pl
 9. Deduplicate and compress.
 10. Return a compact bundle with inclusion reasons and expansion handles.
 
-The pipeline is shared by high-level workflow tools such as `get_context_capsule`, `prepare_change`, `plan_edit`, `trace_scenario`, and `diagnose_failure`; see [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md#final-tool-list).
+The pipeline is shared by high-level workflow routes behind `context`, `prepare_change`, `impact`, and `diagnose`; see [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools).
 
 ## Candidate sources
 

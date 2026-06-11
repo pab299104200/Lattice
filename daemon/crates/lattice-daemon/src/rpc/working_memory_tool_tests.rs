@@ -41,9 +41,9 @@ fn tools_list_registers_inspect_working_memory_schema() {
         let (handler, _memory_store, workspace_root, context_cache_path) =
             build_handler("tools-list");
         let response = handler
-            .handle("tools/list", json!({}))
+            .handle("lattice/tools/list_all", json!({}))
             .await
-            .expect("tools/list succeeds");
+            .expect("internal tools/list succeeds");
         let tools = response["tools"].as_array().expect("tool array");
         let tool = tools
             .iter()
@@ -75,7 +75,7 @@ async fn compact_mode_returns_summary_and_snapshot_handle() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "inspect_working_memory",
                 "arguments": {
@@ -118,7 +118,7 @@ async fn diagnostic_mode_returns_full_state_and_include_excluded_controls_visibi
 
     let without_excluded = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "inspect_working_memory",
                 "arguments": {
@@ -146,7 +146,7 @@ async fn diagnostic_mode_returns_full_state_and_include_excluded_controls_visibi
 
     let with_excluded = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "inspect_working_memory",
                 "arguments": {
@@ -191,7 +191,7 @@ async fn tool_falls_back_to_latest_checkpoint_when_session_cache_is_empty() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "inspect_working_memory",
                 "arguments": {

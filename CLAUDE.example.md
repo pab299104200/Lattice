@@ -5,18 +5,16 @@
 Lattice provides a dependency graph and context engine for this codebase.
 
 - Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
-- If you would otherwise open 3 or more unfamiliar files, start with `diagnose_failure`, `trace_scenario`, `prepare_change`, `plan_edit`, or `get_context_capsule` instead of broad file reads.
+- If you would otherwise open 3 or more unfamiliar files, start with `context`, `prepare_change`, or `diagnose` instead of broad file reads.
 - Use the tool that matches the task shape:
-  - `diagnose_failure` for failing tests, compiler errors, stack traces, or runtime failures
-  - `trace_scenario` for behavior-level debugging when you have a scenario but not the exact symbol
-  - `prepare_change` when the likely change area is known and you need edit files, symbols, tests, and risks
-  - `plan_edit` when you need a patch-oriented plan with candidate edit spans, affected callers/dependencies, docs, and recommended tests
-  - `get_context_capsule` for unfamiliar subsystems or architecture questions
-- Use `expand_context` when one of those tools returns a `context_handle` or `suggested_expand` instead of restarting discovery.
-- Prefer stable follow-up targets when provided. `expand_context` resolves exact `symbol_id:` and `file_id:` handles first, then legacy `symbol:` and `file:` targets for compatibility.
-- Use `summarize_subsystem`, `get_repo_playbook`, or `get_skeleton` when you explicitly want a summary-first map, repo-wide conventions, or file structure before opening source.
-- Use `get_docs_capsule` for doc-first questions and `get_backlinks`, `get_outgoing_links`, and `find_stale_docs` for docs-graph navigation and drift checks.
-- Use `impact_from_diff` and `find_relevant_tests` when reviewing local edits, checking blast radius, or deciding what to run.
+  - `diagnose` for failing tests, compiler errors, stack traces, or runtime failures
+  - `prepare_change` for implementation work; use `mode: "plan_edit"` for patch spans or `mode: "trace"` for scenario debugging
+  - `context` for unfamiliar subsystems, docs, repo rules, file skeletons, working sets, and expanding prior handles
+  - `impact` before multi-file or non-obvious changes
+  - `search` for symbols, call paths, backlinks, and outgoing links
+  - `recall` / `remember` for durable task memory and workflow outcomes
+  - `status` for indexing, stale docs, stale memory, and conflict health
+- Use `context` with `mode: "expand"` when a tool returns a `context_handle` or `suggested_expand` instead of restarting discovery.
 - Prefer durable, verified memory over weaker freeform recollection. Reuse or record repo-/branch-scoped workflow outcomes when they are verified, and treat structured memory fields like verification, provenance, evidence, freshness, and contradiction status as signals for trust.
 - Treat retrieved memory as recall, not proof. A memory is only dependable after current code, docs, and tests confirm it.
 - Prefer memories with `trust_status: "trusted"`, matching `checkout_state`, concrete `evidence_links`, and useful `recheck_commands`.
@@ -36,7 +34,6 @@ Use exact Markdown file + heading references when documented behavior matters.
 
 ## Project Structure
 
-- `extension/` — VS Code extension
 - `daemon/` — Rust daemon and core graph/index/query implementation
 - `daemon/crates/lattice-core/` — parser, graph, query engine, indexer, storage
 - `daemon/crates/lattice-daemon/` — binary entry point and RPC server
@@ -44,5 +41,4 @@ Use exact Markdown file + heading references when documented behavior matters.
 ## Build And Test
 
 - Daemon: `cd daemon && cargo build --release`
-- Extension: `cd extension && npm install && npm run compile`
 - Tests: `cd daemon && cargo test --workspace`

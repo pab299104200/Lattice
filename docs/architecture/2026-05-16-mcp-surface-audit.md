@@ -1,5 +1,7 @@
 # MCP Surface Audit
 
+> Superseded: this Phase 8 audit records the pre-overhaul surface. The current agent-facing MCP contract is the 2026-06-11 8-verb surface in [MCP Tool Reference](./2026-06-11-mcp-tool-reference.md#public-mcp-tools). Deprecated aliases and MCP shims described below were removed from the public MCP surface by the agent adoption overhaul.
+
 This audit is the Phase 8 contract check for the cognitive workspace fork. It reconciles the MCP surface in `daemon/crates/lattice-daemon/src/rpc/mcp.rs` with [## MCP Surface](../plans/2026-05-16-cognitive-workspace-fork-plan.md#mcp-surface), [## MCP Tool Contract Principles](../plans/2026-05-16-cognitive-workspace-fork-plan.md#mcp-tool-contract-principles), [## Phase 8: Workflow Engine V2](../plans/2026-05-16-cognitive-workspace-fork-plan.md#phase-8-workflow-engine-v2), and the compatibility rules in [MCP Compatibility Policy](./2026-05-16-mcp-compatibility-policy.md). The canonical final inventory is [MCP Tool Reference](./2026-05-16-mcp-tool-reference.md).
 
 Spec framing from [## MCP Surface](../plans/2026-05-16-cognitive-workspace-fork-plan.md#mcp-surface):

@@ -70,7 +70,7 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
             Ok(status) => print_index_status(root, &status),
             Err(error) => {
                 failures += 1;
-                println!("FAIL workspace {} index_status: {}", root.display(), error);
+                println!("FAIL workspace {} status: {}", root.display(), error);
             }
         }
     }
@@ -213,14 +213,14 @@ fn index_status_for(root: &Path) -> Result<Value> {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "index_status", "arguments": {}}
+                "params": {"name": "status", "arguments": {"scope": "index"}}
             }),
         ],
         2,
     )?;
     let status_line = output
         .get(1)
-        .ok_or_else(|| anyhow::anyhow!("missing index_status response"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing status response"))?;
     let response: JsonRpcLine = serde_json::from_str(status_line)?;
     if let Some(error) = response.error {
         anyhow::bail!("{}", error);
@@ -471,10 +471,6 @@ fn binary_skew_report() -> Result<Vec<String>> {
     let mut paths = vec![current.clone()];
     if let Ok(cwd) = std::env::current_dir() {
         paths.push(cwd.join("daemon/target/release/lattice"));
-        paths.push(cwd.join("extension/bin/lattice"));
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        paths.push(home.join(".vscode/extensions/lattice.lattice-0.1.0/bin/lattice"));
     }
 
     let mut lines = Vec::new();

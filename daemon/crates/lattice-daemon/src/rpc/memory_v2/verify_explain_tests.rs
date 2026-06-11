@@ -51,7 +51,6 @@ fn serde_round_trips_verify_and_conflict_requests_and_responses() {
         summary_lines: vec!["all verification checks passed".to_string()],
         render_mode: verify_explain_memory::VerifyExplainRenderMode::Full,
         diagnostic_trace: None,
-        deprecation_warning: None,
     };
     round_trip(&verify_response);
 
@@ -146,7 +145,7 @@ async fn verify_explain_memory_uses_phase7_status_taxonomy_only() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {
@@ -222,7 +221,7 @@ async fn every_check_result_carries_an_evidence_reference() {
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {
@@ -282,7 +281,7 @@ async fn deleted_linked_symbol_transitions_to_stale_with_linked_symbol_missing_f
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {
@@ -361,7 +360,7 @@ async fn list_memory_conflicts_returns_contradicts_and_supersedes_with_correct_d
 
     let response = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "list_memory_conflicts",
                 "arguments": {
@@ -436,7 +435,7 @@ async fn scope_leak_negative_paths_return_explicit_errors() {
 
     let verify = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "verify_explain_memory",
                 "arguments": {
@@ -452,7 +451,7 @@ async fn scope_leak_negative_paths_return_explicit_errors() {
 
     let conflicts = handler
         .handle(
-            "tools/call",
+            "lattice/tool_call",
             json!({
                 "name": "list_memory_conflicts",
                 "arguments": {
@@ -465,89 +464,6 @@ async fn scope_leak_negative_paths_return_explicit_errors() {
         )
         .await;
     assert!(conflicts.is_err());
-    cleanup_paths(&workspace_root, &context_cache_path);
-}
-
-#[tokio::test]
-async fn verify_and_explain_deprecation_shims_forward_correctly() {
-    let (
-        handler,
-        memory_store,
-        _event_store,
-        indexer,
-        graph_store,
-        workspace_root,
-        context_cache_path,
-    ) = build_handler("shim-forward");
-    seed_indexed_file(
-        &workspace_root,
-        &indexer,
-        &graph_store,
-        "src/auth.rs",
-        "fn refresh_token() {}\n",
-    )
-    .await;
-    let memory_id = {
-        let store = memory_store.lock().await;
-        let id = store
-            .store(seed_memory(
-                "shim target",
-                MemoryScope::Repo,
-                &workspace_root.to_string_lossy(),
-            ))
-            .expect("store memory");
-        let mut fields = MemoryStructuredFields::default();
-        fields.evidence = vec![MemoryEvidence {
-            kind: "file".to_string(),
-            reference: Some("src/auth.rs".to_string()),
-            detail: None,
-            captured_at: Some(1),
-            span: None,
-            evidence_content_hash: None,
-        }];
-        store
-            .update_structured_fields(&id, &fields)
-            .expect("fields");
-        id
-    };
-
-    let verify = handler
-        .handle(
-            "tools/call",
-            json!({
-                "name": "verify_memory",
-                "arguments": {
-                    "memory_id": {
-                        "workspace_id": workspace_root.to_string_lossy(),
-                        "ulid": memory_id
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("verify shim succeeds");
-    let verify_payload = parse_tool_payload(&verify);
-    assert!(verify_payload["deprecation_warning"].as_str().is_some());
-
-    let explain = handler
-        .handle(
-            "tools/call",
-            json!({
-                "name": "explain_memory",
-                "arguments": {
-                    "memory_id": {
-                        "workspace_id": workspace_root.to_string_lossy(),
-                        "ulid": memory_id
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("explain shim succeeds");
-    let explain_payload = parse_tool_payload(&explain);
-    assert!(explain_payload["deprecation_warning"].as_str().is_some());
-    assert_eq!(explain_payload["status"], verify_payload["status"]);
-
     cleanup_paths(&workspace_root, &context_cache_path);
 }
 

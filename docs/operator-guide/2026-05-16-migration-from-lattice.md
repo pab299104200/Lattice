@@ -15,7 +15,7 @@ Migration preserves useful Lattice assets while replacing memory retrieval, even
 5. Run pre-flight checks from [## Pre-flight checks](#pre-flight-checks).
 6. Run the storage migration command or startup migration path defined by the current daemon release.
 7. Reindex the workspace and confirm `index_status` reports a healthy graph.
-8. Verify MCP compatibility with a representative `get_context_capsule`, `prepare_change`, and `search_memory` call.
+8. Verify MCP compatibility with representative `context`, `prepare_change`, and `recall` calls.
 9. Inspect migrated memory, stale state, proposals, event trace, indexing health, and graph health through MCP tools.
 10. Capture post-migration verification evidence in the operator change record.
 
@@ -54,8 +54,8 @@ Run these checks after migration:
 
 - `index_status` reports expected workspace, branch, file count, and language mix.
 - `get_repo_playbook` returns a bounded summary.
-- `get_context_capsule` returns stable handles and suggested expansion.
-- `search_memory` returns migrated memory with scope and verification labels.
-- `verify_explain_memory` explains a migrated memory state.
+- `context` returns stable handles and suggested expansion.
+- `recall` returns migrated memory with scope and verification labels.
+- `recall` with `mode=verify` explains a migrated memory state.
 - `get_event_trace` returns scoped events for a recent task or session.
 - Memory, event, metrics, and health MCP responses do not show unsupported data as authoritative.

@@ -5,13 +5,9 @@
 //! `### 4. Memory Graph` contracts from
 //! `docs/plans/2026-05-16-cognitive-workspace-fork-plan.md`.
 //!
-//! "Tool surface discipline: ten new memory tools is a meaningful cognitive
-//! load for clients. Before shipping Phase 8, audit whether
-//! `propose_memory_evolution` + `apply_memory_evolution` can collapse into a
-//! single tool with an `action` parameter, and whether `verify_memory` +
-//! `explain_memory` can be unified. The goal is the smallest surface that
-//! covers all assistant workflows. Consolidate before stabilizing the MCP
-//! contract."
+//! The public MCP surface is consolidated to 8 agent-facing verbs; these memory
+//! handlers remain available behind those verbs and the daemon-internal raw
+//! tool-call path.
 
 use lattice_core::identity::{encode_identity, Identity, MemoryId};
 use lattice_core::memory::model::{
@@ -235,9 +231,6 @@ pub struct EvolutionProposal {
     pub prior_state: serde_json::Value,
     /// Proposed state snapshot or applied state snapshot.
     pub proposed_state: serde_json::Value,
-    /// Optional deprecation warning attached by shimmed calls.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deprecation_warning: Option<String>,
 }
 
 pub(crate) fn coarse_memory_type(memory_class: &MemoryClass) -> MemoryType {
