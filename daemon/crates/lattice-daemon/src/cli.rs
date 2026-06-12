@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::adoption_metrics::render_metrics_for_workspace;
 use crate::proxy::{daemon_addr, ProxyHello};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,17 +37,23 @@ pub(crate) fn is_cli_query_command() -> bool {
     matches!(
         std::env::args().nth(1).as_deref(),
         Some("context")
+            | Some("prepare_change")
             | Some("impact")
             | Some("search")
             | Some("diagnose")
             | Some("remember")
             | Some("recall")
             | Some("status")
+            | Some("metrics")
     )
 }
 
 pub(crate) async fn run_from_env() -> i32 {
-    match parse_args(std::env::args().collect()) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("metrics") {
+        return run_metrics_command(args);
+    }
+    match parse_args(args) {
         Ok(request) => run_request(request).await,
         Err(error) => {
             eprintln!("lattice: {}", error);
@@ -103,13 +110,15 @@ async fn call_daemon(request: &CliRequest) -> Result<Value, CliError> {
         &serde_json::to_value(hello).map_err(anyhow::Error::from)?,
     )
     .await?;
+    let mut arguments = request.arguments.clone();
+    attach_invocation_metadata(&mut arguments);
     let rpc = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
             "name": request.tool,
-            "arguments": request.arguments,
+            "arguments": arguments,
         }
     });
     write_json_line(&mut stream, &rpc).await?;
@@ -139,6 +148,65 @@ async fn call_daemon(request: &CliRequest) -> Result<Value, CliError> {
     Err(CliError::DaemonUnavailable)
 }
 
+fn run_metrics_command(args: Vec<String>) -> i32 {
+    match parse_metrics_args(args)
+        .and_then(|(workspace, days, json)| render_metrics_for_workspace(&workspace, days, json))
+    {
+        Ok(output) => {
+            println!("{}", output.trim_end());
+            0
+        }
+        Err(error) => {
+            eprintln!("lattice: {}", error);
+            1
+        }
+    }
+}
+
+fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool)> {
+    let mut workspace = None;
+    let mut days = 14usize;
+    let mut json = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--workspace" | "-w" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--workspace requires a path"))?;
+                workspace = Some(canonical_workspace(Path::new(value))?);
+                i += 1;
+            }
+            "--days" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--days requires a positive integer"))?;
+                days = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --days `{}`", value))?;
+                if days == 0 {
+                    return Err(anyhow!("--days must be positive"));
+                }
+                i += 1;
+            }
+            other => return Err(anyhow!("unknown metrics argument `{}`", other)),
+        }
+        i += 1;
+    }
+    Ok((workspace.unwrap_or(detect_workspace_root()?), days, json))
+}
+
+fn attach_invocation_metadata(arguments: &mut Value) {
+    if std::env::var("LATTICE_SKIP_METRICS").ok().as_deref() == Some("1") {
+        return;
+    }
+    let client = std::env::var("LATTICE_CLIENT_NAME").unwrap_or_else(|_| "lattice-cli".to_string());
+    let channel = std::env::var("LATTICE_CLIENT_CHANNEL").unwrap_or_else(|_| "cli".to_string());
+    set_default(arguments, "_lattice_client", json!(client));
+    set_default(arguments, "_lattice_channel", json!(channel));
+}
+
 async fn write_json_line(stream: &mut TcpStream, value: &Value) -> Result<(), CliError> {
     let mut text = serde_json::to_string(value).map_err(anyhow::Error::from)?;
     text.push('\n');
@@ -155,6 +223,7 @@ fn parse_args(args: Vec<String>) -> Result<CliRequest> {
     let command = parser.command.clone();
     let mut request = match command.as_str() {
         "context" => parse_context(&mut parser)?,
+        "prepare_change" => parse_prepare_change(&mut parser)?,
         "impact" => parse_impact(&mut parser)?,
         "search" => parse_search(&mut parser)?,
         "diagnose" => parse_diagnose(&mut parser)?,
@@ -200,6 +269,23 @@ fn parse_context(parser: &mut ArgParser) -> Result<CliRequest> {
     Ok(parser.request("context", arguments))
 }
 
+fn parse_prepare_change(parser: &mut ArgParser) -> Result<CliRequest> {
+    let mode = parser
+        .take_flag_value("--mode")?
+        .unwrap_or_else(|| "prepare".to_string());
+    let task = parser.join_positionals();
+    if task.trim().is_empty() {
+        return Err(anyhow!("prepare_change requires a task"));
+    }
+    Ok(parser.request(
+        "prepare_change",
+        json!({
+            "task": task,
+            "mode": mode,
+        }),
+    ))
+}
+
 fn parse_impact(parser: &mut ArgParser) -> Result<CliRequest> {
     let include_tests = !parser.take_bool("--no-tests");
     let direction = parser.take_flag_value("--direction")?;
@@ -215,9 +301,22 @@ fn parse_impact(parser: &mut ArgParser) -> Result<CliRequest> {
         if target.trim().is_empty() {
             return Err(anyhow!("impact requires a symbol, path, or --diff"));
         }
-        set_value(&mut arguments, "target", json!(target));
+        if looks_like_path_target(&target) {
+            set_value(&mut arguments, "file", json!(target));
+        } else {
+            set_value(&mut arguments, "target", json!(target));
+        }
     }
     Ok(parser.request("impact", arguments))
+}
+
+fn looks_like_path_target(target: &str) -> bool {
+    target.contains('/')
+        || target.contains('\\')
+        || Path::new(target).exists()
+        || target.rsplit_once('.').is_some_and(|(_, ext)| {
+            ext.chars().all(|ch| ch.is_ascii_alphanumeric()) && (1..=8).contains(&ext.len())
+        })
 }
 
 fn parse_search(parser: &mut ArgParser) -> Result<CliRequest> {
@@ -635,6 +734,24 @@ mod tests {
         assert_eq!(request.arguments["min_relevance"], 0.35);
         assert!(request.json);
         assert_eq!(request.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn parses_impact_path_as_file_argument() {
+        let request = parse_args(vec![
+            "lattice".into(),
+            "impact".into(),
+            "daemon/crates/lattice-daemon/src/cli.rs".into(),
+            "--no-tests".into(),
+        ])
+        .expect("parse succeeds");
+        assert_eq!(request.tool, "impact");
+        assert_eq!(
+            request.arguments["file"],
+            "daemon/crates/lattice-daemon/src/cli.rs"
+        );
+        assert!(request.arguments["target"].is_null());
+        assert_eq!(request.arguments["include_tests"], false);
     }
 
     #[test]

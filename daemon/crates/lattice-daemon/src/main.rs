@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod adoption_metrics;
 mod cli;
 mod doctor;
 mod lifecycle_log;

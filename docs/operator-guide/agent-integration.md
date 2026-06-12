@@ -56,8 +56,19 @@ Codex shell commands can also call the CLI directly:
 
 ```bash
 lattice context "how does retrieval ranking work?" --mode docs
+lattice prepare_change "add adoption metrics to CLI"
 lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
 lattice status --scope index
 ```
 
 The CLI is useful when MCP is not configured or when a prompt needs fast, grep-shaped access to the same 8 public verbs.
+
+## Adoption Metrics
+
+Run:
+
+```bash
+lattice metrics
+```
+
+The command renders the last 14 days of workspace-local adoption counters grouped by `client`, `channel`, and `tool`. Hook invocations set `client=claude-code` and `channel=hook`; direct shell calls set `client=lattice-cli` and `channel=cli`; MCP calls use the initialized client name when available and otherwise fall back to `mcp`.

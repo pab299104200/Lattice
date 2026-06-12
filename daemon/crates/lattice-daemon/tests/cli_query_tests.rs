@@ -13,10 +13,15 @@ fn cli_query_subcommands_call_public_tools_over_daemon_protocol() {
     let workspace = unique_workspace("cli-happy");
     std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let (addr, server) = start_fake_daemon(7, Arc::clone(&observed), FakeMode::Immediate);
+    let (addr, server) = start_fake_daemon(8, Arc::clone(&observed), FakeMode::Immediate);
 
     let cases: Vec<(&str, Vec<&str>, Option<&str>)> = vec![
         ("context", vec!["context", "auth flow"], None),
+        (
+            "prepare_change",
+            vec!["prepare_change", "fix auth flow", "--mode", "prepare"],
+            None,
+        ),
         ("impact", vec!["impact", "src/main.rs", "--no-tests"], None),
         (
             "search",
@@ -53,6 +58,7 @@ fn cli_query_subcommands_call_public_tools_over_daemon_protocol() {
             "context".to_string(),
             "diagnose".to_string(),
             "impact".to_string(),
+            "prepare_change".to_string(),
             "recall".to_string(),
             "remember".to_string(),
             "search".to_string(),

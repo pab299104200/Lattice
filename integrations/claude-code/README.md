@@ -19,6 +19,8 @@ Implementation choice: Lattice uses this `install.sh` package instead of adding 
 
 Every script first checks whether the Lattice binary exists and whether the daemon answers `lattice status` within `LATTICE_HOOK_PROBE_TIMEOUT` seconds. If either check fails, the script exits `0` without output so hooks never break a Claude session.
 
+Actual hook calls set `LATTICE_CLIENT_NAME=claude-code` and `LATTICE_CLIENT_CHANNEL=hook` before invoking the CLI. Readiness probes set `LATTICE_SKIP_METRICS=1`, so `lattice metrics` measures delivered hook value instead of probe noise.
+
 ## Controls
 
 - Set `LATTICE_BIN=/absolute/path/to/lattice` to force a binary path.

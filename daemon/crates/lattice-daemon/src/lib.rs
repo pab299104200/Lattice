@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+#[allow(dead_code)]
+pub(crate) mod adoption_metrics;
 pub(crate) mod lifecycle_log;
 pub(crate) mod repo_state;
 pub mod rpc;

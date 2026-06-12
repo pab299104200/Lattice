@@ -42,7 +42,7 @@ if [[ -z "${edited_file//[[:space:]]/}" ]]; then
   exit 0
 fi
 
-impact="$("$lattice_bin" impact "$edited_file" --no-tests --timeout "${LATTICE_HOOK_TIMEOUT:-1.5}" 2>/dev/null || true)"
+impact="$(lattice_hook_call impact "$edited_file" --no-tests --timeout "${LATTICE_HOOK_TIMEOUT:-1.5}" 2>/dev/null || true)"
 if [[ -z "${impact//[[:space:]]/}" ]]; then
   exit 0
 fi

@@ -8,8 +8,8 @@ if ! lattice_hook_ready; then
   exit 0
 fi
 
-recall_json="$("$lattice_bin" recall "session start" --mode task --json --timeout "${LATTICE_HOOK_TIMEOUT:-1.6}" 2>/dev/null || true)"
-rules="$("$lattice_bin" context "repo rules and operator workflow" --mode rules --timeout "${LATTICE_HOOK_RULES_TIMEOUT:-1.0}" 2>/dev/null || true)"
+recall_json="$(lattice_hook_call recall "session start" --mode task --json --timeout "${LATTICE_HOOK_TIMEOUT:-1.6}" 2>/dev/null || true)"
+rules="$(lattice_hook_call context "repo rules and operator workflow" --mode rules --timeout "${LATTICE_HOOK_RULES_TIMEOUT:-1.0}" 2>/dev/null || true)"
 
 recall_text="$(printf '%s' "$recall_json" | lattice_json_text 2>/dev/null || true)"
 content="$(

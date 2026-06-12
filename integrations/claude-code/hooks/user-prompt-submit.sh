@@ -31,7 +31,7 @@ if [[ -z "${prompt//[[:space:]]/}" ]]; then
   exit 0
 fi
 
-context="$("$lattice_bin" context "$prompt" --mode auto --min-relevance "${LATTICE_HOOK_MIN_RELEVANCE:-0.25}" --timeout "${LATTICE_HOOK_TIMEOUT:-1.8}" 2>/dev/null || true)"
+context="$(lattice_hook_call context "$prompt" --mode auto --min-relevance "${LATTICE_HOOK_MIN_RELEVANCE:-0.25}" --timeout "${LATTICE_HOOK_TIMEOUT:-1.8}" 2>/dev/null || true)"
 if [[ ${#context} -lt 80 ]]; then
   exit 0
 fi

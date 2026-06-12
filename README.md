@@ -153,15 +153,17 @@ The same 8 public verbs are available from the shell. These commands are thin cl
 
 ```bash
 lattice context "how does memory verification work?" --mode docs
+lattice prepare_change "add adoption metrics to CLI"
 lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
 lattice search "McpHandler" --kind symbol
 lattice diagnose -
 lattice remember "Verified CLI context path with cargo test" --kind quick
 lattice recall "CLI context path" --mode search
 lattice status --scope index
+lattice metrics
 ```
 
-Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. The daemon-down message is intentionally one actionable line: `lattice daemon not running — start with: lattice --daemon`.
+Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. `lattice metrics` reads the workspace-local adoption ledger and supports `--days <n>` plus `--json`; hook calls are tagged as `claude-code` / `hook`, direct CLI calls as `lattice-cli` / `cli`, and MCP calls as the initialized client name or `mcp` / `mcp`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. The daemon-down message is intentionally one actionable line: `lattice daemon not running — start with: lattice --daemon`.
 
 ## MCP Tools
 

@@ -56,5 +56,5 @@ if [[ -z "${edited_files//[[:space:]]/}" ]]; then
 fi
 
 summary="Session edited files: $(printf '%s' "$edited_files" | paste -sd ', ' -)"
-"$lattice_bin" remember "$summary" --kind outcome --timeout "${LATTICE_HOOK_TIMEOUT:-1.5}" >/dev/null 2>&1 || true
+lattice_hook_call remember "$summary" --kind outcome --timeout "${LATTICE_HOOK_TIMEOUT:-1.5}" >/dev/null 2>&1 || true
 exit 0

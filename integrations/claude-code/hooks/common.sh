@@ -23,7 +23,13 @@ lattice_find_bin() {
 
 lattice_hook_ready() {
   lattice_bin="$(lattice_find_bin)" || return 1
-  "$lattice_bin" status --timeout "${LATTICE_HOOK_PROBE_TIMEOUT:-0.2}" >/dev/null 2>&1
+  LATTICE_SKIP_METRICS=1 "$lattice_bin" status --timeout "${LATTICE_HOOK_PROBE_TIMEOUT:-0.2}" >/dev/null 2>&1
+}
+
+lattice_hook_call() {
+  LATTICE_CLIENT_NAME="${LATTICE_CLIENT_NAME:-claude-code}" \
+    LATTICE_CLIENT_CHANNEL="${LATTICE_CLIENT_CHANNEL:-hook}" \
+    "$lattice_bin" "$@"
 }
 
 lattice_limit_chars() {

@@ -15,5 +15,6 @@ The CLI twins from Phase 3 also work directly from Codex shell commands without 
 
 ```bash
 /home/pete/cadres/lattice/daemon/target/release/lattice context "where is memory verification handled?"
+/home/pete/cadres/lattice/daemon/target/release/lattice prepare_change "add adoption metrics to CLI"
 /home/pete/cadres/lattice/daemon/target/release/lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
 ```

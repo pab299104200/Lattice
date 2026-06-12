@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 use tracing::Instrument;
@@ -48,6 +49,9 @@ use super::workflow_v2::{
     self, VecEventSink, WorkflowBundle, WorkflowRenderChoice, WorkflowRequest,
 };
 use super::working_memory_tool;
+use crate::adoption_metrics::{
+    follow_through_from_arguments, source_from_arguments, AdoptionMetricsStore, ToolCallRecord,
+};
 use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
 use crate::runtime_support::{
     background_vector_sync_enabled, build_incremental_index_for_roots,
@@ -74,6 +78,8 @@ pub struct McpHandler {
     indexing: Arc<AtomicBool>,
     context_cache: Arc<Mutex<ContextHandleCache>>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
+    adoption_metrics: Arc<AdoptionMetricsStore>,
+    client_name: Arc<Mutex<Option<String>>>,
     event_capture: Option<Arc<EventCapture>>,
     workflow_outcome_recorder: Arc<WorkflowOutcomeRecorder>,
     session_consolidator: Option<Arc<StdMutex<SessionConsolidator>>>,
@@ -274,7 +280,7 @@ impl McpHandler {
             graph_store,
             embedding_engine,
             vector_index,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             session_id,
             workspace_manager,
             workspace_roots,
@@ -283,6 +289,8 @@ impl McpHandler {
                 context_cache_path,
             ))),
             session_metrics: Arc::new(Mutex::new(SessionMetrics::new())),
+            adoption_metrics: Arc::new(AdoptionMetricsStore::new(&workspace_root)),
+            client_name: Arc::new(Mutex::new(None)),
             event_capture,
             workflow_outcome_recorder: Arc::new(WorkflowOutcomeRecorder::new()),
             session_consolidator,
@@ -539,6 +547,19 @@ impl McpHandler {
 
     // ── MCP Protocol Methods ──────────────────────────────────────────
 
+    async fn remember_client_info(&self, params: &Value) {
+        let Some(name) = params
+            .get("clientInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return;
+        };
+        let mut client = self.client_name.lock().await;
+        *client = Some(name.to_string());
+    }
+
     fn handle_initialize(&self) -> Value {
         json!({
             "protocolVersion": "2024-11-05",
@@ -787,8 +808,9 @@ impl McpHandler {
         let arguments = &params["arguments"];
         let span = tracing::info_span!("tool", name = tool_name);
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
+        let started = Instant::now();
 
-        let result = async {
+        let result = match tokio::time::timeout(Duration::from_secs(5), async {
             match tool_name {
                 "context" => self.tool_agent_context(arguments).await,
                 "prepare_change" => self.tool_agent_prepare_change(arguments).await,
@@ -800,13 +822,24 @@ impl McpHandler {
                 "status" => self.tool_agent_status(arguments).await,
                 _ => Err((-32602, format!("Unknown tool: {}", tool_name))),
             }
-        }
+        })
         .instrument(span)
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(wrap_tool_result(json!({
+                "partial": true,
+                "timeout": true,
+                "tool": tool_name,
+                "message": "server-side 5s cap reached; returning a bounded partial response",
+            }))),
+        };
 
         if let Ok(ref value) = result {
             self.record_tool_metrics(tool_name, value).await;
         }
+        self.record_adoption_tool_call(tool_name, arguments, started.elapsed())
+            .await;
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
             .await;
 
@@ -879,13 +912,17 @@ impl McpHandler {
             return self.tool_find_relevant_tests(&routed).await;
         }
 
-        let impact = match direction {
-            "dependencies" => self.tool_get_dependencies(&routed).await?,
-            "both" => json!({
-                "dependents": self.tool_get_dependents(&routed).await?,
-                "dependencies": self.tool_get_dependencies(&routed).await?
-            }),
-            _ => self.tool_blast_radius(&routed).await?,
+        let impact = if routed["name"].as_str().is_none() && routed["file"].as_str().is_some() {
+            self.tool_file_impact(&routed, direction).await?
+        } else {
+            match direction {
+                "dependencies" => self.tool_get_dependencies(&routed).await?,
+                "both" => json!({
+                    "dependents": self.tool_get_dependents(&routed).await?,
+                    "dependencies": self.tool_get_dependencies(&routed).await?
+                }),
+                _ => self.tool_blast_radius(&routed).await?,
+            }
         };
         if args["include_tests"].as_bool().unwrap_or(true) {
             let tests = self.tool_find_relevant_tests(&routed).await?;
@@ -896,6 +933,112 @@ impl McpHandler {
         } else {
             Ok(impact)
         }
+    }
+
+    async fn tool_file_impact(
+        &self,
+        args: &Value,
+        direction: &str,
+    ) -> Result<Value, (i32, String)> {
+        let file = args["file"]
+            .as_str()
+            .ok_or((-32602, "Missing required parameter: file".to_string()))?;
+        let hops = (args["hops"].as_u64().unwrap_or(3) as usize).min(10);
+        let symbol_limit = (args["limit"].as_u64().unwrap_or(12) as usize).min(50);
+        let relation_limit = 25usize;
+
+        let engine = self.engine.lock().await;
+        let file_nodes = engine.file_symbols(file);
+        let mut affected_files = HashSet::new();
+        let mut symbol_impacts = Vec::new();
+
+        for node in file_nodes.iter().take(symbol_limit) {
+            let dependents = if direction == "dependencies" {
+                Vec::new()
+            } else {
+                engine.graph().get_transitive_dependents(&node.id, hops)
+            };
+            let dependencies = if direction == "dependents" {
+                Vec::new()
+            } else {
+                engine
+                    .graph()
+                    .get_dependencies(&node.id)
+                    .into_iter()
+                    .map(|(dep, _)| dep.clone())
+                    .collect::<Vec<_>>()
+            };
+
+            let dependent_values: Vec<Value> = dependents
+                .iter()
+                .take(relation_limit)
+                .map(|dep| {
+                    affected_files.insert(dep.file.clone());
+                    json!({
+                        "s": dep.name,
+                        "k": dep.kind.short_code(),
+                        "f": dep.file,
+                        "l": dep.line,
+                    })
+                })
+                .collect();
+            let dependency_values: Vec<Value> = dependencies
+                .iter()
+                .take(relation_limit)
+                .map(|dep| {
+                    affected_files.insert(dep.file.clone());
+                    json!({
+                        "s": dep.name,
+                        "k": dep.kind.short_code(),
+                        "f": dep.file,
+                        "l": dep.line,
+                    })
+                })
+                .collect();
+
+            let mut item = json!({
+                "symbol": node.name,
+                "kind": node.kind.short_code(),
+                "line": node.line,
+            });
+            if direction != "dependencies" {
+                set_value(
+                    &mut item,
+                    "dependents",
+                    json!({
+                        "items": dependent_values,
+                        "count": dependents.len(),
+                        "truncated": dependents.len() > relation_limit,
+                    }),
+                );
+            }
+            if direction != "dependents" {
+                set_value(
+                    &mut item,
+                    "dependencies",
+                    json!({
+                        "items": dependency_values,
+                        "count": dependencies.len(),
+                        "truncated": dependencies.len() > relation_limit,
+                    }),
+                );
+            }
+            symbol_impacts.push(item);
+        }
+
+        let mut files: Vec<String> = affected_files.into_iter().collect();
+        files.sort();
+
+        Ok(wrap_tool_result(json!({
+            "file": file,
+            "direction": direction,
+            "hops": hops,
+            "symbols": symbol_impacts,
+            "symbol_count": file_nodes.len(),
+            "symbols_truncated": file_nodes.len() > symbol_limit,
+            "files": files,
+            "count": files.len(),
+        })))
     }
 
     async fn tool_agent_diagnose(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -1857,6 +2000,7 @@ impl McpHandler {
         let arguments = &params["arguments"];
         let span = tracing::info_span!("tool", name = tool_name);
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
+        let started = Instant::now();
 
         let result = async {
             match tool_name {
@@ -1912,6 +2056,10 @@ impl McpHandler {
             if tool_name != "get_session_metrics" {
                 self.record_tool_metrics(tool_name, value).await;
             }
+        }
+        if tool_name != "get_session_metrics" {
+            self.record_adoption_tool_call(tool_name, arguments, started.elapsed())
+                .await;
         }
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
             .await;
@@ -3904,6 +4052,31 @@ impl McpHandler {
             context_origin.as_deref(),
             metadata,
         );
+    }
+
+    async fn record_adoption_tool_call(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        elapsed: Duration,
+    ) {
+        let default_client = self
+            .client_name
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "mcp".to_string());
+        let source = source_from_arguments(arguments, &default_client, "mcp");
+        let latency_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        if let Err(error) = self.adoption_metrics.record(ToolCallRecord {
+            client: source.client,
+            channel: source.channel,
+            tool: tool_name.to_string(),
+            latency_ms,
+            follow_through_edit: follow_through_from_arguments(tool_name, arguments),
+        }) {
+            tracing::warn!(%error, tool = tool_name, "failed to record adoption metrics");
+        }
     }
 
     async fn tool_get_symbol(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -5979,7 +6152,10 @@ impl RequestHandler for McpHandler {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, (i32, String)> {
         match method {
-            "initialize" => Ok(self.handle_initialize()),
+            "initialize" => {
+                self.remember_client_info(&params).await;
+                Ok(self.handle_initialize())
+            }
             "tools/list" => Ok(self.handle_agent_tools_list()),
             "tools/call" => self.handle_agent_tools_call(&params).await,
             "lattice/tools/list_all" => Ok(self.handle_tools_list()),
