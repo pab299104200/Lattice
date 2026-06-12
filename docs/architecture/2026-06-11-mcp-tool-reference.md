@@ -51,6 +51,22 @@ The 8 public verbs reuse the existing compact workflow renderers and structured 
 
 Memory returned through `recall` is recall, not proof. Callers must use the trust diagnostics, checkout state, evidence links, and verification modes before relying on durable memory in high-risk work.
 
+## CLI Twins
+
+The `lattice` binary exposes shell equivalents for the same public verbs:
+
+```bash
+lattice context "<query>" [--mode ...] [--files ...]
+lattice impact <symbol|path|--diff> [--no-tests]
+lattice search "<query>" [--kind symbol|flow|links]
+lattice diagnose [-]
+lattice remember "<content>" [--kind quick|durable|outcome]
+lattice recall "<query>" [--mode search|task]
+lattice status [--scope index|docs|memory]
+```
+
+The CLI speaks the same daemon protocol as the stdio proxy but does not auto-start the daemon. Markdown is the default stdout format; `--json` returns the raw MCP result. `lattice context` defaults to `--mode subsystem` to keep shell calls query-relevant and under the latency budget; pass `--mode auto` or a more specific mode for broader routing. Exit code `2` means the daemon is unreachable, and exit code `3` means the CLI timeout expired.
+
 ## Validation
 
 The phase-2 contract is guarded by:
@@ -59,3 +75,8 @@ The phase-2 contract is guarded by:
 - `cargo test -p lattice-daemon --bin lattice mcp_compat_tests`
 - `cargo test --workspace`
 - A real `--stdio` MCP handshake whose `tools/list` response contains exactly the 8 public names above.
+
+The phase-3 CLI contract is guarded by:
+
+- `cargo test -p lattice-daemon --test cli_query_tests`
+- A live `lattice context ... --timeout 2` smoke test against the daemon with measured latency under 2 seconds.

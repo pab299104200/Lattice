@@ -145,6 +145,22 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 
 The configured command should stay `lattice --stdio --workspace ...`. Do not point MCP clients at `lattice --daemon`; that mode is the long-lived internal server that proxies start or reuse automatically.
 
+## CLI Query Interface
+
+The same 8 public verbs are available from the shell. These commands are thin clients to the live daemon over `LATTICE_DAEMON_ADDR` and auto-detect the workspace root by walking up from `$PWD` to a repo marker such as `.mcp.json`, `.lattice`, or `.git`. `lattice context` defaults to `--mode subsystem` for query-relevant shell latency; pass `--mode auto`, `--mode docs`, or another mode when you want broader routing.
+
+```bash
+lattice context "how does memory verification work?" --mode docs
+lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
+lattice search "McpHandler" --kind symbol
+lattice diagnose -
+lattice remember "Verified CLI context path with cargo test" --kind quick
+lattice recall "CLI context path" --mode search
+lattice status --scope index
+```
+
+Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. The daemon-down message is intentionally one actionable line: `lattice daemon not running — start with: lattice --daemon`.
+
 ## MCP Tools
 
 `tools/list` advertises exactly these 8 agent-facing tools:

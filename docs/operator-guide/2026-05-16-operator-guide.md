@@ -22,6 +22,19 @@ After building, use the canonical restart procedure in [Operator Runbook](./2026
 
 The MCP contract and tool list are in [MCP Tool Reference](../architecture/2026-06-11-mcp-tool-reference.md#public-mcp-tools).
 
+The same verbs are available from the shell once the daemon is running:
+
+```bash
+lattice context "where is daemon MCP dispatch?" --mode auto
+lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
+lattice search "McpHandler" --kind symbol
+lattice diagnose -
+lattice recall "last daemon CLI change" --mode search
+lattice status --scope index
+```
+
+CLI output defaults to compact Markdown. `lattice context` defaults to `--mode subsystem` for query-relevant shell latency; pass `--mode auto` or a more specific mode when broader routing is worth the cost. Use `--json` for raw machine-readable output, `--workspace <path>` to override workspace detection, and `--timeout <seconds>` to cap wall-clock time. Exit code `2` means the daemon is unreachable; start it with `lattice --daemon` or let an MCP stdio proxy start it.
+
 ## Daily operations
 
 Use high-level workflow tools for assistant tasks:
@@ -35,6 +48,7 @@ Use high-level workflow tools for assistant tasks:
 Operational rules:
 
 - Keep MCP clients on `--stdio`; `--daemon` is the internal long-lived process started by proxies.
+- Use the CLI query commands from shell-based agents or manual diagnostics when MCP tool loading is unavailable or slower than a shell call.
 - Use `LATTICE_DAEMON_ADDR` only when the default loopback listener `127.0.0.1:47659` conflicts with another local service.
 - Bound resident daemon memory with `LATTICE_MAX_LOADED_WORKSPACES` and `LATTICE_WORKSPACE_IDLE_TTL_SECS`; defaults are `8` loaded runtimes and `1800` seconds idle TTL.
 - Leave `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC` unset unless the operator explicitly wants full-graph semantic embedding sync during background indexing.

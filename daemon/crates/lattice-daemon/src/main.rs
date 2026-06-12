@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod cli;
 mod doctor;
 mod lifecycle_log;
 mod proxy;
@@ -61,6 +62,10 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    if cli::is_cli_query_command() {
+        std::process::exit(cli::run_from_env().await);
     }
 
     if has_arg("--daemon") {

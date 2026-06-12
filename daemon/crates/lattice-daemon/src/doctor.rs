@@ -280,7 +280,13 @@ fn self_handshake(root: Option<&PathBuf>) -> Result<(usize, u128)> {
         2,
     )?;
     let tools_line = output
-        .get(1)
+        .iter()
+        .find(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                == Some(json!(2))
+        })
         .ok_or_else(|| anyhow::anyhow!("missing tools/list response"))?;
     let response: JsonRpcLine = serde_json::from_str(tools_line)?;
     if let Some(error) = response.error {
@@ -292,6 +298,9 @@ fn self_handshake(root: Option<&PathBuf>) -> Result<(usize, u128)> {
         .and_then(|result| result["tools"].as_array())
         .map(Vec::len)
         .unwrap_or_default();
+    if count != 8 {
+        anyhow::bail!("tools/list returned {count} tools, expected 8");
+    }
     Ok((count, started.elapsed().as_millis()))
 }
 
