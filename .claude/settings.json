@@ -1,0 +1,49 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledPlugins": {
+    "superpowers@superpowers-marketplace": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/post-tool-use.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/session-start.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/stop.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/user-prompt-submit.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

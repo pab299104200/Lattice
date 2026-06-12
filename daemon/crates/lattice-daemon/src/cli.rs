@@ -178,12 +178,22 @@ fn parse_context(parser: &mut ArgParser) -> Result<CliRequest> {
         .take_flag_value("--mode")?
         .unwrap_or_else(|| "subsystem".to_string());
     let files = parser.take_repeated("--files")?;
+    let min_relevance = parser.take_flag_value("--min-relevance")?;
     let query = parser.join_positionals();
     if query.trim().is_empty() {
         return Err(anyhow!("context requires a query"));
     }
     let mut arguments = json!({ "query": query });
     set_value(&mut arguments, "mode", json!(mode));
+    if let Some(min_relevance) = min_relevance {
+        let score = min_relevance
+            .parse::<f64>()
+            .with_context(|| format!("invalid --min-relevance `{}`", min_relevance))?;
+        if !(score.is_finite() && (0.0..=1.0).contains(&score)) {
+            return Err(anyhow!("--min-relevance must be a number from 0.0 to 1.0"));
+        }
+        set_value(&mut arguments, "min_relevance", json!(score));
+    }
     if !files.is_empty() {
         set_value(&mut arguments, "files", json!(files));
     }
@@ -607,6 +617,8 @@ mod tests {
             "docs".into(),
             "--files".into(),
             "README.md".into(),
+            "--min-relevance".into(),
+            "0.35".into(),
             "--json".into(),
             "--timeout".into(),
             "1.5".into(),
@@ -620,6 +632,7 @@ mod tests {
         assert_eq!(request.tool, "context");
         assert_eq!(request.arguments["query"], "auth flow");
         assert_eq!(request.arguments["mode"], "docs");
+        assert_eq!(request.arguments["min_relevance"], 0.35);
         assert!(request.json);
         assert_eq!(request.timeout, Duration::from_millis(1500));
     }

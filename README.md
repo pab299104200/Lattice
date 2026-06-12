@@ -145,6 +145,8 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 
 The configured command should stay `lattice --stdio --workspace ...`. Do not point MCP clients at `lattice --daemon`; that mode is the long-lived internal server that proxies start or reuse automatically.
 
+For the full agent setup path, including Claude Code hooks, Codex `config.toml`, CLI usage, duplicate-registration rules, and `lattice doctor` verification, see `docs/operator-guide/agent-integration.md`.
+
 ## CLI Query Interface
 
 The same 8 public verbs are available from the shell. These commands are thin clients to the live daemon over `LATTICE_DAEMON_ADDR` and auto-detect the workspace root by walking up from `$PWD` to a repo marker such as `.mcp.json`, `.lattice`, or `.git`. `lattice context` defaults to `--mode subsystem` for query-relevant shell latency; pass `--mode auto`, `--mode docs`, or another mode when you want broader routing.
