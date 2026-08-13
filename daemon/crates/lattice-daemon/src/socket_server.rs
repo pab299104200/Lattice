@@ -10,12 +10,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::hook_session_route::{HookSessionRoute, HOOK_SESSION_OPEN_METHOD};
+use crate::hook_session_route::{
+    HookSessionRoute, HOOK_EVENT_METHOD, HOOK_SESSION_CLOSE_METHOD, HOOK_SESSION_OPEN_METHOD,
+};
 use crate::lifecycle_log;
 use crate::proxy::daemon_addr;
 use crate::rpc::protocol::{format_response, parse_request, JsonRpcResponse};
 use crate::rpc::server::RequestHandler;
-use crate::transport::{ConnectionMetadata, ProxyRequest, ServerTransport};
+use crate::transport::{ClientKind, ConnectionMetadata, ProxyRequest, ServerTransport};
 
 struct ActiveRequest {
     generation: u64,
@@ -1015,7 +1017,7 @@ async fn handle_proxy_connection(
 async fn run_json_rpc_connection(
     daemon: Arc<GlobalDaemon>,
     proxy_request: ProxyRequest,
-    _connection: ConnectionMetadata,
+    connection: ConnectionMetadata,
     mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
@@ -1047,16 +1049,37 @@ async fn run_json_rpc_connection(
                 let is_notification = request.id.is_null();
                 let request_id = request_id_key(&request.id);
 
-                if request.method == HOOK_SESSION_OPEN_METHOD {
+                if matches!(
+                    request.method.as_str(),
+                    HOOK_SESSION_OPEN_METHOD | HOOK_EVENT_METHOD | HOOK_SESSION_CLOSE_METHOD
+                ) {
                     if is_notification {
                         continue;
                     }
-                    let response = match daemon.hook_session_route.as_ref() {
+                    let response = if connection.client_kind != ClientKind::HookAdapter {
+                        JsonRpcResponse::error(
+                            request.id,
+                            -32601,
+                            "Method not found".to_string(),
+                        )
+                    } else { match daemon.hook_session_route.as_ref() {
                         Some(route) => {
                             let route = Arc::clone(route);
                             let hook_request = proxy_request.clone();
+                            let method = request.method;
                             match tokio::task::spawn_blocking(move || {
-                                route.handle(&hook_request, request.params)
+                                match method.as_str() {
+                                    HOOK_SESSION_OPEN_METHOD => {
+                                        route.handle_open(&hook_request, request.params)
+                                    }
+                                    HOOK_EVENT_METHOD => {
+                                        route.handle_event(&hook_request, request.params)
+                                    }
+                                    HOOK_SESSION_CLOSE_METHOD => {
+                                        route.handle_close(&hook_request, request.params)
+                                    }
+                                    _ => unreachable!("hook route was matched above"),
+                                }
                             }).await {
                                 Ok(Ok(result)) => JsonRpcResponse::success(request.id, result),
                                 Ok(Err(error)) => {
@@ -1075,8 +1098,19 @@ async fn run_json_rpc_connection(
                             -32603,
                             "hook session service is unavailable".to_string(),
                         ),
-                    };
+                    }};
                     write_response(&mut writer, &response).await?;
+                    continue;
+                }
+
+                if connection.client_kind == ClientKind::HookAdapter {
+                    if !is_notification {
+                        write_response(&mut writer, &JsonRpcResponse::error(
+                            request.id,
+                            -32601,
+                            "Method not found".to_string(),
+                        )).await?;
+                    }
                     continue;
                 }
 
@@ -1266,17 +1300,17 @@ mod tests {
             focus_files: Vec::new(),
             focus_dirs: Vec::new(),
         };
-        let (mut reader, mut writer, server) =
-            authenticated_test_connection(Arc::clone(&daemon), &proxy_request).await;
+        let (mut reader, mut writer, server) = authenticated_test_connection_kind(
+            Arc::clone(&daemon),
+            &proxy_request,
+            ClientKind::HookAdapter,
+        )
+        .await;
 
         assert!(daemon.shards.lock().await.is_empty());
-        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&root).unwrap();
         let params = serde_json::json!({
             "integration": "codex/v1",
             "host_session_id": "host-session-1",
-            "checkout_root": identity.checkout_root.to_string_lossy(),
-            "repository_id": identity.repository_id,
-            "checkout_id": identity.checkout_root.to_string_lossy(),
         });
         let mut unknown = params.clone();
         unknown["client_name"] = serde_json::json!("trusted-hook");
@@ -1285,17 +1319,7 @@ mod tests {
         assert_eq!(rejected_label["error"]["code"], -32602);
         assert_eq!(
             rejected_label["error"]["message"],
-            "hook session open request is invalid"
-        );
-
-        let mut mismatch = params.clone();
-        mismatch["repository_id"] = serde_json::json!("claimed-repository");
-        write_json_rpc_request(&mut writer, 0, HOOK_SESSION_OPEN_METHOD, mismatch).await;
-        let rejected_identity = read_json_line(&mut reader).await;
-        assert_eq!(rejected_identity["error"]["code"], -32001);
-        assert_eq!(
-            rejected_identity["error"]["message"],
-            "hook session open rejected"
+            "hook request is invalid"
         );
         assert!(daemon.shards.lock().await.is_empty());
 
@@ -1308,7 +1332,7 @@ mod tests {
         write_json_rpc_request(&mut writer, 2, HOOK_SESSION_OPEN_METHOD, params.clone()).await;
         let exclusive = read_json_line(&mut reader).await;
         assert_eq!(exclusive["error"]["code"], -32001);
-        assert_eq!(exclusive["error"]["message"], "hook session open rejected");
+        assert_eq!(exclusive["error"]["message"], "hook request rejected");
 
         let mut resumed_params = params;
         resumed_params["resume"] = serde_json::json!({
@@ -1366,9 +1390,12 @@ mod tests {
             focus_files: Vec::new(),
             focus_dirs: Vec::new(),
         };
-        let (mut reader, mut writer, server) =
-            authenticated_test_connection(Arc::clone(&daemon), &proxy_request).await;
-        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&root).unwrap();
+        let (mut reader, mut writer, server) = authenticated_test_connection_kind(
+            Arc::clone(&daemon),
+            &proxy_request,
+            ClientKind::HookAdapter,
+        )
+        .await;
         write_json_rpc_request(
             &mut writer,
             1,
@@ -1376,15 +1403,12 @@ mod tests {
             serde_json::json!({
                 "integration": "codex/v1",
                 "host_session_id": "host-session-1",
-                "checkout_root": identity.checkout_root.to_string_lossy(),
-                "repository_id": identity.repository_id,
-                "checkout_id": identity.checkout_root.to_string_lossy(),
             }),
         )
         .await;
         let rejected = read_json_line(&mut reader).await;
         assert_eq!(rejected["error"]["code"], -32001);
-        assert_eq!(rejected["error"]["message"], "hook session open rejected");
+        assert_eq!(rejected["error"]["message"], "hook request rejected");
         assert!(daemon.shards.lock().await.is_empty());
 
         drop(writer);
@@ -1393,6 +1417,45 @@ mod tests {
         drop(daemon);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_hook_clients_cannot_call_hook_routes() {
+        let root = committed_test_repository("hook-client-kind");
+        let state = unique_test_root("hook-client-kind-state");
+        let route = HookSessionRoute::open_at(&state).expect("open test hook route");
+        let daemon =
+            Arc::new(GlobalDaemon::new_with_config(8, false).with_hook_session_route(route));
+        let proxy_request = ProxyRequest {
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        for kind in [ClientKind::StdioProxy, ClientKind::Cli, ClientKind::Doctor] {
+            let (mut reader, mut writer, server) =
+                authenticated_test_connection_kind(Arc::clone(&daemon), &proxy_request, kind).await;
+            write_json_rpc_request(
+                &mut writer,
+                1,
+                HOOK_SESSION_OPEN_METHOD,
+                serde_json::json!({
+                    "integration": "codex/v1",
+                    "host_session_id": "not-authorized",
+                }),
+            )
+            .await;
+            let rejected = read_json_line(&mut reader).await;
+            assert_eq!(rejected["error"]["code"], -32601);
+            assert_eq!(rejected["error"]["message"], "Method not found");
+            drop(writer);
+            drop(reader);
+            server.await.unwrap().unwrap();
+        }
+        assert!(daemon.shards.lock().await.is_empty());
+
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(state).unwrap();
     }
 
@@ -2170,6 +2233,18 @@ mod tests {
         tokio::net::tcp::OwnedWriteHalf,
         JoinHandle<Result<()>>,
     ) {
+        authenticated_test_connection_kind(daemon, request, ClientKind::Cli).await
+    }
+
+    async fn authenticated_test_connection_kind(
+        daemon: Arc<GlobalDaemon>,
+        request: &ProxyRequest,
+        client_kind: ClientKind,
+    ) -> (
+        tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        tokio::net::tcp::OwnedWriteHalf,
+        JoinHandle<Result<()>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let transport = Arc::new(ServerTransport::issue(&address).unwrap());
@@ -2178,7 +2253,7 @@ mod tests {
             handle_proxy_connection(daemon, transport, stream).await
         });
         let mut client = TcpStream::connect(&address).await.unwrap();
-        client_handshake(&mut client, &address, ClientKind::Cli, request)
+        client_handshake(&mut client, &address, client_kind, request)
             .await
             .unwrap();
         let (read_half, write_half) = client.into_split();

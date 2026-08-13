@@ -214,6 +214,9 @@ pub struct RegistryVerifyRequest {
     pub current_checkout: HookCheckoutIdentity,
     pub now_ms: i64,
     pub idle_ttl_ms: i64,
+    /// Allows only an exact, already-sealed close receipt to authenticate for
+    /// idempotent retry. Ordinary traffic must leave this unset.
+    pub replay_delivery_id: Option<RegistryId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -631,8 +634,22 @@ impl HookSessionRegistry {
             return Err(HookRegistryError::AuthorityMismatch);
         }
         expire_binding_if_needed(&transaction, &mut binding, request.now_ms)?;
+        let sealed_close_replay = if binding.state == RegistryBindingState::Sealed {
+            match request.replay_delivery_id.as_ref() {
+                Some(delivery_id) => load_receipt_from(&transaction, &binding_id, delivery_id)?
+                    .is_some_and(|receipt| {
+                        receipt.kind == RegistryDeliveryKind::Close
+                            && receipt.status == RegistryReceiptStatus::Sealed
+                            && receipt.prune_after_ms > request.now_ms
+                    }),
+                None => false,
+            }
+        } else {
+            false
+        };
         let state_error = match binding.state {
             RegistryBindingState::Open => None,
+            RegistryBindingState::Sealed if sealed_close_replay => None,
             RegistryBindingState::Sealed => Some(HookRegistryError::Sealed),
             RegistryBindingState::Expired => Some(HookRegistryError::Expired),
             RegistryBindingState::Revoked => Some(HookRegistryError::Revoked),
@@ -641,22 +658,23 @@ impl HookSessionRegistry {
             transaction.commit()?;
             return Err(error);
         }
-        let idle_deadline_ms = request
-            .now_ms
-            .checked_add(request.idle_ttl_ms)
-            .ok_or(HookRegistryError::InvalidValue)?
-            .min(binding.absolute_deadline_ms);
-        transaction.execute(
-            "UPDATE hook_bindings
-             SET row_version = row_version + 1, last_seen_at_ms = ?2,
-                 idle_deadline_ms = ?3
-             WHERE binding_id = ?1 AND state = 'open'",
-            params![
-                binding.binding_id.as_bytes(),
-                request.now_ms,
-                idle_deadline_ms
-            ],
-        )?;
+        let idle_deadline_ms = if binding.state == RegistryBindingState::Open {
+            let deadline = request
+                .now_ms
+                .checked_add(request.idle_ttl_ms)
+                .ok_or(HookRegistryError::InvalidValue)?
+                .min(binding.absolute_deadline_ms);
+            transaction.execute(
+                "UPDATE hook_bindings
+                 SET row_version = row_version + 1, last_seen_at_ms = ?2,
+                     idle_deadline_ms = ?3
+                 WHERE binding_id = ?1 AND state = 'open'",
+                params![binding.binding_id.as_bytes(), request.now_ms, deadline],
+            )?;
+            deadline
+        } else {
+            binding.idle_deadline_ms
+        };
         transaction.commit()?;
         Ok(RegistryVerification {
             binding_id: request.binding_id,
@@ -735,6 +753,8 @@ impl HookSessionRegistry {
             return Err(error);
         }
         if admission.sequence < binding.next_sequence {
+            revoke_in(&transaction, &admission.binding_id)?;
+            transaction.commit()?;
             return Err(HookRegistryError::OrderViolation);
         }
         if admission.sequence.saturating_sub(binding.next_sequence) > self.config.reorder_window {
@@ -869,6 +889,34 @@ impl HookSessionRegistry {
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![now_ms, to_i64(limit as u64)?], pending_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Returns available work for one exact binding. This prevents unrelated
+    /// noisy bindings from starving bounded recovery of the active lease.
+    pub fn pending_for_binding(
+        &self,
+        binding_id: &RegistryId,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<RegistryPendingDelivery>, HookRegistryError> {
+        if limit == 0 || limit > 4_096 || now_ms < 0 {
+            return Err(HookRegistryError::InvalidValue);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT schema_version, row_version, binding_id, delivery_id,
+                    sequence_number, delivery_kind, event_schema_version,
+                    normalized_hash, admitted_at_ms, attempt_count,
+                    available_after_ms
+             FROM hook_outbox
+             WHERE binding_id = ?1 AND available_after_ms <= ?2
+             ORDER BY sequence_number ASC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![binding_id.as_bytes(), now_ms, to_i64(limit as u64)?],
+            pending_from_row,
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1619,6 +1667,7 @@ mod tests {
                         .unwrap(),
                     now_ms: 90,
                     idle_ttl_ms: 100,
+                    replay_delivery_id: None,
                 },
             )
             .unwrap();
@@ -1639,6 +1688,7 @@ mod tests {
                         .unwrap(),
                     now_ms: 100,
                     idle_ttl_ms: 100,
+                    replay_delivery_id: None,
                 },
             )
             .unwrap_err();
