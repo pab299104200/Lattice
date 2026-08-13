@@ -43,6 +43,12 @@ pub struct BatchIndexReport {
     pub requested_count: usize,
     pub indexed_count: usize,
     pub is_partial: bool,
+    /// Successfully parsed upserts. Used by shard health to resolve a prior
+    /// parse failure for the same path.
+    pub indexed_files: Vec<String>,
+    /// Requested deletions, whether or not the file had a previous graph
+    /// entry. A deleted file can no longer leave the shard partially indexed.
+    pub removed_files: Vec<String>,
     pub failures: Vec<IndexFailure>,
 }
 
@@ -171,6 +177,8 @@ impl Indexer {
                 requested_count: 0,
                 indexed_count: 0,
                 is_partial: false,
+                indexed_files: Vec::new(),
+                removed_files: Vec::new(),
                 failures: Vec::new(),
             };
         }
@@ -186,10 +194,12 @@ impl Indexer {
         }
 
         let mut count = 0usize;
+        let mut indexed_files = Vec::new();
         let mut failures = Vec::new();
         for handle in handles {
             match handle.await {
                 Ok((_file, Ok(parsed))) => {
+                    indexed_files.push(parsed.file.clone());
                     self.parsed_files.insert(parsed.file.clone(), parsed);
                     count += 1;
                 }
@@ -218,6 +228,8 @@ impl Indexer {
             requested_count,
             indexed_count: count,
             is_partial: count != requested_count || !failures.is_empty(),
+            indexed_files,
+            removed_files: Vec::new(),
             failures,
         }
     }
