@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-# shellcheck source=/home/pete/cadres/lattice/integrations/claude-code/hooks/common.sh
+# shellcheck disable=SC1091 # Sibling source path is resolved dynamically for portable project installs.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 if ! lattice_hook_ready; then
@@ -23,6 +23,5 @@ case "$context" in
   *"No relevant"* | *"no relevant"* | *"no result"* | *"No result"*) exit 0 ;;
 esac
 
-content="$(printf '## Lattice Prompt Context\n\n%s\n' "$context" | lattice_limit_chars "${LATTICE_HOOK_PROMPT_CHAR_BUDGET:-4800}")"
-lattice_emit_context "UserPromptSubmit" "$content"
+printf '## Lattice Prompt Context\n\n%s\n' "$context" | lattice_limit_chars "${LATTICE_HOOK_PROMPT_CHAR_BUDGET:-4800}"
 exit 0

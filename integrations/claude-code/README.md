@@ -17,14 +17,14 @@ Implementation choice: Lattice uses this `install.sh` package instead of adding 
 - `PostToolUse`: for `Edit|Write`, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
 - `Stop`: extracts edited files from the hook payload and calls `lattice remember --kind outcome` so the next session can recall the work.
 
-Every script first checks whether the Lattice binary exists and whether the daemon answers `lattice status` within `LATTICE_HOOK_PROBE_TIMEOUT` seconds. If either check fails, the script exits `0` without output so hooks never break a Claude session.
+Every script first checks whether the Lattice binary exists and whether the daemon answers `lattice status` within `LATTICE_HOOK_PROBE_TIMEOUT` seconds. The readiness probe uses the same verb-first CLI shape as delivery calls, so normal CLI workspace detection remains authoritative. If either check fails, the script exits `0` without output so hooks never break a Claude session. Session recall and rule lookup run concurrently.
 
 Actual hook calls set `LATTICE_CLIENT_NAME=claude-code` and `LATTICE_CLIENT_CHANNEL=hook` before invoking the CLI. Readiness probes set `LATTICE_SKIP_METRICS=1`, so `lattice metrics` measures delivered hook value instead of probe noise.
 
 ## Controls
 
 - Set `LATTICE_BIN=/absolute/path/to/lattice` to force a binary path.
-- Set `LATTICE_HOOK_PROBE_TIMEOUT` to tune the readiness probe timeout; the default is `0.2` seconds.
+- Set `LATTICE_HOOK_PROBE_TIMEOUT` to tune the readiness probe timeout; the default is `0.5` seconds.
 - Set `LATTICE_HOOK_MIN_RELEVANCE` to tune prompt context filtering.
 - Set `LATTICE_HOOK_MIN_DEPENDENTS` to tune PostToolUse noise filtering.
 - Disable a hook by removing its entry from `.claude/settings.json`.

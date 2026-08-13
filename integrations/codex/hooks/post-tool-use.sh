@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-# shellcheck source=/home/pete/cadres/lattice/integrations/claude-code/hooks/common.sh
+# shellcheck disable=SC1091 # Sibling source path is resolved dynamically for portable project installs.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 if ! lattice_hook_ready; then
@@ -41,9 +41,7 @@ for line in lines[:10]:
 '
 )"
 
-if [[ -z "${summary//[[:space:]]/}" ]]; then
-  exit 0
+if [[ -n "${summary//[[:space:]]/}" ]]; then
+  printf '## Lattice Edit Impact\n\n%s\n' "$summary"
 fi
-
-lattice_emit_context "PostToolUse" "## Lattice Edit Impact"$'\n\n'"$summary"
 exit 0

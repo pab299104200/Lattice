@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -u
 
-# shellcheck source=/home/pete/cadres/lattice/integrations/claude-code/hooks/common.sh
+# shellcheck disable=SC1091 # Sibling source path is resolved dynamically for portable project installs.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 if ! lattice_hook_ready; then
   exit 0
 fi
 
-temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lattice-claude-session.XXXXXX")" || exit 0
+temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lattice-codex-session.XXXXXX")" || exit 0
 trap 'rm -rf -- "$temp_dir"' EXIT
 
 lattice_hook_call recall "session start" --mode task --json --timeout "${LATTICE_HOOK_TIMEOUT:-3.5}" >"$temp_dir/recall" 2>/dev/null &
@@ -20,8 +20,8 @@ wait "$rules_pid" 2>/dev/null || true
 
 recall_json="$(<"$temp_dir/recall")"
 rules="$(<"$temp_dir/rules")"
-
 recall_text="$(printf '%s' "$recall_json" | lattice_json_text 2>/dev/null || true)"
+
 content="$(
   {
     printf '## Lattice Session Context\n\n'
@@ -34,5 +34,7 @@ content="$(
   } | lattice_limit_chars "${LATTICE_HOOK_SESSION_CHAR_BUDGET:-6000}"
 )"
 
-lattice_emit_context "SessionStart" "$content"
+if [[ -n "${content//[[:space:]]/}" ]]; then
+  printf '%s\n' "$content"
+fi
 exit 0
