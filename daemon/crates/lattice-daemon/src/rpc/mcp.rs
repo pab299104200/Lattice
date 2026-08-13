@@ -125,6 +125,11 @@ const TINY_WORKFLOW_TOKEN_CAP: usize = 260;
 const COMPACT_WORKFLOW_TOKEN_CAP: usize = 850;
 const FULL_WORKFLOW_TOKEN_CAP: usize = 2600;
 
+pub(crate) const AGENT_CONTEXT_MODE_DEFAULT: &str = "auto";
+pub(crate) const AGENT_IMPACT_LIMIT_DEFAULT: u64 = 12;
+pub(crate) const AGENT_RECALL_MODE_DEFAULT: &str = "search";
+pub(crate) const AGENT_STATUS_SCOPE_DEFAULT: &str = "index";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowWireFormat {
     Auto,
@@ -626,12 +631,14 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "query": { "type": "string", "description": "Natural language query for retrieval modes." },
                             "mode": {
                                 "type": "string",
                                 "description": "Context mode.",
                                 "enum": ["auto", "focused", "subsystem", "docs", "skeleton", "working_set", "rules", "expand", "repo"],
-                                "default": "auto"
+                                "default": AGENT_CONTEXT_MODE_DEFAULT
                             },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
@@ -651,6 +658,8 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "task": { "type": "string", "description": "Natural language task." },
                             "query": { "type": "string", "description": "Alias for task." },
                             "mode": {
@@ -674,6 +683,8 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "target": { "description": "Symbol/file/diff target. May be a string or object.", "oneOf": [{ "type": "string" }, { "type": "object" }] },
                             "direction": { "type": "string", "enum": ["dependents", "dependencies", "both", "diff", "tests"], "default": "dependents" },
                             "include_tests": { "type": "boolean", "default": true },
@@ -683,7 +694,7 @@ impl McpHandler {
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
                             "hops": { "type": "integer", "default": 3 },
-                            "limit": { "type": "integer", "default": 8 },
+                            "limit": { "type": "integer", "default": AGENT_IMPACT_LIMIT_DEFAULT },
                             "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
                             "max_tokens": { "type": "integer" },
                             "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
@@ -697,6 +708,8 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "failure_text": { "type": "string" },
                             "input": { "type": "string", "description": "Alias for failure_text." },
                             "context_files": { "type": "array", "items": { "type": "string" } },
@@ -716,6 +729,8 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "query": { "type": "string" },
                             "kind": { "type": "string", "enum": ["symbol", "flow", "links", "symbol_detail"], "default": "symbol" },
                             "name": { "type": "string" },
@@ -739,6 +754,8 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "content": { "type": "string" },
                             "kind": { "type": "string", "enum": ["quick", "durable", "outcome"], "default": "quick" },
                             "task": { "type": "string" },
@@ -766,11 +783,13 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "query": { "type": "string" },
-                            "mode": { "type": "string", "enum": ["search", "task", "verify"], "default": "search" },
+                            "mode": { "type": "string", "enum": ["search", "task", "verify"], "default": AGENT_RECALL_MODE_DEFAULT },
                             "task_id": { "type": "string" },
                             "task_statement": { "type": "string" },
-                            "memory_id": {},
+                            "memory_id": { "type": "string" },
                             "limit": { "type": "integer" },
                             "budget_tokens": { "type": "integer" },
                             "focus_files": { "type": "array", "items": { "type": "string" } },
@@ -786,11 +805,13 @@ impl McpHandler {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts"], "default": "index" },
+                            "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
+                            "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
+                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts"], "default": AGENT_STATUS_SCOPE_DEFAULT },
                             "query": { "type": "string" },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
-                            "anchor": {},
+                            "anchor": { "type": "string" },
                             "limit": { "type": "integer" },
                             "cursor": { "type": "integer" },
                             "render_mode": { "type": "string", "enum": ["compact", "full", "diagnostic"] }
@@ -847,7 +868,7 @@ impl McpHandler {
     }
 
     async fn tool_agent_context(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let mode = args["mode"].as_str().unwrap_or("auto");
+        let mode = args["mode"].as_str().unwrap_or(AGENT_CONTEXT_MODE_DEFAULT);
         let mut routed = clone_object_value(args);
         match mode {
             "focused" => {
@@ -867,7 +888,7 @@ impl McpHandler {
             "working_set" => self.tool_get_working_set_context(&routed).await,
             "rules" => self.tool_get_project_rules(&routed).await,
             "expand" => self.tool_expand_context(&routed).await,
-            "repo" | "playbook" => self.tool_get_repo_playbook(&routed).await,
+            "repo" => self.tool_get_repo_playbook(&routed).await,
             "auto" | _ => {
                 set_string(&mut routed, "mode", "full");
                 self.tool_query_context(&routed).await
@@ -944,7 +965,10 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: file".to_string()))?;
         let hops = (args["hops"].as_u64().unwrap_or(3) as usize).min(10);
-        let symbol_limit = (args["limit"].as_u64().unwrap_or(12) as usize).min(50);
+        let symbol_limit = (args["limit"]
+            .as_u64()
+            .unwrap_or(AGENT_IMPACT_LIMIT_DEFAULT) as usize)
+            .min(50);
         let relation_limit = 25usize;
 
         let engine = self.engine.lock().await;
@@ -1082,7 +1106,7 @@ impl McpHandler {
     }
 
     async fn tool_agent_recall(&self, args: &Value) -> Result<Value, (i32, String)> {
-        match args["mode"].as_str().unwrap_or("search") {
+        match args["mode"].as_str().unwrap_or(AGENT_RECALL_MODE_DEFAULT) {
             "task" => self.tool_get_task_memory_v2(args).await,
             "verify" => self.tool_verify_explain_memory(args).await,
             "search" | _ => self.tool_search_memory(args).await,
@@ -1090,7 +1114,7 @@ impl McpHandler {
     }
 
     async fn tool_agent_status(&self, args: &Value) -> Result<Value, (i32, String)> {
-        match args["scope"].as_str().unwrap_or("index") {
+        match args["scope"].as_str().unwrap_or(AGENT_STATUS_SCOPE_DEFAULT) {
             "docs" => self.tool_find_stale_docs(args).await,
             "memory" => self.tool_list_stale_memories(args).await,
             "conflicts" => self.tool_list_memory_conflicts(args).await,

@@ -6,6 +6,10 @@
 use serde_json::json;
 
 use super::super::server::RequestHandler;
+use super::super::mcp::{
+    AGENT_CONTEXT_MODE_DEFAULT, AGENT_IMPACT_LIMIT_DEFAULT, AGENT_RECALL_MODE_DEFAULT,
+    AGENT_STATUS_SCOPE_DEFAULT,
+};
 use super::{call_args, SchemaFixture};
 
 /// The 8 advertised agent-facing tool names in the order they appear in the reference.
@@ -89,6 +93,72 @@ async fn every_advertised_tool_carries_name_description_and_input_schema() {
             "tool `{name}` schema should declare type=object"
         );
     }
+}
+
+#[tokio::test]
+async fn advertised_defaults_match_dispatcher_defaults() {
+    let fixture = SchemaFixture::new("schema-defaults");
+    let response = fixture
+        .handler
+        .handle("tools/list", json!({}))
+        .await
+        .expect("tools/list succeeds");
+    let tools = response["tools"].as_array().expect("tools array");
+    let schema_for = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))["inputSchema"]
+            .clone()
+    };
+
+    assert_eq!(
+        schema_for("context")["properties"]["mode"]["default"],
+        AGENT_CONTEXT_MODE_DEFAULT
+    );
+    assert_eq!(
+        schema_for("impact")["properties"]["limit"]["default"],
+        AGENT_IMPACT_LIMIT_DEFAULT
+    );
+    assert_eq!(
+        schema_for("recall")["properties"]["mode"]["default"],
+        AGENT_RECALL_MODE_DEFAULT
+    );
+    assert_eq!(
+        schema_for("status")["properties"]["scope"]["default"],
+        AGENT_STATUS_SCOPE_DEFAULT
+    );
+}
+
+#[tokio::test]
+async fn metadata_and_identifier_fields_are_typed() {
+    let fixture = SchemaFixture::new("schema-types");
+    let response = fixture
+        .handler
+        .handle("tools/list", json!({}))
+        .await
+        .expect("tools/list succeeds");
+    let tools = response["tools"].as_array().expect("tools array");
+    for tool_name in ADVERTISED_TOOLS {
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == *tool_name)
+            .expect("advertised tool")["inputSchema"]
+            .clone();
+        for field in ["_lattice_client", "_lattice_channel"] {
+            assert_eq!(schema["properties"][field]["type"], "string");
+        }
+    }
+    assert_eq!(schema_for_tool(&tools, "recall")["properties"]["memory_id"]["type"], "string");
+    assert_eq!(schema_for_tool(&tools, "status")["properties"]["anchor"]["type"], "string");
+}
+
+fn schema_for_tool(tools: &[serde_json::Value], name: &str) -> serde_json::Value {
+    tools
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("missing tool {name}"))["inputSchema"]
+        .clone()
 }
 
 #[tokio::test]
