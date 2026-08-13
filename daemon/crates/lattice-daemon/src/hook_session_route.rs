@@ -363,14 +363,19 @@ fn ensure_private_database_file(path: &Path) -> Result<()> {
         open_private_read(path, "hook-session registry")?;
         return Ok(());
     }
-    OpenOptions::new()
+    match OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .context("failed to create hook-session registry")?
-        .sync_all()?;
+    {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_private_read(path, "hook-session registry")?;
+        }
+        Err(error) => return Err(error).context("failed to create hook-session registry"),
+    }
     validate_private_file(path, "hook-session registry")
 }
 
