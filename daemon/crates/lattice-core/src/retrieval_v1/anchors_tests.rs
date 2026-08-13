@@ -94,6 +94,102 @@ fn unknown_paths_resolve_to_unresolved_without_panicking() {
 }
 
 #[test]
+fn root_level_file_with_known_extension_resolves_as_path_anchor() {
+    let fixture = fixture_builder()
+        .markdown(WORKSPACE, "AGENTS.md", "# Instructions\n")
+        .build();
+    let task = "Update AGENTS.md shared standards routing";
+    let resolved = resolve_anchors(
+        extract_anchors(task, &classify_intent(task)),
+        &fixture.resolver,
+    );
+    let agents = resolved
+        .iter()
+        .find(|anchor| anchor.anchor_text == "AGENTS.md")
+        .expect("root-level path anchor");
+
+    assert!(matches!(
+        agents.resolution,
+        AnchorResolution::Resolved(Identity::File(_))
+    ));
+}
+
+#[test]
+fn root_level_instruction_and_build_files_are_explicit_path_anchors() {
+    let task = "Update AGENTS.md, Cargo.toml, Makefile, README, and .gitignore";
+    let anchors = extract_anchors(task, &classify_intent(task));
+
+    for path in [
+        "AGENTS.md",
+        "Cargo.toml",
+        "Makefile",
+        "README",
+        ".gitignore",
+    ] {
+        let anchor = anchors
+            .iter()
+            .find(|anchor| anchor.anchor_text == path)
+            .unwrap_or_else(|| panic!("missing root path anchor {path}"));
+        assert_eq!(anchor.kind, AnchorKind::Path);
+    }
+}
+
+#[test]
+fn structural_targets_emit_normalized_file_and_qualified_symbol_anchors() {
+    let fixture = fixture_builder()
+        .rust(WORKSPACE, "src/auth.rs", "pub fn login_user() {}\n")
+        .build();
+    let task = "Modify `./src\\auth.rs::login_user()`";
+    let anchors = extract_anchors(task, &classify_intent(task));
+
+    let path = anchors
+        .iter()
+        .find(|anchor| anchor.kind == AnchorKind::Path)
+        .expect("structural file anchor");
+    assert_eq!(path.anchor_text, "src/auth.rs");
+    let symbol = anchors
+        .iter()
+        .find(|anchor| anchor.kind == AnchorKind::Symbol)
+        .expect("qualified symbol anchor");
+    assert_eq!(symbol.anchor_text, "src/auth.rs::login_user");
+
+    let resolved = resolve_anchors(anchors, &fixture.resolver);
+    assert!(resolved.iter().any(|anchor| {
+        anchor.anchor_text == "src/auth.rs"
+            && matches!(
+                anchor.resolution,
+                AnchorResolution::Resolved(Identity::File(_))
+            )
+    }));
+    assert!(resolved.iter().any(|anchor| {
+        anchor.anchor_text == "src/auth.rs::login_user"
+            && matches!(
+                anchor.resolution,
+                AnchorResolution::Resolved(Identity::Symbol(_))
+            )
+    }));
+}
+
+#[test]
+fn stack_path_anchors_normalize_windows_separators_and_line_columns() {
+    let fixture = fixture_builder()
+        .rust(WORKSPACE, "src/auth.rs", "pub fn login_user() {}\n")
+        .build();
+    let task = "thread 'main' panicked at .\\src\\auth.rs:12:5";
+    let resolved = resolve_anchors(
+        extract_anchors(task, &classify_intent(task)),
+        &fixture.resolver,
+    );
+
+    assert!(resolved.iter().any(|anchor| {
+        matches!(
+            anchor.resolution,
+            AnchorResolution::Resolved(Identity::File(_))
+        )
+    }));
+}
+
+#[test]
 fn resolver_round_trip_preserves_source_spans() {
     let fixture = fixture_builder()
         .rust(WORKSPACE, "src/auth.rs", "pub fn login_user() {}\n")

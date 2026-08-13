@@ -42,6 +42,15 @@ const MCP_TOOL_NAMES: [&str; 10] = [
     "search_symbols",
     "search_logic_flow",
 ];
+const ROOT_FILE_NAMES: [&str; 7] = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README",
+    "README.md",
+    "Cargo.toml",
+    "Makefile",
+    ".gitignore",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AnchorKind {
@@ -249,9 +258,7 @@ fn extract_line_anchors(line: &str, line_offset: usize) -> Vec<RawAnchor> {
     anchors.extend(extract_tool_api_anchors(line, line_offset));
 
     for token in tokenize_with_spans(line, line_offset) {
-        if let Some(anchor) = classify_token_anchor(line, token) {
-            anchors.push(anchor);
-        }
+        anchors.extend(classify_token_anchors(line, token));
     }
     anchors
 }
@@ -344,31 +351,93 @@ fn extract_tool_api_anchors(line: &str, line_offset: usize) -> Vec<RawAnchor> {
     anchors
 }
 
-fn classify_token_anchor(line: &str, token: TokenSpan) -> Option<RawAnchor> {
+fn classify_token_anchors(line: &str, token: TokenSpan) -> Vec<RawAnchor> {
+    // A structural target carries two useful identities. Keep the literal
+    // file anchor (for exact entry-file retrieval) and the qualified symbol
+    // anchor (for graph lookup), rather than treating the whole target as a
+    // malformed path.
+    if let Some((path, symbol, path_len)) = structural_symbol_parts(&token.text) {
+        let path_span = SourceSpan {
+            start: token.span.start,
+            end: token.span.start + path_len,
+        };
+        let symbol_query = format!("{path}::{symbol}");
+        return vec![
+            path_anchor(&path, path_span),
+            RawAnchor {
+                kind: AnchorKind::Symbol,
+                anchor_text: symbol_query.clone(),
+                source_span: token.span,
+                data: RawAnchorData::Symbol(SymbolAnchor {
+                    query: symbol_query,
+                }),
+            },
+        ];
+    }
     if let Some(anchor) = path_anchor_from_token(&token.text, token.span) {
-        return Some(anchor);
+        return vec![anchor];
     }
     if let Some(anchor) = config_anchor_from_token(&token.text, token.span) {
-        return Some(anchor);
+        return vec![anchor];
     }
     if let Some(anchor) = symbol_anchor_from_token(line, &token.text, token.span) {
-        return Some(anchor);
+        return vec![anchor];
     }
-    None
+    Vec::new()
 }
 
 fn path_anchor_from_token(token: &str, span: SourceSpan) -> Option<RawAnchor> {
     let trimmed = trim_token_edge(token);
-    if !looks_like_path(trimmed) {
+    let (path, heading) = normalized_path_parts(trimmed)?;
+    if !looks_like_path(&path) {
         return None;
     }
-    let (path, heading) = split_markdown_heading(trimmed);
-    Some(RawAnchor {
+    Some(path_anchor(&path, span).with_heading(heading))
+}
+
+fn path_anchor(path: &str, span: SourceSpan) -> RawAnchor {
+    RawAnchor {
         kind: AnchorKind::Path,
-        anchor_text: trimmed.to_string(),
+        anchor_text: path.to_string(),
         source_span: span,
-        data: RawAnchorData::Path(PathAnchor { path, heading }),
-    })
+        data: RawAnchorData::Path(PathAnchor {
+            path: path.to_string(),
+            heading: None,
+        }),
+    }
+}
+
+trait PathAnchorExt {
+    fn with_heading(self, heading: Option<String>) -> RawAnchor;
+}
+
+impl PathAnchorExt for RawAnchor {
+    fn with_heading(mut self, heading: Option<String>) -> RawAnchor {
+        if let RawAnchorData::Path(path) = &mut self.data {
+            path.heading = heading;
+        }
+        self
+    }
+}
+
+fn normalized_path_parts(token: &str) -> Option<(String, Option<String>)> {
+    let token = token.replace('\\', "/");
+    let (path, heading) = split_markdown_heading(&token);
+    let path = split_path_line_column(&path)
+        .map(|(path, _, _)| path.to_string())
+        .unwrap_or(path);
+    let path = path.trim().trim_start_matches("./").trim_start_matches('/');
+    (!path.is_empty()).then(|| (path.to_string(), heading))
+}
+
+fn structural_symbol_parts(token: &str) -> Option<(String, String, usize)> {
+    let trimmed = trim_token_edge(token);
+    let (raw_path, symbol) = trimmed.rsplit_once("::")?;
+    let (path, _) = normalized_path_parts(raw_path)?;
+    if !looks_like_path(&path) || !looks_like_symbol(symbol) {
+        return None;
+    }
+    Some((path, normalize_symbol_token(symbol), raw_path.len()))
 }
 
 fn config_anchor_from_token(token: &str, span: SourceSpan) -> Option<RawAnchor> {
@@ -589,14 +658,17 @@ fn find_embedded_command(line: &str) -> Option<String> {
 
 fn looks_like_path(text: &str) -> bool {
     let lowered = text.to_lowercase();
-    let has_path_separator = lowered.contains('/') || lowered.contains('\\');
+    let basename = lowered.rsplit('/').next().unwrap_or(&lowered);
     let has_known_extension = [
         ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".md", ".json", ".toml",
         ".yaml", ".yml",
     ]
     .iter()
-    .any(|extension| lowered.contains(extension));
-    has_path_separator && has_known_extension
+    .any(|extension| basename.ends_with(extension));
+    has_known_extension
+        || ROOT_FILE_NAMES
+            .iter()
+            .any(|name| basename == name.to_lowercase())
         || lowered.starts_with("src/")
         || lowered.starts_with("docs/")
 }
