@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use thiserror::Error;
+
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
 use crate::storage::{SharedVectorIndex, VectorScope, VectorSearchResult};
@@ -57,6 +59,105 @@ const DOCUMENT_RESULT_QUERY_KEYWORDS: &[&str] = &[
 const FILE_SUMMARY_VECTOR_NAME: &str = "file_summary";
 const FILE_SUMMARY_VECTOR_OFFSET: usize = usize::MAX;
 
+/// Typed rejection from the non-queueing query admission gate.
+///
+/// Query traversal is CPU-bound and runs outside the daemon's short-lived live
+/// engine lock. Callers must reject work when the bounded executor is full
+/// rather than accumulating an unbounded queue of stale requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum QueryAdmissionError {
+    /// A gate must admit at least one query to be useful.
+    #[error("query admission capacity must be greater than zero")]
+    InvalidCapacity,
+    /// All slots are occupied. The caller may return a bounded partial response.
+    #[error("query admission capacity of {capacity} is saturated")]
+    CapacityExhausted { capacity: usize },
+}
+
+#[derive(Debug)]
+struct QueryAdmissionState {
+    active_jobs: usize,
+    capacity: usize,
+}
+
+/// A deterministic, non-queueing admission gate for CPU query jobs.
+///
+/// The permit is intentionally RAII: cancellation of a caller must not free a
+/// slot while its blocking job still executes. The job owns its permit until it
+/// actually exits, which prevents timed-out requests from multiplying in the
+/// background.
+#[derive(Clone, Debug)]
+pub struct QueryAdmission {
+    state: Arc<Mutex<QueryAdmissionState>>,
+}
+
+/// A live query admission. Releasing it returns exactly one slot to its gate.
+#[derive(Debug)]
+pub struct QueryPermit {
+    state: Arc<Mutex<QueryAdmissionState>>,
+}
+
+impl QueryAdmission {
+    /// Create a gate with a fixed positive capacity.
+    pub fn new(capacity: usize) -> Result<Self, QueryAdmissionError> {
+        if capacity == 0 {
+            return Err(QueryAdmissionError::InvalidCapacity);
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(QueryAdmissionState {
+                active_jobs: 0,
+                capacity,
+            })),
+        })
+    }
+
+    /// Admit one job immediately or reject it. This method never queues.
+    pub fn try_acquire(&self) -> Result<QueryPermit, QueryAdmissionError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active_jobs >= state.capacity {
+            return Err(QueryAdmissionError::CapacityExhausted {
+                capacity: state.capacity,
+            });
+        }
+        state.active_jobs += 1;
+        Ok(QueryPermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    /// Fixed capacity configured for this gate.
+    pub fn capacity(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity
+    }
+
+    /// Number of currently executing jobs.
+    pub fn active_jobs(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_jobs
+    }
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A permit is only constructed by `try_acquire`, so an underflow would
+        // be an internal invariant violation. Saturating here keeps poisoned or
+        // panic-unwinding recovery deterministic instead of creating capacity.
+        state.active_jobs = state.active_jobs.saturating_sub(1);
+    }
+}
+
 /// A candidate node with its computed score for ranking.
 struct ScoredCandidate<'a> {
     node: &'a GraphNode,
@@ -71,11 +172,12 @@ struct ScoredCandidate<'a> {
 
 /// The query engine orchestrates intent detection, search, graph traversal,
 /// ranking, and budget allocation to produce Context Capsules.
+#[derive(Clone)]
 pub struct QueryEngine {
     graph: Arc<CodeGraph>,
     vector_index: Option<SharedVectorIndex>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
-    query_history: HashMap<String, usize>,
+    query_history: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl QueryEngine {
@@ -90,7 +192,7 @@ impl QueryEngine {
             graph: Arc::new(graph),
             vector_index,
             memory_store,
-            query_history: HashMap::new(),
+            query_history: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -103,8 +205,30 @@ impl QueryEngine {
             graph,
             vector_index,
             memory_store,
-            query_history: HashMap::new(),
+            query_history: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Capture an immutable query snapshot for work that will run after the
+    /// caller releases the live engine lock.
+    ///
+    /// The returned engine keeps the current graph `Arc`, vector index, memory
+    /// store, and query history. A later `update_graph` on the live engine
+    /// publishes a new graph pointer, so this snapshot can never observe a
+    /// mixed graph generation. Query history remains shared deliberately: its
+    /// adaptive-budget signal is session state, not graph state.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        self.clone()
+    }
+
+    /// Capture the current immutable graph generation without copying it.
+    ///
+    /// This is useful to callers that need a stable structural view but do not
+    /// need to execute the full ranking pipeline.
+    #[must_use]
+    pub fn graph_snapshot(&self) -> Arc<CodeGraph> {
+        Arc::clone(&self.graph)
     }
 
     /// Execute a query and produce a Context Capsule.
@@ -520,6 +644,19 @@ impl QueryEngine {
             .iter()
             .map(|word| word.as_str())
             .collect();
+        let max_modified = all_node_ids
+            .iter()
+            .filter_map(|nid| self.graph.get_node(nid))
+            .map(|node| node.last_modified)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let max_callers = all_node_ids
+            .iter()
+            .map(|nid| self.graph.get_dependents(nid).len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
         for (id, semantic_sim) in &candidate_ids {
             if let Some(node) = self.graph.get_node(id) {
@@ -531,13 +668,6 @@ impl QueryEngine {
                 let centrality = self.graph.centrality(id);
 
                 // Recency: normalize last_modified to 0..1 range based on max
-                let max_modified = all_node_ids
-                    .iter()
-                    .filter_map(|nid| self.graph.get_node(nid))
-                    .map(|n| n.last_modified)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
                 let recency = node.last_modified as f64 / max_modified as f64;
 
                 // Caller count: number of incoming edges (dependents).
@@ -548,12 +678,6 @@ impl QueryEngine {
                 // log(1+n)/log(1+max) compresses the range: 5 deps → ~0.5, 500 → ~0.9
                 // instead of the linear 5→0.01, 500→1.0.
                 let caller_count = self.graph.get_dependents(id).len() as f64;
-                let max_callers = all_node_ids
-                    .iter()
-                    .map(|nid| self.graph.get_dependents(nid).len())
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
                 let caller_norm = (1.0 + caller_count).ln() / (1.0 + max_callers as f64).ln();
 
                 // Hub dampening: symbols with extreme centrality (top 1% by dependents)
@@ -699,7 +823,13 @@ impl QueryEngine {
         }
 
         // Step 5: Budget allocation (adaptive: repeated queries expand context)
-        let repeat_count = self.query_history.get(query_text).copied().unwrap_or(0);
+        let repeat_count = self
+            .query_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(query_text)
+            .copied()
+            .unwrap_or(0);
         let mut pivots = Vec::new();
         let mut context = Vec::new();
         let mut tokens_used: usize = 0;
@@ -1156,12 +1286,29 @@ impl QueryEngine {
     }
 
     /// Record a query for frequency tracking.
-    pub fn record_query(&mut self, query: &str) {
+    pub fn record_query(&self, query: &str) {
+        let mut query_history = self
+            .query_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Cap history size to prevent unbounded memory growth
-        if self.query_history.len() >= 1000 {
-            self.query_history.clear();
+        if query_history.len() >= 1000 {
+            query_history.clear();
         }
-        *self.query_history.entry(query.to_string()).or_insert(0) += 1;
+        *query_history.entry(query.to_string()).or_insert(0) += 1;
+    }
+
+    /// Return the shared adaptive-history count for a query.
+    ///
+    /// This is crate-visible so the daemon and focused concurrency tests can
+    /// verify snapshot behavior without exposing mutable history state.
+    pub(crate) fn recorded_query_count(&self, query: &str) -> usize {
+        self.query_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(query)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Find seed hits using semantic search (vector store) or keyword fallback.

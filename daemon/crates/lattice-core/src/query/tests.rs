@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use super::capsule::QueryIntent;
 use super::engine::{
-    merge_seed_hits, parse_query_filters, query_prefers_markdown_results, QueryEngine,
+    merge_seed_hits, parse_query_filters, query_prefers_markdown_results, QueryAdmission,
+    QueryAdmissionError, QueryEngine,
 };
 use super::intent::detect_intent;
 
@@ -49,6 +50,77 @@ fn test_detect_keyword_heavy_explore() {
 #[test]
 fn test_detect_explore_with_flow_keyword() {
     assert_eq!(detect_intent("user auth flow"), QueryIntent::Explore,);
+}
+
+// ─── Query isolation and bounded admission tests ───────────────────
+
+#[test]
+fn query_snapshot_keeps_one_graph_generation_after_live_publication() {
+    let mut live = QueryEngine::new(build_test_graph(), None, None);
+    let snapshot = live.snapshot();
+    let graph_snapshot = live.graph_snapshot();
+
+    let mut replacement = CodeGraph::new();
+    replacement.add_node(
+        make_id("src/replacement.ts", "replacement", 0),
+        SymbolKind::Function,
+        "replacement".to_string(),
+        "function replacement(): void".to_string(),
+        "function replacement() {}".to_string(),
+        "src/replacement.ts".to_string(),
+        1,
+        1,
+        true,
+        Language::TypeScript,
+    );
+    live.update_graph(replacement);
+
+    assert_eq!(live.graph().stats().node_count, 1);
+    assert_eq!(snapshot.graph().stats().node_count, 4);
+    assert_eq!(graph_snapshot.stats().node_count, 4);
+    assert!(snapshot.find_symbol("loginUser").is_some());
+    assert!(snapshot.find_symbol("replacement").is_none());
+}
+
+#[test]
+fn query_snapshot_shares_adaptive_history_without_sharing_graph_publication() {
+    let mut live = QueryEngine::new(build_test_graph(), None, None);
+    let mut snapshot = live.snapshot();
+
+    live.query("How does loginUser work?", None, false);
+    snapshot.query("How does loginUser work?", None, false);
+
+    assert_eq!(live.recorded_query_count("How does loginUser work?"), 2);
+}
+
+#[test]
+fn query_admission_rejects_at_fixed_capacity_without_queueing() {
+    let admission = QueryAdmission::new(2).expect("valid capacity");
+    let first = admission.try_acquire().expect("first slot");
+    let second = admission.try_acquire().expect("second slot");
+
+    assert_eq!(admission.active_jobs(), 2);
+    assert!(matches!(
+        admission.try_acquire(),
+        Err(QueryAdmissionError::CapacityExhausted { capacity: 2 })
+    ));
+
+    drop(first);
+    assert_eq!(admission.active_jobs(), 1);
+    let third = admission.try_acquire().expect("released slot is reusable");
+    assert_eq!(admission.active_jobs(), 2);
+
+    drop(second);
+    drop(third);
+    assert_eq!(admission.active_jobs(), 0);
+}
+
+#[test]
+fn query_admission_rejects_zero_capacity() {
+    assert!(matches!(
+        QueryAdmission::new(0),
+        Err(QueryAdmissionError::InvalidCapacity)
+    ));
 }
 
 // ─── Engine tests ───────────────────────────────────────────────────
