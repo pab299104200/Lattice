@@ -13,8 +13,8 @@ pub use git_intelligence_store::{
     StoredGitIntelligenceSnapshot,
 };
 pub use graph_store::{
-    FileIndexEntry, GraphStore, GraphStoreRecovery, FILE_INDEX_PARSER_VERSION,
-    FILE_INDEX_SCHEMA_VERSION,
+    FileIndexEntry, GraphStore, GraphStoreRecovery, IndexSnapshot, IndexSnapshotLoad,
+    ModuleDigestCache, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
 };
 pub use usearch_index::UsearchVectorIndex;
 pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};

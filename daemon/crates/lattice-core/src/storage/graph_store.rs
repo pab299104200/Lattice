@@ -1,15 +1,129 @@
 use super::schema::CREATE_TABLES;
 use crate::error::LatticeError;
+use crate::graph::digest::{
+    generate_module_digests, GeneratedModuleDigest, ModuleDigestPayload,
+    MODULE_DIGEST_GENERATOR_VERSION, MODULE_DIGEST_SCHEMA_VERSION,
+};
 use crate::graph::model::CodeGraph;
 use crate::graph::model::EdgeKind;
 use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const FILE_INDEX_PARSER_VERSION: i64 = 1;
 pub const FILE_INDEX_SCHEMA_VERSION: i64 = 1;
+
+const MODULE_DIGEST_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS graph_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    index_epoch INTEGER NOT NULL CHECK (index_epoch >= 0),
+    digest_schema_version INTEGER NOT NULL CHECK (digest_schema_version > 0)
+);
+
+INSERT OR IGNORE INTO graph_metadata
+    (singleton, index_epoch, digest_schema_version)
+VALUES
+    (1, 0, 1);
+
+CREATE TABLE IF NOT EXISTS module_digests (
+    module_path TEXT PRIMARY KEY,
+    index_epoch INTEGER NOT NULL CHECK (index_epoch > 0),
+    generator_version INTEGER NOT NULL CHECK (generator_version > 0),
+    input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64),
+    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_module_digests_epoch
+    ON module_digests(index_epoch, module_path);
+"#;
+
+/// Immutable, validated module digests for one committed graph generation.
+#[derive(Debug, Clone)]
+pub struct ModuleDigestCache {
+    epoch: u64,
+    digests: Arc<BTreeMap<String, GeneratedModuleDigest>>,
+    token_postings: Arc<BTreeMap<String, Arc<[String]>>>,
+}
+
+impl ModuleDigestCache {
+    fn new(epoch: u64, digests: Vec<GeneratedModuleDigest>) -> Self {
+        let digests = digests
+            .into_iter()
+            .map(|digest| (digest.module_path.clone(), digest))
+            .collect::<BTreeMap<_, _>>();
+        let mut postings = BTreeMap::<String, BTreeSet<String>>::new();
+        for (path, digest) in &digests {
+            for term in &digest.payload.search_terms {
+                postings
+                    .entry(term.clone())
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+        let token_postings = postings
+            .into_iter()
+            .map(|(term, paths)| {
+                let paths = paths.into_iter().collect::<Vec<_>>();
+                (term, Arc::<[String]>::from(paths))
+            })
+            .collect();
+        Self {
+            epoch,
+            digests: Arc::new(digests),
+            token_postings: Arc::new(token_postings),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.digests.is_empty()
+    }
+
+    pub fn get(&self, module_path: &str) -> Option<&GeneratedModuleDigest> {
+        self.digests.get(module_path)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &GeneratedModuleDigest)> {
+        self.digests
+            .iter()
+            .map(|(path, digest)| (path.as_str(), digest))
+    }
+
+    pub fn postings(&self, token: &str) -> &[String] {
+        self.token_postings
+            .get(token)
+            .map(AsRef::as_ref)
+            .unwrap_or_default()
+    }
+}
+
+/// Graph and digest cache committed under the same monotonically increasing epoch.
+#[derive(Clone)]
+pub struct IndexSnapshot {
+    pub epoch: u64,
+    pub graph: Arc<CodeGraph>,
+    pub module_digests: ModuleDigestCache,
+}
+
+/// Result of warming graph state from storage.
+pub enum IndexSnapshotLoad {
+    Ready(IndexSnapshot),
+    /// A pre-digest database remains usable for graph-backed fallback but needs reindexing.
+    DigestCacheMissing {
+        graph: Arc<CodeGraph>,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStoreRecovery {
@@ -105,6 +219,15 @@ impl GraphStore {
                 Some(path) => map_sqlite_error(path, "initialize schema", e),
                 None => LatticeError::Storage(format!("Failed to initialize schema: {}", e)),
             })?;
+        self.conn
+            .execute_batch(MODULE_DIGEST_TABLES)
+            .map_err(|e| match &self.path {
+                Some(path) => map_sqlite_error(path, "initialize module digest schema", e),
+                None => LatticeError::Storage(format!(
+                    "Failed to initialize module digest schema: {}",
+                    e
+                )),
+            })?;
         Ok(())
     }
 
@@ -114,16 +237,59 @@ impl GraphStore {
 
     /// Save a CodeGraph to the database, replacing any previous data.
     pub fn save_graph(&self, graph: &CodeGraph) -> Result<(), LatticeError> {
+        self.commit_graph_generation(graph).map(|_| ())
+    }
+
+    /// Atomically persist a graph generation and return the exact immutable snapshot committed.
+    pub fn save_index_snapshot(&self, graph: &CodeGraph) -> Result<IndexSnapshot, LatticeError> {
+        let module_digests = self.commit_graph_generation(graph)?;
+        Ok(IndexSnapshot {
+            epoch: module_digests.epoch(),
+            graph: Arc::new(graph.clone()),
+            module_digests,
+        })
+    }
+
+    fn commit_graph_generation(
+        &self,
+        graph: &CodeGraph,
+    ) -> Result<ModuleDigestCache, LatticeError> {
+        // Generation happens before SQLite mutation so any invalid graph leaves the prior
+        // generation wholly intact.
+        let digests = generate_module_digests(graph).map_err(|error| {
+            LatticeError::Storage(format!("Failed to generate module digests: {}", error))
+        })?;
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| LatticeError::Storage(format!("Failed to begin transaction: {}", e)))?;
+
+        let current_epoch: i64 = tx
+            .query_row(
+                "SELECT index_epoch FROM graph_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to load graph index epoch: {}", e))
+            })?;
+        let next_epoch = current_epoch.checked_add(1).ok_or_else(|| {
+            LatticeError::Storage("Graph index epoch exhausted at i64::MAX".to_string())
+        })?;
+        if next_epoch <= 0 {
+            return Err(LatticeError::Storage(format!(
+                "Invalid persisted graph index epoch: {}",
+                current_epoch
+            )));
+        }
 
         // Delete all existing data
         tx.execute("DELETE FROM edges", [])
             .map_err(|e| LatticeError::Storage(format!("Failed to clear edges: {}", e)))?;
         tx.execute("DELETE FROM nodes", [])
             .map_err(|e| LatticeError::Storage(format!("Failed to clear nodes: {}", e)))?;
+        tx.execute("DELETE FROM module_digests", [])
+            .map_err(|e| LatticeError::Storage(format!("Failed to clear module digests: {}", e)))?;
 
         // Insert all nodes (scoped so prepared statement is dropped before commit)
         {
@@ -178,10 +344,49 @@ impl GraphStore {
             }
         }
 
+        {
+            let mut insert_digest = tx
+                .prepare(
+                    "INSERT INTO module_digests (module_path, index_epoch, generator_version, input_fingerprint, payload_sha256, payload_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to prepare module digest insert: {}",
+                        e
+                    ))
+                })?;
+            for digest in &digests {
+                insert_digest
+                    .execute(params![
+                        &digest.module_path,
+                        next_epoch,
+                        i64::from(digest.generator_version),
+                        &digest.input_fingerprint,
+                        &digest.payload_sha256,
+                        &digest.payload_json,
+                    ])
+                    .map_err(|e| {
+                        LatticeError::Storage(format!(
+                            "Failed to insert module digest {}: {}",
+                            digest.module_path, e
+                        ))
+                    })?;
+            }
+        }
+
+        tx.execute(
+            "UPDATE graph_metadata SET index_epoch = ?1, digest_schema_version = ?2 WHERE singleton = 1",
+            params![next_epoch, i64::from(MODULE_DIGEST_SCHEMA_VERSION)],
+        )
+        .map_err(|e| {
+            LatticeError::Storage(format!("Failed to publish graph index epoch: {}", e))
+        })?;
+
         tx.commit()
             .map_err(|e| LatticeError::Storage(format!("Failed to commit transaction: {}", e)))?;
 
-        Ok(())
+        Ok(ModuleDigestCache::new(next_epoch as u64, digests))
     }
 
     pub fn load_file_index(&self) -> Result<HashMap<String, FileIndexEntry>, LatticeError> {
@@ -311,11 +516,184 @@ impl GraphStore {
 
     /// Load a CodeGraph from the database.
     pub fn load_graph(&self) -> Result<CodeGraph, LatticeError> {
+        Self::load_graph_from(&self.conn)
+    }
+
+    /// Load graph and digest state under one SQLite read transaction.
+    pub fn load_index_snapshot(&self) -> Result<IndexSnapshotLoad, LatticeError> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to begin graph snapshot read: {}", e))
+        })?;
+        let graph = Arc::new(Self::load_graph_from(&tx)?);
+        let (metadata_rows, epoch, schema_version): (i64, i64, i64) = tx
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(index_epoch), 0), COALESCE(MAX(digest_schema_version), 0) FROM graph_metadata",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to load graph digest metadata: {}", e))
+            })?;
+        if metadata_rows != 1 {
+            return Err(LatticeError::Storage(format!(
+                "Invalid graph digest metadata: expected one singleton row, found {}",
+                metadata_rows
+            )));
+        }
+        if epoch < 0 {
+            return Err(LatticeError::Storage(format!(
+                "Invalid graph digest metadata epoch: {}",
+                epoch
+            )));
+        }
+        if epoch == 0 {
+            tx.commit().map_err(|e| {
+                LatticeError::Storage(format!("Failed to finish graph snapshot read: {}", e))
+            })?;
+            return Ok(IndexSnapshotLoad::DigestCacheMissing { graph });
+        }
+        if schema_version != i64::from(MODULE_DIGEST_SCHEMA_VERSION) {
+            return Err(LatticeError::Storage(format!(
+                "Invalid graph digest metadata at epoch {}: expected schema version {}, found {}",
+                epoch, MODULE_DIGEST_SCHEMA_VERSION, schema_version
+            )));
+        }
+
+        let digests = Self::load_and_validate_module_digests(&tx, &graph, epoch)?;
+        tx.commit().map_err(|e| {
+            LatticeError::Storage(format!("Failed to finish graph snapshot read: {}", e))
+        })?;
+        let module_digests = ModuleDigestCache::new(epoch as u64, digests);
+        Ok(IndexSnapshotLoad::Ready(IndexSnapshot {
+            epoch: epoch as u64,
+            graph,
+            module_digests,
+        }))
+    }
+
+    fn load_and_validate_module_digests(
+        conn: &Connection,
+        graph: &CodeGraph,
+        epoch: i64,
+    ) -> Result<Vec<GeneratedModuleDigest>, LatticeError> {
+        let expected = generate_module_digests(graph).map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to validate module digests at epoch {} against graph: {}",
+                epoch, error
+            ))
+        })?;
+        let expected = expected
+            .into_iter()
+            .map(|digest| (digest.module_path.clone(), digest))
+            .collect::<BTreeMap<_, _>>();
+        let mut stmt = conn
+            .prepare(
+                "SELECT module_path, index_epoch, generator_version, input_fingerprint, payload_sha256, payload_json FROM module_digests ORDER BY module_path",
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to prepare module digest query: {}", e))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| LatticeError::Storage(format!("Failed to query module digests: {}", e)))?;
+
+        let mut hydrated = Vec::with_capacity(expected.len());
+        for row in rows {
+            let (
+                path,
+                row_epoch,
+                generator_version,
+                input_fingerprint,
+                payload_sha256,
+                payload_json,
+            ) = row.map_err(|e| {
+                LatticeError::Storage(format!("Failed to read module digest row: {}", e))
+            })?;
+            let invalid = |reason: &str| {
+                LatticeError::Storage(format!(
+                    "Invalid module digest {:?} at epoch {}: {}",
+                    path, epoch, reason
+                ))
+            };
+            if row_epoch != epoch {
+                return Err(invalid(&format!(
+                    "row epoch {} does not match metadata epoch",
+                    row_epoch
+                )));
+            }
+            let expected_digest = expected
+                .get(&path)
+                .ok_or_else(|| invalid("module is absent from the committed graph"))?;
+            if generator_version != i64::from(MODULE_DIGEST_GENERATOR_VERSION) {
+                return Err(invalid(&format!(
+                    "expected generator version {}, found {}",
+                    MODULE_DIGEST_GENERATOR_VERSION, generator_version
+                )));
+            }
+            if input_fingerprint != expected_digest.input_fingerprint {
+                return Err(invalid(
+                    "input fingerprint does not match the committed graph",
+                ));
+            }
+            if payload_sha256 != expected_digest.payload_sha256 {
+                return Err(invalid(
+                    "payload SHA-256 does not match the generated payload",
+                ));
+            }
+            let payload: ModuleDigestPayload = serde_json::from_str(&payload_json)
+                .map_err(|e| invalid(&format!("payload JSON cannot be decoded: {}", e)))?;
+            if payload.schema_version != MODULE_DIGEST_SCHEMA_VERSION {
+                return Err(invalid(&format!(
+                    "expected payload schema version {}, found {}",
+                    MODULE_DIGEST_SCHEMA_VERSION, payload.schema_version
+                )));
+            }
+            if payload.module_path != path {
+                return Err(invalid("payload module path does not match its row key"));
+            }
+            let canonical = serde_json::to_string(&payload)
+                .map_err(|e| invalid(&format!("payload cannot be canonically encoded: {}", e)))?;
+            if canonical != payload_json {
+                return Err(invalid("payload JSON is not canonical"));
+            }
+            if payload_json != expected_digest.payload_json || payload != expected_digest.payload {
+                return Err(invalid("payload facts do not match the committed graph"));
+            }
+            hydrated.push(expected_digest.clone());
+        }
+        if hydrated.len() != expected.len() {
+            let loaded = hydrated
+                .iter()
+                .map(|digest| digest.module_path.as_str())
+                .collect::<BTreeSet<_>>();
+            let missing = expected
+                .keys()
+                .filter(|path| !loaded.contains(path.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(LatticeError::Storage(format!(
+                "Invalid module digest cache at epoch {}: missing rows for {}",
+                epoch,
+                missing.join(", ")
+            )));
+        }
+        Ok(hydrated)
+    }
+
+    fn load_graph_from(conn: &Connection) -> Result<CodeGraph, LatticeError> {
         let mut graph = CodeGraph::new();
 
         // Load all nodes
-        let mut stmt = self
-            .conn
+        let mut stmt = conn
             .prepare(
                 "SELECT file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, edit_count, last_modified FROM nodes",
             )
@@ -404,8 +782,7 @@ impl GraphStore {
         }
 
         // Load all edges
-        let mut stmt = self
-            .conn
+        let mut stmt = conn
             .prepare(
                 "SELECT from_file, from_name, from_offset, to_file, to_name, to_offset, kind FROM edges",
             )
@@ -615,5 +992,133 @@ fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
         "Mentions" => Some(EdgeKind::Mentions),
         "CoChanges" => Some(EdgeKind::CoChanges),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod module_digest_tests {
+    use super::*;
+
+    fn id(file: &str, name: &str) -> SymbolId {
+        SymbolId {
+            file: file.to_string(),
+            name: name.to_string(),
+            byte_offset: 0,
+        }
+    }
+
+    fn graph(files: &[&str]) -> CodeGraph {
+        let mut graph = CodeGraph::new();
+        for (line, file) in files.iter().enumerate() {
+            let name = format!("symbol_{line}");
+            graph.add_node(
+                id(file, &name),
+                SymbolKind::Function,
+                name.clone(),
+                format!("fn {name}()"),
+                "{}",
+                (*file).to_string(),
+                line + 1,
+                line + 1,
+                true,
+                Language::Rust,
+            );
+        }
+        graph
+    }
+
+    fn ready(load: IndexSnapshotLoad) -> IndexSnapshot {
+        match load {
+            IndexSnapshotLoad::Ready(snapshot) => snapshot,
+            IndexSnapshotLoad::DigestCacheMissing { .. } => panic!("expected ready snapshot"),
+        }
+    }
+
+    #[test]
+    fn fresh_store_reports_digest_cache_missing_without_rejecting_graph() {
+        let store = GraphStore::open_in_memory().unwrap();
+        match store.load_index_snapshot().unwrap() {
+            IndexSnapshotLoad::DigestCacheMissing { graph } => {
+                assert_eq!(graph.node_count(), 0);
+            }
+            IndexSnapshotLoad::Ready(_) => panic!("fresh store must have epoch zero"),
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trip_hydrates_digests_and_sorted_postings() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let saved = store
+            .save_index_snapshot(&graph(&["src/z.rs", "src/a.rs"]))
+            .unwrap();
+        let loaded = ready(store.load_index_snapshot().unwrap());
+
+        assert_eq!(saved.epoch, 1);
+        assert_eq!(loaded.epoch, saved.epoch);
+        assert_eq!(loaded.graph.node_count(), 2);
+        assert_eq!(loaded.module_digests.len(), 2);
+        assert_eq!(
+            loaded.module_digests.postings("rust"),
+            &["src/a.rs".to_string(), "src/z.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn replacement_advances_epoch_and_removes_vanished_modules() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .save_index_snapshot(&graph(&["src/a.rs", "src/b.rs"]))
+            .unwrap();
+        let replaced = store.save_index_snapshot(&graph(&["src/b.rs"])).unwrap();
+        let loaded = ready(store.load_index_snapshot().unwrap());
+
+        assert_eq!(replaced.epoch, 2);
+        assert_eq!(loaded.module_digests.len(), 1);
+        assert!(loaded.module_digests.get("src/a.rs").is_none());
+        assert!(loaded.module_digests.get("src/b.rs").is_some());
+    }
+
+    #[test]
+    fn hydration_rejects_tampered_payload_instead_of_serving_subset() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .save_index_snapshot(&graph(&["src/a.rs", "src/b.rs"]))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE module_digests SET payload_json = '{}' WHERE module_path = 'src/a.rs'",
+                [],
+            )
+            .unwrap();
+
+        let error = store.load_index_snapshot().err().unwrap().to_string();
+        assert!(error.contains("src/a.rs"), "{error}");
+        assert!(error.contains("payload JSON cannot be decoded"), "{error}");
+    }
+
+    #[test]
+    fn digest_generation_failure_preserves_prior_generation() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.save_index_snapshot(&graph(&["src/good.rs"])).unwrap();
+        let invalid = graph(&["/absolute.rs"]);
+
+        assert!(store.save_index_snapshot(&invalid).is_err());
+        let loaded = ready(store.load_index_snapshot().unwrap());
+        assert_eq!(loaded.epoch, 1);
+        assert!(loaded.module_digests.get("src/good.rs").is_some());
+        assert!(loaded.module_digests.get("/absolute.rs").is_none());
+    }
+
+    #[test]
+    fn empty_graph_commits_positive_epoch_and_empty_cache() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let saved = store.save_index_snapshot(&CodeGraph::new()).unwrap();
+        let loaded = ready(store.load_index_snapshot().unwrap());
+
+        assert_eq!(saved.epoch, 1);
+        assert_eq!(loaded.epoch, 1);
+        assert!(loaded.module_digests.is_empty());
+        assert_eq!(loaded.graph.node_count(), 0);
     }
 }
