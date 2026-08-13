@@ -1,5 +1,3 @@
-pub mod lazy;
-
 #[cfg(test)]
 mod tests;
 
