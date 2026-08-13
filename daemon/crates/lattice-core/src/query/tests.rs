@@ -1,5 +1,5 @@
 use crate::graph::model::{CodeGraph, EdgeKind};
-use crate::storage::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
+use crate::storage::{GraphStore, SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use std::sync::Arc;
 
@@ -199,6 +199,24 @@ fn build_test_graph() -> CodeGraph {
     graph.add_edge(&id_login, &id_validate, EdgeKind::Calls);
 
     graph
+}
+
+fn indexed_query_engine(graph: &CodeGraph) -> QueryEngine {
+    let store = GraphStore::open_in_memory().expect("in-memory graph store");
+    let snapshot = store
+        .save_index_snapshot(graph)
+        .expect("graph and module digests should commit together");
+    QueryEngine::from_index_snapshot(snapshot, None, None)
+}
+
+fn module_digest_context(
+    capsule: &crate::query::ContextCapsule,
+) -> Vec<&crate::query::ContextNode> {
+    capsule
+        .context
+        .iter()
+        .filter(|node| node.kind == "module_digest")
+        .collect()
 }
 
 fn build_lattice_workflow_graph() -> CodeGraph {
@@ -566,6 +584,84 @@ fn test_query_engine_produces_capsule() {
         "formatDate should be excluded, got: {:?}",
         all_symbols
     );
+}
+
+#[test]
+fn indexed_query_engine_selects_at_most_two_cached_digests_with_citations() {
+    let graph = build_test_graph();
+    let mut engine = indexed_query_engine(&graph);
+
+    let capsule = engine.query("How does the auth token flow work?", None, false);
+    let digests = module_digest_context(&capsule);
+    let digest_files = digests
+        .iter()
+        .map(|node| node.file.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(digest_files, ["src/auth.ts", "src/crypto.ts"]);
+    assert!(digests.len() <= 2);
+    for digest in digests {
+        assert!(digest.line > 0);
+        assert!(
+            digest
+                .relationship
+                .starts_with("cached_module_digest (query_term_overlap: "),
+            "unexpected digest relationship: {}",
+            digest.relationship
+        );
+        assert!(
+            digest.skeleton.contains("[citations: "),
+            "digest must expose explicit citation metadata: {}",
+            digest.skeleton
+        );
+        assert!(
+            digest.skeleton.contains(&format!("{}:", digest.file)),
+            "digest must cite its ranked source file: {}",
+            digest.skeleton
+        );
+    }
+}
+
+#[test]
+fn cached_digest_selection_is_deterministic_and_respects_ranked_file_filters() {
+    let graph = build_test_graph();
+    let store = GraphStore::open_in_memory().expect("in-memory graph store");
+    let snapshot = store.save_index_snapshot(&graph).expect("indexed snapshot");
+    let mut first = QueryEngine::from_index_snapshot(snapshot.clone(), None, None);
+    let mut second = QueryEngine::from_index_snapshot(snapshot, None, None);
+
+    let first_capsule = first.query("file:src/auth.ts auth token flow", None, false);
+    let second_capsule = second.query("file:src/auth.ts auth token flow", None, false);
+    let first_digests = module_digest_context(&first_capsule);
+    let second_digests = module_digest_context(&second_capsule);
+
+    assert_eq!(first_digests.len(), 1);
+    assert_eq!(first_digests[0].file, "src/auth.ts");
+    assert_eq!(
+        first_digests
+            .iter()
+            .map(|node| (&node.file, &node.skeleton, node.score))
+            .collect::<Vec<_>>(),
+        second_digests
+            .iter()
+            .map(|node| (&node.file, &node.skeleton, node.score))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn graph_only_construction_and_graph_mutation_never_synthesize_digests() {
+    let graph = build_test_graph();
+    let mut graph_only = QueryEngine::new(graph.clone(), None, None);
+    assert!(module_digest_context(&graph_only.query("auth token flow", None, false)).is_empty());
+
+    let mut indexed = indexed_query_engine(&graph);
+    assert!(!module_digest_context(&indexed.query("auth token flow", None, false)).is_empty());
+
+    // Even requesting direct mutable access invalidates the paired cache before
+    // any mutation can occur, preventing stale summaries from being rendered.
+    let _ = indexed.graph_mut();
+    assert!(module_digest_context(&indexed.query("auth token flow", None, false)).is_empty());
 }
 
 #[test]

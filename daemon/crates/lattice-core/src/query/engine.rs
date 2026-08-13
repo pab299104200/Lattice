@@ -3,9 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
+use crate::graph::digest::GeneratedModuleDigest;
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
 use crate::memory::MemoryStore;
-use crate::storage::{SharedVectorIndex, VectorScope, VectorSearchResult};
+use crate::storage::{
+    IndexSnapshot, ModuleDigestCache, SharedVectorIndex, VectorScope, VectorSearchResult,
+};
 use crate::symbols::{SymbolId, SymbolKind};
 
 use super::capsule::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
@@ -15,7 +18,7 @@ use super::intent::{detect_intent, IntentParams};
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Engine version for diagnosing binary freshness.
-const ENGINE_VERSION: &str = "v31";
+const ENGINE_VERSION: &str = "v32";
 
 /// Stop words excluded from the negative keyword signal.
 /// These are too generic to carry semantic meaning in symbol names
@@ -58,6 +61,7 @@ const DOCUMENT_RESULT_QUERY_KEYWORDS: &[&str] = &[
 
 const FILE_SUMMARY_VECTOR_NAME: &str = "file_summary";
 const FILE_SUMMARY_VECTOR_OFFSET: usize = usize::MAX;
+const MAX_CACHED_MODULE_DIGESTS: usize = 2;
 
 /// Typed rejection from the non-queueing query admission gate.
 ///
@@ -175,6 +179,11 @@ struct ScoredCandidate<'a> {
 #[derive(Clone)]
 pub struct QueryEngine {
     graph: Arc<CodeGraph>,
+    /// Immutable digests loaded with the same committed graph generation.
+    ///
+    /// Graph-only construction deliberately leaves this empty. Query execution
+    /// must never generate or refresh module digests on the hot path.
+    module_digests: Option<ModuleDigestCache>,
     vector_index: Option<SharedVectorIndex>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
     query_history: Arc<Mutex<HashMap<String, usize>>>,
@@ -190,6 +199,7 @@ impl QueryEngine {
     ) -> Self {
         Self {
             graph: Arc::new(graph),
+            module_digests: None,
             vector_index,
             memory_store,
             query_history: Arc::new(Mutex::new(HashMap::new())),
@@ -203,6 +213,32 @@ impl QueryEngine {
     ) -> Self {
         Self {
             graph,
+            module_digests: None,
+            vector_index,
+            memory_store,
+            query_history: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a query engine from a graph and digest cache loaded atomically.
+    ///
+    /// This is the only constructor that enables cached module-digest results.
+    /// The snapshot owns the epoch pairing; the query path only selects and
+    /// renders its validated payloads.
+    pub fn from_index_snapshot(
+        snapshot: IndexSnapshot,
+        vector_index: Option<SharedVectorIndex>,
+        memory_store: Option<Arc<Mutex<MemoryStore>>>,
+    ) -> Self {
+        let IndexSnapshot {
+            epoch,
+            graph,
+            module_digests,
+        } = snapshot;
+        debug_assert_eq!(epoch, module_digests.epoch());
+        Self {
+            graph,
+            module_digests: Some(module_digests),
             vector_index,
             memory_store,
             query_history: Arc::new(Mutex::new(HashMap::new())),
@@ -822,6 +858,17 @@ impl QueryEngine {
             });
         }
 
+        // Select summaries only from immutable digests loaded with this graph
+        // generation. Ranked files constrain relevance; cached search terms add
+        // a second topical gate. The helper returns owned render nodes so the
+        // rest of capsule assembly cannot retain a cache borrow.
+        let mut digest_query_terms = scoring_q_word_storage.clone();
+        digest_query_terms.extend(extract_identifier_fragments(&clean_query));
+        digest_query_terms.sort();
+        digest_query_terms.dedup();
+        let mut cached_module_digests =
+            self.select_cached_module_digests(&candidates, &digest_query_terms);
+
         // Step 5: Budget allocation (adaptive: repeated queries expand context)
         let repeat_count = self
             .query_history
@@ -830,18 +877,29 @@ impl QueryEngine {
             .get(query_text)
             .copied()
             .unwrap_or(0);
-        let mut pivots = Vec::new();
-        let mut context = Vec::new();
-        let mut tokens_used: usize = 0;
         let budget = if focused {
             1500
         } else {
             params.base_token_budget + (repeat_count * 500)
         };
+        let mut cached_digest_tokens = 0usize;
+        cached_module_digests.retain(|node| {
+            let node_tokens = node.skeleton.len() / CHARS_PER_TOKEN;
+            if cached_digest_tokens + node_tokens > budget {
+                return false;
+            }
+            cached_digest_tokens += node_tokens;
+            true
+        });
+        let mut pivots = Vec::new();
+        let mut context = Vec::new();
+        let mut tokens_used: usize = cached_digest_tokens;
         // Cap context nodes to prevent 3rd-degree noise from flooding results.
         // Pivots (full source) are uncapped since they're budget-limited by token cost.
         // Context (signatures) are cheap, so without a count cap they can explode to 100+.
         let max_context_nodes: usize = if focused { 5 } else { 30 };
+        let max_symbol_context_nodes =
+            max_context_nodes.saturating_sub(cached_module_digests.len());
         let max_pivots: usize = if focused { 1 } else { usize::MAX };
 
         // Relative pivot threshold: if the best candidate scores 0.15, absolute
@@ -867,7 +925,7 @@ impl QueryEngine {
                 let source_tokens = candidate.node.body.len() / CHARS_PER_TOKEN;
                 if tokens_used + source_tokens > budget {
                     // Try to fit as context instead
-                    if context.len() < max_context_nodes {
+                    if context.len() < max_symbol_context_nodes {
                         let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
                         if tokens_used + sig_tokens <= budget {
                             context.push(ContextNode {
@@ -893,7 +951,7 @@ impl QueryEngine {
                 });
 
                 if is_duplicate {
-                    if context.len() < max_context_nodes {
+                    if context.len() < max_symbol_context_nodes {
                         let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
                         if tokens_used + sig_tokens <= budget {
                             let dup_of = pivots
@@ -937,7 +995,7 @@ impl QueryEngine {
                     reason,
                 });
                 tokens_used += source_tokens;
-            } else if candidate.score > 0.05 && context.len() < max_context_nodes {
+            } else if candidate.score > 0.05 && context.len() < max_symbol_context_nodes {
                 // Context: include skeleton (signature only) for weaker matches
                 let sig_tokens = candidate.node.signature.len() / CHARS_PER_TOKEN;
                 if tokens_used + sig_tokens > budget {
@@ -1189,6 +1247,10 @@ impl QueryEngine {
             tokens_used += dep_tokens_used;
         }
 
+        // Digests are appended after symbol context so existing consumers retain
+        // source-first ordering. Capacity and token budget were reserved above.
+        context.extend(cached_module_digests);
+
         // Calculate tokens saved
         let total_tokens_if_all: usize = candidates
             .iter()
@@ -1254,6 +1316,7 @@ impl QueryEngine {
 
     /// Get the underlying graph mutably for direct updates.
     pub fn graph_mut(&mut self) -> &mut CodeGraph {
+        self.module_digests = None;
         Arc::make_mut(&mut self.graph)
     }
 
@@ -1279,10 +1342,80 @@ impl QueryEngine {
     /// Replace the code graph with a new one.
     pub fn update_graph(&mut self, graph: CodeGraph) {
         self.graph = Arc::new(graph);
+        self.module_digests = None;
     }
 
     pub fn update_graph_arc(&mut self, graph: Arc<CodeGraph>) {
         self.graph = graph;
+        self.module_digests = None;
+    }
+
+    fn select_cached_module_digests(
+        &self,
+        candidates: &[ScoredCandidate<'_>],
+        query_terms: &[String],
+    ) -> Vec<ContextNode> {
+        let Some(cache) = self.module_digests.as_ref() else {
+            return Vec::new();
+        };
+        if query_terms.is_empty() || cache.is_empty() {
+            return Vec::new();
+        }
+
+        // Collapse symbol ranking into a deterministic file ranking. A path's
+        // strongest candidate is sufficient because `candidates` has already
+        // passed filters, graph ranking, and duplicate suppression.
+        let mut best_file_scores = HashMap::<&str, f64>::new();
+        for candidate in candidates {
+            best_file_scores
+                .entry(candidate.node.file.as_str())
+                .and_modify(|score| *score = score.max(candidate.score))
+                .or_insert(candidate.score);
+        }
+
+        let mut ranked = best_file_scores
+            .into_iter()
+            .filter_map(|(path, score)| {
+                let digest = cache.get(path)?;
+                let overlap = query_terms
+                    .iter()
+                    .filter(|term| {
+                        digest
+                            .payload
+                            .search_terms
+                            .binary_search_by(|candidate| candidate.as_str().cmp(term.as_str()))
+                            .is_ok()
+                    })
+                    .count();
+                (overlap > 0).then_some((digest, overlap, score))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| {
+                    right
+                        .2
+                        .partial_cmp(&left.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.0.module_path.cmp(&right.0.module_path))
+        });
+
+        ranked
+            .into_iter()
+            .take(MAX_CACHED_MODULE_DIGESTS)
+            .map(|(digest, overlap, score)| ContextNode {
+                symbol: format!("module_digest:{}", digest.module_path),
+                kind: "module_digest".to_string(),
+                file: digest.module_path.clone(),
+                line: digest.payload.entry_anchor.line,
+                skeleton: render_cached_module_digest(digest),
+                relationship: format!("cached_module_digest (query_term_overlap: {overlap})"),
+                score,
+            })
+            .collect()
     }
 
     /// Record a query for frequency tracking.
@@ -2137,6 +2270,28 @@ fn format_edge_kind_reverse(kind: EdgeKind) -> String {
         EdgeKind::Mentions => "mentioned_by".to_string(),
         EdgeKind::CoChanges => "co_changes_with".to_string(),
     }
+}
+
+/// Render only facts present in the validated cache payload. Citations are
+/// repeated in a uniform suffix so clients do not need to parse prose to find
+/// the exact supporting locations.
+fn render_cached_module_digest(digest: &GeneratedModuleDigest) -> String {
+    digest
+        .payload
+        .facts
+        .iter()
+        .map(|fact| {
+            let mut citations = fact
+                .citations
+                .iter()
+                .map(|citation| format!("{}:{}", citation.path, citation.line))
+                .collect::<Vec<_>>();
+            citations.sort();
+            citations.dedup();
+            format!("{} [citations: {}]", fact.sentence, citations.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Classify the relationship of a node based on its semantic similarity.
