@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use lattice_core::graph::CodeGraph;
-use lattice_core::indexer::Indexer;
+use lattice_core::indexer::{BatchIndexReport, IndexFailure, IndexFailureKind, Indexer};
 use lattice_core::parser;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{
@@ -27,6 +27,7 @@ pub(crate) struct IncrementalIndexResult {
     pub(crate) file_index: Vec<FileIndexEntry>,
     pub(crate) changed_count: usize,
     pub(crate) removed_count: usize,
+    pub(crate) index_report: BatchIndexReport,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ pub(crate) fn build_incremental_index_for_roots(
     parsed_files.retain(|file, _| current_files.contains(file));
 
     let mut changed_count = 0usize;
+    let mut failures = Vec::new();
     let mut file_index = Vec::with_capacity(records.len());
     let now = unix_timestamp_secs();
     for record in records {
@@ -189,6 +191,11 @@ pub(crate) fn build_incremental_index_for_roots(
                         Err(err) => {
                             tracing::warn!("Failed to parse {}: {}", record.indexed_path, err);
                             parsed_files.remove(&record.indexed_path);
+                            failures.push(IndexFailure {
+                                file: record.indexed_path.clone(),
+                                kind: IndexFailureKind::ParseError,
+                                message: err.to_string(),
+                            });
                         }
                     }
                     file_index.push(FileIndexEntry {
@@ -226,12 +233,21 @@ pub(crate) fn build_incremental_index_for_roots(
     let mut indexer = Indexer::new(PathBuf::new());
     indexer.replace_parsed_files(parsed_files);
     let (graph, parsed_files) = indexer.into_parts();
+    let indexed_count = parsed_files.len();
     IncrementalIndexResult {
         graph: Arc::new(graph),
         parsed_files,
         file_index,
         changed_count,
         removed_count,
+        index_report: BatchIndexReport {
+            requested_count: current_files.len(),
+            indexed_count,
+            is_partial: !failures.is_empty(),
+            indexed_files: Vec::new(),
+            removed_files: Vec::new(),
+            failures,
+        },
     }
 }
 

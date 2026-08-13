@@ -83,37 +83,89 @@ impl ShardEntry {
 }
 
 struct RuntimeLease {
-    shards: Vec<Arc<ShardEntry>>,
+    retained_shards: Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
     handler: Arc<dyn RequestHandler>,
 }
 
 impl Drop for RuntimeLease {
     fn drop(&mut self) {
-        for shard in &self.shards {
+        let retained = self
+            .retained_shards
+            .lock()
+            .map(|mut shards| shards.drain().map(|(_, shard)| shard).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for shard in retained {
             shard.release();
         }
     }
 }
 
 struct RetainedShard {
-    shard: Arc<ShardEntry>,
+    shard: Option<Arc<ShardEntry>>,
 }
 
 impl RetainedShard {
-    fn new(shard: Arc<ShardEntry>) -> Self {
-        shard.retain();
-        Self { shard }
+    fn from_retained(shard: Arc<ShardEntry>) -> Self {
+        Self { shard: Some(shard) }
     }
 
     fn handler(&self) -> Result<Arc<dyn RequestHandler>> {
-        self.shard.handler()
+        self.shard
+            .as_ref()
+            .expect("retained shard is present until ownership transfer")
+            .handler()
+    }
+
+    fn root(&self) -> &PathBuf {
+        &self
+            .shard
+            .as_ref()
+            .expect("retained shard is present until ownership transfer")
+            .root
+    }
+
+    fn into_shard(mut self) -> Arc<ShardEntry> {
+        self.shard
+            .take()
+            .expect("retained shard is transferred at most once")
     }
 }
 
 impl Drop for RetainedShard {
     fn drop(&mut self) {
-        self.shard.release();
+        if let Some(shard) = self.shard.as_ref() {
+            shard.release();
+        }
     }
+}
+
+fn adopt_retained_lease_shard(
+    retained_shards: &Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
+    shard: Arc<ShardEntry>,
+) -> Result<()> {
+    let key = shard_key(&shard.root);
+    let mut retained = match retained_shards.lock() {
+        Ok(retained) => retained,
+        Err(_) => {
+            shard.release();
+            anyhow::bail!("logical-view retained shard lock poisoned");
+        }
+    };
+    if retained.contains_key(&key) {
+        shard.release();
+        return Ok(());
+    }
+    retained.insert(key, shard);
+    Ok(())
+}
+
+fn retained_shard_count(
+    retained_shards: &Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
+) -> usize {
+    retained_shards
+        .lock()
+        .map(|shards| shards.len())
+        .unwrap_or(0)
 }
 
 struct ViewRequestHandler {
@@ -162,6 +214,34 @@ impl RequestHandler for ViewRequestHandler {
             return self.handle_cross_shard_workflow(method, params).await;
         }
 
+        if is_memory_write_tool(tool_name) {
+            match &route_decision {
+                RouteDecision::Ambiguous { path, candidates } => {
+                    return Err((
+                        -32602,
+                        format!(
+                            "Ambiguous workspace for memory write path {path:?}; candidates: {}. Use an absolute linked file/doc/test path or a path unique to one configured workspace.",
+                            candidates.join(", ")
+                        ),
+                    ));
+                }
+                RouteDecision::None if self.roots.len() > 1 => {
+                    let response = self.primary_handler.handle(method, params).await?;
+                    return Ok(annotate_wrapped_tool_json(
+                        response,
+                        serde_json::json!({
+                            "routing_diagnostics": {
+                                "status": "primary_workspace_fallback",
+                                "fallback_workspace": self.primary_root.to_string_lossy(),
+                                "reason": "No path-bearing memory arguments matched a configured workspace; stdio MCP does not expose a per-call caller working directory. Provide linked_files, linked_docs, linked_tests, files, or an embedded absolute path to route durable memory writes to a non-primary shard."
+                            }
+                        }),
+                    ));
+                }
+                RouteDecision::Match(_) | RouteDecision::None => {}
+            }
+        }
+
         let response = self.primary_handler.handle(method, params).await?;
         if let RouteDecision::Ambiguous { path, candidates } = route_decision {
             Ok(annotate_wrapped_tool_json(
@@ -191,13 +271,18 @@ impl ViewRequestHandler {
     ) -> Result<Value, (i32, String)> {
         let shard = self
             .daemon
-            .shard_for(root, self.focus_files.clone(), self.focus_dirs.clone())
+            .shard_for(
+                root,
+                self.focus_files.clone(),
+                self.focus_dirs.clone(),
+                true,
+            )
             .await
             .map_err(internal_error)?;
-        let retained = RetainedShard::new(shard);
+        let retained = RetainedShard::from_retained(shard);
         let handler = retained.handler().map_err(internal_error)?;
         let value = handler.handle(method, params).await?;
-        self.remember_handles_for_root(&value, &retained.shard.root)
+        self.remember_handles_for_root(&value, retained.root())
             .await;
         Ok(value)
     }
@@ -211,10 +296,11 @@ impl ViewRequestHandler {
                     root.clone(),
                     self.focus_files.clone(),
                     self.focus_dirs.clone(),
+                    true,
                 )
                 .await
                 .map_err(internal_error)?;
-            let retained = RetainedShard::new(shard);
+            let retained = RetainedShard::from_retained(shard);
             let handler = retained.handler().map_err(internal_error)?;
             let value = handler.handle("tools/call", params.clone()).await?;
             statuses.push(extract_tool_json(value)?);
@@ -451,6 +537,7 @@ pub(crate) struct GlobalDaemon {
     idle_ttl: Duration,
     has_loaded_runtime: AtomicBool,
     exit_when_idle: bool,
+    index_work: Arc<crate::index_work::IndexWorkCoordinator>,
 }
 
 impl GlobalDaemon {
@@ -458,9 +545,9 @@ impl GlobalDaemon {
         Self::new_with_config(
             env_usize(
                 "LATTICE_MAX_LOADED_SHARDS",
-                env_usize("LATTICE_MAX_LOADED_WORKSPACES", 8),
+                env_usize("LATTICE_MAX_LOADED_WORKSPACES", 3),
             ),
-            env_bool("LATTICE_PREWARM_VIEW_SHARDS", true),
+            env_bool("LATTICE_PREWARM_VIEW_SHARDS", false),
         )
     }
 
@@ -476,6 +563,7 @@ impl GlobalDaemon {
             ),
             has_loaded_runtime: AtomicBool::new(false),
             exit_when_idle: env_bool("LATTICE_DAEMON_EXIT_WHEN_IDLE", false),
+            index_work: crate::index_work::IndexWorkCoordinator::from_env(),
         }
     }
 
@@ -488,19 +576,23 @@ impl GlobalDaemon {
             .first()
             .ok_or_else(|| anyhow::anyhow!("workspace request resolved to zero shards"))?
             .clone();
-        let primary = self
-            .shard_for(
-                primary_root,
+        let primary = RetainedShard::from_retained(
+            self.shard_for(
+                primary_root.clone(),
                 hello.focus_files.clone(),
                 hello.focus_dirs.clone(),
+                true,
             )
-            .await?;
+            .await?,
+        );
         let primary_handler = primary.handler()?;
+        let retained_shards = Arc::new(StdMutex::new(HashMap::new()));
+        adopt_retained_lease_shard(&retained_shards, primary.into_shard())?;
         let handler: Arc<dyn RequestHandler> = if roots.len() > 1 {
             Arc::new(ViewRequestHandler {
                 daemon: Arc::clone(self),
                 roots: roots.clone(),
-                primary_root: primary.root.clone(),
+                primary_root: primary_root.clone(),
                 primary_handler,
                 focus_files: hello.focus_files.clone(),
                 focus_dirs: hello.focus_dirs.clone(),
@@ -509,7 +601,6 @@ impl GlobalDaemon {
         } else {
             primary_handler
         };
-        primary.retain();
         if self.prewarm_view_shards && roots.len() > 1 {
             self.spawn_view_prewarm(
                 view_key.clone(),
@@ -524,15 +615,18 @@ impl GlobalDaemon {
             &[
                 ("workspace_key", serde_json::json!(view_key)),
                 ("requested_shard_count", serde_json::json!(roots.len())),
-                ("active_shard_count", serde_json::json!(1)),
+                (
+                    "active_shard_count",
+                    serde_json::json!(retained_shard_count(&retained_shards)),
+                ),
                 (
                     "primary_shard",
-                    serde_json::json!(primary.root.to_string_lossy().to_string()),
+                    serde_json::json!(primary_root.to_string_lossy().to_string()),
                 ),
             ],
         );
         Ok(RuntimeLease {
-            shards: vec![primary],
+            retained_shards,
             handler,
         })
     }
@@ -557,17 +651,16 @@ impl GlobalDaemon {
             for root in roots {
                 let shard_key = shard_key(&root);
                 match daemon
-                    .shard_for(root, focus_files.clone(), focus_dirs.clone())
+                    .shard_for(root, focus_files.clone(), focus_dirs.clone(), false)
                     .await
                 {
-                    Ok(_) => lifecycle_log::log_event(
-                        "daemon",
-                        "view_prewarm_shard_ready",
-                        &[
+                    Ok(_) => {
+                        let fields = vec![
                             ("workspace_key", serde_json::json!(view_key.clone())),
                             ("shard_key", serde_json::json!(shard_key)),
-                        ],
-                    ),
+                        ];
+                        lifecycle_log::log_event("daemon", "view_prewarm_shard_ready", &fields);
+                    }
                     Err(error) => {
                         lifecycle_log::log_event(
                             "daemon",
@@ -595,12 +688,16 @@ impl GlobalDaemon {
         root: PathBuf,
         focus_files: Vec<String>,
         focus_dirs: Vec<String>,
+        retain: bool,
     ) -> Result<Arc<ShardEntry>> {
         let key = shard_key(&root);
         loop {
             let wait_for = {
                 let shards = self.shards.lock().await;
                 if let Some(entry) = shards.get(&key) {
+                    if retain {
+                        entry.retain();
+                    }
                     lifecycle_log::log_event(
                         "daemon",
                         "shard_reused",
@@ -614,16 +711,46 @@ impl GlobalDaemon {
                 if let Some(waiter) = loading.get(&key) {
                     Some(Arc::clone(waiter))
                 } else {
-                    let shards = self.shards.lock().await;
-                    if shards.len() >= self.max_loaded_shards {
-                        anyhow::bail!(
-                            "lattice daemon already has {} loaded workspace shards; refuse to load {}. Close idle clients, wait for idle eviction, or raise LATTICE_MAX_LOADED_SHARDS.",
-                            self.max_loaded_shards,
-                            key
-                        );
-                    }
-                    drop(shards);
+                    let victim = {
+                        let mut shards = self.shards.lock().await;
+                        if shards.len() < self.max_loaded_shards {
+                            None
+                        } else {
+                            let victim_key = shards
+                                .iter()
+                                .filter(|(_, entry)| {
+                                    entry.active_connections.load(Ordering::Acquire) == 0
+                                        && !self
+                                            .index_work
+                                            .workspace_is_busy(&shard_key(&entry.root))
+                                })
+                                .min_by_key(|(_, entry)| {
+                                    entry.last_used_epoch_secs.load(Ordering::Acquire)
+                                })
+                                .map(|(candidate, _)| candidate.clone());
+                            let Some(victim_key) = victim_key else {
+                                anyhow::bail!(
+                                    "lattice daemon has {} loaded workspace shards and all are active or indexing; refuse to load {} until a shard becomes evictable or LATTICE_MAX_LOADED_SHARDS is raised.",
+                                    self.max_loaded_shards,
+                                    key
+                                );
+                            };
+                            shards.remove(&victim_key).map(|entry| (victim_key, entry))
+                        }
+                    };
                     loading.insert(key.clone(), Arc::new(Notify::new()));
+                    drop(loading);
+                    if let Some((victim_key, victim)) = victim {
+                        lifecycle_log::log_event(
+                            "daemon",
+                            "shard_capacity_eviction",
+                            &[
+                                ("evicted_shard", serde_json::json!(victim_key)),
+                                ("requested_shard", serde_json::json!(key.clone())),
+                            ],
+                        );
+                        victim.shutdown().await;
+                    }
                     None
                 }
             };
@@ -639,8 +766,13 @@ impl GlobalDaemon {
             waiter.notified().await;
         }
 
-        let runtime_result =
-            crate::build_workspace_runtime(vec![root.clone()], focus_files, focus_dirs).await;
+        let runtime_result = crate::build_workspace_runtime(
+            vec![root.clone()],
+            focus_files,
+            focus_dirs,
+            Arc::clone(&self.index_work),
+        )
+        .await;
 
         let notify = {
             let mut loading = self.loading.lock().await;
@@ -661,6 +793,9 @@ impl GlobalDaemon {
         let mut shards = self.shards.lock().await;
         let result = if let Some(existing) = shards.get(&key) {
             let existing = Arc::clone(existing);
+            if retain {
+                existing.retain();
+            }
             drop(shards);
             entry.shutdown().await;
             Ok(existing)
@@ -673,6 +808,9 @@ impl GlobalDaemon {
                 key
             ))
         } else {
+            if retain {
+                entry.retain();
+            }
             shards.insert(key.clone(), Arc::clone(&entry));
             self.has_loaded_runtime.store(true, Ordering::Release);
             lifecycle_log::log_event(
@@ -1106,8 +1244,107 @@ mod tests {
             warmed,
             "combined workspace views should prewarm non-primary shards without blocking the initial lease"
         );
+        {
+            let shards = daemon.shards.lock().await;
+            let root_b_entry = shards
+                .get(&root_b_key)
+                .expect("prewarmed secondary shard should be loaded");
+            assert_eq!(
+                root_b_entry.active_connections.load(Ordering::Acquire),
+                0,
+                "prewarmed secondary shards must stay evictable when the logical view is idle"
+            );
+        }
 
         drop(lease);
+        {
+            let shards = daemon.shards.lock().await;
+            let root_b_entry = shards
+                .get(&root_b_key)
+                .expect("prewarmed secondary shard should remain loaded until shutdown");
+            assert_eq!(
+                root_b_entry.active_connections.load(Ordering::Acquire),
+                0,
+                "dropping the logical-view lease must leave secondary shards evictable"
+            );
+        }
+        shutdown_all_shards(&daemon).await;
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[tokio::test]
+    async fn shard_capacity_evicts_inactive_runtime_before_loading_another() {
+        let roots = (0..3)
+            .map(|index| {
+                let root = unique_test_root(&format!("lattice-capacity-{index}"));
+                std::fs::create_dir_all(&root).expect("create capacity root");
+                root.canonicalize().unwrap_or(root)
+            })
+            .collect::<Vec<_>>();
+        let daemon = Arc::new(GlobalDaemon::new_with_config(2, false));
+
+        for root in &roots {
+            let lease = daemon
+                .handler_for(&ProxyHello {
+                    workspace_roots: vec![root.to_string_lossy().to_string()],
+                    focus_files: Vec::new(),
+                    focus_dirs: Vec::new(),
+                })
+                .await
+                .expect("load shard within bounded capacity");
+            drop(lease);
+            wait_for_index_work(&daemon, root).await;
+        }
+
+        let shards = daemon.shards.lock().await;
+        assert_eq!(shards.len(), 2);
+        assert!(shards.contains_key(&shard_key(&roots[2])));
+        assert!(
+            roots[..2]
+                .iter()
+                .any(|root| !shards.contains_key(&shard_key(root))),
+            "one inactive shard should be evicted instead of exceeding capacity"
+        );
+        drop(shards);
+        shutdown_all_shards(&daemon).await;
+        for root in roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_lookup_retention_prevents_capacity_eviction_before_request_use() {
+        let root_a = unique_test_root("lattice-retained-capacity-a");
+        let root_b = unique_test_root("lattice-retained-capacity-b");
+        std::fs::create_dir_all(&root_a).expect("create retained root a");
+        std::fs::create_dir_all(&root_b).expect("create retained root b");
+        let root_a = root_a.canonicalize().unwrap_or(root_a);
+        let root_b = root_b.canonicalize().unwrap_or(root_b);
+        let daemon = Arc::new(GlobalDaemon::new_with_config(1, false));
+
+        let retained = RetainedShard::from_retained(
+            daemon
+                .shard_for(root_a.clone(), Vec::new(), Vec::new(), true)
+                .await
+                .expect("load and retain first shard"),
+        );
+        let error = match daemon
+            .shard_for(root_b.clone(), Vec::new(), Vec::new(), false)
+            .await
+        {
+            Ok(_) => panic!("capacity must not evict a shard retained by a pending request"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("all are active or indexing"));
+
+        drop(retained);
+        wait_for_index_work(&daemon, &root_a).await;
+        daemon
+            .shard_for(root_b.clone(), Vec::new(), Vec::new(), false)
+            .await
+            .expect("released shard should become capacity-evictable");
+
         shutdown_all_shards(&daemon).await;
         let _ = std::fs::remove_dir_all(root_a);
         let _ = std::fs::remove_dir_all(root_b);
@@ -1231,6 +1468,43 @@ mod tests {
     }
 
     #[test]
+    fn save_memory_linked_files_route_to_unique_matching_shard() {
+        let root_a = unique_test_root("lattice-route-save-memory-a");
+        let root_b = unique_test_root("lattice-route-save-memory-b");
+        std::fs::create_dir_all(root_b.join("docs/audit")).expect("create shard b docs");
+        std::fs::write(
+            root_b.join("docs/audit/meridian-memory.md"),
+            "Cadres Meridian memory evidence",
+        )
+        .expect("write shard b linked file");
+
+        let handler = ViewRequestHandler {
+            daemon: Arc::new(GlobalDaemon::new_with_config(8, false)),
+            roots: vec![root_a.clone(), root_b.clone()],
+            primary_root: root_a.clone(),
+            primary_handler: Arc::new(NoopRequestHandler),
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+            handle_owners: Mutex::new(HashMap::new()),
+        };
+        let params = serde_json::json!({
+            "name": "save_memory",
+            "arguments": {
+                "content": "Cadres Meridian workflow contract",
+                "linked_files": ["docs/audit/meridian-memory.md"]
+            }
+        });
+
+        assert_eq!(
+            handler.route_root_for_tool_call(&params),
+            Some(root_b.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn relative_file_paths_do_not_route_when_ambiguous_across_shards() {
         let root_a = unique_test_root("lattice-route-ambiguous-a");
         let root_b = unique_test_root("lattice-route-ambiguous-b");
@@ -1261,6 +1535,46 @@ mod tests {
             handler.route_root_for_tool_call(&params).is_none(),
             "ambiguous relative paths must not silently pick a non-primary shard"
         );
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_memory_write_path_returns_error_instead_of_primary_fallback() {
+        let root_a = unique_test_root("lattice-write-ambiguous-a");
+        let root_b = unique_test_root("lattice-write-ambiguous-b");
+        for root in [&root_a, &root_b] {
+            std::fs::create_dir_all(root.join("docs/audit")).expect("create docs");
+            std::fs::write(root.join("docs/audit/remediation.md"), "same relative file")
+                .expect("write relative file");
+        }
+
+        let handler = ViewRequestHandler {
+            daemon: Arc::new(GlobalDaemon::new_with_config(8, false)),
+            roots: vec![root_a.clone(), root_b.clone()],
+            primary_root: root_a.clone(),
+            primary_handler: Arc::new(NoopRequestHandler),
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+            handle_owners: Mutex::new(HashMap::new()),
+        };
+        let params = serde_json::json!({
+            "name": "save_memory",
+            "arguments": {
+                "content": "Ambiguous durable memory",
+                "linked_files": ["docs/audit/remediation.md"]
+            }
+        });
+
+        let error = handler
+            .handle("tools/call", params)
+            .await
+            .expect_err("ambiguous memory write should fail");
+        assert_eq!(error.0, -32602);
+        assert!(error
+            .1
+            .contains("Ambiguous workspace for memory write path"));
 
         let _ = std::fs::remove_dir_all(root_a);
         let _ = std::fs::remove_dir_all(root_b);
@@ -1547,6 +1861,17 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{nanos}-{}", std::process::id()))
     }
 
+    async fn wait_for_index_work(daemon: &GlobalDaemon, root: &PathBuf) {
+        let key = shard_key(root);
+        for _ in 0..100 {
+            if !daemon.index_work.workspace_is_busy(&key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("index work did not finish for {}", root.display());
+    }
+
     struct NoopRequestHandler;
 
     #[async_trait::async_trait]
@@ -1651,12 +1976,24 @@ fn explicit_path_values(value: &Value) -> Vec<&str> {
         "from_file",
         "to_file",
         "files",
+        "linked_files",
+        "linked_docs",
+        "linked_tests",
         "entry_files",
         "focus_files",
     ] {
         collect_path_values(value.get(key), &mut paths);
     }
-    for key in ["query", "task", "summary", "task_statement", "intent_hint"] {
+    for key in [
+        "query",
+        "task",
+        "summary",
+        "task_statement",
+        "intent_hint",
+        "content",
+        "source_query",
+        "refresh_key",
+    ] {
         collect_embedded_path_values(value.get(key), &mut paths);
     }
     paths
@@ -1783,6 +2120,13 @@ fn is_authoritative_cross_shard_graph_tool(tool_name: &str) -> bool {
             | "get_impact_graph"
             | "blast_radius"
             | "search_logic_flow"
+    )
+}
+
+fn is_memory_write_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "save_memory" | "save_quick_memory" | "record_workflow_outcome"
     )
 }
 

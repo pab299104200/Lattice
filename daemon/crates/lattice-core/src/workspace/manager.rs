@@ -69,6 +69,24 @@ impl WorkspaceManager {
         }
     }
 
+    pub fn apply_file_batch_contents(
+        &mut self,
+        repo_name: &str,
+        upserts: Vec<(String, String)>,
+        removals: Vec<String>,
+    ) -> Option<crate::indexer::BatchIndexReport> {
+        let repo = self.repos.get_mut(repo_name)?;
+        let upserts = upserts
+            .into_iter()
+            .map(|(rel_path, content)| (repo_rel_path(repo_name, &rel_path), content))
+            .collect();
+        let removals = removals
+            .into_iter()
+            .map(|rel_path| repo_rel_path(repo_name, &rel_path))
+            .collect();
+        Some(repo.indexer.apply_file_batch_contents(upserts, removals))
+    }
+
     /// Build a unified graph from all repos.
     pub fn unified_graph(&self) -> CodeGraph {
         self.build_merged_graph()

@@ -3,6 +3,8 @@
 mod adoption_metrics;
 mod cli;
 mod doctor;
+mod index_health;
+mod index_work;
 mod lifecycle_log;
 mod proxy;
 mod repo_state;
@@ -14,15 +16,15 @@ mod watcher;
 mod watcher_health;
 
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
+use index_health::IndexHealth;
+use index_work::{IndexReadiness, IndexWorkCoordinator};
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::events::{
     CompactionConfig, Compactor, EventStore, EventWriter, FlushPolicy, SchedulerHandle,
@@ -31,18 +33,19 @@ use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
 use lattice_core::memory::MemoryStore;
 use lattice_core::memory_graph::MemoryMigrator;
-use lattice_core::parser;
 use lattice_core::query::QueryEngine;
-use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{
-    FileIndexEntry, GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
-    FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+    GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
 };
 use lattice_core::symbols::ParsedFile;
-use lattice_core::watcher as core_watcher;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
+use runtime_support::{
+    background_vector_sync_enabled, build_incremental_index_for_roots, load_incremental_cache,
+    max_warm_graph_bytes, max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
+    WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
+};
 use watcher_health::WatcherHealth;
 
 #[tokio::main]
@@ -177,39 +180,14 @@ async fn main() -> Result<()> {
         .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
     );
 
+    let index_work = IndexWorkCoordinator::from_env();
     let graph_path = lattice_dir.join("graph.db");
-    let graph_store = match GraphStore::open(&graph_path) {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to open persistent graph store at {}: {}. Falling back to memory-only graph store.",
-                graph_path.display(),
-                e
-            );
-            GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
-        }
-    };
-    let graph = match should_warm_load_graph(&graph_store, &workspace_root) {
-        false => CodeGraph::new(),
-        true => match graph_store.load_graph() {
-            Ok(loaded) => {
-                let stats = loaded.stats();
-                if stats.node_count > 0 {
-                    tracing::info!(
-                        "Warm-loaded persisted graph: {} nodes, {} edges, {} files",
-                        stats.node_count,
-                        stats.edge_count,
-                        stats.file_count
-                    );
-                }
-                loaded
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load persisted graph: {}", e);
-                CodeGraph::new()
-            }
-        },
-    };
+    let (graph_store, graph) = open_graph_store_with_warm_graph(
+        graph_path,
+        workspace_root.clone(),
+        Arc::clone(&index_work),
+    )
+    .await?;
     let graph = Arc::new(graph);
     let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
     let engine = QueryEngine::new_shared(
@@ -237,7 +215,9 @@ async fn main() -> Result<()> {
 
     // Shared indexing state flag
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let index_readiness = Arc::new(IndexReadiness::default());
     let watcher_health = Arc::new(WatcherHealth::default());
+    let index_health = Arc::new(IndexHealth::default());
     let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
         &workspace_root,
     )));
@@ -254,9 +234,16 @@ async fn main() -> Result<()> {
         let ws_root = workspace_root.clone();
         let lattice_dir_bg = ws_root.join(".lattice");
         let vector_index_bg = vector_index.clone();
+        let index_work_bg = Arc::clone(&index_work);
+        let index_readiness_bg = Arc::clone(&index_readiness);
+        let index_health_bg = Arc::clone(&index_health);
 
         tokio::spawn(async move {
             tracing::info!("Background indexing starting...");
+            let _index_permit = index_work_bg
+                .acquire(ws_root.to_string_lossy().to_string(), "startup")
+                .await
+                .expect("index work coordinator remains open for the process lifetime");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
             let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
@@ -272,36 +259,46 @@ async fn main() -> Result<()> {
             } else {
                 vec![ws_root.clone()]
             };
-            let incremental = tokio::task::spawn_blocking(move || {
+            let incremental = match tokio::task::spawn_blocking(move || {
                 build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
             })
             .await
-            .unwrap_or_else(|err| {
-                tracing::warn!("Incremental indexing task failed: {}", err);
-                IncrementalIndexResult::empty()
-            });
+            {
+                Ok(incremental) => incremental,
+                Err(error) => {
+                    tracing::error!(%error, "Incremental indexing worker failed; keeping the previously published graph");
+                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                    index_readiness_bg.mark_ready();
+                    return;
+                }
+            };
 
-            persist_incremental_cache(
-                &graph_store_bg,
-                &incremental.graph,
-                &incremental.file_index,
-                &incremental.parsed_files,
-            )
-            .await;
+            let Some(incremental) = persist_incremental_cache(&graph_store_bg, incremental).await
+            else {
+                indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                index_readiness_bg.mark_ready();
+                return;
+            };
+            let IncrementalIndexResult {
+                graph: incremental_graph,
+                parsed_files,
+                file_index,
+                changed_count,
+                removed_count,
+                index_report,
+            } = incremental;
+            index_health_bg.replace_from_report(&index_report);
             {
                 let mut idx = indexer_bg.lock().await;
-                idx.replace_shared_index(
-                    Arc::clone(&incremental.graph),
-                    incremental.parsed_files.clone(),
-                );
+                idx.replace_shared_index(incremental_graph, parsed_files);
             }
             tracing::info!(
                 "Incremental indexing: {} current files, {} parsed/updated, {} removed",
-                incremental.file_index.len(),
-                incremental.changed_count,
-                incremental.removed_count
+                file_index.len(),
+                changed_count,
+                removed_count
             );
-            let files_indexed = incremental.changed_count;
+            let files_indexed = changed_count;
             tracing::info!("Indexed {} files total", files_indexed);
 
             // Final save to graph store
@@ -319,12 +316,6 @@ async fn main() -> Result<()> {
                     stats.file_count
                 );
 
-                {
-                    let gs = graph_store_bg.lock().await;
-                    if let Err(e) = gs.save_graph(&new_graph) {
-                        tracing::warn!("Failed to save graph: {}", e);
-                    }
-                }
                 if let Ok(mut graph) = compaction_graph_bg.lock() {
                     *graph = Arc::clone(&new_graph);
                 } else {
@@ -394,6 +385,7 @@ async fn main() -> Result<()> {
             }
 
             indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+            index_readiness_bg.mark_ready();
             tracing::info!("Background indexing complete");
         });
     }
@@ -410,7 +402,10 @@ async fn main() -> Result<()> {
         let vector_index = vector_index.clone();
         let repo_state = Arc::clone(&repo_state);
         let indexing_state = Arc::clone(&indexing);
+        let index_work_for_watchers = Arc::clone(&index_work);
+        let index_readiness_for_watchers = Arc::clone(&index_readiness);
         let watcher_health = Arc::clone(&watcher_health);
+        let index_health = Arc::clone(&index_health);
 
         tokio::spawn(async move {
             for root in workspace_roots {
@@ -425,7 +420,10 @@ async fn main() -> Result<()> {
                     vector_index.clone(),
                     Arc::clone(&repo_state),
                     Arc::clone(&indexing_state),
+                    Arc::clone(&index_work_for_watchers),
+                    Arc::clone(&index_readiness_for_watchers),
                     Arc::clone(&watcher_health),
+                    Arc::clone(&index_health),
                 );
 
                 tokio::spawn(async move {
@@ -475,7 +473,9 @@ async fn main() -> Result<()> {
         default_focus.files,
         default_focus.dirs,
         repo_state,
+        index_work,
         watcher_health,
+        index_health,
     ));
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
@@ -510,6 +510,7 @@ pub(crate) async fn build_workspace_runtime(
     workspace_roots: Vec<PathBuf>,
     default_focus_files: Vec<String>,
     default_focus_dirs: Vec<String>,
+    index_work: Arc<IndexWorkCoordinator>,
 ) -> Result<WorkspaceRuntime> {
     let workspace_root = workspace_roots[0].clone();
     let is_multi_repo = workspace_roots.len() > 1;
@@ -540,39 +541,12 @@ pub(crate) async fn build_workspace_runtime(
     );
 
     let graph_path = lattice_dir.join("graph.db");
-    let graph_store = match GraphStore::open(&graph_path) {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to open persistent graph store at {}: {}. Falling back to memory-only graph store.",
-                graph_path.display(),
-                e
-            );
-            GraphStore::open_in_memory().expect("Failed to create in-memory graph store")
-        }
-    };
-    let graph = match should_warm_load_graph(&graph_store, &workspace_root) {
-        false => CodeGraph::new(),
-        true => match graph_store.load_graph() {
-            Ok(loaded) => {
-                let stats = loaded.stats();
-                if stats.node_count > 0 {
-                    tracing::info!(
-                        "Warm-loaded persisted graph for {}: {} nodes, {} edges, {} files",
-                        workspace_root.display(),
-                        stats.node_count,
-                        stats.edge_count,
-                        stats.file_count
-                    );
-                }
-                loaded
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load persisted graph: {}", e);
-                CodeGraph::new()
-            }
-        },
-    };
+    let (graph_store, graph) = open_graph_store_with_warm_graph(
+        graph_path,
+        workspace_root.clone(),
+        Arc::clone(&index_work),
+    )
+    .await?;
     let graph = Arc::new(graph);
     let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
     let engine = QueryEngine::new_shared(
@@ -596,7 +570,9 @@ pub(crate) async fn build_workspace_runtime(
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
     let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let index_readiness = Arc::new(IndexReadiness::default());
     let watcher_health = Arc::new(WatcherHealth::default());
+    let index_health = Arc::new(IndexHealth::default());
     let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
         &workspace_root,
     )));
@@ -612,9 +588,16 @@ pub(crate) async fn build_workspace_runtime(
         let ws_root = workspace_root.clone();
         let lattice_dir_bg = ws_root.join(".lattice");
         let vector_index_bg = vector_index.clone();
+        let index_work_bg = Arc::clone(&index_work);
+        let index_readiness_bg = Arc::clone(&index_readiness);
+        let index_health_bg = Arc::clone(&index_health);
 
         let task = tokio::spawn(async move {
             tracing::info!("Background indexing starting for {}...", ws_root.display());
+            let _index_permit = index_work_bg
+                .acquire(ws_root.to_string_lossy().to_string(), "startup")
+                .await
+                .expect("index work coordinator remains open for the process lifetime");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
             let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
@@ -630,30 +613,39 @@ pub(crate) async fn build_workspace_runtime(
             } else {
                 vec![ws_root.clone()]
             };
-            let incremental = tokio::task::spawn_blocking(move || {
+            let incremental = match tokio::task::spawn_blocking(move || {
                 build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
             })
             .await
-            .unwrap_or_else(|err| {
-                tracing::warn!("Incremental indexing task failed: {}", err);
-                IncrementalIndexResult::empty()
-            });
+            {
+                Ok(incremental) => incremental,
+                Err(error) => {
+                    tracing::error!(%error, "Incremental indexing worker failed; keeping the previously published graph");
+                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                    index_readiness_bg.mark_ready();
+                    return;
+                }
+            };
 
-            persist_incremental_cache(
-                &graph_store_bg,
-                &incremental.graph,
-                &incremental.file_index,
-                &incremental.parsed_files,
-            )
-            .await;
+            let Some(incremental) = persist_incremental_cache(&graph_store_bg, incremental).await
+            else {
+                indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                index_readiness_bg.mark_ready();
+                return;
+            };
+            let IncrementalIndexResult {
+                graph: incremental_graph,
+                parsed_files,
+                changed_count,
+                index_report,
+                ..
+            } = incremental;
+            index_health_bg.replace_from_report(&index_report);
             {
                 let mut idx = indexer_bg.lock().await;
-                idx.replace_shared_index(
-                    Arc::clone(&incremental.graph),
-                    incremental.parsed_files.clone(),
-                );
+                idx.replace_shared_index(incremental_graph, parsed_files);
             }
-            let files_indexed = incremental.changed_count;
+            let files_indexed = changed_count;
             tracing::info!("Indexed {} files total", files_indexed);
 
             {
@@ -669,12 +661,6 @@ pub(crate) async fn build_workspace_runtime(
                     stats.edge_count,
                     stats.file_count
                 );
-                {
-                    let gs = graph_store_bg.lock().await;
-                    if let Err(e) = gs.save_graph(&new_graph) {
-                        tracing::warn!("Failed to save graph: {}", e);
-                    }
-                }
                 if let Ok(mut graph) = compaction_graph_bg.lock() {
                     *graph = Arc::clone(&new_graph);
                 }
@@ -719,6 +705,7 @@ pub(crate) async fn build_workspace_runtime(
             }
 
             indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+            index_readiness_bg.mark_ready();
             tracing::info!("Background indexing complete for {}", ws_root.display());
         });
         background_tasks.push(task);
@@ -733,6 +720,7 @@ pub(crate) async fn build_workspace_runtime(
         let embedding_engine = Arc::clone(&embedding_engine);
         let vector_index = vector_index.clone();
         let watcher_health = Arc::clone(&watcher_health);
+        let index_health = Arc::clone(&index_health);
 
         for root in workspace_roots {
             let watcher = crate::watcher::FileWatcher::new(
@@ -746,7 +734,10 @@ pub(crate) async fn build_workspace_runtime(
                 vector_index.clone(),
                 Arc::clone(&repo_state),
                 Arc::clone(&indexing),
+                Arc::clone(&index_work),
+                Arc::clone(&index_readiness),
                 Arc::clone(&watcher_health),
+                Arc::clone(&index_health),
             );
             let task = tokio::spawn(async move {
                 if let Err(e) = watcher.run().await {
@@ -798,7 +789,9 @@ pub(crate) async fn build_workspace_runtime(
         default_focus_files,
         default_focus_dirs,
         repo_state,
+        index_work,
         watcher_health,
+        index_health,
     ));
     {
         let handler = Arc::clone(&handler);
@@ -892,18 +885,51 @@ fn env_usize(name: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-pub(crate) fn background_vector_sync_enabled() -> bool {
-    matches!(
-        std::env::var("LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
+async fn open_graph_store_with_warm_graph(
+    graph_path: PathBuf,
+    workspace_root: PathBuf,
+    index_work: Arc<IndexWorkCoordinator>,
+) -> Result<(GraphStore, CodeGraph)> {
+    let _permit = index_work
+        .acquire(workspace_root.to_string_lossy().to_string(), "warm_load")
+        .await
+        .expect("index work coordinator remains open for the process lifetime");
+    tokio::task::spawn_blocking(move || {
+        let graph_store = GraphStore::open_recovering(&graph_path)?;
+        if graph_store.recovery() == lattice_core::storage::GraphStoreRecovery::RebuiltCorrupt {
+            tracing::warn!(
+                graph_path = %graph_path.display(),
+                workspace = %workspace_root.display(),
+                "Replaced corrupt derived graph database; workspace indexing will rebuild it"
+            );
+        }
+        let graph = if should_warm_load_graph(&graph_store, &workspace_root) {
+            graph_store.load_graph().unwrap_or_else(|error| {
+                tracing::warn!(
+                    workspace = %workspace_root.display(),
+                    %error,
+                    "Failed to load persisted graph"
+                );
+                CodeGraph::new()
+            })
+        } else {
+            CodeGraph::new()
+        };
+        let stats = graph.stats();
+        if stats.node_count > 0 {
+            tracing::info!(
+                workspace = %workspace_root.display(),
+                nodes = stats.node_count,
+                edges = stats.edge_count,
+                files = stats.file_count,
+                "Warm-loaded persisted graph"
+            );
+        }
+        Ok((graph_store, graph))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("graph warm-load worker failed: {error}"))?
 }
-
-const WARM_GRAPH_FILE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_FILES";
-const WARM_GRAPH_BYTE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_BYTES";
-const DEFAULT_MAX_WARM_GRAPH_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn should_warm_load_graph(graph_store: &GraphStore, workspace_root: &Path) -> bool {
     let max_files = max_warm_graph_files();
@@ -949,22 +975,6 @@ fn should_warm_load_graph(graph_store: &GraphStore, workspace_root: &Path) -> bo
             false
         }
     }
-}
-
-fn max_warm_graph_files() -> usize {
-    std::env::var(WARM_GRAPH_FILE_LIMIT_ENV)
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(50_000)
-}
-
-fn max_warm_graph_bytes() -> u64 {
-    std::env::var(WARM_GRAPH_BYTE_LIMIT_ENV)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_WARM_GRAPH_BYTES)
 }
 
 fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
@@ -1512,37 +1522,6 @@ fn generate_session_id() -> String {
     format!("s-{:08x}{:08x}", (h >> 32) as u32, now.subsec_nanos())
 }
 
-#[derive(Debug, Clone)]
-struct SourceFileRecord {
-    indexed_path: String,
-    rel_path: String,
-    root: PathBuf,
-    content_hash: Option<String>,
-    mtime_ns: i64,
-    size_bytes: i64,
-}
-
-#[derive(Clone)]
-pub(crate) struct IncrementalIndexResult {
-    graph: Arc<CodeGraph>,
-    parsed_files: HashMap<String, ParsedFile>,
-    file_index: Vec<FileIndexEntry>,
-    changed_count: usize,
-    removed_count: usize,
-}
-
-impl IncrementalIndexResult {
-    fn empty() -> Self {
-        Self {
-            graph: Arc::new(CodeGraph::new()),
-            parsed_files: HashMap::new(),
-            file_index: Vec::new(),
-            changed_count: 0,
-            removed_count: 0,
-        }
-    }
-}
-
 async fn publish_cached_parsed_graph_snapshot(
     parsed_files: &HashMap<String, ParsedFile>,
     indexer: Option<&Arc<Mutex<Indexer>>>,
@@ -1592,356 +1571,6 @@ async fn publish_cached_parsed_graph_snapshot(
         true
     } else {
         false
-    }
-}
-
-pub(crate) async fn load_incremental_cache(
-    graph_store: &Arc<Mutex<GraphStore>>,
-) -> (HashMap<String, FileIndexEntry>, HashMap<String, ParsedFile>) {
-    let store = graph_store.lock().await;
-    let manifest = store.load_file_index().unwrap_or_else(|err| {
-        tracing::warn!("Failed to load file index manifest: {}", err);
-        HashMap::new()
-    });
-    let max_cached_files = max_cached_parsed_files();
-    if manifest.len() > max_cached_files {
-        tracing::warn!(
-            cached_files = manifest.len(),
-            max_cached_files,
-            "Skipping persisted parsed-file cache because it exceeds the safety limit"
-        );
-        return (HashMap::new(), HashMap::new());
-    }
-    let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
-        tracing::warn!("Failed to load cached parsed files: {}", err);
-        HashMap::new()
-    });
-    (manifest, parsed_files)
-}
-
-pub(crate) async fn persist_incremental_cache(
-    graph_store: &Arc<Mutex<GraphStore>>,
-    graph: &CodeGraph,
-    file_index: &[FileIndexEntry],
-    parsed_files: &HashMap<String, ParsedFile>,
-) {
-    let store = graph_store.lock().await;
-    if let Err(err) = store.save_graph(graph) {
-        tracing::warn!("Failed to save graph: {}", err);
-    }
-    if let Err(err) = store.save_file_index(file_index) {
-        tracing::warn!("Failed to save file index manifest: {}", err);
-    }
-    if let Err(err) = store.save_parsed_files(parsed_files) {
-        tracing::warn!("Failed to save cached parsed files: {}", err);
-    }
-}
-
-pub(crate) fn build_incremental_index_for_roots(
-    roots: &[PathBuf],
-    manifest: Option<&HashMap<String, FileIndexEntry>>,
-    mut parsed_files: HashMap<String, ParsedFile>,
-) -> IncrementalIndexResult {
-    let manifest = manifest.cloned().unwrap_or_default();
-    let records = collect_indexable_file_records(roots);
-    warn_if_indexable_file_count_exceeds_warm_limit(roots, records.len());
-    let current_files: HashSet<String> = records
-        .iter()
-        .map(|record| record.indexed_path.clone())
-        .collect();
-    let removed_count = manifest
-        .keys()
-        .filter(|file| !current_files.contains(*file))
-        .count();
-
-    parsed_files.retain(|file, _| current_files.contains(file));
-
-    let mut changed_count = 0usize;
-    let mut file_index = Vec::with_capacity(records.len());
-    let now = unix_timestamp_secs();
-    for record in records {
-        let previous = manifest.get(&record.indexed_path);
-        let metadata_unchanged = previous
-            .map(|entry| entry.mtime_ns == record.mtime_ns && entry.size_bytes == record.size_bytes)
-            .unwrap_or(false);
-        let parser_unchanged = previous
-            .map(|entry| {
-                entry.parser_version == FILE_INDEX_PARSER_VERSION
-                    && entry.schema_version == FILE_INDEX_SCHEMA_VERSION
-            })
-            .unwrap_or(false);
-        let unchanged = metadata_unchanged
-            && parser_unchanged
-            && parsed_files.contains_key(&record.indexed_path);
-
-        if !unchanged {
-            let abs_path = record.root.join(&record.rel_path);
-            match fs::read_to_string(&abs_path) {
-                Ok(content) => {
-                    let content_hash = stable_content_hash(content.as_bytes());
-                    if previous
-                        .map(|entry| entry.content_hash == content_hash && parser_unchanged)
-                        .unwrap_or(false)
-                        && parsed_files.contains_key(&record.indexed_path)
-                    {
-                        file_index.push(FileIndexEntry {
-                            file: record.indexed_path,
-                            content_hash,
-                            mtime_ns: record.mtime_ns,
-                            size_bytes: record.size_bytes,
-                            parser_version: FILE_INDEX_PARSER_VERSION,
-                            schema_version: FILE_INDEX_SCHEMA_VERSION,
-                            last_indexed_at: now,
-                        });
-                        continue;
-                    }
-
-                    match parser::parse_file(&record.indexed_path, &content) {
-                        Ok(parsed) => {
-                            parsed_files.insert(record.indexed_path.clone(), parsed);
-                            changed_count += 1;
-                        }
-                        Err(err) => {
-                            tracing::warn!("Failed to parse {}: {}", record.indexed_path, err);
-                            parsed_files.remove(&record.indexed_path);
-                        }
-                    }
-                    file_index.push(FileIndexEntry {
-                        file: record.indexed_path,
-                        content_hash,
-                        mtime_ns: record.mtime_ns,
-                        size_bytes: record.size_bytes,
-                        parser_version: FILE_INDEX_PARSER_VERSION,
-                        schema_version: FILE_INDEX_SCHEMA_VERSION,
-                        last_indexed_at: now,
-                    });
-                    continue;
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to read {}: {}", abs_path.display(), err);
-                    parsed_files.remove(&record.indexed_path);
-                }
-            }
-        }
-
-        file_index.push(FileIndexEntry {
-            file: record.indexed_path,
-            content_hash: record
-                .content_hash
-                .or_else(|| previous.map(|entry| entry.content_hash.clone()))
-                .unwrap_or_default(),
-            mtime_ns: record.mtime_ns,
-            size_bytes: record.size_bytes,
-            parser_version: FILE_INDEX_PARSER_VERSION,
-            schema_version: FILE_INDEX_SCHEMA_VERSION,
-            last_indexed_at: now,
-        });
-    }
-
-    let mut indexer = Indexer::new(PathBuf::new());
-    indexer.replace_parsed_files(parsed_files);
-    let (graph, parsed_files) = indexer.into_parts();
-    IncrementalIndexResult {
-        graph: Arc::new(graph),
-        parsed_files,
-        file_index,
-        changed_count,
-        removed_count,
-    }
-}
-
-fn warn_if_indexable_file_count_exceeds_warm_limit(roots: &[PathBuf], candidate_files: usize) {
-    let max_files = max_warm_graph_files();
-    if candidate_files <= max_files {
-        return;
-    }
-    let root_list = roots
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    tracing::warn!(
-        workspace_roots = %root_list,
-        candidate_files,
-        max_files,
-        env_var = WARM_GRAPH_FILE_LIMIT_ENV,
-        "Workspace contains more candidate files than the warm graph safety limit"
-    );
-}
-
-fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
-    let multi_repo = roots.len() > 1;
-    let mut records = Vec::new();
-    for root in roots {
-        let security_filter = SecurityFilter::new(root);
-        let mut files = collect_indexable_files(root, &security_filter);
-        prioritize_indexable_paths(root, &mut files);
-        let repo_name = repo_name_for_root(root);
-        for path in files {
-            let rel_path = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let indexed_path = if multi_repo {
-                lattice_core::workspace::repo_rel_path(&repo_name, &rel_path)
-            } else {
-                rel_path.clone()
-            };
-            let Ok(metadata) = fs::metadata(&path) else {
-                continue;
-            };
-            if metadata.len() > max_index_file_bytes() {
-                tracing::debug!(
-                    file = indexed_path.as_str(),
-                    size_bytes = metadata.len(),
-                    "Skipping oversized index candidate"
-                );
-                continue;
-            }
-            records.push(SourceFileRecord {
-                indexed_path,
-                rel_path,
-                root: root.clone(),
-                content_hash: None,
-                mtime_ns: metadata_mtime_ns(&metadata),
-                size_bytes: metadata.len() as i64,
-            });
-        }
-    }
-    records.sort_by(|a, b| a.indexed_path.cmp(&b.indexed_path));
-    records
-}
-
-fn max_index_file_bytes() -> u64 {
-    std::env::var("LATTICE_MAX_INDEX_FILE_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(1_000_000)
-}
-
-fn max_cached_parsed_files() -> usize {
-    std::env::var("LATTICE_MAX_CACHED_PARSED_FILES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(50_000)
-}
-
-fn stable_content_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn metadata_mtime_ns(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64 * 1_000_000_000 + duration.subsec_nanos() as i64)
-        .unwrap_or(0)
-}
-
-fn unix_timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Collect all indexable file paths from a workspace root.
-/// Returns paths filtered by SecurityFilter and supported language extensions.
-fn collect_indexable_files(root: &PathBuf, security_filter: &SecurityFilter) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_files_recursive(root, root, security_filter, &mut files);
-    prioritize_indexable_paths(root, &mut files);
-    files
-}
-
-pub(crate) fn prioritize_indexable_paths(root: &Path, files: &mut Vec<PathBuf>) {
-    files.sort_by(|a, b| {
-        let a_rel = a
-            .strip_prefix(root)
-            .unwrap_or(a.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let b_rel = b
-            .strip_prefix(root)
-            .unwrap_or(b.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        indexing_priority(&a_rel)
-            .cmp(&indexing_priority(&b_rel))
-            .then_with(|| a_rel.cmp(&b_rel))
-    });
-}
-
-fn indexing_priority(rel_path: &str) -> (u8, u8) {
-    let normalized = rel_path.replace('\\', "/");
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    let lower = normalized.to_ascii_lowercase();
-
-    let is_markdown = lower.ends_with(".md");
-    let is_doc_dir = lower.starts_with("docs/");
-    let is_repo_guide = matches!(
-        file_name,
-        "README.md" | "CLAUDE.md" | "AGENTS.md" | "CONTRIBUTING.md"
-    );
-
-    if is_repo_guide || (is_markdown && is_doc_dir) {
-        (0, 0)
-    } else if is_markdown {
-        (0, 1)
-    } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
-        (1, 0)
-    } else {
-        (2, 0)
-    }
-}
-
-/// Recursively collect indexable files into the output vec.
-fn collect_files_recursive(
-    dir: &PathBuf,
-    root: &PathBuf,
-    security_filter: &SecurityFilter,
-    out: &mut Vec<PathBuf>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.is_dir() {
-            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                if security_filter.is_excluded_dir(dir_name) {
-                    continue;
-                }
-            }
-            collect_files_recursive(&path, root, security_filter, out);
-        } else if path.is_file() {
-            let rel_path = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            if security_filter.is_excluded(&rel_path) {
-                continue;
-            }
-
-            if !core_watcher::should_index_file(&rel_path) {
-                continue;
-            }
-
-            out.push(path);
-        }
     }
 }
 

@@ -214,6 +214,42 @@ async fn test_batch_indexing_rebuilds_once_for_multiple_files() {
 }
 
 #[test]
+fn watcher_batch_applies_upserts_and_removals_with_one_graph_rebuild() {
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    indexer
+        .index_file_content("src/removed.ts", "export function removed(): void {}")
+        .expect("seed removed file");
+    let before_snapshot = indexer.graph_snapshot_id();
+
+    let report = indexer.apply_file_batch_contents(
+        vec![
+            (
+                "src/alpha.ts".to_string(),
+                "export function alpha(): void {}".to_string(),
+            ),
+            (
+                "src/beta.ts".to_string(),
+                "export function beta(): void { alpha(); }".to_string(),
+            ),
+        ],
+        vec!["src/removed.ts".to_string()],
+    );
+
+    assert_eq!(report.indexed_count, 2);
+    assert!(!report.is_partial);
+    assert_eq!(indexer.graph_snapshot_id(), before_snapshot + 1);
+    let names = indexer
+        .graph()
+        .all_nodes()
+        .into_iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"alpha"));
+    assert!(names.contains(&"beta"));
+    assert!(!names.contains(&"removed"));
+}
+
+#[test]
 fn test_stale_memory_on_file_change() {
     use crate::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
 

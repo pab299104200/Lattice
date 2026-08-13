@@ -229,6 +229,10 @@ fn index_status_for(root: &Path) -> Result<Value> {
 }
 
 fn print_index_status(root: &Path, response: &Value) {
+    println!("{}", format_index_status(root, response));
+}
+
+fn format_index_status(root: &Path, response: &Value) -> String {
     let payload = response["content"]
         .as_array()
         .and_then(|items| items.first())
@@ -237,25 +241,47 @@ fn print_index_status(root: &Path, response: &Value) {
         .unwrap_or_else(|| response.clone());
     let status = payload["status"].as_str().unwrap_or("unknown");
     let files = payload["files"].as_i64().unwrap_or_default();
+    let parse_failures = payload["parse_failures"].as_u64().unwrap_or_default();
+    if parse_failures > 0 {
+        let failed_files = payload["failed_files"]
+            .as_array()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|files| !files.is_empty())
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        return format!(
+            "WARN workspace {} status={} files={} index=partial parse_failures={} failed_files={}",
+            root.display(),
+            status,
+            files,
+            parse_failures,
+            failed_files
+        );
+    }
     let degraded = payload["watch_degraded"].as_bool().unwrap_or(false);
     if degraded {
         let reason = payload["watch_degraded_reason"]
             .as_str()
             .unwrap_or("unknown");
-        println!(
+        format!(
             "WARN workspace {} status={} files={} watcher=degraded reason={}",
             root.display(),
             status,
             files,
             reason
-        );
+        )
     } else {
-        println!(
+        format!(
             "PASS workspace {} status={} files={} watcher=healthy",
             root.display(),
             status,
             files
-        );
+        )
     }
 }
 
@@ -581,6 +607,25 @@ mod tests {
 
         assert_eq!(report.registrations.len(), 1);
         assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn index_status_reports_partial_index_as_a_warning() {
+        let root = PathBuf::from("/workspace");
+        let output = format_index_status(
+            &root,
+            &json!({
+                "status": "ready",
+                "files": 42,
+                "parse_failures": 2,
+                "failed_files": ["src/a.rs", "src/z.rs"]
+            }),
+        );
+
+        assert_eq!(
+            output,
+            "WARN workspace /workspace status=ready files=42 index=partial parse_failures=2 failed_files=src/a.rs,src/z.rs"
+        );
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

@@ -240,6 +240,54 @@ impl Indexer {
         self.rebuild_graph();
     }
 
+    /// Apply a watcher change-set with one graph rebuild for the entire batch.
+    ///
+    /// Upserts are parsed synchronously so callers can place the complete
+    /// operation on a bounded blocking worker. Parse failures preserve the last
+    /// valid representation of that file, matching `index_file_content`.
+    pub fn apply_file_batch_contents(
+        &mut self,
+        upserts: Vec<(String, String)>,
+        removals: Vec<String>,
+    ) -> BatchIndexReport {
+        let requested_count = upserts.len();
+        let mut indexed_count = 0;
+        let mut indexed_files = Vec::new();
+        let mut failures = Vec::new();
+        for (rel_path, content) in upserts {
+            match parser::parse_file(&rel_path, &content) {
+                Ok(parsed) => {
+                    indexed_files.push(rel_path.clone());
+                    self.parsed_files.insert(rel_path, parsed);
+                    indexed_count += 1;
+                }
+                Err(error) => failures.push(IndexFailure {
+                    file: rel_path,
+                    kind: IndexFailureKind::ParseError,
+                    message: error.to_string(),
+                }),
+            }
+        }
+
+        let removed_files = removals;
+        let removed_count = removed_files
+            .iter()
+            .filter(|rel_path| self.parsed_files.remove(*rel_path).is_some())
+            .count();
+        if indexed_count > 0 || removed_count > 0 {
+            self.rebuild_graph();
+        }
+
+        BatchIndexReport {
+            requested_count,
+            indexed_count,
+            is_partial: indexed_count != requested_count || !failures.is_empty(),
+            indexed_files,
+            removed_files,
+            failures,
+        }
+    }
+
     /// Number of files currently indexed.
     pub fn file_count(&self) -> usize {
         self.parsed_files.len()
@@ -248,11 +296,7 @@ impl Indexer {
     /// Rebuild the code graph from all currently parsed files.
     fn rebuild_graph(&mut self) {
         let previous_graph = Arc::clone(&self.graph);
-        let mut builder = GraphBuilder::new();
-        for parsed in self.parsed_files.values() {
-            builder.add_file(parsed.clone());
-        }
-        let mut graph = builder.build();
+        let mut graph = GraphBuilder::build_from_files(self.parsed_files.values());
         graph.hydrate_missing_bodies_from(previous_graph.as_ref());
         self.graph = Arc::new(graph);
         strip_symbol_bodies(&mut self.parsed_files);
