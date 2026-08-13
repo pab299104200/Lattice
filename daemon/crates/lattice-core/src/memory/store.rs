@@ -3,6 +3,7 @@ use super::model::{
     MemoryFreshnessPolicy, MemoryLinkRecord, MemoryProvenance, MemoryScope, MemoryScoreKind,
     MemoryScoreRecord, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
 };
+use super::session_digest::{SessionDigest, SessionDigestCandidate};
 use crate::error::LatticeError;
 use crate::verification::{
     allows as scope_allows, MemoryScopeFilteredEvent, ScopeFilter, ScopeFilterError,
@@ -13,7 +14,10 @@ use crate::working_memory::{
 };
 use crate::{DateTime, Utc};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 #[cfg(test)]
@@ -24,7 +28,32 @@ const MEMORY_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 const MEMORY_DB_AUTO_CHECKPOINT_PAGES: u32 = 100;
 const MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES: u32 = 1_048_576;
 const MEMORIES_FTS_TABLE: &str = "memories_fts";
-const MEMORY_FTS_STATE_TABLE: &str = "memory_fts_state";
+pub(crate) const MEMORY_FTS_STATE_TABLE: &str = "memory_fts_state";
+pub(crate) const SESSION_DIGEST_DELIVERIES_TABLE: &str = "session_digest_deliveries";
+pub(crate) const SESSION_DIGEST_CAPTURE_COMMITS_TABLE: &str = "session_digest_capture_commits";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedSessionDigestBatch {
+    pub delivery_key: String,
+    pub memory_ids: Vec<String>,
+    pub candidate_count: usize,
+    pub committed_count: usize,
+    pub dropped_observation_count: usize,
+    pub replayed: bool,
+}
+
+struct ExistingSessionDigestDelivery {
+    normalized_fingerprint: String,
+    candidate_count: usize,
+    committed_count: usize,
+    dropped_observation_count: usize,
+}
+
+struct ExistingSessionDigestCommit {
+    candidate_idempotency_key: String,
+    candidate_fingerprint: String,
+    memory_id: String,
+}
 
 /// A schema migration is recorded only after its DDL succeeds.  Individual
 /// column migrations make interrupted upgrades resumable: a later open skips
@@ -64,6 +93,7 @@ const MEMORY_SCHEMA_MIGRATIONS: &[MemorySchemaMigration] = &[
     MemorySchemaMigration { version: 25, name: "add_expires_at", column: "expires_at", sql: "ALTER TABLE memories ADD COLUMN expires_at INTEGER" },
     MemorySchemaMigration { version: 26, name: "add_last_verified_at", column: "last_verified_at", sql: "ALTER TABLE memories ADD COLUMN last_verified_at INTEGER" },
     MemorySchemaMigration { version: 27, name: "add_last_verified_graph_snapshot_id", column: "last_verified_graph_snapshot_id", sql: "ALTER TABLE memories ADD COLUMN last_verified_graph_snapshot_id INTEGER" },
+    MemorySchemaMigration { version: 28, name: "add_applicable_checkout_id", column: "applicable_checkout_id", sql: "ALTER TABLE memories ADD COLUMN applicable_checkout_id TEXT" },
 ];
 
 fn now_unix_micros() -> i64 {
@@ -79,6 +109,8 @@ pub struct MemoryStore {
     conn: Connection,
     #[cfg(test)]
     direct_write_count: AtomicUsize,
+    #[cfg(test)]
+    capture_failure_after_step: AtomicUsize,
 }
 
 impl MemoryStore {
@@ -93,6 +125,8 @@ impl MemoryStore {
             conn,
             #[cfg(test)]
             direct_write_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            capture_failure_after_step: AtomicUsize::new(usize::MAX),
         };
         store.initialize()?;
         Ok(store)
@@ -110,6 +144,8 @@ impl MemoryStore {
             conn,
             #[cfg(test)]
             direct_write_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            capture_failure_after_step: AtomicUsize::new(usize::MAX),
         };
         store.initialize()?;
         Ok(store)
@@ -123,6 +159,12 @@ impl MemoryStore {
     #[cfg(test)]
     pub fn direct_write_count(&self) -> usize {
         self.direct_write_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_capture_failure_after_step(&self, step: Option<usize>) {
+        self.capture_failure_after_step
+            .store(step.unwrap_or(usize::MAX), Ordering::Relaxed);
     }
 
     #[cfg(not(test))]
@@ -208,7 +250,8 @@ impl MemoryStore {
                     stale_reason    TEXT,
                     is_invalidated  INTEGER NOT NULL DEFAULT 0,
                     last_verified_at INTEGER,
-                    last_verified_graph_snapshot_id INTEGER
+                    last_verified_graph_snapshot_id INTEGER,
+                    applicable_checkout_id TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_memories_created
@@ -260,6 +303,37 @@ impl MemoryStore {
                     attempted_branch TEXT,
                     memory_scope TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS session_digest_deliveries (
+                    delivery_key TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    checkout_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    branch TEXT,
+                    revision TEXT NOT NULL,
+                    segment INTEGER NOT NULL CHECK (segment >= 0),
+                    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+                    payload_hash TEXT NOT NULL,
+                    extractor_version TEXT NOT NULL,
+                    normalized_fingerprint TEXT NOT NULL,
+                    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+                    committed_count INTEGER NOT NULL CHECK (
+                        committed_count >= 0 AND committed_count <= candidate_count
+                    ),
+                    dropped_observation_count INTEGER NOT NULL CHECK (dropped_observation_count >= 0),
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS session_digest_capture_commits (
+                    delivery_key TEXT NOT NULL
+                        REFERENCES session_digest_deliveries(delivery_key) ON DELETE CASCADE,
+                    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
+                    candidate_idempotency_key TEXT NOT NULL UNIQUE,
+                    candidate_fingerprint TEXT NOT NULL,
+                    memory_id TEXT NOT NULL UNIQUE
+                        REFERENCES memories(id) ON DELETE RESTRICT,
+                    PRIMARY KEY (delivery_key, candidate_ordinal)
                 );",
             )
             .map_err(|e| {
@@ -296,7 +370,13 @@ impl MemoryStore {
                  CREATE INDEX IF NOT EXISTS idx_memory_accesses_memory_time
                     ON memory_accesses(memory_id, accessed_at DESC);
                  CREATE INDEX IF NOT EXISTS idx_memory_scores_memory_kind
-                    ON memory_scores(memory_id, score_kind, computed_at DESC);",
+                    ON memory_scores(memory_id, score_kind, computed_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_memories_applicable_checkout
+                    ON memories(applicable_checkout_id);
+                 CREATE INDEX IF NOT EXISTS idx_session_digest_deliveries_session
+                    ON session_digest_deliveries(repository_id, checkout_id, session_id, segment);
+                 CREATE INDEX IF NOT EXISTS idx_session_digest_capture_memory
+                    ON session_digest_capture_commits(memory_id);",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory indexes: {}", e))
@@ -410,11 +490,12 @@ impl MemoryStore {
                      superseded_by_memory_id, contradicts_memory_ids, contradicted_by_memory_ids,
                      freshness_policy, freshness_policy_detail, validity_conditions_json, invalidation_triggers_json,
                      provenance_json, evidence_json, linked_docs_json, linked_tests_json, linked_memories_json, expires_at,
-                     created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated)
+                     created_at, last_accessed, access_count, is_stale, stale_reason, is_invalidated,
+                     applicable_checkout_id)
                  VALUES
                      (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                      ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, 0)",
+                      ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, 0, ?37)",
                 params![
                     memory.id,
                     memory.session_id,
@@ -452,6 +533,7 @@ impl MemoryStore {
                     memory.access_count as i64,
                     memory.is_stale as i32,
                     memory.stale_reason,
+                    metadata.applicable_checkout_id,
                 ],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to store memory: {}", e)))?;
@@ -461,6 +543,227 @@ impl MemoryStore {
         self.upsert_fts_row(&memory)?;
 
         Ok(memory.id)
+    }
+
+    /// Atomically persist one already-normalized automatic session digest.
+    ///
+    /// This primitive is crate-private so only the authority-bound router can
+    /// reach it. The transaction owns the journal row, memory rows, structured
+    /// metadata, normalized evidence, FTS documents, and capture-commit rows.
+    pub(crate) fn persist_session_digest_candidate_batch(
+        &self,
+        digest: &SessionDigest,
+        candidates: &[SessionDigestCandidate],
+        extractor_version: &str,
+    ) -> Result<PersistedSessionDigestBatch, LatticeError> {
+        let checkout_id = digest.checkout_id.as_deref().ok_or_else(|| {
+            LatticeError::Storage(
+                "automatic session capture requires exact checkout applicability".to_string(),
+            )
+        })?;
+        let delivery_key = session_digest_delivery_key(digest);
+        let candidate_fingerprints = candidates
+            .iter()
+            .map(session_digest_candidate_fingerprint)
+            .collect::<Result<Vec<_>, _>>()?;
+        let normalized_fingerprint =
+            session_digest_batch_fingerprint(digest, extractor_version, &candidate_fingerprints)?;
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(
+            |error| {
+                LatticeError::Storage(format!(
+                    "Failed to begin automatic session capture transaction: {error}"
+                ))
+            },
+        )?;
+
+        if let Some(existing) = load_session_digest_delivery(&tx, &delivery_key)? {
+            if existing.normalized_fingerprint != normalized_fingerprint
+                || existing.candidate_count != candidates.len()
+                || existing.committed_count != candidates.len()
+                || existing.dropped_observation_count != digest.dropped_observation_count
+            {
+                return Err(LatticeError::Storage(
+                    "automatic session capture delivery key was replayed with different normalized content"
+                        .to_string(),
+                ));
+            }
+            let commits = load_session_digest_commits(&tx, &delivery_key)?;
+            if commits.len() != candidates.len()
+                || commits
+                    .iter()
+                    .zip(candidates.iter().zip(&candidate_fingerprints))
+                    .any(|(commit, (candidate, fingerprint))| {
+                        commit.candidate_idempotency_key != candidate.idempotency_key
+                            || commit.candidate_fingerprint != *fingerprint
+                    })
+            {
+                return Err(LatticeError::Storage(
+                    "automatic session capture replay does not match its committed candidate set"
+                        .to_string(),
+                ));
+            }
+            return Ok(PersistedSessionDigestBatch {
+                delivery_key,
+                memory_ids: commits.into_iter().map(|commit| commit.memory_id).collect(),
+                candidate_count: existing.candidate_count,
+                committed_count: existing.committed_count,
+                dropped_observation_count: existing.dropped_observation_count,
+                replayed: true,
+            });
+        }
+
+        for (candidate, fingerprint) in candidates.iter().zip(&candidate_fingerprints) {
+            if let Some(existing) =
+                load_session_digest_commit_by_candidate(&tx, &candidate.idempotency_key)?
+            {
+                let reason = if existing.candidate_fingerprint == *fingerprint {
+                    "automatic session capture candidate key is already bound to another delivery"
+                } else {
+                    "automatic session capture candidate key was reused for different normalized content"
+                };
+                return Err(LatticeError::Storage(reason.to_string()));
+            }
+        }
+
+        tx.execute(
+            &format!(
+                "INSERT INTO {SESSION_DIGEST_DELIVERIES_TABLE}
+                    (delivery_key, repository_id, checkout_id, session_id, branch, revision,
+                     segment, schema_version, payload_hash, extractor_version,
+                     normalized_fingerprint, candidate_count, committed_count,
+                     dropped_observation_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?14)"
+            ),
+            params![
+                delivery_key,
+                digest.repository_id,
+                checkout_id,
+                digest.session_id,
+                digest.branch,
+                digest.revision,
+                digest.segment as i64,
+                digest.schema_version as i64,
+                digest.payload_hash,
+                extractor_version,
+                normalized_fingerprint,
+                candidates.len() as i64,
+                digest.dropped_observation_count as i64,
+                digest.received_at.unix_seconds(),
+            ],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to journal automatic session capture delivery: {error}"
+            ))
+        })?;
+        self.inject_capture_failure(1)?;
+
+        tx.execute(
+            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 1 WHERE singleton = 1"),
+            [],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to enter automatic session capture FTS recovery state: {error}"
+            ))
+        })?;
+
+        let mut memory_ids = Vec::with_capacity(candidates.len());
+        for (ordinal, (candidate, fingerprint)) in
+            candidates.iter().zip(&candidate_fingerprints).enumerate()
+        {
+            let memory_id = session_digest_memory_id(&candidate.idempotency_key);
+            insert_session_digest_memory(
+                &tx,
+                digest,
+                candidate,
+                &memory_id,
+                checkout_id,
+                extractor_version,
+            )?;
+            self.inject_capture_failure(2)?;
+            insert_session_digest_evidence(&tx, digest, candidate, &memory_id)?;
+            self.inject_capture_failure(3)?;
+            insert_session_digest_fts(&tx, candidate, &memory_id)?;
+            self.inject_capture_failure(4)?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {SESSION_DIGEST_CAPTURE_COMMITS_TABLE}
+                        (delivery_key, candidate_ordinal, candidate_idempotency_key,
+                         candidate_fingerprint, memory_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)"
+                ),
+                params![
+                    delivery_key,
+                    ordinal as i64,
+                    candidate.idempotency_key,
+                    fingerprint,
+                    memory_id,
+                ],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to commit automatic session capture candidate: {error}"
+                ))
+            })?;
+            memory_ids.push(memory_id);
+        }
+        self.inject_capture_failure(5)?;
+
+        tx.execute(
+            &format!(
+                "UPDATE {SESSION_DIGEST_DELIVERIES_TABLE}
+                 SET committed_count = ?1
+                 WHERE delivery_key = ?2"
+            ),
+            params![candidates.len() as i64, delivery_key],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to reduce automatic session capture result: {error}"
+            ))
+        })?;
+        tx.execute(
+            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 0 WHERE singleton = 1"),
+            [],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to finalize automatic session capture FTS state: {error}"
+            ))
+        })?;
+        self.inject_capture_failure(6)?;
+
+        tx.commit().map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to commit automatic session capture transaction: {error}"
+            ))
+        })?;
+
+        Ok(PersistedSessionDigestBatch {
+            delivery_key,
+            memory_ids,
+            candidate_count: candidates.len(),
+            committed_count: candidates.len(),
+            dropped_observation_count: digest.dropped_observation_count,
+            replayed: false,
+        })
+    }
+
+    #[cfg(not(test))]
+    fn inject_capture_failure(&self, _step: usize) -> Result<(), LatticeError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_capture_failure(&self, step: usize) -> Result<(), LatticeError> {
+        if self.capture_failure_after_step.load(Ordering::Relaxed) == step {
+            return Err(LatticeError::Storage(
+                "injected automatic session capture failure".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn save_working_memory_checkpoint_for_scope(
@@ -486,8 +789,37 @@ impl MemoryStore {
         limit: usize,
         scope: &ScopeFilter,
     ) -> Result<Vec<Memory>, LatticeError> {
+        self.query_with_applicable_checkout(keyword, limit, scope, None)
+    }
+
+    /// Scope-enforced query for an authority that owns an exact checkout.
+    /// Restricted automatic-capture rows are visible only to that checkout;
+    /// legacy and explicit rows with no applicability restriction remain
+    /// visible under their existing session/branch/repository scope.
+    pub(crate) fn query_for_checkout(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+        scope: &ScopeFilter,
+        checkout_id: &str,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        if checkout_id.trim().is_empty() {
+            return Err(LatticeError::Storage(
+                "exact-checkout memory query requires a non-empty checkout identity".to_string(),
+            ));
+        }
+        self.query_with_applicable_checkout(keyword, limit, scope, Some(checkout_id))
+    }
+
+    fn query_with_applicable_checkout(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+        scope: &ScopeFilter,
+        checkout_id: Option<&str>,
+    ) -> Result<Vec<Memory>, LatticeError> {
         scope.validate().map_err(scope_filter_error)?;
-        let predicate = scope_sql_predicate(scope);
+        let predicate = scope_sql_predicate(scope, checkout_id);
         let mut bind_values = predicate.bind_values;
         let sql = if let Some(fts_query) = build_fts_query(keyword.unwrap_or_default()) {
             let sql = format!(
@@ -528,13 +860,18 @@ impl MemoryStore {
         };
 
         let memories = self.query_memories_values(&sql, bind_values, "scoped memory query")?;
-        self.enforce_scope_boundary(memories, scope, "scoped memory query")
+        self.enforce_scope_boundary_with_checkout(
+            memories,
+            scope,
+            checkout_id,
+            "scoped memory query",
+        )
     }
 
     pub fn list_all_scoped(&self, scope: &ScopeFilter) -> Result<Vec<Memory>, LatticeError> {
         scope.validate().map_err(scope_filter_error)?;
         let memories = self.list_all()?;
-        self.filter_scope_boundary(memories, scope)
+        self.filter_scope_boundary(memories, scope, None)
     }
 
     pub fn get_by_id_scoped(
@@ -546,7 +883,7 @@ impl MemoryStore {
         let Some(memory) = self.get_by_id(id)? else {
             return Ok(None);
         };
-        if scope_allows(&memory, scope) {
+        if scope_allows(&memory, scope) && self.applicable_checkout_id(id)?.is_none() {
             return Ok(Some(memory));
         }
         self.record_scope_filtered(&memory, scope)?;
@@ -560,7 +897,7 @@ impl MemoryStore {
     ) -> Result<Vec<Memory>, LatticeError> {
         scope.validate().map_err(scope_filter_error)?;
         let memories = self.search_by_keyword(keyword)?;
-        self.filter_scope_boundary(memories, scope)
+        self.filter_scope_boundary(memories, scope, None)
     }
 
     /// Explicit unscoped path for migrations, snapshots, and legacy admin flows.
@@ -2509,10 +2846,13 @@ impl MemoryStore {
         &self,
         memories: Vec<Memory>,
         scope: &ScopeFilter,
+        checkout_id: Option<&str>,
     ) -> Result<Vec<Memory>, LatticeError> {
         let mut allowed = Vec::with_capacity(memories.len());
         for memory in memories {
-            if scope_allows(&memory, scope) {
+            if scope_allows(&memory, scope)
+                && self.checkout_applicability_allows(&memory.id, checkout_id)?
+            {
                 allowed.push(memory);
                 continue;
             }
@@ -2527,9 +2867,21 @@ impl MemoryStore {
         scope: &ScopeFilter,
         context: &str,
     ) -> Result<Vec<Memory>, LatticeError> {
+        self.enforce_scope_boundary_with_checkout(memories, scope, None, context)
+    }
+
+    fn enforce_scope_boundary_with_checkout(
+        &self,
+        memories: Vec<Memory>,
+        scope: &ScopeFilter,
+        checkout_id: Option<&str>,
+        context: &str,
+    ) -> Result<Vec<Memory>, LatticeError> {
         let mut allowed = Vec::with_capacity(memories.len());
         for memory in memories {
-            if scope_allows(&memory, scope) {
+            if scope_allows(&memory, scope)
+                && self.checkout_applicability_allows(&memory.id, checkout_id)?
+            {
                 allowed.push(memory);
                 continue;
             }
@@ -2671,7 +3023,7 @@ impl MemoryStore {
     ) -> Result<ExistingVerificationMetadata, LatticeError> {
         self.conn
             .query_row(
-                "SELECT expires_at
+                "SELECT expires_at, applicable_checkout_id
                  FROM memories
                  WHERE id = ?1
                  LIMIT 1",
@@ -2681,6 +3033,7 @@ impl MemoryStore {
                         expires_at: row
                             .get::<_, Option<i64>>(0)?
                             .map(DateTime::from_unix_seconds),
+                        applicable_checkout_id: row.get(1)?,
                     })
                 },
             )
@@ -2693,6 +3046,33 @@ impl MemoryStore {
             })?
             .map_or(Ok(ExistingVerificationMetadata::default()), Ok)
     }
+
+    fn applicable_checkout_id(&self, id: &str) -> Result<Option<String>, LatticeError> {
+        self.conn
+            .query_row(
+                "SELECT applicable_checkout_id FROM memories WHERE id = ?1 AND is_invalidated = 0",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to load memory checkout applicability: {error}"
+                ))
+            })
+            .map(Option::flatten)
+    }
+
+    fn checkout_applicability_allows(
+        &self,
+        id: &str,
+        checkout_id: Option<&str>,
+    ) -> Result<bool, LatticeError> {
+        Ok(match self.applicable_checkout_id(id)? {
+            None => true,
+            Some(required) => checkout_id.is_some_and(|actual| actual == required),
+        })
+    }
 }
 
 struct ScopeSqlPredicate {
@@ -2700,9 +3080,335 @@ struct ScopeSqlPredicate {
     bind_values: Vec<Value>,
 }
 
+fn session_digest_delivery_key(digest: &SessionDigest) -> String {
+    hash_capture_parts(&[
+        "lattice.session-digest.delivery.v1",
+        &digest.repository_id,
+        digest.checkout_id.as_deref().unwrap_or_default(),
+        &digest.session_id,
+        &digest.segment.to_string(),
+    ])
+}
+
+fn session_digest_candidate_fingerprint(
+    candidate: &SessionDigestCandidate,
+) -> Result<String, LatticeError> {
+    let encoded = serde_json::to_vec(candidate).map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to encode normalized automatic capture candidate: {error}"
+        ))
+    })?;
+    Ok(hash_capture_bytes(
+        b"lattice.session-digest.normalized-candidate.v1\0",
+        &encoded,
+    ))
+}
+
+fn session_digest_batch_fingerprint(
+    digest: &SessionDigest,
+    extractor_version: &str,
+    candidate_fingerprints: &[String],
+) -> Result<String, LatticeError> {
+    let encoded = serde_json::to_vec(&(digest, extractor_version, candidate_fingerprints))
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to encode normalized automatic capture batch: {error}"
+            ))
+        })?;
+    Ok(hash_capture_bytes(
+        b"lattice.session-digest.normalized-batch.v1\0",
+        &encoded,
+    ))
+}
+
+fn hash_capture_parts(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_capture_bytes(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn session_digest_memory_id(idempotency_key: &str) -> String {
+    let digest = idempotency_key
+        .strip_prefix("sha256:")
+        .unwrap_or(idempotency_key);
+    format!("session-digest-{digest}")
+}
+
+fn load_session_digest_delivery(
+    tx: &Transaction<'_>,
+    delivery_key: &str,
+) -> Result<Option<ExistingSessionDigestDelivery>, LatticeError> {
+    tx.query_row(
+        &format!(
+            "SELECT normalized_fingerprint, candidate_count, committed_count,
+                    dropped_observation_count
+             FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+             WHERE delivery_key = ?1"
+        ),
+        params![delivery_key],
+        |row| {
+            Ok(ExistingSessionDigestDelivery {
+                normalized_fingerprint: row.get(0)?,
+                candidate_count: row.get::<_, i64>(1)? as usize,
+                committed_count: row.get::<_, i64>(2)? as usize,
+                dropped_observation_count: row.get::<_, i64>(3)? as usize,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to load automatic session capture delivery: {error}"
+        ))
+    })
+}
+
+fn load_session_digest_commits(
+    tx: &Transaction<'_>,
+    delivery_key: &str,
+) -> Result<Vec<ExistingSessionDigestCommit>, LatticeError> {
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT commits.candidate_idempotency_key, commits.candidate_fingerprint,
+                    commits.memory_id
+             FROM {SESSION_DIGEST_CAPTURE_COMMITS_TABLE} commits
+             INNER JOIN memories ON memories.id = commits.memory_id
+             WHERE commits.delivery_key = ?1
+             ORDER BY candidate_ordinal"
+        ))
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to prepare automatic session capture replay: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(params![delivery_key], |row| {
+            Ok(ExistingSessionDigestCommit {
+                candidate_idempotency_key: row.get(0)?,
+                candidate_fingerprint: row.get(1)?,
+                memory_id: row.get(2)?,
+            })
+        })
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to query automatic session capture replay: {error}"
+            ))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to decode automatic session capture replay: {error}"
+        ))
+    })
+}
+
+fn load_session_digest_commit_by_candidate(
+    tx: &Transaction<'_>,
+    candidate_key: &str,
+) -> Result<Option<ExistingSessionDigestCommit>, LatticeError> {
+    tx.query_row(
+        &format!(
+            "SELECT candidate_idempotency_key, candidate_fingerprint, memory_id
+             FROM {SESSION_DIGEST_CAPTURE_COMMITS_TABLE}
+             WHERE candidate_idempotency_key = ?1"
+        ),
+        params![candidate_key],
+        |row| {
+            Ok(ExistingSessionDigestCommit {
+                candidate_idempotency_key: row.get(0)?,
+                candidate_fingerprint: row.get(1)?,
+                memory_id: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to inspect automatic session capture idempotency: {error}"
+        ))
+    })
+}
+
+fn insert_session_digest_memory(
+    tx: &Transaction<'_>,
+    digest: &SessionDigest,
+    candidate: &SessionDigestCandidate,
+    memory_id: &str,
+    checkout_id: &str,
+    extractor_version: &str,
+) -> Result<(), LatticeError> {
+    let (memory_type, assertion_type) = match candidate.memory_class {
+        MemoryClass::FailurePattern => (MemoryType::AntiPattern, MemoryAssertionType::AntiPattern),
+        _ => (
+            MemoryType::Observation,
+            MemoryAssertionType::WorkflowOutcome,
+        ),
+    };
+    let (scope, freshness_policy) = if digest.branch.is_some() {
+        (MemoryScope::Branch, MemoryFreshnessPolicy::BranchScoped)
+    } else {
+        (MemoryScope::Session, MemoryFreshnessPolicy::SessionScoped)
+    };
+    let linked_symbols = "[]";
+    let linked_files =
+        serde_json::to_string(&candidate.evidence.edited_paths).map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to encode automatic session capture linked files: {error}"
+            ))
+        })?;
+    let evidence = session_digest_memory_evidence(candidate)?;
+    let evidence_json = serde_json::to_string(&[evidence]).map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to encode automatic session capture evidence: {error}"
+        ))
+    })?;
+    let provenance = vec![
+        MemoryProvenance {
+            source: format!("lattice.session_digest.schema.v{}", digest.schema_version),
+            reference: Some(digest.payload_hash.clone()),
+            captured_at: Some(digest.received_at.unix_seconds().max(0) as u64),
+            note: None,
+        },
+        MemoryProvenance {
+            source: "lattice.session_digest.extractor".to_string(),
+            reference: Some(extractor_version.to_string()),
+            captured_at: Some(digest.received_at.unix_seconds().max(0) as u64),
+            note: None,
+        },
+    ];
+    let provenance_json = serde_json::to_string(&provenance).map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to encode automatic session capture provenance: {error}"
+        ))
+    })?;
+    let captured_at = digest.received_at.unix_seconds();
+
+    tx.execute(
+        "INSERT INTO memories
+            (id, session_id, content, memory_type, scope, confidence, linked_symbols,
+             linked_files, workspace_id, branch, scope_organization_id, refresh_key,
+             source_query, memory_class, assertion_type, verification_status,
+             confidence_reason, freshness_policy, provenance_json, evidence_json,
+             created_at, last_accessed, applicable_checkout_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12,
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20, ?21)",
+        params![
+            memory_id,
+            digest.session_id,
+            candidate.claim,
+            memory_type.as_str(),
+            scope.as_str(),
+            0.7_f64,
+            linked_symbols,
+            linked_files,
+            digest.repository_id,
+            digest.branch,
+            candidate.assertion_fingerprint,
+            "automatic_session_digest",
+            candidate.memory_class.as_str(),
+            assertion_type.as_str(),
+            MemoryVerificationStatus::Unverified.as_str(),
+            "deterministically extracted from a sanitized, authority-bound session digest",
+            freshness_policy.as_str(),
+            provenance_json,
+            evidence_json,
+            captured_at,
+            checkout_id,
+        ],
+    )
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to store automatic session capture memory: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn session_digest_memory_evidence(
+    candidate: &SessionDigestCandidate,
+) -> Result<MemoryEvidence, LatticeError> {
+    let detail = serde_json::to_string(&candidate.evidence).map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to encode typed automatic session capture evidence: {error}"
+        ))
+    })?;
+    Ok(MemoryEvidence {
+        kind: "session_digest".to_string(),
+        reference: Some(candidate.idempotency_key.clone()),
+        detail: Some(detail),
+        captured_at: Some(candidate.evidence.captured_at.unix_seconds().max(0) as u64),
+        span: None,
+        evidence_content_hash: None,
+    })
+}
+
+fn insert_session_digest_evidence(
+    tx: &Transaction<'_>,
+    _digest: &SessionDigest,
+    candidate: &SessionDigestCandidate,
+    memory_id: &str,
+) -> Result<(), LatticeError> {
+    let evidence = session_digest_memory_evidence(candidate)?;
+    tx.execute(
+        "INSERT INTO memory_evidence
+            (evidence_id, memory_id, kind, reference, detail, captured_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            format!("{memory_id}:evidence:0"),
+            memory_id,
+            evidence.kind,
+            evidence.reference,
+            evidence.detail,
+            evidence.captured_at.map(|value| value as i64),
+        ],
+    )
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to store automatic session capture evidence row: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn insert_session_digest_fts(
+    tx: &Transaction<'_>,
+    candidate: &SessionDigestCandidate,
+    memory_id: &str,
+) -> Result<(), LatticeError> {
+    let linked_files = candidate.evidence.edited_paths.join(" ");
+    tx.execute(
+        &format!(
+            "INSERT INTO {MEMORIES_FTS_TABLE}
+                (memory_id, content, linked_symbols, linked_files)
+             VALUES (?1, ?2, '', ?3)"
+        ),
+        params![
+            memory_id,
+            augment_search_text(&candidate.claim),
+            linked_files
+        ],
+    )
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to index automatic session capture memory: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct ExistingVerificationMetadata {
     expires_at: Option<DateTime<Utc>>,
+    applicable_checkout_id: Option<String>,
 }
 
 struct GraphDeltaReferenceFilter {
@@ -2711,7 +3417,7 @@ struct GraphDeltaReferenceFilter {
     is_like: bool,
 }
 
-fn scope_sql_predicate(scope: &ScopeFilter) -> ScopeSqlPredicate {
+fn scope_sql_predicate(scope: &ScopeFilter, checkout_id: Option<&str>) -> ScopeSqlPredicate {
     let mut predicates = Vec::new();
     let mut bind_values = Vec::new();
 
@@ -2736,8 +3442,15 @@ fn scope_sql_predicate(scope: &ScopeFilter) -> ScopeSqlPredicate {
         bind_values.push(Value::Text(organization_id.clone()));
     }
 
+    let applicability = if let Some(checkout_id) = checkout_id {
+        bind_values.push(Value::Text(checkout_id.to_string()));
+        "(applicable_checkout_id IS NULL OR applicable_checkout_id = ?)"
+    } else {
+        "applicable_checkout_id IS NULL"
+    };
+
     ScopeSqlPredicate {
-        where_clause: format!("({})", predicates.join(" OR ")),
+        where_clause: format!("({}) AND {applicability}", predicates.join(" OR ")),
         bind_values,
     }
 }

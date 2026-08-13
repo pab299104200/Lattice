@@ -210,7 +210,7 @@ fn test_open_backfills_fts_for_legacy_memory_rows() {
         })
         .expect("Failed to inspect recorded memory schema migrations");
     assert_eq!(
-        migration_count, 27,
+        migration_count, 28,
         "every legacy column migration is recorded"
     );
     let fts_is_dirty: i64 = store

@@ -14,7 +14,7 @@ pub use model::{
 };
 pub use router::{
     AuthorityQualifiedMemoryId, MemoryAuthority, MemoryQueryAuthority, MemoryRecallResult,
-    MemoryRecallTier, MemoryStoreRole, MemoryStoreRouter,
+    MemoryRecallTier, MemoryStoreRole, MemoryStoreRouter, SessionDigestCaptureResult,
 };
 pub use session_capture::{
     parse_session_capture_close, parse_session_capture_event, reduce_session_capture,

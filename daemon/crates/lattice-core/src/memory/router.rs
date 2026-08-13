@@ -7,6 +7,10 @@
 //! returned identifier.
 
 use super::model::MemoryProvenance;
+use super::session_digest::{
+    extract_default_session_digest_candidates, SessionDigest, SessionDigestCandidate,
+    SESSION_DIGEST_EXTRACTOR_VERSION,
+};
 use super::{Memory, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryVerificationStatus};
 use crate::error::LatticeError;
 use crate::events::BranchRef;
@@ -157,6 +161,18 @@ pub struct MemoryRecallResult {
     pub trust_reason: String,
 }
 
+/// Durable outcome of one repository-owned automatic session capture batch.
+/// Exact retries return the same qualified IDs and counts with `replayed` set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDigestCaptureResult {
+    pub delivery_key: String,
+    pub memory_ids: Vec<AuthorityQualifiedMemoryId>,
+    pub candidate_count: usize,
+    pub committed_count: usize,
+    pub dropped_observation_count: usize,
+    pub replayed: bool,
+}
+
 /// Router over a repository-private store and optional organization-shared
 /// store. It intentionally has no unscoped assistant-facing query API.
 pub struct MemoryStoreRouter<'a> {
@@ -261,6 +277,68 @@ impl<'a> MemoryStoreRouter<'a> {
         }
     }
 
+    /// Persist the deterministic candidate batch for an authority-bound
+    /// session digest in one repository-store transaction.
+    ///
+    /// Capture has no organization target or shared-store fallback. Candidate
+    /// normalization is verified again at this boundary so a caller cannot
+    /// retain an idempotency key while changing its claim or evidence.
+    pub fn capture_session_digest_candidate_batch(
+        &self,
+        digest: &SessionDigest,
+        candidates: &[SessionDigestCandidate],
+    ) -> Result<SessionDigestCaptureResult, LatticeError> {
+        if digest.repository_id != self.authority.repository_id
+            || digest.session_id != self.authority.session_id
+            || digest.checkout_id.as_deref() != Some(self.authority.checkout_id.as_str())
+            || digest.branch != self.authority.branch
+        {
+            self.audit_denial(
+                "capture session digest",
+                "session digest authority does not match the repository router",
+            )?;
+            return Err(LatticeError::Storage(
+                "automatic session capture authority does not match the repository router"
+                    .to_string(),
+            ));
+        }
+
+        let expected = extract_default_session_digest_candidates(digest);
+        if candidates != expected.as_slice() {
+            self.audit_denial(
+                "capture session digest",
+                "candidate batch differs from deterministic normalized extraction",
+            )?;
+            return Err(LatticeError::Storage(
+                "automatic session capture candidate batch is not the deterministic normalized batch"
+                    .to_string(),
+            ));
+        }
+
+        let persisted = self
+            .repository_store
+            .persist_session_digest_candidate_batch(
+                digest,
+                candidates,
+                SESSION_DIGEST_EXTRACTOR_VERSION,
+            )?;
+        Ok(SessionDigestCaptureResult {
+            delivery_key: persisted.delivery_key,
+            memory_ids: persisted
+                .memory_ids
+                .into_iter()
+                .map(|local_id| AuthorityQualifiedMemoryId {
+                    authority: MemoryAuthority::Repository(self.authority.repository_id.clone()),
+                    local_id,
+                })
+                .collect(),
+            candidate_count: persisted.candidate_count,
+            committed_count: persisted.committed_count,
+            dropped_observation_count: persisted.dropped_observation_count,
+            replayed: persisted.replayed,
+        })
+    }
+
     /// Merged, bounded recall. Each store is searched independently before
     /// merging; a shared tier is never opened or searched without configured
     /// organization authority.
@@ -271,10 +349,11 @@ impl<'a> MemoryStoreRouter<'a> {
     ) -> Result<Vec<MemoryRecallResult>, LatticeError> {
         let limit = limit.max(1);
         let oversample = limit.saturating_mul(2).clamp(8, 64);
-        let repository = self.repository_store.query(
+        let repository = self.repository_store.query_for_checkout(
             keyword,
             oversample,
             &self.authority.repository_scope_filter(),
+            &self.authority.checkout_id,
         )?;
         let mut ranked = repository
             .into_iter()
@@ -603,7 +682,15 @@ fn ensure_role_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryClass, MemoryType};
+    use crate::memory::store::{
+        MEMORY_FTS_STATE_TABLE, SESSION_DIGEST_CAPTURE_COMMITS_TABLE,
+        SESSION_DIGEST_DELIVERIES_TABLE,
+    };
+    use crate::memory::{
+        bind_session_digest_authority, parse_session_digest, MemoryClass, MemoryType,
+        SessionDigestAuthority,
+    };
+    use crate::DateTime;
 
     fn authority(repository: &str, organization: Option<&str>) -> MemoryQueryAuthority {
         MemoryQueryAuthority::new(
@@ -645,6 +732,58 @@ mod tests {
             memory_class: MemoryClass::Observation,
             ..Default::default()
         }
+    }
+
+    fn capture_authority(checkout: &str, branch: Option<&str>) -> MemoryQueryAuthority {
+        MemoryQueryAuthority::new(
+            "repo-capture",
+            checkout,
+            branch.map(str::to_string),
+            "session-capture",
+            Some("cadres".to_string()),
+        )
+        .unwrap()
+    }
+
+    fn capture_digest(checkout: &str, branch: Option<&str>) -> SessionDigest {
+        let received_at = DateTime::from_unix_seconds(1_700_000_010);
+        let content = parse_session_digest(
+            r#"{
+                "schema_version":1,
+                "ended_at":"2023-11-14T22:13:20Z",
+                "edited_paths":["src/capture.rs"],
+                "final_summary":"Implemented atomic session capture.",
+                "observations":[
+                    {"kind":"check","label":"lattice-core tests","outcome":"passed"}
+                ]
+            }"#,
+            received_at,
+        )
+        .unwrap();
+        bind_session_digest_authority(
+            content,
+            &SessionDigestAuthority {
+                session_id: "session-capture".to_string(),
+                repository_id: "repo-capture".to_string(),
+                checkout_id: Some(checkout.to_string()),
+                branch: branch.map(str::to_string),
+                revision: "0123456789abcdef".to_string(),
+                segment: 7,
+            },
+        )
+        .unwrap()
+    }
+
+    fn table_count(store: &MemoryStore, table: &str) -> i64 {
+        store
+            .with_connection(|connection| {
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| LatticeError::Storage(error.to_string()))
+            })
+            .unwrap()
     }
 
     #[test]
@@ -867,5 +1006,226 @@ mod tests {
             .unwrap();
 
         assert!(router.recall(Some("deployment"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_digest_batch_is_atomic_deterministic_and_exactly_replayable() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let shared = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            capture_authority("checkout-a", Some("main")),
+        )
+        .unwrap();
+        let digest = capture_digest("checkout-a", Some("main"));
+        let candidates = extract_default_session_digest_candidates(&digest);
+
+        let first = router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+        let replay = router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.delivery_key, first.delivery_key);
+        assert_eq!(replay.memory_ids, first.memory_ids);
+        assert_eq!(replay.candidate_count, first.candidate_count);
+        assert_eq!(replay.committed_count, first.committed_count);
+        assert_eq!(first.committed_count, candidates.len());
+        assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
+        assert_eq!(
+            table_count(&repository, SESSION_DIGEST_CAPTURE_COMMITS_TABLE),
+            candidates.len() as i64
+        );
+        assert_eq!(
+            table_count(&repository, "memories"),
+            candidates.len() as i64
+        );
+        assert_eq!(
+            table_count(&repository, "memory_evidence"),
+            candidates.len() as i64
+        );
+        assert_eq!(
+            table_count(&repository, "memories_fts"),
+            candidates.len() as i64
+        );
+        assert_eq!(table_count(&shared, "memories"), 0);
+        assert_eq!(table_count(&shared, SESSION_DIGEST_DELIVERIES_TABLE), 0);
+
+        repository
+            .with_connection(|connection| {
+                let unsafe_journal_fields: i64 = connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM pragma_table_info('{SESSION_DIGEST_DELIVERIES_TABLE}')
+                             WHERE name IN ('claim', 'summary', 'evidence', 'edited_paths')"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                assert_eq!(unsafe_journal_fields, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn changed_normalized_candidate_with_same_key_is_rejected() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority("checkout-a", Some("main")),
+        )
+        .unwrap();
+        let digest = capture_digest("checkout-a", Some("main"));
+        let candidates = extract_default_session_digest_candidates(&digest);
+        router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+
+        let mut changed = candidates.clone();
+        changed[0].claim.push_str(" changed");
+        let error = repository
+            .persist_session_digest_candidate_batch(
+                &digest,
+                &changed,
+                SESSION_DIGEST_EXTRACTOR_VERSION,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different normalized content"));
+        assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
+        assert_eq!(
+            table_count(&repository, "memories"),
+            candidates.len() as i64
+        );
+    }
+
+    #[test]
+    fn automatic_capture_is_exact_checkout_and_branch_applicable() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let digest = capture_digest("checkout-a", Some("main"));
+        let candidates = extract_default_session_digest_candidates(&digest);
+        MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority("checkout-a", Some("main")),
+        )
+        .unwrap()
+        .capture_session_digest_candidate_batch(&digest, &candidates)
+        .unwrap();
+
+        let mut legacy = memory(MemoryScope::Branch, None, "legacy branch observation");
+        legacy.workspace_id = Some("repo-capture".to_string());
+        legacy.branch = Some("main".to_string());
+        repository.store(legacy).unwrap();
+
+        let same_checkout = MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority("checkout-a", Some("main")),
+        )
+        .unwrap()
+        .recall(None, 20)
+        .unwrap();
+        assert_eq!(same_checkout.len(), candidates.len() + 1);
+
+        let other_checkout = MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority("checkout-b", Some("main")),
+        )
+        .unwrap()
+        .recall(None, 20)
+        .unwrap();
+        assert_eq!(other_checkout.len(), 1);
+        assert_eq!(
+            other_checkout[0].memory.content,
+            "legacy branch observation"
+        );
+
+        let other_branch = MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority("checkout-a", Some("feature")),
+        )
+        .unwrap()
+        .recall(None, 20)
+        .unwrap();
+        assert!(other_branch.is_empty());
+    }
+
+    #[test]
+    fn injected_capture_failures_roll_back_every_persistence_component() {
+        for failure_step in 1..=6 {
+            let repository = MemoryStore::open_in_memory().unwrap();
+            repository.set_capture_failure_after_step(Some(failure_step));
+            let digest = capture_digest("checkout-a", Some("main"));
+            let candidates = extract_default_session_digest_candidates(&digest);
+            let router = MemoryStoreRouter::new(
+                &repository,
+                None,
+                capture_authority("checkout-a", Some("main")),
+            )
+            .unwrap();
+
+            let error = router
+                .capture_session_digest_candidate_batch(&digest, &candidates)
+                .unwrap_err();
+            assert!(error.to_string().contains("injected"));
+            for table in [
+                "memories",
+                "memory_evidence",
+                "memories_fts",
+                SESSION_DIGEST_DELIVERIES_TABLE,
+                SESSION_DIGEST_CAPTURE_COMMITS_TABLE,
+            ] {
+                assert_eq!(
+                    table_count(&repository, table),
+                    0,
+                    "failure step {failure_step} left rows in {table}"
+                );
+            }
+            let fts_dirty = repository
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            &format!(
+                                "SELECT is_dirty FROM {MEMORY_FTS_STATE_TABLE} WHERE singleton = 1"
+                            ),
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|error| LatticeError::Storage(error.to_string()))
+                })
+                .unwrap();
+            assert_eq!(fts_dirty, 0, "failure step {failure_step} left FTS dirty");
+        }
+    }
+
+    #[test]
+    fn capture_rejects_mismatched_checkout_without_touching_shared_store() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let shared = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            capture_authority("checkout-a", Some("main")),
+        )
+        .unwrap();
+        let digest = capture_digest("checkout-b", Some("main"));
+        let candidates = extract_default_session_digest_candidates(&digest);
+
+        let error = router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap_err();
+        assert!(error.to_string().contains("authority"));
+        assert_eq!(table_count(&repository, "memories"), 0);
+        assert_eq!(table_count(&shared, "memories"), 0);
+        assert_eq!(table_count(&shared, SESSION_DIGEST_DELIVERIES_TABLE), 0);
     }
 }
