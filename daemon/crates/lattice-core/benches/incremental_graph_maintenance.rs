@@ -1,17 +1,20 @@
 //! Measurement gate for C3 incremental graph maintenance.
 //!
-//! The production indexer currently rebuilds the complete graph after every
-//! change. This benchmark compares that implementation with a scoped-update
-//! candidate on deterministic 609-file and 5,000-file corpora. The candidate
-//! models the indexes a production implementation would retain: the changed
-//! file's replacement nodes and the already-resolved edges whose source or
-//! target belongs to that file.
+//! The production [`Indexer`](lattice_core::indexer::Indexer) now performs a
+//! bounded rebuild of the affected dependency component. This benchmark keeps
+//! two deliberately lower-level measurements on deterministic 609-file and
+//! 5,000-file corpora: a complete [`GraphBuilder`] rebuild and the graph
+//! mutation portion of a one-file scoped update. The latter is a lower bound,
+//! not a timing claim for the public indexer; it excludes parsing, dependency
+//! closure discovery, and the component-local `GraphBuilder` pass performed
+//! by `Indexer::index_file_content`.
 //!
-//! This is deliberately a benchmark-local candidate, not a second runtime
-//! graph implementation. Each fixture first proves that applying its update
-//! produces the same nodes and edges as a full rebuild. If that assertion
-//! stops holding as graph semantics evolve, the benchmark fails before it
-//! records misleading timings.
+//! Keeping the lower-bound fixture is useful for detecting graph-mutation
+//! regressions without making a benchmark-sized synthetic parser workload a
+//! requirement. Each fixture first proves that applying its update produces
+//! the same nodes and edges as a full rebuild. If that assertion stops holding
+//! as graph semantics evolve, the benchmark fails before it records
+//! misleading timings.
 
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -245,7 +248,7 @@ fn bench_incremental_graph_maintenance(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
-            BenchmarkId::new("scoped_candidate_one_file", file_count),
+            BenchmarkId::new("scoped_graph_mutation_lower_bound_one_file", file_count),
             &fixture,
             |bencher, fixture| {
                 bencher.iter_batched(
