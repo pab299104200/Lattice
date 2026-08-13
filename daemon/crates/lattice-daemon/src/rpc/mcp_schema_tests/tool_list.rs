@@ -5,11 +5,11 @@
 
 use serde_json::json;
 
-use super::super::server::RequestHandler;
 use super::super::mcp::{
     AGENT_CONTEXT_MODE_DEFAULT, AGENT_IMPACT_LIMIT_DEFAULT, AGENT_RECALL_MODE_DEFAULT,
     AGENT_STATUS_SCOPE_DEFAULT,
 };
+use super::super::server::RequestHandler;
 use super::{call_args, SchemaFixture};
 
 /// The 8 advertised agent-facing tool names in the order they appear in the reference.
@@ -149,8 +149,14 @@ async fn metadata_and_identifier_fields_are_typed() {
             assert_eq!(schema["properties"][field]["type"], "string");
         }
     }
-    assert_eq!(schema_for_tool(&tools, "recall")["properties"]["memory_id"]["type"], "string");
-    assert_eq!(schema_for_tool(&tools, "status")["properties"]["anchor"]["type"], "string");
+    assert_eq!(
+        schema_for_tool(&tools, "recall")["properties"]["memory_id"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema_for_tool(&tools, "status")["properties"]["anchor"]["type"],
+        "string"
+    );
 }
 
 fn schema_for_tool(tools: &[serde_json::Value], name: &str) -> serde_json::Value {
