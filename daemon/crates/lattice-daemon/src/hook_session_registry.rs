@@ -214,6 +214,10 @@ pub struct RegistryVerifyRequest {
     pub current_checkout: HookCheckoutIdentity,
     pub now_ms: i64,
     pub idle_ttl_ms: i64,
+    /// Renewal is disabled for the route's authority-only preflight so
+    /// malformed content cannot extend a lease. Successful admission renews
+    /// atomically with its receipt/outbox row.
+    pub renew_idle: bool,
     /// Allows only an exact, already-sealed close receipt to authenticate for
     /// idempotent retry. Ordinary traffic must leave this unset.
     pub replay_delivery_id: Option<RegistryId>,
@@ -658,7 +662,8 @@ impl HookSessionRegistry {
             transaction.commit()?;
             return Err(error);
         }
-        let idle_deadline_ms = if binding.state == RegistryBindingState::Open {
+        let idle_deadline_ms = if binding.state == RegistryBindingState::Open && request.renew_idle
+        {
             let deadline = request
                 .now_ms
                 .checked_add(request.idle_ttl_ms)
@@ -1667,6 +1672,7 @@ mod tests {
                         .unwrap(),
                     now_ms: 90,
                     idle_ttl_ms: 100,
+                    renew_idle: true,
                     replay_delivery_id: None,
                 },
             )
@@ -1688,6 +1694,7 @@ mod tests {
                         .unwrap(),
                     now_ms: 100,
                     idle_ttl_ms: 100,
+                    renew_idle: true,
                     replay_delivery_id: None,
                 },
             )

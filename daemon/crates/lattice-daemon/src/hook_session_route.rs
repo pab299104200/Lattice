@@ -240,6 +240,7 @@ impl HookSessionRoute {
                     current_checkout: checkout,
                     now_ms: admitted_at_ms,
                     idle_ttl_ms: IDLE_TTL_MS,
+                    renew_idle: false,
                     replay_delivery_id: (kind == RegistryDeliveryKind::Close)
                         .then_some(delivery_id.clone()),
                 },
@@ -865,10 +866,13 @@ fn map_registry_error(error: HookRegistryError) -> HookSessionRouteError {
         | HookRegistryError::AuthorityMismatch
         | HookRegistryError::Expired
         | HookRegistryError::Sealed
-        | HookRegistryError::Revoked => HookSessionRouteError::AuthorityRejected,
+        | HookRegistryError::Revoked
+        | HookRegistryError::ReplayViolation
+        | HookRegistryError::OrderViolation => HookSessionRouteError::AuthorityRejected,
         HookRegistryError::InvalidConfiguration
         | HookRegistryError::InvalidIdentifier
-        | HookRegistryError::InvalidValue => HookSessionRouteError::InvalidRequest,
+        | HookRegistryError::InvalidValue
+        | HookRegistryError::OrderWindowExceeded => HookSessionRouteError::InvalidRequest,
         _ => HookSessionRouteError::Unavailable,
     }
 }
