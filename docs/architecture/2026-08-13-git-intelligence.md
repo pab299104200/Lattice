@@ -25,25 +25,23 @@ newest-first `CommitSample` values and returns a `GitIntelligenceSnapshot`; it h
 no process, filesystem, database, clock, or Git dependency. Fixtures can therefore
 prove the same input produces the same ordered output on every platform.
 
-A thin `git2` adapter owns repository discovery, revision traversal, diffing,
-rename resolution, author normalization, and historical blob parsing. A graph
-store adapter owns schema migration, commit reuse, snapshot publication, and
-queries. The daemon coordinates those adapters and schedules refreshes. Retrieval,
-`impact`, and hooks only read the published snapshot; they never traverse Git on a
-request path.
+A thin `git2` adapter owns repository discovery, reachable-commit traversal, and
+first-parent tree diffing. It intentionally collects file paths only: it does
+not parse historical blobs, resolve semantic renames, or apply mailmap
+normalization. A graph store adapter owns schema creation, commit reuse,
+snapshot publication, and reads. The daemon coordinates those adapters and
+schedules refreshes. Retrieval, `impact`, and hooks only read the published
+snapshot; they never traverse Git on a request path.
 
 The adapter records only data required for aggregation:
 
-- immutable commit object id and first-parent-independent traversal position;
-- commit subject and optional canonical author identity;
-- canonical repository-relative changed paths and change kind; and
-- parser-resolved stable symbol keys when both the historical blob and supported
-  parser are available.
+- immutable commit object id and its bounded traversal position;
+- commit subject and the author identity exposed by Git; and
+- canonical repository-relative changed paths and change kind.
 
-Commit bodies, email addresses, raw blobs, and arbitrary diff content are not
-persisted. Author identity is normalized from configured mailmap information when
-available and otherwise uses a stable, non-display identity. It is an attribution
-signal, not an ownership declaration.
+Commit bodies, raw blobs, arbitrary diff content, and historical symbol
+observations are not persisted. The adapter's author string is an attribution
+signal only; it is not mailmap-normalized and is not an ownership declaration.
 
 ## Signal semantics
 
@@ -58,10 +56,9 @@ signal, not an ownership declaration.
 - Author count is the number of distinct known identities in the active window.
   Bus factor is the fewest known contributors accounting for a strict majority of
   attributed touches. It is absent if any relevant commit has unknown authorship.
-- A rename contributes one touch to the destination path. When `git2` resolves a
-  rename, historical observations in the active window are associated with the
-  destination lineage for that refresh; the old path is retained only as commit
-  evidence, not exposed as a second current hotspot.
+- The adapter does not enable similarity-based rename detection. A Git rename
+  therefore contributes the old and new paths reported by the tree diff; this
+  is an intentional file-history limitation, not a claim of semantic lineage.
 
 The subject classifier uses the small, case-insensitive vocabulary `fix`, `bug`,
 `hotfix`, `patch`, and `regression` with token boundaries. It is deliberately an
@@ -76,7 +73,7 @@ keys and constraints are contractual:
 | Record | Key | Required contents |
 | --- | --- | --- |
 | repository state | workspace identity | active generation, resolved head OID, limits/version, refreshed time, freshness and completeness |
-| commit sample | repository identity + commit OID | subject classification, normalized author identity, truncation flags |
+| commit key | repository identity + commit OID | immutable identity for window membership and replay-safe cleanup |
 | file observation | repository identity + commit OID + path | change kind and optional rename source |
 | symbol observation | repository identity + commit OID + stable symbol key | canonical current path |
 | window membership | generation + ordinal | commit OID, newest first |
@@ -103,31 +100,33 @@ infer freshness solely from the presence of aggregate rows.
 
 ## Refresh and publication transaction
 
-Initial indexing schedules a history refresh after the static graph is available.
-The existing watcher schedules another refresh when the owned checkout's `HEAD`,
-current ref, `packed-refs`, shallow boundary, or worktree control state changes.
-Sibling-worktree control files and ordinary working-tree edits do not cause Git
-mining. Bursts are coalesced by the existing index-work coordinator, so at most one
-refresh per workspace runs and one later refresh is pending.
+The runtime opens the Git-intelligence store with the workspace and hydrates the
+read handle from its active generation, if one exists. It does not mine during
+open. The watcher schedules refresh after it observes the owned checkout's
+`HEAD`; bursts are latest-wins and share the index-work coordinator, so at most
+one refresh per workspace runs. Ordinary working-tree edits and sibling-worktree
+control files do not cause mining.
 
 Refresh has two phases:
 
-1. Outside the database write transaction, resolve `HEAD`, traverse the bounded
-   commit window, reuse commit evidence already keyed by OID, collect missing
-   samples, and deterministically aggregate a candidate generation. Re-read
-   `HEAD` after mining. If it changed, discard the candidate and retry once through
-   the coordinator instead of publishing a mixed-history view.
+1. Outside the database write transaction, traverse the bounded commit window
+   from the requested checkout head and deterministically aggregate a candidate
+   generation. The current runtime performs a bounded read on each refresh;
+   commit keys are reused only for persisted membership and cleanup, not as a
+   shortcut around diff extraction. A latest-wins request superseding the worker
+   causes its candidate to be discarded instead of publishing mixed history.
 2. In one SQLite `BEGIN IMMEDIATE` transaction, upsert immutable commit evidence,
    insert the candidate membership and aggregates, mark its completeness, switch
    the repository state's active-generation pointer, and retire the prior
    generation. Commit publication is all-or-nothing. Orphan evidence and retired
    generations are garbage-collected only after the new pointer is durable.
 
-If traversal, parsing, serialization, or SQLite work fails, the transaction rolls
-back and the previous generation remains readable with `stale` status, attempted
-head OID, last-success time, and an actionable error class. A repository with no
-commits publishes an explicit complete empty generation. A missing or unreadable
-repository publishes no fabricated zero-valued snapshot.
+If traversal, serialization, or SQLite work fails, publication is skipped and the
+previous generation remains in the store; the read handle is marked `stale` by
+the watcher until a later refresh succeeds. A repository with no commits
+publishes an explicit complete empty generation. A missing or unreadable
+repository has no fabricated zero-valued snapshot: consumers expose
+`availability: unavailable` when no generation can be hydrated.
 
 Daemon shutdown may cancel mining before publication. Publication itself is a
 short, non-cancellable transaction. Refresh is replay-safe: processing the same
@@ -141,10 +140,10 @@ All bounds are enforced before allocation grows with untrusted repository histor
 | --- | --- |
 | history window | 500 commits; operator values are clamped to `0..=500`; zero explicitly disables mining |
 | changed paths per commit | 20,000 normalized paths; an over-wide commit is recorded as excluded rather than partially counted |
-| symbols per commit | 4,096 stable symbols; an overflow omits that commit's symbol observations while retaining complete file observations |
+| symbols per commit | not mined by the Git adapter; symbol rows are retained only for pure-miner fixtures/API compatibility and are empty for runtime history |
 | co-change width | commits touching more than 256 files contribute hotspots but no co-change pairs and increment an exclusion counter |
 | unique co-change pairs | 250,000 per generation; overflow makes co-change unavailable for the entire generation rather than publishing a biased partial set |
-| adapter deadline | 5 seconds by default, configurable up to 30 seconds; deadline expiry preserves the prior generation as stale |
+| adapter work | bounded by the commit/path/co-change limits and serialized through the index-work coordinator; failures preserve the prior generation as stale |
 | retained generations | active plus one prior generation until successful publication cleanup |
 
 Input is normalized and deduplicated before applying a bound. Ordered maps and
@@ -166,8 +165,9 @@ symbol, and line tie-breaks.
 
 Every history contribution included in a result explanation names the signal,
 observed count or per-mille ratio, window size, and snapshot head. If the snapshot
-is stale or degraded, ranking omits the feature while metadata reports why. Author
-identities and bus-factor values are not used as relevance boosts.
+is unavailable, stale, or degraded, ranking omits the feature while metadata
+reports the corresponding availability. Author identities and bus-factor values
+are not used as relevance boosts.
 
 ### `impact`
 
@@ -185,13 +185,14 @@ is persisted from this advisory relationship.
 
 ### PostToolUse hook
 
-The hook canonicalizes successfully edited repository paths and performs one
-bounded snapshot lookup. It warns only when a changed file's hotspot is at or above
-the computed top-decile cutoff among nonzero file hotspots. One invocation emits a
-single non-blocking summary capped at five files, including hotspot counts, window
-size, and snapshot head. It emits nothing for stale/degraded snapshots, failed tool
-operations, paths outside the workspace, or repositories without a cutoff. Hook
-failure remains best-effort and exits `0` quickly when the daemon is unavailable.
+The hook passes successfully edited, workspace-scoped paths to one bounded
+`impact` request. The MCP result includes at most five file warnings when a
+path's hotspot is at or above the computed top-decile cutoff among nonzero file
+hotspots. The integration scripts extract those marked warnings into one
+non-blocking `Git History Warning` section. They emit nothing for failed tool
+operations, paths outside the workspace, unavailable/stale/degraded history, or
+repositories without a cutoff. Hook failure remains best-effort and exits `0`
+quickly when the daemon is unavailable.
 
 ## Removal of pseudo-hotspots
 
@@ -213,17 +214,18 @@ from a missing Git snapshot to `edit_count`.
 
 ## Observability and recovery
 
-Status and diagnostic output expose the active and attempted head OIDs, aggregation
-version, effective limits, sampled/included/excluded commit counts, co-change
-completeness, last-success time, refresh duration, freshness, and last error class.
-Logs include workspace identity and generation but never raw commit subjects or
-author identities.
+MCP workflow payloads expose the read-handle generation and compact metadata:
+availability, sampled window size, and head commit id. The report retained in
+`graph.db` carries aggregation limits and exclusion counters for diagnostics.
+Consumers suppress history whenever the handle is not `available`, so a missing
+or stale generation cannot be mistaken for zero risk.
 
-Corrupt Git-intelligence rows are derived data. Recovery quarantines or rebuilds
-only the Git-intelligence tables/generation, preserving the static graph and other
-workspace data. Until rebuild succeeds, consumers omit the signal and report it as
-unavailable. Rebuild uses the same bounded refresh path; it has no separate
-unbounded repair mode.
+The runtime validates the store while opening a workspace and publishes an
+existing generation as stale until a refresh succeeds. Store-open or generation
+validation errors fail runtime construction rather than silently creating an
+empty snapshot. A failed refresh leaves the prior generation untouched; the
+next checkout-head event retries the same bounded path. There is no unbounded
+repair mode or request-time Git fallback.
 
 ## Acceptance tests
 

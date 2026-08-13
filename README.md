@@ -141,6 +141,29 @@ If `memories.db` cannot be opened cleanly, the daemon first quarantines `memorie
 
 If the USearch index cannot be opened or synchronized, the daemon falls back to exact SQLite vector search without changing MCP response shapes.
 
+### Git history intelligence
+
+Lattice mines a bounded, newest-first window of up to 500 reachable Git commits
+into an atomic generation in `graph.db`. The runtime adapter intentionally mines
+file history only: it records changed repository-relative paths, commit
+subjects, and Git-provided author strings, but does not parse historical blobs
+or infer semantic rename lineage. File hotspots, bug-fix density, attribution
+summaries, and file co-change advisories are secondary signals; they never add
+graph edges or admit a result that primary retrieval rejected. The pure miner
+and store also expose symbol-shaped fields for API/test compatibility, but the
+runtime Git adapter leaves historical symbol observations empty.
+
+The published read handle reports `availability` as `available`, `degraded`,
+`stale`, or `unavailable`. Only `available` generations affect context ranking,
+impact ordering, co-change advisories, or hotspot warnings; other states remain
+visible as metadata and suppress history-derived signals. `impact` includes at
+most ten missing co-change partners (requiring two supporting commits). The
+Claude Code and Codex PostToolUse hooks extract at most five top-decile hotspot
+warnings from a successful, workspace-scoped `impact` call. Warnings are
+non-blocking and fail silent/fast when the daemon or history snapshot is
+unavailable. See [Git Intelligence](docs/architecture/2026-08-13-git-intelligence.md)
+for the storage, refresh, bounds, and consumer contract.
+
 ## Which Tool First?
 
 If you are not sure which tool to call, choose one of these public verbs:
