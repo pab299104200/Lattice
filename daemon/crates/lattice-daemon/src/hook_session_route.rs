@@ -3,13 +3,15 @@
 use anyhow::{Context, Result};
 use lattice_core::memory::{
     parse_session_capture_close, parse_session_capture_event, reduce_session_capture,
-    DaemonSessionCaptureEvent, MemoryQueryAuthority, MemoryStore, MemoryStoreRouter,
-    SessionCaptureFact, SessionDigestAuthority, SESSION_CAPTURE_SCHEMA_VERSION,
+    DaemonSessionCaptureEvent, MemoryClass, MemoryQueryAuthority, MemoryRecallResult,
+    MemoryRecallTier, MemoryStore, MemoryStoreRouter, SessionCaptureFact, SessionDigestAuthority,
+    SESSION_CAPTURE_SCHEMA_VERSION,
 };
 use lattice_core::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -18,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::adoption_metrics::{AdoptionMetricsStore, CaptureMetricRecord, CaptureOutcome};
+use crate::adoption_metrics::{
+    AdoptionMetricsStore, CaptureMetricRecord, CaptureOutcome, MemoryInjectionActionRecord,
+    MemoryInjectionRecord,
+};
 use crate::hook_session_binding::{
     HookBindingId, HookCheckoutIdentity, HookIntegrationId, HookRepositoryState,
     HookSessionCapability, HookSessionCryptography, HostSessionId,
@@ -40,6 +45,15 @@ const RECOVERY_BATCH: usize = 64;
 const MAX_JOURNAL_ROWS_PER_BINDING: i64 = 16_385;
 const RETRY_BASE_MS: i64 = 250;
 const RETRY_MAX_MS: i64 = 30_000;
+const PRESENTATION_CANDIDATE_LIMIT: usize = 64;
+const SESSION_PRESENTATION_LIMIT: usize = 5;
+const PROMPT_PRESENTATION_LIMIT: usize = 5;
+const SESSION_PRESENTATION_BUDGET_TOKENS: usize = 1_500;
+const PROMPT_PRESENTATION_BUDGET_TOKENS: usize = 1_200;
+const POST_TOOL_PRESENTATION_BUDGET_TOKENS: usize = 240;
+const MIN_PRESENTATION_RELEVANCE_BPS: u16 = 2_500;
+const MAX_PROMPT_BYTES: usize = 8 * 1024;
+const MAX_REQUEST_ID_BYTES: usize = 128;
 // The route itself is the first and only extractor for the bounded hook facts.
 // Keep this numeric metric dimension independent of the user-controlled
 // integration identifier and of the string stored with session digests.
@@ -78,6 +92,29 @@ struct HookSessionOpenParams {
     host_session_id: String,
     #[serde(default)]
     resume: Option<HookSessionResumeParams>,
+    #[serde(default)]
+    presentation: Option<HookPresentationParams>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookPresentationParams {
+    kind: HookPresentationKind,
+    request_id: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    acted_on_injection_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum HookPresentationKind {
+    SessionStart,
+    UserPromptSubmit,
+    PostToolUse,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +145,14 @@ struct HookSessionOpenResult {
     absolute_deadline_ms: i64,
     repository_id: String,
     checkout_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presentation: Option<HookPresentationResult>,
+}
+
+#[derive(Serialize)]
+struct HookPresentationResult {
+    injection_id: String,
+    context: String,
 }
 
 impl HookSessionRoute {
@@ -147,6 +192,7 @@ impl HookSessionRoute {
         let resolved = resolve_authority(hello)?;
         let integration = HookIntegrationId::new(params.integration)
             .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+        let metric_client = capture_metric_integration(integration.as_str());
         let host_session_id = HostSessionId::new(params.host_session_id)
             .map_err(|_| HookSessionRouteError::InvalidRequest)?;
         let checkout = HookCheckoutIdentity::new(
@@ -156,6 +202,7 @@ impl HookSessionRoute {
         .map_err(|_| HookSessionRouteError::Unavailable)?;
         let repository_state = resolve_repository_state(&resolved.checkout_root)?;
         let resume = params.resume.map(decode_resume).transpose()?;
+        let presentation_request = params.presentation;
         let request = registry_open_request(
             integration,
             host_session_id,
@@ -169,6 +216,10 @@ impl HookSessionRoute {
             .map_err(|_| HookSessionRouteError::Unavailable)?
             .open_or_resume(&self.cryptography, request)
             .map_err(map_registry_error)?;
+        let presentation = presentation_request
+            .map(|request| present_hook_memory(&resolved, &outcome, metric_client, request))
+            .transpose()?
+            .flatten();
         serde_json::to_value(HookSessionOpenResult {
             binding_id: encode_hex(outcome.binding_id.as_bytes()),
             capability: encode_hex(outcome.capability.as_bytes()),
@@ -178,6 +229,7 @@ impl HookSessionRoute {
             absolute_deadline_ms: outcome.absolute_deadline_ms,
             repository_id: resolved.repository_id,
             checkout_id: resolved.checkout_root.to_string_lossy().to_string(),
+            presentation,
         })
         .map_err(|_| HookSessionRouteError::Unavailable)
     }
@@ -444,6 +496,561 @@ fn capture_schema_version(event: &Value) -> u32 {
         .and_then(Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
         .unwrap_or_default()
+}
+
+struct HookMemoryStores {
+    repository: MemoryStore,
+    shared: Option<MemoryStore>,
+    organization_id: Option<String>,
+}
+
+struct RankedHookMemory {
+    result: MemoryRecallResult,
+    class: MemoryClass,
+    relevance_bps: u16,
+}
+
+struct HookMemoryClasses {
+    repository: BTreeMap<String, MemoryClass>,
+    shared: BTreeMap<String, MemoryClass>,
+}
+
+fn present_hook_memory(
+    identity: &WorkspaceIdentity,
+    outcome: &crate::hook_session_registry::RegistryOpenOutcome,
+    client: &'static str,
+    request: HookPresentationParams,
+) -> Result<Option<HookPresentationResult>, HookSessionRouteError> {
+    validate_presentation_request(identity, &request)?;
+    let session_id = encode_hex(outcome.internal_session_id.as_bytes());
+    let metrics = AdoptionMetricsStore::new(&identity.repository_root);
+
+    // An action is admitted only as an explicit exact-id claim on a later
+    // request that has already authenticated by opening/resuming this lease.
+    // There is deliberately no time/proximity or edited-file inference here.
+    if let Some(injection_id) = request.acted_on_injection_id.as_deref() {
+        if !valid_injection_id(injection_id) {
+            return Err(HookSessionRouteError::InvalidRequest);
+        }
+        let action_metric_id = format!(
+            "hook-action-v1:{}:{}:{}",
+            session_id, request.request_id, injection_id
+        );
+        metrics
+            .record_memory_injection_action_once(
+                &action_metric_id,
+                MemoryInjectionActionRecord {
+                    injection_id: injection_id.to_string(),
+                    acted_count: 1,
+                },
+            )
+            .map_err(|_| HookSessionRouteError::Unavailable)?;
+    }
+
+    let repository_state = resolve_repository_state(&identity.checkout_root)?;
+    let stores = HookMemoryStores::open(identity)?;
+    let authority = MemoryQueryAuthority::new(
+        identity.repository_id.clone(),
+        identity.checkout_root.to_string_lossy().to_string(),
+        repository_state.branch().map(str::to_owned),
+        session_id.clone(),
+        stores.organization_id.clone(),
+    )
+    .map_err(|_| HookSessionRouteError::Unavailable)?;
+    let router = MemoryStoreRouter::new(&stores.repository, stores.shared.as_ref(), authority)
+        .map_err(|_| HookSessionRouteError::Unavailable)?;
+    let candidates = router
+        .recall(None, PRESENTATION_CANDIDATE_LIMIT)
+        .map_err(|_| HookSessionRouteError::Unavailable)?;
+    let classes = stores.memory_classes(&candidates)?;
+    let dirty_files = match request.kind {
+        HookPresentationKind::SessionStart => dirty_working_set(&identity.checkout_root)?,
+        _ => Vec::new(),
+    };
+    let mut ranked = Vec::new();
+    for result in candidates {
+        let class = classes.class_for(&result)?;
+        let relevance_bps = presentation_relevance(
+            &request,
+            &result,
+            repository_state.branch(),
+            &dirty_files,
+            class,
+        );
+        if passes_presentation_gate(relevance_bps) {
+            ranked.push(RankedHookMemory {
+                result,
+                class,
+                relevance_bps,
+            });
+        }
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .relevance_bps
+            .cmp(&left.relevance_bps)
+            .then_with(|| {
+                right
+                    .result
+                    .memory
+                    .confidence
+                    .partial_cmp(&left.result.memory.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.result.memory_id.cmp(&right.result.memory_id))
+    });
+    let (limit, budget_tokens, channel) = match request.kind {
+        HookPresentationKind::SessionStart => (
+            SESSION_PRESENTATION_LIMIT,
+            SESSION_PRESENTATION_BUDGET_TOKENS,
+            "hook-session-start",
+        ),
+        HookPresentationKind::UserPromptSubmit => (
+            PROMPT_PRESENTATION_LIMIT,
+            PROMPT_PRESENTATION_BUDGET_TOKENS,
+            "hook-user-prompt-submit",
+        ),
+        HookPresentationKind::PostToolUse => (
+            1,
+            POST_TOOL_PRESENTATION_BUDGET_TOKENS,
+            "hook-post-tool-use",
+        ),
+    };
+    ranked.truncate(limit);
+    if ranked.is_empty() {
+        return Ok(None);
+    }
+    let injection_id = stable_injection_id(outcome, &request, &ranked);
+    let (context, shown_count) =
+        render_hook_presentation(request.kind, &injection_id, &ranked, budget_tokens);
+    if shown_count == 0 {
+        return Ok(None);
+    }
+    metrics
+        .record_memory_injection_once(
+            &format!("hook-injection-v1:{injection_id}"),
+            MemoryInjectionRecord {
+                session_id,
+                client: client.to_string(),
+                channel: channel.to_string(),
+                injection_id: injection_id.clone(),
+                shown_count: shown_count as u64,
+            },
+        )
+        .map_err(|_| HookSessionRouteError::Unavailable)?;
+    Ok(Some(HookPresentationResult {
+        injection_id,
+        context,
+    }))
+}
+
+impl HookMemoryStores {
+    fn open(identity: &WorkspaceIdentity) -> Result<Self, HookSessionRouteError> {
+        std::fs::create_dir_all(&identity.repository_lattice_dir)
+            .map_err(|_| HookSessionRouteError::Unavailable)?;
+        let repository = MemoryStore::open(&identity.memories_path())
+            .map_err(|_| HookSessionRouteError::Unavailable)?;
+        let config = hook_shared_memory_config()?;
+        let (shared, organization_id) = match config {
+            Some((organization_id, path)) => (
+                Some(MemoryStore::open(&path).map_err(|_| HookSessionRouteError::Unavailable)?),
+                Some(organization_id),
+            ),
+            None => (None, None),
+        };
+        Ok(Self {
+            repository,
+            shared,
+            organization_id,
+        })
+    }
+
+    fn memory_classes(
+        &self,
+        results: &[MemoryRecallResult],
+    ) -> Result<HookMemoryClasses, HookSessionRouteError> {
+        let repository_ids = results
+            .iter()
+            .filter(|result| result.source_tier == MemoryRecallTier::Repository)
+            .map(|result| result.memory.id.as_str())
+            .collect::<Vec<_>>();
+        let shared_ids = results
+            .iter()
+            .filter(|result| result.source_tier == MemoryRecallTier::Organization)
+            .map(|result| result.memory.id.as_str())
+            .collect::<Vec<_>>();
+        let repository = load_memory_classes(&self.repository, &repository_ids)?;
+        let shared = match (self.shared.as_ref(), shared_ids.is_empty()) {
+            (_, true) => BTreeMap::new(),
+            (Some(store), false) => load_memory_classes(store, &shared_ids)?,
+            (None, false) => return Err(HookSessionRouteError::Unavailable),
+        };
+        Ok(HookMemoryClasses { repository, shared })
+    }
+}
+
+impl HookMemoryClasses {
+    fn class_for(&self, result: &MemoryRecallResult) -> Result<MemoryClass, HookSessionRouteError> {
+        let classes = match result.source_tier {
+            MemoryRecallTier::Repository => &self.repository,
+            MemoryRecallTier::Organization => &self.shared,
+        };
+        classes
+            .get(&result.memory.id)
+            .copied()
+            .ok_or(HookSessionRouteError::Unavailable)
+    }
+}
+
+fn load_memory_classes(
+    store: &MemoryStore,
+    ids: &[&str],
+) -> Result<BTreeMap<String, MemoryClass>, HookSessionRouteError> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    store
+        .with_connection(|connection| {
+            let placeholders = std::iter::repeat("?")
+                .take(ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT id, memory_class FROM memories WHERE id IN ({placeholders})"
+                ))
+                .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+            let mut classes = BTreeMap::new();
+            for row in rows {
+                let (id, class) =
+                    row.map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                classes.insert(id, MemoryClass::from_str(&class));
+            }
+            Ok(classes)
+        })
+        .map_err(|_| HookSessionRouteError::Unavailable)
+}
+
+fn validate_presentation_request(
+    identity: &WorkspaceIdentity,
+    request: &HookPresentationParams,
+) -> Result<(), HookSessionRouteError> {
+    if request.request_id.is_empty()
+        || request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || !request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(HookSessionRouteError::InvalidRequest);
+    }
+    match request.kind {
+        HookPresentationKind::SessionStart
+            if request.prompt.is_some() || request.path.is_some() =>
+        {
+            Err(HookSessionRouteError::InvalidRequest)
+        }
+        HookPresentationKind::UserPromptSubmit => {
+            let prompt = request
+                .prompt
+                .as_deref()
+                .filter(|prompt| !prompt.trim().is_empty())
+                .ok_or(HookSessionRouteError::InvalidRequest)?;
+            if prompt.len() > MAX_PROMPT_BYTES || request.path.is_some() {
+                return Err(HookSessionRouteError::InvalidRequest);
+            }
+            Ok(())
+        }
+        HookPresentationKind::PostToolUse => {
+            if request.prompt.is_some() {
+                return Err(HookSessionRouteError::InvalidRequest);
+            }
+            let path = request
+                .path
+                .as_deref()
+                .ok_or(HookSessionRouteError::InvalidRequest)?;
+            validate_event_path(
+                &identity.checkout_root,
+                &SessionCaptureFact::EditedPath {
+                    path: path.to_string(),
+                },
+            )
+        }
+        HookPresentationKind::SessionStart => Ok(()),
+    }
+}
+
+fn presentation_relevance(
+    request: &HookPresentationParams,
+    result: &MemoryRecallResult,
+    branch: Option<&str>,
+    dirty_files: &[String],
+    class: MemoryClass,
+) -> u16 {
+    if matches!(request.kind, HookPresentationKind::PostToolUse) {
+        if !matches!(
+            class,
+            MemoryClass::Decision | MemoryClass::Constraint | MemoryClass::AntiPattern
+        ) {
+            return 0;
+        }
+        let Some(path) = request.path.as_deref() else {
+            return 0;
+        };
+        return if result
+            .memory
+            .linked_files
+            .iter()
+            .any(|linked| same_repo_path(linked, path))
+        {
+            10_000
+        } else {
+            0
+        };
+    }
+
+    let mut score = (result.memory.confidence.clamp(0.0, 1.0) * 1_000.0).round() as u16;
+    let subject = match request.kind {
+        HookPresentationKind::UserPromptSubmit => request.prompt.as_deref().unwrap_or_default(),
+        HookPresentationKind::SessionStart => "",
+        HookPresentationKind::PostToolUse => unreachable!(),
+    };
+    let terms = query_terms(subject);
+    if !terms.is_empty() {
+        let haystack = format!(
+            "{} {} {}",
+            result.memory.content,
+            result.memory.linked_files.join(" "),
+            result.memory.linked_symbols.join(" ")
+        )
+        .to_ascii_lowercase();
+        let matched = terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count();
+        score = score.saturating_add(((matched * 7_000) / terms.len()) as u16);
+    }
+    if matches!(request.kind, HookPresentationKind::SessionStart) {
+        if branch.is_some() && result.memory.branch.as_deref() == branch {
+            score = score.saturating_add(2_500);
+        }
+        if result.memory.linked_files.iter().any(|linked| {
+            dirty_files
+                .iter()
+                .any(|dirty| same_repo_path(linked, dirty))
+        }) {
+            score = score.saturating_add(7_000);
+        }
+    }
+    score.min(10_000)
+}
+
+fn passes_presentation_gate(relevance_bps: u16) -> bool {
+    relevance_bps >= MIN_PRESENTATION_RELEVANCE_BPS
+}
+
+fn stable_injection_id(
+    outcome: &crate::hook_session_registry::RegistryOpenOutcome,
+    request: &HookPresentationParams,
+    ranked: &[RankedHookMemory],
+) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"lattice.hook-injection.v1\0");
+    material.extend_from_slice(outcome.binding_id.as_bytes());
+    material.extend_from_slice(&outcome.generation.to_be_bytes());
+    material.extend_from_slice(request.request_id.as_bytes());
+    material.push(match request.kind {
+        HookPresentationKind::SessionStart => 1,
+        HookPresentationKind::UserPromptSubmit => 2,
+        HookPresentationKind::PostToolUse => 3,
+    });
+    for memory in ranked {
+        material.extend_from_slice(memory.result.memory_id.encoded().as_bytes());
+        material.push(0);
+    }
+    format!("hinj_{}", encode_hex(&sha256(&material)[..16]))
+}
+
+fn render_hook_presentation(
+    kind: HookPresentationKind,
+    injection_id: &str,
+    ranked: &[RankedHookMemory],
+    budget_tokens: usize,
+) -> (String, usize) {
+    let char_budget = budget_tokens.saturating_mul(4);
+    if matches!(kind, HookPresentationKind::PostToolUse) {
+        let memory = &ranked[0];
+        let prefix = format!(
+            "Lattice memory warning [injection_id={injection_id}] [{}] ({}): ",
+            memory.result.memory_id.encoded(),
+            memory.class.as_str()
+        );
+        let available = char_budget.saturating_sub(prefix.chars().count());
+        let content = clipped_one_line(&memory.result.memory.content, available);
+        return (clipped_text(&format!("{prefix}{content}"), char_budget), 1);
+    }
+
+    let mut output = format!("Lattice memory context [injection_id={injection_id}]:");
+    let mut shown_count = 0;
+    for memory in ranked {
+        let prefix = format!(
+            "\n- [{}] {}: ",
+            memory.result.memory_id.encoded(),
+            memory.class.as_str()
+        );
+        let used = output.chars().count() + prefix.chars().count();
+        if used >= char_budget {
+            break;
+        }
+        let content = clipped_one_line(&memory.result.memory.content, char_budget - used);
+        if content.is_empty() {
+            break;
+        }
+        output.push_str(&prefix);
+        output.push_str(&content);
+        shown_count += 1;
+    }
+    (clipped_text(&output, char_budget), shown_count)
+}
+
+fn clipped_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let mut clipped = value.chars().take(max_chars - 1).collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
+fn clipped_one_line(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let mut clipped = normalized.chars().take(max_chars - 1).collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
+fn query_terms(value: &str) -> Vec<String> {
+    let mut terms = value
+        .split(|character: char| !(character.is_alphanumeric() || "/._-".contains(character)))
+        .filter(|term| term.chars().count() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms.truncate(32);
+    terms
+}
+
+fn same_repo_path(left: &str, right: &str) -> bool {
+    left.trim_start_matches("./").replace('\\', "/")
+        == right.trim_start_matches("./").replace('\\', "/")
+}
+
+fn valid_injection_id(value: &str) -> bool {
+    value.len() == 37
+        && value.starts_with("hinj_")
+        && value[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn dirty_working_set(checkout_root: &Path) -> Result<Vec<String>, HookSessionRouteError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout_root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|_| HookSessionRouteError::Unavailable)?;
+    if !output.status.success() {
+        return Err(HookSessionRouteError::Unavailable);
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            (record.len() > 3).then(|| String::from_utf8_lossy(&record[3..]).into_owned())
+        })
+        .take(64)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Loads the same operator-owned authority contract as the D2 MCP runtime.
+/// Request payloads and repository files never grant organization access.
+fn hook_shared_memory_config() -> Result<Option<(String, PathBuf)>, HookSessionRouteError> {
+    let mut configured_organization = None;
+    let mut configured_path = None;
+    if let Some(home) = std::env::var_os("HOME") {
+        let config_path = PathBuf::from(&home).join(".lattice/config.toml");
+        if let Ok(text) = std::fs::read_to_string(config_path) {
+            let mut in_memory = false;
+            for raw in text.lines() {
+                let line = raw.split('#').next().unwrap_or_default().trim();
+                if line.starts_with('[') && line.ends_with(']') {
+                    in_memory = line == "[memory]";
+                    continue;
+                }
+                if !in_memory || line.is_empty() {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    return Err(HookSessionRouteError::Unavailable);
+                };
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                match key.trim() {
+                    "organization_id" => configured_organization = Some(value.to_string()),
+                    "shared_store_path" => configured_path = Some(PathBuf::from(value)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let organization_id = match std::env::var("LATTICE_ORGANIZATION_ID") {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        Ok(_) => return Err(HookSessionRouteError::Unavailable),
+        Err(std::env::VarError::NotPresent) => configured_organization,
+        Err(_) => return Err(HookSessionRouteError::Unavailable),
+    };
+    let Some(organization_id) = organization_id else {
+        return Ok(None);
+    };
+    let path = match std::env::var_os("LATTICE_SHARED_MEMORY_PATH") {
+        Some(value) => PathBuf::from(value),
+        None => configured_path
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".lattice/shared/memories.db"))
+            })
+            .ok_or(HookSessionRouteError::Unavailable)?,
+    };
+    if !path.is_absolute() {
+        return Err(HookSessionRouteError::Unavailable);
+    }
+    Ok(Some((organization_id, path)))
 }
 
 struct JournalDelivery<'a> {
@@ -1337,6 +1944,16 @@ mod tests {
     }
 
     #[test]
+    fn presentation_gate_includes_exact_threshold_and_budget_is_hard() {
+        assert!(!passes_presentation_gate(
+            MIN_PRESENTATION_RELEVANCE_BPS - 1
+        ));
+        assert!(passes_presentation_gate(MIN_PRESENTATION_RELEVANCE_BPS));
+        assert_eq!(clipped_text("abcdef", 5), "abcd…");
+        assert_eq!(clipped_text("abcde", 5), "abcde");
+    }
+
+    #[test]
     fn binding_capability_resumes_after_route_reopen() {
         let directory = test_directory("restart-state");
         let checkout = committed_repository("restart-checkout");
@@ -1523,6 +2140,194 @@ mod tests {
         }
 
         drop(route);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    #[test]
+    fn bound_presentations_are_relevant_bounded_idempotent_and_explicitly_attributed() {
+        use lattice_core::memory::{
+            Memory, MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
+        };
+
+        let directory = test_directory("presentation-state");
+        let checkout = committed_repository("presentation-checkout");
+        let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+        let hello = ProxyRequest {
+            workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        std::fs::create_dir_all(&identity.repository_lattice_dir).unwrap();
+        let store = MemoryStore::open(&identity.memories_path()).unwrap();
+        let constraint_id = store
+            .store(Memory {
+                id: "constraint-fixture".to_string(),
+                session_id: "prior-session".to_string(),
+                content: "Keep fixture writes atomic; partial writes corrupt recovery.".to_string(),
+                memory_type: MemoryType::Observation,
+                scope: MemoryScope::Repo,
+                confidence: 0.92,
+                linked_symbols: Vec::new(),
+                linked_files: vec!["fixture.txt".to_string()],
+                workspace_id: Some(identity.repository_id.clone()),
+                branch: Some("other-branch".to_string()),
+                scope_organization_id: None,
+                refresh_key: None,
+                source_query: None,
+                created_at: 1,
+                last_accessed: 1,
+                access_count: 0,
+                is_stale: false,
+                stale_reason: None,
+                verification_status: MemoryVerificationStatus::Unverified,
+            })
+            .unwrap();
+        let mut fields = MemoryStructuredFields::default();
+        fields.memory_class = MemoryClass::Constraint;
+        store
+            .update_structured_fields(&constraint_id, &fields)
+            .unwrap();
+        std::fs::write(checkout.join("fixture.txt"), "dirty working set\n").unwrap();
+
+        let route = HookSessionRoute::open_at(&directory).unwrap();
+        let opened = route
+            .handle_open(
+                &hello,
+                serde_json::json!({
+                    "integration": "codex-hooks/v1",
+                    "host_session_id": "presentation-session",
+                    "presentation": {
+                        "kind": "session-start",
+                        "request_id": "start-1"
+                    }
+                }),
+            )
+            .unwrap();
+        let start = opened["presentation"].as_object().expect("working-set hit");
+        let injection_id = start["injection_id"].as_str().unwrap().to_string();
+        let context = start["context"].as_str().unwrap();
+        assert!(context.contains("constraint-fixture"));
+        assert!(context.contains(&injection_id));
+        assert!(context.chars().count() <= SESSION_PRESENTATION_BUDGET_TOKENS * 4);
+
+        let resume = |request_id: &str, mut presentation: Value| {
+            presentation["request_id"] = Value::String(request_id.to_string());
+            serde_json::json!({
+                "integration": "codex-hooks/v1",
+                "host_session_id": "presentation-session",
+                "resume": {
+                    "binding_id": opened["binding_id"],
+                    "capability": opened["capability"]
+                },
+                "presentation": presentation
+            })
+        };
+        let replay = route
+            .handle_open(
+                &hello,
+                resume("start-1", serde_json::json!({"kind": "session-start"})),
+            )
+            .unwrap();
+        assert_eq!(replay["presentation"]["injection_id"], injection_id);
+
+        let prompt = route
+            .handle_open(
+                &hello,
+                resume(
+                    "prompt-1",
+                    serde_json::json!({
+                        "kind": "user-prompt-submit",
+                        "prompt": "How should fixture writes avoid corrupt recovery?"
+                    }),
+                ),
+            )
+            .unwrap();
+        assert!(prompt["presentation"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("constraint-fixture"));
+
+        let unrelated = route
+            .handle_open(
+                &hello,
+                resume(
+                    "edit-unrelated",
+                    serde_json::json!({"kind": "post-tool-use", "path": "unrelated.rs"}),
+                ),
+            )
+            .unwrap();
+        assert!(unrelated.get("presentation").is_none());
+
+        let edit = route
+            .handle_open(
+                &hello,
+                resume(
+                    "edit-fixture",
+                    serde_json::json!({"kind": "post-tool-use", "path": "fixture.txt"}),
+                ),
+            )
+            .unwrap();
+        let warning = edit["presentation"]["context"].as_str().unwrap();
+        assert!(!warning.contains('\n'));
+        assert!(warning.contains("constraint-fixture"));
+        assert!(warning.chars().count() <= POST_TOOL_PRESENTATION_BUDGET_TOKENS * 4);
+
+        // An unrelated authenticated request causes no inferred action. The
+        // exact prior id must be supplied explicitly on a later request.
+        let before_action = std::fs::read_to_string(
+            identity
+                .repository_root
+                .join(".lattice/adoption_metrics.jsonl"),
+        )
+        .unwrap();
+        assert!(!before_action.contains("memory_injection_action"));
+        route
+            .handle_open(
+                &hello,
+                resume(
+                    "action-1",
+                    serde_json::json!({
+                        "kind": "user-prompt-submit",
+                        "prompt": "completely unrelated phrase",
+                        "acted_on_injection_id": injection_id
+                    }),
+                ),
+            )
+            .unwrap();
+        let metrics_path = identity
+            .repository_root
+            .join(".lattice/adoption_metrics.jsonl");
+        let after_action = std::fs::read_to_string(&metrics_path).unwrap();
+        assert_eq!(after_action.matches("memory_injection_action").count(), 1);
+        route
+            .handle_open(
+                &hello,
+                resume(
+                    "action-1",
+                    serde_json::json!({
+                        "kind": "user-prompt-submit",
+                        "prompt": "completely unrelated phrase",
+                        "acted_on_injection_id": injection_id
+                    }),
+                ),
+            )
+            .unwrap();
+        let replayed_metrics = std::fs::read_to_string(metrics_path).unwrap();
+        assert_eq!(
+            replayed_metrics.matches("memory_injection_action").count(),
+            1
+        );
+        assert_eq!(
+            replayed_metrics
+                .matches("\"kind\":\"memory_injection\"")
+                .count(),
+            3,
+            "start replay must not duplicate its metric; only start, prompt, and edit present"
+        );
+
+        drop(route);
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(checkout).unwrap();
     }

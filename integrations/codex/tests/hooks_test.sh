@@ -47,6 +47,7 @@ exercise_package() {
   local before after output payload hook event
   local -a cases=(
     'session-start.sh:session-start'
+    'user-prompt-submit.sh:user-prompt-submit'
     'post-tool-use.sh:post-tool-use'
     'stop.sh:stop'
   )
@@ -70,11 +71,6 @@ assert int(line[3]) > 0, line
 PY
   done
 
-  before="$(wc -l <"$temp_dir/commands")"
-  output="$(run_hook "$hooks_dir" user-prompt-submit.sh '{"prompt":"must not enter capture"}')"
-  [[ -z "$output" ]]
-  after="$(wc -l <"$temp_dir/commands")"
-  [[ "$after" -eq "$before" ]]
 }
 
 : >"$temp_dir/commands"
@@ -117,9 +113,11 @@ if [[ -n "${LATTICE_HOOK_E2E_BIN:-}" ]]; then
   git -C "$e2e_repo" add src/example.rs
   git -C "$e2e_repo" commit -qm fixture
   e2e_address="${LATTICE_HOOK_E2E_ADDR:-127.0.0.1:48763}"
-  HOME="$e2e_home" XDG_RUNTIME_DIR="$e2e_runtime" XDG_STATE_HOME="$e2e_state" \
-    LATTICE_DAEMON_ADDR="$e2e_address" "$LATTICE_HOOK_E2E_BIN" --daemon \
-    >"$e2e_root/daemon.out" 2>"$e2e_root/daemon.err" &
+  (
+    cd "$e2e_repo"
+    HOME="$e2e_home" XDG_RUNTIME_DIR="$e2e_runtime" XDG_STATE_HOME="$e2e_state" \
+      LATTICE_DAEMON_ADDR="$e2e_address" "$LATTICE_HOOK_E2E_BIN" --daemon
+  ) >"$e2e_root/daemon.out" 2>"$e2e_root/daemon.err" &
   daemon_pid=$!
   for _ in $(seq 1 50); do
     if find "$e2e_runtime/lattice" -maxdepth 1 -type f 2>/dev/null | head -n 1 | read -r; then
@@ -127,6 +125,49 @@ if [[ -n "${LATTICE_HOOK_E2E_BIN:-}" ]]; then
     fi
     sleep 0.1
   done
+
+  # Bootstrap the authority-bound repository store, then seed one linked
+  # Constraint directly in the fixture database. This keeps the package test
+  # independent of public CLI recall/remember paths while exercising the real
+  # adapter, daemon lease, router, presentation, and metric path end to end.
+  (
+    cd "$e2e_repo"
+    HOME="$e2e_home" XDG_RUNTIME_DIR="$e2e_runtime" XDG_STATE_HOME="$e2e_state" \
+      LATTICE_DAEMON_ADDR="$e2e_address" LATTICE_BIN="$LATTICE_HOOK_E2E_BIN" \
+      "$codex_hooks_dir/session-start.sh" \
+      <<<'{"session_id":"fixture-bootstrap","hook_event_id":"bootstrap-1"}' >/dev/null
+  )
+  python3 - "$e2e_repo/.lattice/memories.db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+repository_id = connection.execute(
+    "select value from lattice_memory_store_metadata where key = 'repository_id'"
+).fetchone()[0]
+connection.execute(
+    """insert into memories
+       (id, session_id, content, memory_type, scope, confidence,
+        linked_symbols, linked_files, workspace_id, memory_class,
+        assertion_type, verification_status, created_at, last_accessed)
+       values (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, 1, 1)""",
+    (
+        "constraint-fixture",
+        "fixture-prior-session",
+        "Fixture writes must remain atomic to protect recovery.",
+        "observation",
+        "repo",
+        0.99,
+        '["src/example.rs"]',
+        repository_id,
+        "constraint",
+        "constraint",
+        "unverified",
+    ),
+)
+connection.commit()
+PY
+  printf '%s\n' 'dirty working-set fixture' >"$e2e_repo/src/example.rs"
 
   for client in codex claude-code; do
     if [[ "$client" == codex ]]; then
@@ -145,12 +186,20 @@ if [[ -n "${LATTICE_HOOK_E2E_BIN:-}" ]]; then
     (
       cd "$e2e_repo"
       env "${common_env[@]}" "$hooks_dir/session-start.sh" \
-        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\"}"
+        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\"}" \
+        >"$e2e_root/$client-session-start.out"
+      env "${common_env[@]}" "$hooks_dir/user-prompt-submit.sh" \
+        <<<"{\"session_id\":\"$session\",\"hook_event_id\":\"$client-prompt-1\",\"prompt\":\"describe the fixture memory\",\"transcript_path\":\"/tmp/never-open-$client\"}" \
+        >"$e2e_root/$client-user-prompt.out"
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
-        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"sentinel-$client\"}}"
+        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"sentinel-$client\"}}" \
+        >"$e2e_root/$client-post-tool.out"
       env "${common_env[@]}" "$hooks_dir/stop.sh" \
         <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"files\":[\"forged-$client\"]}"
     )
+    rg -q 'constraint-fixture' "$e2e_root/$client-session-start.out"
+    rg -q 'constraint-fixture' "$e2e_root/$client-user-prompt.out"
+    rg -q 'constraint-fixture' "$e2e_root/$client-post-tool.out"
   done
 
   kill "$daemon_pid"
@@ -168,6 +217,15 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 count = connection.execute("select count(*) from session_digest_deliveries").fetchone()[0]
 assert count >= 2, count
+PY
+  python3 - "$e2e_repo/.lattice/adoption_metrics.jsonl" <<'PY'
+import json
+import sys
+
+events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+injections = [event for event in events if event.get("kind") == "memory_injection"]
+assert len(injections) >= 6, len(injections)
+assert all(event.get("injection_id", "").startswith("hinj_") for event in injections)
 PY
 fi
 

@@ -59,6 +59,7 @@ impl Integration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HookKind {
     SessionStart,
+    UserPromptSubmit,
     PostToolUse,
     Stop,
 }
@@ -67,6 +68,7 @@ impl HookKind {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "session-start" => Some(Self::SessionStart),
+            "user-prompt-submit" => Some(Self::UserPromptSubmit),
             "post-tool-use" => Some(Self::PostToolUse),
             "stop" => Some(Self::Stop),
             _ => None,
@@ -100,22 +102,41 @@ impl Invocation {
 struct HostFact {
     host_session_id: String,
     payload: Option<HookClientCapturePayload>,
+    presentation: Option<HostPresentationRequest>,
+}
+
+#[derive(Debug)]
+struct HostPresentationRequest {
+    kind: HookKind,
+    request_id: String,
+    prompt: Option<String>,
+    path: Option<String>,
+    acted_on_injection_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostPresentationResult {
+    injection_id: String,
+    context: String,
 }
 
 pub(crate) fn is_hook_adapter_command() -> bool {
     std::env::args().nth(1).as_deref() == Some("__hook-adapter")
 }
 
-/// Hook invocations are deliberately best-effort and silent. All internal
-/// failures are content-free and never render rejected host input.
+/// Hook invocations are deliberately best-effort. Only authenticated, bounded
+/// daemon presentations reach stdout; failures remain silent and never render
+/// rejected host input.
 pub(crate) async fn run_from_env() {
     let Some(invocation) = Invocation::from_env() else {
         return;
     };
-    let _ = tokio::time::timeout(ADAPTER_DEADLINE, run(invocation)).await;
+    if let Ok(Ok(Some(output))) = tokio::time::timeout(ADAPTER_DEADLINE, run(invocation)).await {
+        println!("{output}");
+    }
 }
 
-async fn run(invocation: Invocation) -> Result<()> {
+async fn run(invocation: Invocation) -> Result<Option<String>> {
     let input = read_bounded_stdin(std::io::stdin().lock())?;
     let fact = extract_host_fact(invocation.kind, &input)?;
     let identity = checkout_identity_from_cwd()?;
@@ -129,33 +150,60 @@ async fn run(invocation: Invocation) -> Result<()> {
     let now_ms = unix_time_ms()?;
 
     match invocation.kind {
-        HookKind::SessionStart => {
-            open_or_resume(
+        HookKind::SessionStart | HookKind::UserPromptSubmit => {
+            let presentation = open_or_resume(
                 &client,
                 &key,
                 invocation.integration,
                 &fact.host_session_id,
                 &identity,
                 now_ms,
+                fact.presentation.as_ref(),
             )
             .await?;
+            Ok(presentation.map(|result| {
+                render_host_presentation(invocation.integration, invocation.kind, result)
+            }))
         }
-        HookKind::PostToolUse | HookKind::Stop => {
+        HookKind::PostToolUse => {
             let Some(payload) = fact.payload else {
-                return Ok(());
+                return Ok(None);
             };
+            let presentation = open_or_resume(
+                &client,
+                &key,
+                invocation.integration,
+                &fact.host_session_id,
+                &identity,
+                now_ms,
+                fact.presentation.as_ref(),
+            )
+            .await?;
             let binding = client.load_binding(&key, now_ms)?;
             match client.enqueue(&key, payload, now_ms) {
                 Ok(_) => {}
-                Err(HookSessionClientError::BindingClosed) if invocation.kind == HookKind::Stop => {
-                }
                 Err(error) => return Err(error.into()),
             }
             let mut wire = HookWire::connect(&identity).await?;
             flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
+            Ok(presentation.map(|result| {
+                render_host_presentation(invocation.integration, invocation.kind, result)
+            }))
+        }
+        HookKind::Stop => {
+            let Some(payload) = fact.payload else {
+                return Ok(None);
+            };
+            let binding = client.load_binding(&key, now_ms)?;
+            match client.enqueue(&key, payload, now_ms) {
+                Ok(_) | Err(HookSessionClientError::BindingClosed) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let mut wire = HookWire::connect(&identity).await?;
+            flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 async fn open_or_resume(
@@ -165,7 +213,8 @@ async fn open_or_resume(
     host_session_id: &str,
     identity: &WorkspaceIdentity,
     now_ms: i64,
-) -> Result<()> {
+    presentation: Option<&HostPresentationRequest>,
+) -> Result<Option<HostPresentationResult>> {
     let existing = match client.load_binding(key, now_ms) {
         Ok(binding) => Some(binding),
         Err(HookSessionClientError::BindingMissing) => None,
@@ -185,9 +234,12 @@ async fn open_or_resume(
             "capability": binding.capability().as_str(),
         });
     }
+    if let Some(presentation) = presentation {
+        params["presentation"] = presentation_params(presentation);
+    }
     let mut wire = HookWire::connect(identity).await?;
     let result = wire.call(HOOK_SESSION_OPEN_METHOD, params).await?;
-    let opened = decode_open_result(integration, identity, result)?;
+    let (opened, presentation) = decode_open_result(integration, identity, result)?;
     if let Some(existing) = existing {
         if existing.binding_id() != opened.binding_id()
             || existing.capability() != opened.capability()
@@ -202,7 +254,7 @@ async fn open_or_resume(
         client.store_binding(key, &opened)?;
         flush_pending(client, key, &opened, &mut wire, now_ms).await?;
     }
-    Ok(())
+    Ok(presentation)
 }
 
 #[derive(Deserialize)]
@@ -216,13 +268,15 @@ struct OpenResult {
     absolute_deadline_ms: i64,
     repository_id: String,
     checkout_id: String,
+    #[serde(default)]
+    presentation: Option<HostPresentationResult>,
 }
 
 fn decode_open_result(
     integration: Integration,
     identity: &WorkspaceIdentity,
     value: Value,
-) -> Result<HookClientBinding> {
+) -> Result<(HookClientBinding, Option<HostPresentationResult>)> {
     let result: OpenResult = serde_json::from_value(value)?;
     let _ = (result.generation, result.resumed);
     if result.repository_id != identity.repository_id
@@ -230,15 +284,36 @@ fn decode_open_result(
     {
         return Err(anyhow!("hook binding authority mismatch"));
     }
-    Ok(HookClientBinding::new(
-        HookClientOpaqueId::new(result.binding_id)?,
-        HookClientOpaqueId::new(result.capability)?,
-        integration.binding_id(),
-        result.repository_id,
-        result.checkout_id,
-        result.idle_deadline_ms,
-        result.absolute_deadline_ms,
-    )?)
+    let presentation = result.presentation;
+    if let Some(presentation) = &presentation {
+        if !valid_injection_id(&presentation.injection_id)
+            || !presentation
+                .context
+                .contains(&format!("injection_id={}", presentation.injection_id))
+        {
+            return Err(anyhow!("hook presentation is invalid"));
+        }
+    }
+    Ok((
+        HookClientBinding::new(
+            HookClientOpaqueId::new(result.binding_id)?,
+            HookClientOpaqueId::new(result.capability)?,
+            integration.binding_id(),
+            result.repository_id,
+            result.checkout_id,
+            result.idle_deadline_ms,
+            result.absolute_deadline_ms,
+        )?,
+        presentation,
+    ))
+}
+
+fn valid_injection_id(value: &str) -> bool {
+    value.len() == 37
+        && value.starts_with("hinj_")
+        && value[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 async fn flush_pending(
@@ -400,8 +475,9 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
         .ok_or_else(|| anyhow!("hook session identity is missing"))?
         .to_string();
 
+    let edit_path = extract_edit_path(object);
     let payload = match kind {
-        HookKind::SessionStart => None,
+        HookKind::SessionStart | HookKind::UserPromptSubmit => None,
         HookKind::PostToolUse => extract_edit_event(object)?,
         HookKind::Stop => Some(HookClientCapturePayload::Close(
             parse_session_capture_close(
@@ -411,9 +487,43 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
             .map_err(|_| anyhow!("invalid close marker"))?,
         )),
     };
+    let request_id = host_request_id(object, bytes);
+    let acted_on_injection_id = object
+        .get("lattice_injection_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let presentation = match kind {
+        HookKind::SessionStart => Some(HostPresentationRequest {
+            kind,
+            request_id,
+            prompt: None,
+            path: None,
+            acted_on_injection_id,
+        }),
+        HookKind::UserPromptSubmit => object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|prompt| !prompt.trim().is_empty())
+            .map(|prompt| HostPresentationRequest {
+                kind,
+                request_id,
+                prompt: Some(prompt.to_string()),
+                path: None,
+                acted_on_injection_id,
+            }),
+        HookKind::PostToolUse => edit_path.map(|path| HostPresentationRequest {
+            kind,
+            request_id,
+            prompt: None,
+            path: Some(path.to_string()),
+            acted_on_injection_id,
+        }),
+        HookKind::Stop => None,
+    };
     Ok(HostFact {
         host_session_id,
         payload,
+        presentation,
     })
 }
 
@@ -427,13 +537,7 @@ fn extract_edit_event(
     ) {
         return Ok(None);
     }
-    let path = object.get("file_path").and_then(Value::as_str).or_else(|| {
-        object
-            .get("tool_input")
-            .and_then(Value::as_object)
-            .and_then(|input| input.get("file_path"))
-            .and_then(Value::as_str)
-    });
+    let path = extract_edit_path(object);
     let Some(path) = path else {
         return Ok(None);
     };
@@ -447,6 +551,103 @@ fn extract_edit_event(
     )
     .map_err(|_| anyhow!("invalid edited path"))?;
     Ok(Some(HookClientCapturePayload::Event(normalized)))
+}
+
+fn extract_edit_path(object: &serde_json::Map<String, Value>) -> Option<&str> {
+    let tool_name = object.get("tool_name").and_then(Value::as_str);
+    if !matches!(
+        tool_name,
+        Some("apply_patch" | "Edit" | "Write" | "NotebookEdit")
+    ) {
+        return None;
+    }
+    object.get("file_path").and_then(Value::as_str).or_else(|| {
+        object
+            .get("tool_input")
+            .and_then(Value::as_object)
+            .and_then(|input| input.get("file_path"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn host_request_id(object: &serde_json::Map<String, Value>, bytes: &[u8]) -> String {
+    for key in ["hook_event_id", "event_id", "tool_use_id", "request_id"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str).filter(|value| {
+            !value.is_empty()
+                && value.len() <= 96
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }) {
+            return value.to_string();
+        }
+    }
+    format!("evt_{}", stable_digest_hex(bytes))
+}
+
+fn presentation_params(request: &HostPresentationRequest) -> Value {
+    let kind = match request.kind {
+        HookKind::SessionStart => "session-start",
+        HookKind::UserPromptSubmit => "user-prompt-submit",
+        HookKind::PostToolUse => "post-tool-use",
+        HookKind::Stop => unreachable!("stop has no presentation request"),
+    };
+    let mut value = json!({
+        "kind": kind,
+        "request_id": request.request_id,
+    });
+    if let Some(prompt) = &request.prompt {
+        value["prompt"] = Value::String(prompt.clone());
+    }
+    if let Some(path) = &request.path {
+        value["path"] = Value::String(path.clone());
+    }
+    if let Some(injection_id) = &request.acted_on_injection_id {
+        value["acted_on_injection_id"] = Value::String(injection_id.clone());
+    }
+    value
+}
+
+fn render_host_presentation(
+    integration: Integration,
+    kind: HookKind,
+    result: HostPresentationResult,
+) -> String {
+    let _ = result.injection_id;
+    match integration {
+        Integration::Codex => result.context,
+        Integration::ClaudeCode => json!({
+            "hookSpecificOutput": {
+                "hookEventName": match kind {
+                    HookKind::SessionStart => "SessionStart",
+                    HookKind::UserPromptSubmit => "UserPromptSubmit",
+                    HookKind::PostToolUse => "PostToolUse",
+                    HookKind::Stop => "Stop",
+                },
+                "additionalContext": result.context,
+            }
+        })
+        .to_string(),
+    }
+}
+
+fn stable_digest_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut left = 0xcbf29ce484222325_u64;
+    let mut right = 0x84222325cbf29ce4_u64;
+    for byte in bytes {
+        left ^= u64::from(*byte);
+        left = left.wrapping_mul(0x100000001b3);
+        right ^= u64::from(*byte).rotate_left(1);
+        right = right.wrapping_mul(0x100000001b3);
+    }
+    let digest = [left.to_be_bytes(), right.to_be_bytes()].concat();
+    let mut value = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
 }
 
 fn checkout_identity_from_cwd() -> Result<WorkspaceIdentity> {
@@ -594,5 +795,62 @@ mod tests {
             panic!("expected a close marker");
         };
         assert_eq!(encode_close(&close), json!({"schema_version": 1}));
+    }
+
+    #[test]
+    fn prompt_presentation_retains_only_bounded_dedicated_fields() {
+        let input = br#"{
+            "session_id":"opaque-session",
+            "hook_event_id":"prompt-17",
+            "prompt":"explain atomic fixture recovery",
+            "transcript_path":"/tmp/private-transcript",
+            "cwd":"/forged/root",
+            "lattice_injection_id":"hinj_11111111111111111111111111111111",
+            "extra_secret":"must-not-cross"
+        }"#;
+        let extracted = extract_host_fact(HookKind::UserPromptSubmit, input).unwrap();
+        assert!(extracted.payload.is_none());
+        let presentation = extracted.presentation.unwrap();
+        let wire = presentation_params(&presentation).to_string();
+        assert!(wire.contains("explain atomic fixture recovery"));
+        assert!(wire.contains("prompt-17"));
+        assert!(wire.contains("hinj_11111111111111111111111111111111"));
+        for forbidden in [
+            "opaque-session",
+            "private-transcript",
+            "forged",
+            "must-not-cross",
+        ] {
+            assert!(!wire.contains(forbidden), "wire retained {forbidden}");
+        }
+    }
+
+    #[test]
+    fn presentation_rendering_is_host_specific_and_keeps_injection_id() {
+        let codex = render_host_presentation(
+            Integration::Codex,
+            HookKind::SessionStart,
+            HostPresentationResult {
+                injection_id: "hinj_11111111111111111111111111111111".to_string(),
+                context: "Lattice memory [injection_id=hinj_11111111111111111111111111111111]"
+                    .to_string(),
+            },
+        );
+        assert!(codex.starts_with("Lattice memory"));
+        let claude = render_host_presentation(
+            Integration::ClaudeCode,
+            HookKind::PostToolUse,
+            HostPresentationResult {
+                injection_id: "hinj_22222222222222222222222222222222".to_string(),
+                context: "one-line warning [injection_id=hinj_22222222222222222222222222222222]"
+                    .to_string(),
+            },
+        );
+        let claude: Value = serde_json::from_str(&claude).unwrap();
+        assert_eq!(claude["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(claude["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("hinj_22222222222222222222222222222222"));
     }
 }
