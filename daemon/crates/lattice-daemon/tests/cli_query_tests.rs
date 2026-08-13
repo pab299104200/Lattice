@@ -77,8 +77,9 @@ fn cli_query_daemon_down_exits_two_with_actionable_message() {
 
     let output = run_lattice(&addr, &workspace, &["status"], None);
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("lattice daemon not running — start with: lattice --daemon"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("lattice daemon is not accepting connections at"));
+    assert!(stderr.contains("start with: lattice --daemon"));
 }
 
 #[test]
