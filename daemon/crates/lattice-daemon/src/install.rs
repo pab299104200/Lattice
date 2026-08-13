@@ -103,7 +103,7 @@ const HOOKS: [HookDefinition; 4] = [
         script: "stop.sh",
         matcher: None,
         timeout_secs: 5,
-        status_message: "Recording Lattice session outcome",
+        status_message: "Finalizing protected Lattice session capture",
     },
 ];
 
