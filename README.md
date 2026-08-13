@@ -90,7 +90,7 @@ lattice install codex --workspace /path/to/your/project --verify
 lattice doctor --workspace /path/to/your/project
 ```
 
-`install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. `--verify` performs a disk round-trip check. The standalone packages under `integrations/` remain available for package-level installation and testing.
+`install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. Installation preserves unrelated configuration and removes duplicate Lattice entries. `--verify` re-reads the written file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or each configured hook with representative input. A failed protocol, hook, or tool-surface check is reported as an error. The standalone packages under `integrations/` remain available for package-level installation and testing.
 
 The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. Proxy processes use a cross-process startup lock, so concurrent hooks and MCP clients recheck and reuse one daemon instead of racing to spawn several. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.
 
@@ -183,6 +183,8 @@ lattice metrics
 ```
 
 Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. `lattice metrics` reads the workspace-local adoption ledger and supports `--days <n>` plus `--json`; hook calls are tagged as `claude-code` or `codex` / `hook`, direct CLI calls as `lattice-cli` / `cli`, and MCP calls as the initialized client name or `mcp` / `mcp`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. Connection-refused errors suggest starting the daemon; permission-denied errors identify blocked localhost access instead of falsely reporting that the daemon is absent. Runtime modes are explicit: use `--stdio` for the MCP proxy or `--daemon` for the long-lived server; a bare invocation does not silently select either mode.
+
+Use `lattice metrics --memory` for memory-specific adoption counters. Markdown includes one row per day, client, and channel with `retrievals`, `memories_returned`, `memories_used`, `use_rate`, `injections`, `memories_shown`, `injection_actions`, and `action_rate`. `use_rate` is used memories divided by returned memories; `action_rate` is injection actions divided by shown memories. With `--json`, the same rows are returned under a top-level `days` array using the field names `day`, `client`, `channel`, `retrievals`, `memories_returned`, `memories_used`, `injections`, `memories_shown`, and `injection_actions`; rate columns are presentation-only and are not added to the JSON rows. The view uses the same workspace and day-retention filters as `lattice metrics` and reports `_no memory metrics recorded_` when no qualifying events exist.
 
 ## MCP Tools
 

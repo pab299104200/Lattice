@@ -29,7 +29,7 @@ lattice install codex --workspace /path/to/workspace --verify
 lattice doctor --workspace /path/to/workspace
 ```
 
-`install mcp` writes `.mcp.json`; hook targets write `.claude/settings.json` and `.codex/hooks.json`. Installation is idempotent, preserves unrelated configuration, and rejects invalid targets or more than one workspace for a hook package. Use `LATTICE_ASSET_ROOT` when the executable cannot discover the directory containing `integrations/`. `--verify` performs a canonical read-back check after writing the configuration.
+`install mcp` writes `.mcp.json`; hook targets write `.claude/settings.json` and `.codex/hooks.json`. Installation is idempotent, preserves unrelated configuration, removes duplicate Lattice entries, and rejects invalid targets or more than one workspace for a hook package. Use `LATTICE_ASSET_ROOT` when the executable cannot discover the directory containing `integrations/`. `--verify` re-reads the file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or all four configured hooks with representative input. It fails loudly on protocol errors, tool-surface drift, missing assets, broken hooks, or invalid output.
 
 ## Claude Code Hooks
 
@@ -102,3 +102,7 @@ lattice metrics
 ```
 
 The command renders the last 14 days of workspace-local adoption counters grouped by `client`, `channel`, and `tool`. Hook invocations set `client=claude-code` or `client=codex` with `channel=hook`; direct shell calls set `client=lattice-cli` and `channel=cli`; MCP calls use the initialized client name when available and otherwise fall back to `mcp`.
+
+Use `lattice metrics --memory` to inspect memory adoption separately. Markdown reports one row per day, client, and channel with `retrievals`, `memories_returned`, `memories_used`, `use_rate`, `injections`, `memories_shown`, `injection_actions`, and `action_rate`. The rates are percentages: used divided by returned, and actions divided by shown. `--json` returns `{ "days": [...] }`; each row contains `day`, `client`, `channel`, `retrievals`, `memories_returned`, `memories_used`, `injections`, `memories_shown`, and `injection_actions` (the derived rate columns are Markdown-only). The command applies the normal workspace and `--days` filters and prints `_no memory metrics recorded_` when there are no matching events.
+
+Doctor is the runtime health check after installation. It checks daemon reachability, each requested workspace's index status, the MCP self-handshake and tool count, discovered registrations and conflicts, hook timeout invariants, orphaned stdio proxies, and binary skew. A `FAIL` contributes to the final failure count and makes the command unsuccessful; a `WARN` is visible but does not fail the command. The final line is a JSON summary with `failures` and `warnings`. Start the daemon with `lattice --daemon` when the reachability check fails, then rerun doctor.
