@@ -8,6 +8,18 @@
 session-digest capture across the stdio proxy, CLI, long-lived daemon, and Git
 worktrees.
 
+**Implementation status (2026-08-13):** D3a's authenticated loopback
+transport is implemented for the ordinary stdio proxy, CLI, and doctor paths:
+protected boot credentials, loopback/epoch/token checks, versioned hello/ack,
+and connection metadata are live. The hook-session capability state machine is
+implemented and tested as a library primitive. The SQLite binding
+registry/receipt/outbox is implemented and tested as a durable, payload-free
+primitive. The hook adapter, `hook/session_open`, `hook/event`,
+`hook/session_close`, client capability-file lifecycle, and daemon wiring that
+combines these pieces with digest parsing and memory writes are **not yet
+integrated**. No installed Codex or Claude Code hook currently creates or
+delivers a bound session digest.
+
 This note narrows and completes the identity boundary in the
 [Deterministic Session-Digest Capture Contract](./2026-08-13-session-digest-capture-contract.md).
 That note remains authoritative for sanitization, deterministic extraction,
@@ -15,6 +27,7 @@ memory classes, consolidation, retention, and recall. This note supersedes its
 assumption that an "authenticated local session" already exists and its
 allowance for an integration to inspect a transcript. No D3 component opens,
 reads, copies, hashes, stores, or forwards a transcript or transcript path.
+The authority-free parser also rejects transport-supplied identity fields.
 
 ## Decision
 
@@ -28,7 +41,7 @@ D3 uses two distinct credentials:
    independently of shard/runtime lifetime, presented on every hook event, and
    cannot widen its authority through request fields.
 
-The daemon constructs `MemoryQueryAuthority` from the verified binding and
+The future hook handler constructs `MemoryQueryAuthority` from the verified binding and
 fresh Git state. The hook payload, CLI flags, environment variables,
 `ProxyHello`, and JSON-RPC arguments are claims, never authority. Capture is a
 dedicated authenticated request path that targets the binding's checkout
@@ -296,13 +309,15 @@ an explicitly documented crash-recovery policy later defines otherwise.
 
 ## Daemon, proxy, and shard lifecycle
 
-Hook-session bindings and delivery receipts live in a small versioned daemon
-state registry under `~/.lattice/state/`, not in an in-memory `McpHandler`, TCP
-connection, logical view, or evictable shard. The registry stores authority and
-content-free receipt metadata; sanitized capture facts remain in the owning
-repository store. Registry mutations and memory extraction are coordinated so
-a crash is resolved by receipt/idempotency replay, never by guessing whether a
-write happened.
+The implemented `HookSessionRegistry` is a small versioned SQLite state
+registry suitable for `~/.lattice/state/`; it stores authority fingerprints,
+capability verifiers, delivery hashes/order/receipts, and a payload-free
+outbox marker. It has no event envelope, transcript, summary, path, or command
+field. It is not yet opened or wired by the daemon lifecycle. Once integrated,
+hook-session bindings and receipts must live there—not in an in-memory
+`McpHandler`, TCP connection, logical view, or evictable shard—and registry
+admission plus memory extraction must be coordinated so crash recovery uses
+receipt/idempotency replay rather than guessing whether a write happened.
 
 A TCP disconnect destroys its connection grant but not an open hook binding.
 Proxy idle exit, shard eviction, index rebuild, daemon idle exit, and daemon
@@ -326,6 +341,14 @@ stops the old daemon and proxies after installing the matching binary, as the
 repository deployment contract already requires.
 
 ## Public and internal surfaces
+
+The following hook routes are contract surfaces only; they are not currently
+registered by the daemon or callable through the installed hook packages:
+`hook/session_open`, `hook/event`, and `hook/session_close`. Consequently the
+capture command described in the digest contract must not be documented or
+treated as operational until an adapter presents a capability and the daemon
+connects parsing, registry admission/outbox completion, authority binding, and
+repository-store writes end to end.
 
 The assistant-facing public verbs remain `context`, `prepare_change`, `impact`,
 `diagnose`, `search`, `remember`, `recall`, and `status`. Hook open/event/close

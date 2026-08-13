@@ -6,9 +6,23 @@
 
 **Scope:** Ambient, repository-local capture of bounded session outcomes. The [Shared Memory Architecture](./2026-08-12-shared-memory-architecture.md) remains authoritative for routing, identity, store roles, and promotion.
 
+**Implementation status (2026-08-13):** The authority-free v1 parser,
+normalizer, sanitizer, deterministic extractor, and their unit tests are
+implemented in `lattice-core`. They are library-only at present: no CLI
+`remember --kind session-digest` admission path, hook event route, automatic
+memory-store write, task-recall integration, retention job, or opt-in LLM
+consolidation is wired to this contract. The authenticated D3a transport and
+the capability/registry primitives are implemented separately; they do not
+make capture live by themselves.
+
 ## Decision
 
-Lattice captures a small structured `session-digest` when an agent session stops. The hook sends a sanitized envelope containing repository-relative edited paths, a bounded final summary, and typed outcome observations. The daemon deterministically extracts `WorkflowOutcome` and `FailurePattern` memories with evidence.
+Lattice is designed to capture a small structured `session-digest` when an
+agent session stops. The hook will send sanitized content containing
+repository-relative edited paths, a bounded final summary, and typed outcome
+observations. Trusted session/repository/checkout authority is bound outside
+the payload. The daemon will deterministically extract `WorkflowOutcome` and
+`FailurePattern` memories with evidence once the capture route is integrated.
 
 The system never stores or forwards a raw transcript, transcript path, prompt, tool input/output, command line, terminal output, environment, editor buffer, or diff as session memory. The stop hook is best-effort and fast: capture failure does not fail or delay agent shutdown. The daemon enforces all policy, including for direct or malformed CLI callers.
 
@@ -35,16 +49,23 @@ The bundled Stop hook invokes an explicit public entry point:
 lattice remember --kind session-digest --input <sanitized-json>
 ```
 
-Stdin is preferred so payloads do not appear in process listings. The command accepts a versioned JSON envelope, not a transcript path. An integration may inspect its own transcript path solely to make the envelope, but must not pass that path or transcript onward to the CLI, daemon, event log, or memory store.
+This is the planned public adapter surface, not an implemented capture route.
+The implemented parser accepts content only; it rejects identity fields as
+unknown input. A future adapter must present a valid hook capability over the
+authenticated transport and the daemon must bind the parsed content to that
+capability before persistence. It must not treat a caller-provided
+`session_id`, repository, checkout, branch, or scope as authority.
+
+Stdin is preferred so payloads do not appear in process listings. The planned
+adapter accepts a versioned content envelope, not a transcript path. An
+integration must not inspect, open, hash, or forward a transcript path to make
+the envelope; hosts that do not expose safe structured facts omit them.
 
 Version 1 has this logical shape; exact public field names are set with the CLI schema implementation:
 
 ```json
 {
   "schema_version": 1,
-  "session_id": "opaque-session-id",
-  "repository_id": "claimed-repository-id",
-  "checkout_id": "optional-checkout-id",
   "branch": "optional-branch-name",
   "ended_at": "RFC3339 timestamp",
   "edited_paths": ["daemon/crates/lattice-core/src/memory.rs"],
@@ -56,7 +77,13 @@ Version 1 has this logical shape; exact public field names are set with the CLI 
 }
 ```
 
-The hook is not an authority for repository, checkout, branch, session, scope, or organization. The daemon derives these from the authenticated local session, working directory, and `MemoryQueryAuthority`; claimed identities must match or the capture is rejected. This endpoint always produces repository-local session capture. It cannot accept `scope: organization`.
+The hook is not an authority for repository, checkout, branch, session, scope,
+or organization. The parser is intentionally authority-free: it performs
+bounded lexical/path normalization and sanitization only. The future capture
+handler must derive repository and exact-checkout authority from the verified
+hook capability and construct `MemoryQueryAuthority` there; the payload cannot
+select or override it. This endpoint always produces repository-local session
+capture. It cannot accept `scope: organization`.
 
 ## Admission, normalization, and privacy
 
@@ -64,15 +91,22 @@ Identity violations fail closed. Individual malformed optional observations are 
 
 | Field | Allowed form | Limit and handling |
 |---|---|---|
-| `session_id` | opaque ID | Required, 1–128 ASCII-safe bytes; provenance-only, not searchable content. |
-| `edited_paths` | normalized repository-relative paths | At most 128 unique paths, 512 bytes each. Reject absolute paths, `..`, NUL, excluded/ignored paths, and paths outside the resolved checkout. Sort and deduplicate. |
-| `final_summary` | plain text | Optional. Normalize, redact, then cap at 2,000 bytes; omit if empty or unsafe. |
+| bound session authority | daemon/capability-derived opaque ID | Required at persistence time, 1–128 ASCII-safe bytes; provenance-only, not parser input or searchable content. |
+| `edited_paths` | normalized repository-relative paths | At most 128 unique paths, 512 bytes each. The parser rejects absolute paths, `..`, NUL, separators/drive forms, and excluded components; exact checkout containment, ignored-file policy, symlink resolution, and existence checks belong to the authenticated daemon handler. Sort and deduplicate. |
+| `final_summary` | plain text | Optional. Normalize, reject secret/path/shell/control material, then cap at 2,000 bytes; omit if empty or unsafe. |
 | `observations` | typed allowlist | At most 64 records, 1,024 bytes each; drop unknown kinds. |
 | check label | display check name | At most 256 bytes after redaction. Never store shell arguments, cwd, environment, or output. |
 | error summary | short symptom | At most 512 bytes after redaction. Never store raw stacks, request bodies, headers, or paths outside the repository. |
 | timestamps | RFC3339 UTC | Reject invalid values; clamp far-future values to daemon receive time. |
 
-Before limiting text, the sanitizer removes recognized credential patterns (tokens, private keys, connection strings, and password assignments), secret-bearing environment values, home-directory paths, and external path-like substrings. If safe redaction is uncertain, it drops the entire text field. No original value, replacement value, transcript location, or secret appears in logs, errors, metrics, proposals, or audit events.
+Before limiting text, the sanitizer rejects text containing recognized credential
+patterns (tokens, private keys, connection strings, and password assignments),
+secret-bearing environment values, home-directory paths, and external
+path-like substrings. It also rejects shell/control constructs. If safe
+handling is uncertain, it drops the entire text field; it does not attempt
+replacement redaction. No original value, replacement value, transcript
+location, or secret appears in logs, errors, metrics, proposals, or audit
+events.
 
 This is a deliberately narrow input contract, not a claim that arbitrary prose can safely be stored. Raw diagnostics use a separate, explicit local workflow.
 
@@ -93,7 +127,12 @@ Each candidate has extractor-versioned assertion and claim fingerprints. Its ide
 
 ## Storage, scope, and recall
 
-Capture uses `MemoryStoreRouter::remember` with daemon-derived repository, checkout, branch, and session authority. It receives no direct store handle or admin/unscoped query capability. Router/store role checks reject capture into the organization store.
+When integrated, capture will use `MemoryStoreRouter::remember` with
+daemon-derived repository, checkout, branch, and session authority. The
+current parser and extractor do not receive a store handle and perform no
+persistence. The future handler must receive no admin/unscoped query
+capability; router/store role checks must reject capture into the organization
+store.
 
 Every record preserves integration/version, schema version, sanitized-payload hash, extractor version, opaque session ID, receipt time, repository/check-out identity, branch, repository-relative evidence paths, and typed observation evidence. It preserves no raw command/output/transcript.
 
@@ -120,7 +159,7 @@ Status, doctor, and metrics expose bounded aggregate counters by integration, sc
 
 Session digests require an explicit repository-local age-and-count retention policy before release. Pruning/deletion transactionally removes dependent capture evidence, links, and queued jobs. It must not delete review proposals or durable records derived from the digest; those keep content-free provenance of the deleted opaque source ID and deletion time. Operator deletion by session ID uses the same path and audits no content.
 
-## Required verification
+## Required verification (future integration)
 
 Implementation must prove all of the following through direct daemon/CLI tests and the real bundled Stop-hook package:
 
