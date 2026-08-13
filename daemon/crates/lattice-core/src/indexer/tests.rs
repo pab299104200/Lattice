@@ -371,3 +371,166 @@ fn test_file_linked_memory_stales_even_without_symbol_diff() {
         Some("src/auth.ts changed")
     );
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct CanonicalGraph {
+    nodes: Vec<String>,
+    edges: Vec<String>,
+}
+
+fn canonical_graph(graph: &CodeGraph) -> CanonicalGraph {
+    let mut nodes = graph
+        .all_nodes()
+        .into_iter()
+        .map(|node| {
+            format!(
+                "{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}:{:?}:{}",
+                node.id.file,
+                node.id.name,
+                node.id.byte_offset,
+                node.kind,
+                node.name,
+                node.signature,
+                node.body,
+                node.file,
+                node.line,
+                node.end_line,
+                node.language,
+                node.is_exported
+            )
+        })
+        .collect::<Vec<_>>();
+    nodes.sort();
+
+    let mut edges = graph
+        .all_edges()
+        .into_iter()
+        .map(|(source, target, kind)| {
+            format!(
+                "{}:{}:{}->{:?}->{}:{}:{}",
+                source.id.file,
+                source.id.name,
+                source.id.byte_offset,
+                kind,
+                target.id.file,
+                target.id.name,
+                target.id.byte_offset
+            )
+        })
+        .collect::<Vec<_>>();
+    edges.sort();
+
+    CanonicalGraph { nodes, edges }
+}
+
+fn assert_incremental_matches_full_rebuild(indexer: &Indexer) {
+    let mut full = GraphBuilder::build_from_files(indexer.parsed_files().values());
+    full.hydrate_missing_bodies_from(indexer.graph());
+    assert_eq!(
+        canonical_graph(indexer.graph()),
+        canonical_graph(&full),
+        "incremental graph must be structurally identical to a full build"
+    );
+}
+
+#[test]
+fn incremental_graph_matches_full_rebuild_across_randomized_change_sequences() {
+    const FILE_COUNT: usize = 12;
+    const CHANGE_COUNT: usize = 80;
+
+    fn source(file: usize, revision: u64, target: usize) -> String {
+        let own_name = format!("slot_{}", (file + revision as usize) % 5);
+        let target_name = format!("slot_{}", (target + revision as usize) % 5);
+        format!(
+            "import {{ {target_name} }} from \"./file{target}\";\n\
+             export function {own_name}(): number {{ return {revision}; }}\n\
+             export function caller_{file}(): number {{ return {target_name}(); }}\n"
+        )
+    }
+
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    for file in 0..FILE_COUNT {
+        let target = (file + 1) % FILE_COUNT;
+        indexer
+            .index_file_content(&format!("src/file{file}.ts"), &source(file, 0, target))
+            .expect("seed file should parse");
+    }
+    assert_incremental_matches_full_rebuild(&indexer);
+
+    // Fixed LCG seed keeps the test deterministic while exercising updates,
+    // removals, re-additions, duplicate names, and changing cross-file edges.
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    for revision in 1..=CHANGE_COUNT as u64 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let file = state as usize % FILE_COUNT;
+        let path = format!("src/file{file}.ts");
+
+        if state % 7 == 0 {
+            indexer.remove_file(&path);
+        } else {
+            let target = ((state >> 16) as usize % FILE_COUNT + file + 1) % FILE_COUNT;
+            indexer
+                .index_file_content(&path, &source(file, revision, target))
+                .expect("changed file should parse");
+        }
+
+        assert_incremental_matches_full_rebuild(&indexer);
+    }
+}
+
+#[test]
+fn incremental_graph_re_resolves_document_links_after_target_changes() {
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    indexer
+        .index_file_content(
+            "docs/source.md",
+            "# Source\n\nSee [details](target.md#old).",
+        )
+        .expect("source document should parse");
+    indexer
+        .index_file_content("docs/target.md", "# Target\n\n## Old\n")
+        .expect("target document should parse");
+    assert_incremental_matches_full_rebuild(&indexer);
+
+    indexer
+        .index_file_content("docs/target.md", "# Target\n\n## New\n")
+        .expect("changed target document should parse");
+    assert_incremental_matches_full_rebuild(&indexer);
+
+    indexer.remove_file("docs/target.md");
+    assert_incremental_matches_full_rebuild(&indexer);
+}
+
+#[test]
+fn incremental_update_preserves_retained_arc_snapshots() {
+    let mut indexer = Indexer::new(PathBuf::from("/project"));
+    indexer
+        .index_file_content("src/value.ts", "export function before(): void {}")
+        .expect("initial file should parse");
+    let retained_snapshot = indexer.graph_arc();
+
+    indexer
+        .index_file_content("src/value.ts", "export function after(): void {}")
+        .expect("changed file should parse");
+
+    assert!(retained_snapshot
+        .all_nodes()
+        .iter()
+        .any(|node| node.name == "before"));
+    assert!(!retained_snapshot
+        .all_nodes()
+        .iter()
+        .any(|node| node.name == "after"));
+    assert!(indexer
+        .graph()
+        .all_nodes()
+        .iter()
+        .any(|node| node.name == "after"));
+    assert!(!indexer
+        .graph()
+        .all_nodes()
+        .iter()
+        .any(|node| node.name == "before"));
+}

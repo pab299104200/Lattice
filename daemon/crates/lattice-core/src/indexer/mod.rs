@@ -8,15 +8,15 @@ use crate::identity::FileId;
 use crate::parser;
 use crate::symbols::{ParsedFile, Symbol};
 use crate::verification::IncrementalVerifier;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Incremental indexer that maintains a code graph from parsed files.
 ///
-/// Supports adding, updating, and removing files. On each change the entire
-/// graph is rebuilt from the current set of parsed files so that cross-file
-/// edges stay consistent.
+/// Supports adding, updating, and removing files. Changes rebuild only the
+/// dependency-connected portion of the graph while preserving the same nodes
+/// and edges as a full [`GraphBuilder`] pass.
 pub struct Indexer {
     #[allow(dead_code)]
     root: PathBuf,
@@ -120,19 +120,16 @@ impl Indexer {
         rel_path: &str,
         content: &str,
     ) -> Result<(), LatticeError> {
-        // Parse the file
         let parsed = parser::parse_file(rel_path, content)?;
+        let previous_names = self.symbol_names_for_files([rel_path]);
 
-        // Store / replace in the map
         self.parsed_files.insert(rel_path.to_string(), parsed);
-
-        // Rebuild the graph from all parsed files
-        self.rebuild_graph();
+        self.rebuild_changed_files([rel_path], previous_names);
 
         Ok(())
     }
 
-    /// Parse and index a batch of files, rebuilding the graph once at the end.
+    /// Parse and index a batch of files, updating the graph once at the end.
     ///
     /// This is much cheaper than calling `index_file_content` repeatedly for
     /// cold-start indexing or explicit reindex requests.
@@ -196,9 +193,11 @@ impl Indexer {
         let mut count = 0usize;
         let mut indexed_files = Vec::new();
         let mut failures = Vec::new();
+        let mut previous_names = HashSet::new();
         for handle in handles {
             match handle.await {
                 Ok((_file, Ok(parsed))) => {
+                    previous_names.extend(self.symbol_names_for_files([parsed.file.as_str()]));
                     indexed_files.push(parsed.file.clone());
                     self.parsed_files.insert(parsed.file.clone(), parsed);
                     count += 1;
@@ -223,7 +222,9 @@ impl Indexer {
             }
         }
 
-        self.rebuild_graph();
+        if count > 0 {
+            self.rebuild_changed_files(indexed_files.iter().map(String::as_str), previous_names);
+        }
         BatchIndexReport {
             requested_count,
             indexed_count: count,
@@ -234,10 +235,12 @@ impl Indexer {
         }
     }
 
-    /// Remove a file from the index and rebuild the graph.
+    /// Remove a file from the index and update the affected graph component.
     pub fn remove_file(&mut self, rel_path: &str) {
-        self.parsed_files.remove(rel_path);
-        self.rebuild_graph();
+        let previous_names = self.symbol_names_for_files([rel_path]);
+        if self.parsed_files.remove(rel_path).is_some() {
+            self.rebuild_changed_files([rel_path], previous_names);
+        }
     }
 
     /// Apply a watcher change-set with one graph rebuild for the entire batch.
@@ -254,6 +257,11 @@ impl Indexer {
         let mut indexed_count = 0;
         let mut indexed_files = Vec::new();
         let mut failures = Vec::new();
+        let requested_paths = upserts
+            .iter()
+            .map(|(rel_path, _)| rel_path.as_str())
+            .chain(removals.iter().map(String::as_str));
+        let previous_names = self.symbol_names_for_files(requested_paths);
         for (rel_path, content) in upserts {
             match parser::parse_file(&rel_path, &content) {
                 Ok(parsed) => {
@@ -275,7 +283,11 @@ impl Indexer {
             .filter(|rel_path| self.parsed_files.remove(*rel_path).is_some())
             .count();
         if indexed_count > 0 || removed_count > 0 {
-            self.rebuild_graph();
+            let changed_files = indexed_files
+                .iter()
+                .map(String::as_str)
+                .chain(removed_files.iter().map(String::as_str));
+            self.rebuild_changed_files(changed_files, previous_names);
         }
 
         BatchIndexReport {
@@ -303,8 +315,179 @@ impl Indexer {
         self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
     }
 
+    /// Rebuild the smallest safely replaceable graph component for a change.
+    ///
+    /// Removing a graph node also removes every incoming edge. Therefore the
+    /// replaceable component includes the reverse dependency closure of the
+    /// changed files. It additionally includes sources whose currently
+    /// unresolved references, imports, or document links may start resolving
+    /// to a newly added symbol. Unrelated components retain their nodes and
+    /// edges without passing through `GraphBuilder`.
+    fn rebuild_changed_files<'a>(
+        &mut self,
+        changed_files: impl IntoIterator<Item = &'a str>,
+        mut touched_names: HashSet<String>,
+    ) {
+        let changed_files = changed_files
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if changed_files.is_empty() {
+            return;
+        }
+
+        for rel_path in &changed_files {
+            if let Some(parsed) = self.parsed_files.get(rel_path) {
+                extend_symbol_names(&mut touched_names, parsed);
+            }
+        }
+
+        let changed_markdown = changed_files.iter().any(|rel_path| {
+            rel_path.to_ascii_lowercase().ends_with(".md")
+                || self
+                    .parsed_files
+                    .get(rel_path)
+                    .is_some_and(|file| file.language == crate::symbols::Language::Markdown)
+                || self.graph.all_nodes().iter().any(|node| {
+                    node.file == *rel_path && node.language == crate::symbols::Language::Markdown
+                })
+        });
+
+        let mut affected_files = changed_files.clone();
+        for parsed in self.parsed_files.values() {
+            if parsed.symbols.iter().any(|symbol| {
+                symbol.references.iter().any(|reference| {
+                    touched_names.contains(reference)
+                        || touched_names.contains(simple_symbol_name(reference))
+                })
+            }) || parsed.imports.iter().any(|import| {
+                changed_files.contains(&resolve_import_target(&parsed.file, &import.source))
+            }) || (changed_markdown && !parsed.links.is_empty())
+            {
+                affected_files.insert(parsed.file.clone());
+            }
+        }
+
+        // Removing any affected file's nodes also removes incoming edges. Grow
+        // the reverse closure until no retained source would lose an edge.
+        loop {
+            let incoming_sources = self
+                .graph
+                .all_edges()
+                .into_iter()
+                .filter(|(_, target, _)| affected_files.contains(&target.file))
+                .map(|(source, _, _)| source.file.clone())
+                .collect::<Vec<_>>();
+            let old_len = affected_files.len();
+            affected_files.extend(incoming_sources);
+            if affected_files.len() == old_len {
+                break;
+            }
+        }
+
+        let context_files = self.graph_builder_context(&affected_files);
+        let mut replacement = GraphBuilder::build_from_files(
+            self.parsed_files
+                .values()
+                .filter(|file| context_files.contains(&file.file)),
+        );
+        replacement.hydrate_missing_bodies_from(self.graph.as_ref());
+
+        // Mutate the active graph in place when no reader retains a snapshot.
+        // Arc's copy-on-write behavior still protects concurrent readers, but
+        // the normal watcher path avoids an O(all graph nodes) clone.
+        let graph = Arc::make_mut(&mut self.graph);
+        for rel_path in &affected_files {
+            graph.remove_file_nodes(rel_path);
+        }
+
+        for node in replacement
+            .all_nodes()
+            .into_iter()
+            .filter(|node| affected_files.contains(&node.file))
+        {
+            graph.add_node(
+                node.id.clone(),
+                node.kind,
+                node.name.clone(),
+                node.signature.clone(),
+                node.body.clone(),
+                node.file.clone(),
+                node.line,
+                node.end_line,
+                node.is_exported,
+                node.language,
+            );
+        }
+        for (source, target, kind) in replacement
+            .all_edges()
+            .into_iter()
+            .filter(|(source, _, _)| affected_files.contains(&source.file))
+        {
+            graph.add_edge(&source.id, &target.id, kind);
+        }
+
+        strip_symbol_bodies(&mut self.parsed_files);
+        self.graph_snapshot_id = self.graph_snapshot_id.saturating_add(1);
+    }
+
+    /// Collect the files required for `GraphBuilder` to resolve every outgoing
+    /// edge from `affected_files`. This scans compact parsed metadata but does
+    /// not rebuild unrelated graph nodes.
+    fn graph_builder_context(&self, affected_files: &HashSet<String>) -> HashSet<String> {
+        let mut context = affected_files.clone();
+        let mut referenced_names = HashSet::new();
+        let mut import_targets = HashSet::new();
+        let mut needs_document_targets = false;
+
+        for parsed in self
+            .parsed_files
+            .values()
+            .filter(|file| affected_files.contains(&file.file))
+        {
+            for symbol in &parsed.symbols {
+                for reference in &symbol.references {
+                    referenced_names.insert(simple_symbol_name(reference).to_string());
+                }
+            }
+            import_targets.extend(
+                parsed
+                    .imports
+                    .iter()
+                    .map(|import| resolve_import_target(&parsed.file, &import.source)),
+            );
+            needs_document_targets |= !parsed.links.is_empty();
+        }
+
+        for parsed in self.parsed_files.values() {
+            if import_targets.contains(&parsed.file)
+                || (needs_document_targets && parsed.language == crate::symbols::Language::Markdown)
+                || parsed.symbols.iter().any(|symbol| {
+                    referenced_names.contains(simple_symbol_name(&symbol.name))
+                        || referenced_names.contains(&symbol.name)
+                })
+            {
+                context.insert(parsed.file.clone());
+            }
+        }
+        context
+    }
+
+    fn symbol_names_for_files<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a str>,
+    ) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for rel_path in files {
+            if let Some(parsed) = self.parsed_files.get(rel_path) {
+                extend_symbol_names(&mut names, parsed);
+            }
+        }
+        names
+    }
+
     /// Index a directory using parallel file parsing.
-    /// Files are parsed concurrently, then the graph is rebuilt once.
+    /// Files are parsed concurrently, then the graph is updated once.
     pub async fn index_directory_parallel(
         &mut self,
         dir: &std::path::Path,
@@ -389,7 +572,16 @@ impl Indexer {
 
         // Update index
         self.parsed_files.insert(rel_path.to_string(), new_parsed);
-        self.rebuild_graph();
+        let previous_names = old_symbols
+            .iter()
+            .flat_map(|symbol| {
+                [
+                    symbol.name.clone(),
+                    simple_symbol_name(&symbol.name).to_string(),
+                ]
+            })
+            .collect();
+        self.rebuild_changed_files([rel_path], previous_names);
 
         Ok(changes)
     }
@@ -434,8 +626,17 @@ impl Indexer {
         let new_parsed = crate::parser::parse_file(rel_path, content)?;
         let old_symbols = self.diffable_symbols_for_file(rel_path);
         let changes = crate::diff::diff_symbols(&old_symbols, &new_parsed.symbols);
+        let previous_names = old_symbols
+            .iter()
+            .flat_map(|symbol| {
+                [
+                    symbol.name.clone(),
+                    simple_symbol_name(&symbol.name).to_string(),
+                ]
+            })
+            .collect();
         self.parsed_files.insert(rel_path.to_string(), new_parsed);
-        self.rebuild_graph();
+        self.rebuild_changed_files([rel_path], previous_names);
         Ok(changes)
     }
 
@@ -457,6 +658,49 @@ impl Indexer {
                 hydrated
             })
             .collect()
+    }
+}
+
+fn extend_symbol_names(names: &mut HashSet<String>, parsed: &ParsedFile) {
+    for symbol in &parsed.symbols {
+        names.insert(symbol.name.clone());
+        names.insert(simple_symbol_name(&symbol.name).to_string());
+    }
+}
+
+fn simple_symbol_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+fn resolve_import_target(from_file: &str, import_source: &str) -> String {
+    if !import_source.starts_with('.') {
+        return import_source.to_string();
+    }
+
+    let directory = from_file
+        .rsplit_once('/')
+        .map_or(".", |(directory, _)| directory);
+    let mut parts = directory.split('/').collect::<Vec<_>>();
+    for segment in import_source.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+
+    let resolved = parts.join("/");
+    let has_extension = resolved
+        .rsplit('/')
+        .next()
+        .is_some_and(|file| file.contains('.'));
+    if has_extension {
+        resolved
+    } else {
+        let extension = from_file.rsplit('.').next().unwrap_or("ts");
+        format!("{resolved}.{extension}")
     }
 }
 
