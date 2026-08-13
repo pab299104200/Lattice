@@ -17,6 +17,25 @@ fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
     }
 }
 
+fn assert_structured_cited_overview(overview: &str) {
+    assert!(
+        overview.contains(" at `") && overview.contains(":"),
+        "expected prose with file:line citations, got: {overview}"
+    );
+    assert!(
+        overview.ends_with('.'),
+        "expected a complete final sentence, got: {overview}"
+    );
+    assert!(
+        !overview.contains(". start ")
+            && !overview.contains(". focus ")
+            && !overview.contains(". test ")
+            && !overview.contains(". rule ")
+            && !overview.contains(". memory "),
+        "expected structured prose instead of label fragments, got: {overview}"
+    );
+}
+
 fn build_agent_graph() -> CodeGraph {
     let mut graph = CodeGraph::new();
 
@@ -1385,6 +1404,18 @@ fn test_get_working_set_context_collects_symbols_tests_and_memories() {
     assert!(report.memories.is_empty());
     assert_eq!(report.memory_highlights.len(), 1);
     assert!(!report.overview.is_empty());
+    assert_structured_cited_overview(&report.overview);
+    assert!(
+        report.overview.contains("containing 1 function")
+            && report.overview.contains("declaration is exported"),
+        "expected graph-backed file structure facts, got: {}",
+        report.overview
+    );
+    assert!(
+        report.overview.contains(" calls "),
+        "expected a direct graph relationship in the prose, got: {}",
+        report.overview
+    );
     assert!(
         report.overview.contains("prior repo observation"),
         "expected compact overview to keep only a short memory reference: {}",
@@ -1567,6 +1598,18 @@ fn test_summarize_subsystem_compresses_key_files_symbols_and_tests() {
     );
 
     assert!(!report.overview.is_empty());
+    assert_structured_cited_overview(&report.overview);
+    assert!(
+        report.overview.contains("containing 1 function")
+            && report.overview.contains("declaration is exported"),
+        "expected graph-backed file structure facts, got: {}",
+        report.overview
+    );
+    assert!(
+        report.overview.contains(" calls "),
+        "expected a direct graph relationship in the prose, got: {}",
+        report.overview
+    );
     assert!(
         report
             .key_files
@@ -1719,6 +1762,7 @@ fn test_get_repo_playbook_surfaces_key_files_symbols_and_patterns() {
     let report = get_repo_playbook(&graph, &memories, &rules, BundleMode::Compact);
 
     assert!(!report.overview.is_empty());
+    assert_structured_cited_overview(&report.overview);
     assert!(!report.architecture.is_empty());
     assert!(!report.key_files.is_empty());
     assert!(

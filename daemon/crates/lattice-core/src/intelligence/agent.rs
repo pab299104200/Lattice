@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -1215,6 +1215,7 @@ pub fn prepare_change(
         memory_highlight_text_limit(mode),
     );
     let overview = build_task_bundle_overview(
+        graph,
         &capsule.query,
         &primary_files,
         &symbols,
@@ -2102,6 +2103,7 @@ pub fn trace_scenario(
     }
 
     let overview = build_trace_scenario_overview(
+        graph,
         scenario,
         &likely_entrypoints,
         &execution_path,
@@ -3159,6 +3161,7 @@ pub fn get_working_set_context(
         memory_highlight_text_limit(mode),
     );
     let overview = build_working_set_overview(
+        graph,
         query,
         &files,
         &active_symbols,
@@ -3503,6 +3506,7 @@ pub fn summarize_subsystem(
     }
 
     let overview = build_subsystem_overview(
+        graph,
         query,
         &key_files,
         &key_symbols,
@@ -3658,6 +3662,7 @@ pub fn get_repo_playbook(
     }
 
     let overview = build_repo_playbook_overview(
+        graph,
         &architecture,
         &key_files,
         &notable_symbols,
@@ -4209,7 +4214,8 @@ pub fn diagnose_failure(
     let test_count = tests.len();
     let extracted_file_count = extracted_files.len();
     let extracted_symbol_count = extracted_symbols.len();
-    let overview = build_failure_overview(&failure_kind, &suspects, &tests, &likely_causes, &[]);
+    let overview =
+        build_failure_overview(graph, &failure_kind, &suspects, &tests, &likely_causes, &[]);
     let suggested_expand = suggest_failure_expand(mode, &suspects, &extracted_files);
     let mut next_steps =
         build_failure_next_steps(&failure_kind, &suspects, &tests, &extracted_files);
@@ -5693,8 +5699,16 @@ fn kind_label(kind: &str) -> &'static str {
         "fn" => "function",
         "meth" => "method",
         "cls" => "class",
+        "ifc" => "interface",
+        "type" => "type alias",
+        "enum" => "enum",
+        "mod" => "module",
         "var" => "variable",
         "const" => "constant",
+        "trait" => "trait",
+        "struct" => "struct",
+        "doc" => "document",
+        "sec" => "section",
         _ => "symbol",
     }
 }
@@ -6368,89 +6382,317 @@ fn select_relevant_rules(
     matches
 }
 
+fn source_citation(file: &str, line: usize) -> String {
+    format!("`{}:{}`", file, line)
+}
+
+fn join_prose_items(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [item] => item.clone(),
+        [first, second] => format!("{} and {}", first, second),
+        _ => format!(
+            "{}, and {}",
+            items[..items.len() - 1].join(", "),
+            items.last().expect("non-empty prose list")
+        ),
+    }
+}
+
+fn structured_overview_fallback(
+    sentences: Vec<String>,
+    fallback_location: Option<(&String, usize)>,
+) -> String {
+    if !sentences.is_empty() {
+        return sentences.join(" ");
+    }
+    if let Some((file, line)) = fallback_location {
+        return format!(
+            "The graph identified {} as the only concrete location for this summary.",
+            source_citation(file, line)
+        );
+    }
+    "No graph-backed source location was available for a structured summary.".to_string()
+}
+
+fn first_graph_node_in_file<'a>(graph: &'a CodeGraph, file: &str) -> Option<&'a GraphNode> {
+    graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| node.file == file)
+        .min_by_key(|node| node.line)
+}
+
+fn graph_node_for_compact_symbol<'a>(
+    graph: &'a CodeGraph,
+    symbol: &CompactSymbolSummary,
+) -> Option<&'a GraphNode> {
+    graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| node.file == symbol.file && node.name == symbol.symbol)
+        .min_by_key(|node| node.line.abs_diff(symbol.line))
+}
+
+fn describe_graph_file(graph: &CodeGraph, file: &str) -> Option<String> {
+    let mut nodes: Vec<&GraphNode> = graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| node.file == file)
+        .collect();
+    nodes.sort_by_key(|node| node.line);
+    let first = nodes.first()?;
+
+    let headings: Vec<String> = nodes
+        .iter()
+        .copied()
+        .filter(|node| node.kind.short_code() == "sec")
+        .take(3)
+        .map(|node| format!("`{}` at {}", node.name, source_citation(file, node.line)))
+        .collect();
+    if !headings.is_empty() {
+        return Some(format!(
+            "`{}` is indexed documentation organized around the heading{} {}.",
+            file,
+            if headings.len() == 1 { "" } else { "s" },
+            join_prose_items(&headings)
+        ));
+    }
+
+    let mut kind_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for node in &nodes {
+        *kind_counts.entry(node.kind.short_code()).or_insert(0) += 1;
+    }
+    let kinds: Vec<String> = kind_counts
+        .into_iter()
+        .map(|(kind, count)| counted_kind(kind, count))
+        .collect();
+    let exported = nodes.iter().filter(|node| node.is_exported).count();
+    let file_role = file_role_label(file);
+    Some(format!(
+        "`{}` is {} {} containing {}; its first indexed declaration is `{}` at {}, and {} declaration{} {} exported.",
+        file,
+        indefinite_article(file_role),
+        file_role,
+        join_prose_items(&kinds),
+        first.name,
+        source_citation(file, first.line),
+        exported,
+        if exported == 1 { "" } else { "s" },
+        if exported == 1 { "is" } else { "are" },
+    ))
+}
+
+fn indefinite_article(noun_phrase: &str) -> &'static str {
+    match noun_phrase.chars().next().map(|ch| ch.to_ascii_lowercase()) {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
+fn counted_kind(kind: &str, count: usize) -> String {
+    let singular = kind_label(kind);
+    let plural = match singular {
+        "class" => "classes",
+        "type alias" => "type aliases",
+        "interface" => "interfaces",
+        _ if singular.ends_with('s') => singular,
+        _ => {
+            return format!(
+                "{} {}{}",
+                count,
+                singular,
+                if count == 1 { "" } else { "s" }
+            )
+        }
+    };
+    format!("{} {}", count, if count == 1 { singular } else { plural })
+}
+
+fn describe_compact_symbol_relationship(
+    graph: &CodeGraph,
+    symbols: &[CompactSymbolSummary],
+) -> Option<String> {
+    for from in symbols {
+        let Some(from_node) = graph_node_for_compact_symbol(graph, from) else {
+            continue;
+        };
+        for (target, edge) in graph.get_dependencies(&from_node.id) {
+            if symbols
+                .iter()
+                .any(|candidate| candidate.file == target.file && candidate.symbol == target.name)
+            {
+                return Some(format!(
+                    "`{}` at {} {} `{}` at {}.",
+                    from_node.name,
+                    source_citation(&from_node.file, from_node.line),
+                    prose_edge(edge),
+                    target.name,
+                    source_citation(&target.file, target.line)
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn prose_edge(edge: EdgeKind) -> &'static str {
+    match edge {
+        EdgeKind::Calls => "calls",
+        EdgeKind::Imports => "imports",
+        EdgeKind::Implements => "implements",
+        EdgeKind::Extends => "extends",
+        EdgeKind::TypeRef => "refers to the type of",
+        EdgeKind::Contains => "contains",
+        EdgeKind::LinksTo => "links to",
+        EdgeKind::Mentions => "mentions",
+        EdgeKind::CoChanges => "co-changes with",
+    }
+}
+
+fn graph_node_for_symbol_recommendation<'a>(
+    graph: &'a CodeGraph,
+    symbol: &SymbolRecommendation,
+) -> Option<&'a GraphNode> {
+    graph
+        .all_nodes()
+        .into_iter()
+        .filter(|node| node.file == symbol.file && node.name == symbol.symbol)
+        .min_by_key(|node| node.line.abs_diff(symbol.line))
+}
+
+fn describe_symbol_relationship(
+    graph: &CodeGraph,
+    symbols: &[&SymbolRecommendation],
+) -> Option<String> {
+    for from in symbols {
+        let Some(from_node) = graph_node_for_symbol_recommendation(graph, from) else {
+            continue;
+        };
+        for (target, edge) in graph.get_dependencies(&from_node.id) {
+            if symbols
+                .iter()
+                .any(|candidate| candidate.file == target.file && candidate.symbol == target.name)
+            {
+                return Some(format!(
+                    "`{}` at {} {} `{}` at {}.",
+                    from_node.name,
+                    source_citation(&from_node.file, from_node.line),
+                    prose_edge(edge),
+                    target.name,
+                    source_citation(&target.file, target.line)
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn describe_test_target(graph: &CodeGraph, test: &TestRecommendation) -> Option<String> {
+    let node = first_graph_node_in_file(graph, &test.file)?;
+    Some(format!(
+        "Validate the behavior with `{}` at {}, the highest-ranked graph-linked test target.",
+        node.name,
+        source_citation(&node.file, node.line)
+    ))
+}
+
 fn build_subsystem_overview(
+    graph: &CodeGraph,
     query: &str,
     key_files: &[CompactFileSummary],
     key_symbols: &[CompactSymbolSummary],
     tests: &[TestRecommendation],
-    rules: &[String],
+    _rules: &[String],
     memories: &[MemoryHighlight],
 ) -> String {
-    let mut parts = vec![format!(
-        "{}: {}",
-        truncate_text(query, 42),
-        summarize_item_list(
-            &key_files
-                .iter()
-                .map(|item| basename_without_extension(&item.file))
-                .collect::<Vec<_>>()
-        )
-    )];
+    let mut sentences = Vec::new();
 
     if let Some(symbol) = key_symbols.first() {
-        parts.push(format!("start {}", symbol.symbol));
-    }
-    if let Some(test) = tests.first() {
-        parts.push(format!("test {}", basename_without_extension(&test.file)));
-    }
-    if let Some(rule) = rules.first() {
-        parts.push(format!("rule {}", truncate_text(&rule.to_lowercase(), 28)));
-    }
-    if let Some(memory) = memories.first() {
-        parts.push(format!(
-            "memory {}",
-            truncate_text(&memory_reference_phrase(memory), 28)
-        ));
+        let kind = graph_node_for_compact_symbol(graph, symbol)
+            .map(|node| kind_label(node.kind.short_code()))
+            .unwrap_or("symbol");
+        let mut sentence = format!(
+            "For “{}”, start with `{}` at {}; it is the highest-ranked {} {} anchor.",
+            truncate_text(query, 72),
+            symbol.symbol,
+            source_citation(&symbol.file, symbol.line),
+            symbol_role_label(&symbol.role),
+            kind
+        );
+        if let Some(memory) = memories.first() {
+            sentence = format!(
+                "{}; at {}, {}.",
+                sentence.trim_end_matches('.'),
+                source_citation(&symbol.file, symbol.line),
+                memory_overview_phrase(memory)
+            );
+        }
+        sentences.push(sentence);
     }
 
-    parts.join(". ") + "."
+    sentences.extend(
+        key_files
+            .iter()
+            .filter_map(|item| describe_graph_file(graph, &item.file)),
+    );
+
+    if let Some(relationship) = describe_compact_symbol_relationship(graph, key_symbols) {
+        sentences.push(relationship);
+    }
+    if let Some(test) = tests.first() {
+        if let Some(node) = first_graph_node_in_file(graph, &test.file) {
+            sentences.push(format!(
+                "Validate this path with `{}` at {}, the highest-ranked graph-linked test target.",
+                node.name,
+                source_citation(&node.file, node.line)
+            ));
+        }
+    }
+
+    structured_overview_fallback(
+        sentences,
+        key_symbols.first().map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_repo_playbook_overview(
-    architecture: &[String],
+    graph: &CodeGraph,
+    _architecture: &[String],
     key_files: &[CompactFileSummary],
     notable_symbols: &[CompactSymbolSummary],
-    conventions: &[String],
+    _conventions: &[String],
     memories: &[MemoryHighlight],
 ) -> String {
-    let mut parts = Vec::new();
+    let mut sentences: Vec<String> = key_files
+        .iter()
+        .filter_map(|item| describe_graph_file(graph, &item.file))
+        .collect();
 
-    if let Some(first) = architecture.first() {
-        parts.push(truncate_text(first, 42));
-    }
-    if !key_files.is_empty() {
-        parts.push(format!(
-            "start {}",
-            summarize_item_list(
-                &key_files
-                    .iter()
-                    .map(|item| basename_without_extension(&item.file))
-                    .collect::<Vec<_>>()
-            )
+    if let Some(symbol) = notable_symbols.first() {
+        let kind = graph_node_for_compact_symbol(graph, symbol)
+            .map(|node| kind_label(node.kind.short_code()))
+            .unwrap_or("symbol");
+        let memory_clause = memories
+            .first()
+            .map(|memory| format!("; {} here", memory_overview_phrase(memory)))
+            .unwrap_or_default();
+        sentences.push(format!(
+            "Begin repository exploration at `{}` at {}, the highest-ranked {} anchor{}.",
+            symbol.symbol,
+            source_citation(&symbol.file, symbol.line),
+            kind,
+            memory_clause
         ));
     }
-    if !notable_symbols.is_empty() {
-        parts.push(format!(
-            "symbols {}",
-            summarize_item_list(
-                &notable_symbols
-                    .iter()
-                    .map(|item| item.symbol.clone())
-                    .collect::<Vec<_>>()
-            )
-        ));
-    }
-    if let Some(rule) = conventions.first() {
-        parts.push(format!("rule {}", truncate_text(rule, 32)));
-    }
-    if let Some(memory) = memories.first() {
-        parts.push(format!(
-            "pattern {}",
-            truncate_text(&memory_reference_phrase(memory), 28)
-        ));
+    if let Some(relationship) = describe_compact_symbol_relationship(graph, notable_symbols) {
+        sentences.push(relationship);
     }
 
-    parts.join(". ") + "."
+    structured_overview_fallback(
+        sentences,
+        notable_symbols.first().map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_architecture_highlights(graph: &CodeGraph, key_files: &[String]) -> Vec<String> {
@@ -6467,25 +6709,34 @@ fn build_architecture_highlights(graph: &CodeGraph, key_files: &[String]) -> Vec
     top_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut highlights = Vec::new();
-    if !top_dirs.is_empty() {
-        let line = top_dirs
-            .iter()
-            .take(3)
-            .map(|(dir, count)| format!("{} ({} files)", dir, count))
-            .collect::<Vec<_>>()
-            .join(", ");
-        highlights.push(format!("Primary layout: {}", line));
+    if let Some((dir, count)) = top_dirs.first() {
+        if let Some(node) = graph
+            .all_nodes()
+            .into_iter()
+            .filter(|node| node.file.split('/').next().unwrap_or(&node.file) == dir)
+            .min_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)))
+        {
+            highlights.push(format!(
+                "The largest indexed top-level area is `{}` with {} files, anchored at {}.",
+                dir,
+                count,
+                source_citation(&node.file, node.line)
+            ));
+        }
     }
     if !key_files.is_empty() {
-        highlights.push(format!(
-            "High-signal files: {}",
-            summarize_item_list(
-                &key_files
-                    .iter()
-                    .map(|file| basename_without_extension(file))
-                    .collect::<Vec<_>>()
-            )
-        ));
+        let citations = key_files
+            .iter()
+            .filter_map(|file| {
+                first_graph_node_in_file(graph, file).map(|node| source_citation(file, node.line))
+            })
+            .collect::<Vec<_>>();
+        if !citations.is_empty() {
+            highlights.push(format!(
+                "The highest-signal indexed files begin at {}.",
+                join_prose_items(&citations)
+            ));
+        }
     }
 
     highlights
@@ -6698,96 +6949,145 @@ fn build_plan_edit_overview(
     affected_callers: &[PlanEditImpact],
     relevant_docs: &[PlanEditDocRecommendation],
 ) -> String {
-    let mut parts = vec![truncate_text(base_overview.trim(), 88)];
+    let mut sentences = vec![base_overview.trim().to_string()];
 
     if let Some(span) = candidate_spans.first() {
-        parts.push(format!(
-            "first span {}:{} ({})",
-            basename_without_extension(&span.file),
+        sentences.push(format!(
+            "Apply the first edit to `{}` in {} across lines {}.",
             span.symbol,
-            span.line_span
+            source_citation(&span.file, span.start_line),
+            span.line_span,
         ));
     }
     if let Some(caller) = affected_callers.first() {
-        parts.push(format!(
-            "caller watch {}",
-            truncate_text(&caller.symbol, 28)
+        sentences.push(format!(
+            "Review the affected {} `{}` at {} before changing that span.",
+            caller.relationship.replace('_', " "),
+            caller.symbol,
+            source_citation(&caller.file, caller.line)
         ));
     }
     if let Some(doc) = relevant_docs.first() {
-        parts.push(format!(
-            "doc check {}",
-            basename_without_extension(&doc.file)
+        sentences.push(format!(
+            "Check the related documentation at {} for drift after the edit.",
+            source_citation(&doc.file, doc.line)
         ));
     }
 
-    parts.join(". ") + "."
+    sentences.join(" ")
 }
 
 fn build_trace_scenario_overview(
+    graph: &CodeGraph,
     scenario: &str,
     likely_entrypoints: &[SymbolRecommendation],
     execution_path: &[ScenarioPathSegment],
     failure_branches: &[ScenarioSignal],
     tests: &[TestRecommendation],
 ) -> String {
-    let mut parts = vec![format!("Trace: {}", truncate_text(scenario, 52))];
+    let mut sentences = Vec::new();
 
     if let Some(entrypoint) = likely_entrypoints.first() {
-        parts.push(format!("entry {}", entrypoint.symbol));
+        sentences.push(format!(
+            "Trace “{}” from `{}` at {}, the highest-ranked entrypoint.",
+            truncate_text(scenario, 72),
+            entrypoint.symbol,
+            source_citation(&entrypoint.file, entrypoint.line)
+        ));
     }
     if let Some(segment) = execution_path.first() {
-        parts.push(format!(
-            "path {} -> {}",
-            truncate_text(&segment.from_symbol, 20),
-            truncate_text(&segment.to_symbol, 20)
+        sentences.push(format!(
+            "`{}` at {} {} `{}` at {}.",
+            segment.from_symbol,
+            source_citation(&segment.from_file, segment.from_line),
+            segment.relationship.replace('_', " "),
+            segment.to_symbol,
+            source_citation(&segment.to_file, segment.to_line)
         ));
     }
     if let Some(branch) = failure_branches.first() {
-        parts.push(format!("failure {}", truncate_text(&branch.symbol, 24)));
+        sentences.push(format!(
+            "Inspect `{}` at {} as the leading failure branch.",
+            branch.symbol,
+            source_citation(&branch.file, branch.line)
+        ));
     }
     if let Some(test) = tests.first() {
-        parts.push(format!("test {}", basename_without_extension(&test.file)));
+        if let Some(sentence) = describe_test_target(graph, test) {
+            sentences.push(sentence);
+        }
     }
 
-    parts.join(". ") + "."
+    structured_overview_fallback(
+        sentences,
+        likely_entrypoints
+            .first()
+            .map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_task_bundle_overview(
-    _query: &str,
+    graph: &CodeGraph,
+    query: &str,
     primary_files: &[FileRecommendation],
     symbols: &[SymbolRecommendation],
     tests: &[TestRecommendation],
     risks: &[RiskRecommendation],
     memories: &[MemoryHighlight],
 ) -> String {
-    let mut parts = vec![format!(
-        "Likely edit: {}",
-        summarize_item_list(
-            &primary_files
-                .iter()
-                .map(|item| basename_without_extension(&item.file))
-                .collect::<Vec<_>>()
-        )
-    )];
+    let mut sentences: Vec<String> = primary_files
+        .iter()
+        .filter_map(|item| describe_graph_file(graph, &item.file))
+        .collect();
 
     if let Some(symbol) = symbols.first() {
-        parts.push(format!("focus {}", symbol.symbol));
+        let memory_clause = memories
+            .first()
+            .map(|memory| format!("; {} at this location", memory_overview_phrase(memory)))
+            .unwrap_or_default();
+        sentences.push(format!(
+            "For “{}”, focus on `{}` at {}, the highest-ranked {}{}.",
+            truncate_text(query, 72),
+            symbol.symbol,
+            source_citation(&symbol.file, symbol.line),
+            kind_label(&symbol.kind),
+            memory_clause
+        ));
+    }
+    let symbol_refs: Vec<&SymbolRecommendation> = symbols.iter().collect();
+    if let Some(relationship) = describe_symbol_relationship(graph, &symbol_refs) {
+        sentences.push(relationship);
     }
     if let Some(test) = tests.first() {
-        parts.push(format!("test {}", basename_without_extension(&test.file)));
+        if let Some(sentence) = describe_test_target(graph, test) {
+            sentences.push(sentence);
+        }
     }
     if let Some(risk) = risks.first() {
-        parts.push(format!("watch {}", truncate_text(&risk.symbol, 24)));
-    }
-    if let Some(memory) = memories.first() {
-        parts.push(memory_overview_phrase(memory));
+        if let Some(node) = graph
+            .all_nodes()
+            .into_iter()
+            .find(|node| node.file == risk.file && node.name == risk.symbol)
+        {
+            sentences.push(format!(
+                "Review `{}` at {} because the graph marks it as a {}-risk change with {} affected symbol{}.",
+                risk.symbol,
+                source_citation(&risk.file, node.line),
+                risk.level,
+                risk.impact_count,
+                if risk.impact_count == 1 { "" } else { "s" }
+            ));
+        }
     }
 
-    parts.join(". ") + "."
+    structured_overview_fallback(
+        sentences,
+        symbols.first().map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_working_set_overview(
+    graph: &CodeGraph,
     query: Option<&str>,
     files: &[FileRecommendation],
     active_symbols: &[SymbolRecommendation],
@@ -6795,54 +7095,82 @@ fn build_working_set_overview(
     tests: &[TestRecommendation],
     memories: &[MemoryHighlight],
 ) -> String {
-    let lead = query.unwrap_or("Working set");
-    let mut parts = vec![format!(
-        "{}: {}",
-        truncate_text(lead, 34),
-        summarize_item_list(
-            &files
-                .iter()
-                .map(|item| basename_without_extension(&item.file))
-                .collect::<Vec<_>>()
-        )
-    )];
+    let mut sentences: Vec<String> = files
+        .iter()
+        .filter_map(|item| describe_graph_file(graph, &item.file))
+        .collect();
 
     if let Some(symbol) = active_symbols.first().or_else(|| nearby_symbols.first()) {
-        parts.push(format!("focus {}", symbol.symbol));
+        let memory_clause = memories
+            .first()
+            .map(|memory| format!("; {} at this location", memory_overview_phrase(memory)))
+            .unwrap_or_default();
+        sentences.push(format!(
+            "For “{}”, focus on `{}` at {}, the strongest working-set anchor{}.",
+            truncate_text(query.unwrap_or("the current working set"), 72),
+            symbol.symbol,
+            source_citation(&symbol.file, symbol.line),
+            memory_clause
+        ));
+    }
+    let symbol_refs: Vec<&SymbolRecommendation> =
+        active_symbols.iter().chain(nearby_symbols.iter()).collect();
+    if let Some(relationship) = describe_symbol_relationship(graph, &symbol_refs) {
+        sentences.push(relationship);
     }
     if let Some(test) = tests.first() {
-        parts.push(format!("test {}", basename_without_extension(&test.file)));
-    }
-    if let Some(memory) = memories.first() {
-        parts.push(memory_overview_phrase(memory));
+        if let Some(sentence) = describe_test_target(graph, test) {
+            sentences.push(sentence);
+        }
     }
 
-    parts.join(". ") + "."
+    structured_overview_fallback(
+        sentences,
+        active_symbols
+            .first()
+            .or_else(|| nearby_symbols.first())
+            .map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_failure_overview(
+    graph: &CodeGraph,
     kind: &str,
     suspects: &[SymbolRecommendation],
     tests: &[TestRecommendation],
     likely_causes: &[String],
     memories: &[MemoryHighlight],
 ) -> String {
-    let mut parts = vec![format!("{} diagnosis", kind)];
+    let mut sentences = Vec::new();
 
     if let Some(suspect) = suspects.first() {
-        parts.push(format!("suspect {}", suspect.symbol));
+        let cause_clause = likely_causes
+            .first()
+            .map(|cause| format!("; the leading evidence is {}", cause.trim_end_matches('.')))
+            .unwrap_or_default();
+        let memory_clause = memories
+            .first()
+            .map(|memory| format!("; {} here", memory_overview_phrase(memory)))
+            .unwrap_or_default();
+        sentences.push(format!(
+            "Start the {} diagnosis with `{}` at {}, the highest-ranked suspect{}{}.",
+            kind,
+            suspect.symbol,
+            source_citation(&suspect.file, suspect.line),
+            cause_clause,
+            memory_clause
+        ));
     }
     if let Some(test) = tests.first() {
-        parts.push(format!("test {}", basename_without_extension(&test.file)));
-    }
-    if let Some(cause) = likely_causes.first() {
-        parts.push(truncate_text(cause, 52));
-    }
-    if let Some(memory) = memories.first() {
-        parts.push(memory_overview_phrase(memory));
+        if let Some(sentence) = describe_test_target(graph, test) {
+            sentences.push(sentence);
+        }
     }
 
-    parts.join(". ") + "."
+    structured_overview_fallback(
+        sentences,
+        suspects.first().map(|item| (&item.file, item.line)),
+    )
 }
 
 fn build_failure_next_steps(
