@@ -550,16 +550,6 @@ fn run_mcp_verification_process(
         {
             break Ok(responses);
         }
-        if let Some(status) = child.try_wait()? {
-            let mut stderr = String::new();
-            if let Some(mut stream) = child.stderr.take() {
-                let _ = stream.read_to_string(&mut stderr);
-            }
-            break Err(anyhow!(
-                "verification failed: {label} exited with {status} before returning initialize and tools/list responses: {}",
-                stderr.trim()
-            ));
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
@@ -600,6 +590,22 @@ fn run_mcp_verification_process(
             Err(mpsc::RecvTimeoutError::Disconnected) => break Err(anyhow!(
                 "verification failed: {label} stdout reader stopped before returning initialize and tools/list responses"
             )),
+        }
+
+        // A short-lived command can write both responses and exit before this
+        // loop observes it. Let the stdout reader deliver its queued lines
+        // before treating that exit as a missing-response failure.
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let mut stderr = String::new();
+                if let Some(mut stream) = child.stderr.take() {
+                    let _ = stream.read_to_string(&mut stderr);
+                }
+                break Err(anyhow!(
+                    "verification failed: {label} exited with {status} before returning initialize and tools/list responses: {}",
+                    stderr.trim()
+                ));
+            }
         }
     };
 
@@ -1929,6 +1935,22 @@ mod tests {
             .to_string();
 
         assert!(error.contains("returned 1 tools, expected 8"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_drains_mcp_stdout_after_a_clean_child_exit() {
+        let (root, _workspace, runtime) = install_fixture();
+        let responses = run_mcp_verification_process(
+            &runtime.executable,
+            &["--stdio".to_string()],
+            &mcp_verification_payload(),
+            "fast-exiting MCP fixture",
+        )
+        .unwrap();
+
+        assert!(responses.iter().any(|response| response["id"] == 1));
+        assert!(responses.iter().any(|response| response["id"] == 2));
         fs::remove_dir_all(root).unwrap();
     }
 
