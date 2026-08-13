@@ -47,9 +47,43 @@ pub struct SessionDigest {
     pub dropped_observation_count: usize,
 }
 
-/// Compatibility-oriented name that emphasizes that a parsed digest is always
-/// normalized before it can be extracted or persisted.
-pub type NormalizedSessionDigest = SessionDigest;
+/// Authority-free content admitted from the transport payload.
+///
+/// This type intentionally excludes session, repository, and checkout
+/// identities. Those values are owned by the trusted caller context and must
+/// be bound separately after parsing; a digest payload can therefore never
+/// select its own persistence authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDigestContent {
+    pub schema_version: u32,
+    pub branch: Option<String>,
+    pub ended_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub edited_paths: Vec<String>,
+    pub final_summary: Option<String>,
+    pub observations: Vec<SessionDigestObservation>,
+    /// SHA-256 of the normalized, sanitized transport content. This is not a
+    /// hash of the raw payload or of authority supplied by the caller.
+    pub payload_hash: String,
+    /// Count only: no rejected value or path is retained.
+    pub dropped_observation_count: usize,
+}
+
+/// Trusted, caller-owned scope to bind to parsed digest content.
+///
+/// This is deliberately not part of the digest transport schema. Use
+/// [`bind_session_digest_authority`] after parsing content to create a digest
+/// suitable for extraction or persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDigestAuthority {
+    pub session_id: String,
+    pub repository_id: String,
+    pub checkout_id: Option<String>,
+}
+
+/// Compatibility-oriented name that emphasizes that parsed content is always
+/// normalized before trusted authority is bound for extraction or persistence.
+pub type NormalizedSessionDigest = SessionDigestContent;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -182,10 +216,6 @@ pub enum SessionDigestError {
 #[serde(deny_unknown_fields)]
 struct RawSessionDigest {
     schema_version: u32,
-    session_id: String,
-    repository_id: String,
-    #[serde(default)]
-    checkout_id: Option<String>,
     #[serde(default)]
     branch: Option<String>,
     ended_at: String,
@@ -197,7 +227,12 @@ struct RawSessionDigest {
     observations: Vec<Value>,
 }
 
-/// Parse, normalize, and sanitize a version-one session digest.
+/// Parse, normalize, and sanitize authority-free version-one digest content.
+///
+/// The input schema contains only sanitized content and metadata. Session,
+/// repository, and checkout identities are intentionally rejected as unknown
+/// fields; bind trusted caller-owned values with
+/// [`bind_session_digest_authority`] only after this function succeeds.
 ///
 /// `received_at` is supplied by the daemon so a remote or malformed caller
 /// cannot move capture time forward.  Timestamps more than five minutes in the
@@ -205,7 +240,7 @@ struct RawSessionDigest {
 pub fn parse_session_digest(
     input: &str,
     received_at: DateTime<Utc>,
-) -> Result<SessionDigest, SessionDigestError> {
+) -> Result<SessionDigestContent, SessionDigestError> {
     if input.len() > MAX_SESSION_DIGEST_BYTES {
         return Err(SessionDigestError::InputTooLarge);
     }
@@ -215,17 +250,6 @@ pub fn parse_session_digest(
     if raw.schema_version != SESSION_DIGEST_SCHEMA_VERSION {
         return Err(SessionDigestError::UnsupportedSchemaVersion);
     }
-    if !is_safe_opaque_id(&raw.session_id, MAX_SESSION_ID_BYTES) {
-        return Err(SessionDigestError::InvalidSessionId);
-    }
-    if !is_safe_opaque_id(&raw.repository_id, MAX_SESSION_ID_BYTES) {
-        return Err(SessionDigestError::InvalidRepositoryId);
-    }
-    let checkout_id = match raw.checkout_id {
-        Some(value) if is_safe_opaque_id(&value, MAX_SESSION_ID_BYTES) => Some(value),
-        Some(_) => return Err(SessionDigestError::InvalidCheckoutId),
-        None => None,
-    };
     let branch = match raw.branch {
         Some(value) if is_safe_branch(&value) => Some(value),
         Some(_) => return Err(SessionDigestError::InvalidBranch),
@@ -251,11 +275,8 @@ pub fn parse_session_digest(
         .and_then(|value| sanitize_text(value, MAX_FINAL_SUMMARY_BYTES));
 
     let (observations, dropped_observation_count) = normalize_observations(raw.observations);
-    let mut digest = SessionDigest {
+    let mut content = SessionDigestContent {
         schema_version: SESSION_DIGEST_SCHEMA_VERSION,
-        session_id: raw.session_id,
-        repository_id: raw.repository_id,
-        checkout_id,
         branch,
         ended_at,
         received_at,
@@ -265,8 +286,45 @@ pub fn parse_session_digest(
         payload_hash: String::new(),
         dropped_observation_count,
     };
-    digest.payload_hash = normalized_payload_hash(&digest);
-    Ok(digest)
+    content.payload_hash = normalized_payload_hash(&content);
+    Ok(content)
+}
+
+/// Bind validated, caller-owned authority to already-sanitized digest content.
+///
+/// This is the only transition that creates a [`SessionDigest`]. Keeping it
+/// distinct from parsing prevents the untrusted transport payload from
+/// selecting a session, repository, or checkout scope.
+pub fn bind_session_digest_authority(
+    content: SessionDigestContent,
+    authority: &SessionDigestAuthority,
+) -> Result<SessionDigest, SessionDigestError> {
+    if !is_safe_opaque_id(&authority.session_id, MAX_SESSION_ID_BYTES) {
+        return Err(SessionDigestError::InvalidSessionId);
+    }
+    if !is_safe_opaque_id(&authority.repository_id, MAX_SESSION_ID_BYTES) {
+        return Err(SessionDigestError::InvalidRepositoryId);
+    }
+    let checkout_id = match authority.checkout_id.as_deref() {
+        Some(value) if is_safe_opaque_id(value, MAX_SESSION_ID_BYTES) => Some(value.to_owned()),
+        Some(_) => return Err(SessionDigestError::InvalidCheckoutId),
+        None => None,
+    };
+
+    Ok(SessionDigest {
+        schema_version: content.schema_version,
+        session_id: authority.session_id.clone(),
+        repository_id: authority.repository_id.clone(),
+        checkout_id,
+        branch: content.branch,
+        ended_at: content.ended_at,
+        received_at: content.received_at,
+        edited_paths: content.edited_paths,
+        final_summary: content.final_summary,
+        observations: content.observations,
+        payload_hash: content.payload_hash,
+        dropped_observation_count: content.dropped_observation_count,
+    })
 }
 
 /// Deterministically derive the bounded memory candidates for a digest.
@@ -788,13 +846,10 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn normalized_payload_hash(digest: &SessionDigest) -> String {
+fn normalized_payload_hash(content: &SessionDigestContent) -> String {
     #[derive(Serialize)]
     struct Payload<'a> {
         schema_version: u32,
-        session_id: &'a str,
-        repository_id: &'a str,
-        checkout_id: &'a Option<String>,
         branch: &'a Option<String>,
         ended_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
@@ -803,16 +858,13 @@ fn normalized_payload_hash(digest: &SessionDigest) -> String {
         observations: &'a [SessionDigestObservation],
     }
     hash_json(&Payload {
-        schema_version: digest.schema_version,
-        session_id: &digest.session_id,
-        repository_id: &digest.repository_id,
-        checkout_id: &digest.checkout_id,
-        branch: &digest.branch,
-        ended_at: digest.ended_at,
-        received_at: digest.received_at,
-        edited_paths: &digest.edited_paths,
-        final_summary: &digest.final_summary,
-        observations: &digest.observations,
+        schema_version: content.schema_version,
+        branch: &content.branch,
+        ended_at: content.ended_at,
+        received_at: content.received_at,
+        edited_paths: &content.edited_paths,
+        final_summary: &content.final_summary,
+        observations: &content.observations,
     })
 }
 
@@ -858,8 +910,21 @@ mod tests {
         DateTime::from_unix_seconds(1_800_000_000)
     }
 
+    fn authority() -> SessionDigestAuthority {
+        SessionDigestAuthority {
+            session_id: "session-1".to_owned(),
+            repository_id: "repo-1".to_owned(),
+            checkout_id: Some("checkout-1".to_owned()),
+        }
+    }
+
+    fn parse_content(input: &str) -> SessionDigestContent {
+        parse_session_digest(input, received_at()).expect("digest content should parse")
+    }
+
     fn parse(input: &str) -> SessionDigest {
-        parse_session_digest(input, received_at()).expect("digest should parse")
+        bind_session_digest_authority(parse_content(input), &authority())
+            .expect("trusted authority should bind")
     }
 
     #[test]
@@ -867,9 +932,6 @@ mod tests {
         let input = format!(
             r#"{{
                 "schema_version":1,
-                "session_id":"session-1",
-                "repository_id":"repo-1",
-                "checkout_id":"checkout-1",
                 "branch":"feature/digest",
                 "ended_at":"2026-05-17T14:30:00Z",
                 "edited_paths":["src/z.rs","src/a.rs","src/a.rs"],
@@ -902,6 +964,71 @@ mod tests {
     }
 
     #[test]
+    fn rejects_transport_authority_and_binds_trusted_authority_separately() {
+        let content_input = r#"{
+          "schema_version":1,
+          "ended_at":"2026-05-17T14:30:00Z",
+          "edited_paths":["src/lib.rs"]
+        }"#;
+        let with_transport_authority = r#"{
+          "schema_version":1,
+          "session_id":"untrusted-session",
+          "repository_id":"untrusted-repository",
+          "checkout_id":"untrusted-checkout",
+          "ended_at":"2026-05-17T14:30:00Z"
+        }"#;
+        assert_eq!(
+            parse_session_digest(with_transport_authority, received_at()),
+            Err(SessionDigestError::InvalidJson)
+        );
+
+        let content = parse_content(content_input);
+        let first = bind_session_digest_authority(content.clone(), &authority())
+            .expect("trusted authority should bind");
+        let second_authority = SessionDigestAuthority {
+            session_id: "session-2".to_owned(),
+            repository_id: "repo-2".to_owned(),
+            checkout_id: None,
+        };
+        let second = bind_session_digest_authority(content.clone(), &second_authority)
+            .expect("second trusted authority should bind");
+
+        assert_eq!(content.payload_hash, first.payload_hash);
+        assert_eq!(first.payload_hash, second.payload_hash);
+        assert_eq!(first.session_id, "session-1");
+        assert_eq!(first.repository_id, "repo-1");
+        assert_eq!(first.checkout_id.as_deref(), Some("checkout-1"));
+        assert_eq!(second.session_id, "session-2");
+        assert_eq!(second.repository_id, "repo-2");
+        assert_eq!(second.checkout_id, None);
+
+        let first_candidates = extract_default_session_digest_candidates(&first);
+        let second_candidates = extract_default_session_digest_candidates(&second);
+        assert_ne!(
+            first_candidates[0].idempotency_key,
+            second_candidates[0].idempotency_key
+        );
+        assert_eq!(first_candidates[0].evidence.session_id, "session-1");
+        assert_eq!(second_candidates[0].evidence.repository_id, "repo-2");
+    }
+
+    #[test]
+    fn rejects_invalid_bound_authority_without_retaining_it_in_content() {
+        let content = parse_content(r#"{"schema_version":1,"ended_at":"2026-05-17T14:30:00Z"}"#);
+        let invalid_authority = SessionDigestAuthority {
+            session_id: "unsafe/session".to_owned(),
+            repository_id: "repo-1".to_owned(),
+            checkout_id: None,
+        };
+        assert_eq!(
+            bind_session_digest_authority(content.clone(), &invalid_authority),
+            Err(SessionDigestError::InvalidSessionId)
+        );
+        let serialized_content = serde_json::to_string(&content).unwrap();
+        assert!(!serialized_content.contains("unsafe/session"));
+    }
+
+    #[test]
     fn rejects_unbounded_or_out_of_workspace_paths() {
         for path in [
             "/tmp/source.rs",
@@ -913,7 +1040,7 @@ mod tests {
         ] {
             let path_json = serde_json::to_string(path).unwrap();
             let input = format!(
-                r#"{{"schema_version":1,"session_id":"s","repository_id":"r","ended_at":"2026-05-17T14:30:00Z","edited_paths":[{path_json}],"observations":[]}}"#
+                r#"{{"schema_version":1,"ended_at":"2026-05-17T14:30:00Z","edited_paths":[{path_json}],"observations":[]}}"#
             );
             assert_eq!(
                 parse_session_digest(&input, received_at()),
@@ -928,7 +1055,7 @@ mod tests {
         let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
         let input = format!(
             r#"{{
-              "schema_version":1,"session_id":"s","repository_id":"r",
+              "schema_version":1,
               "ended_at":"2026-05-17T14:30:00Z",
               "final_summary":"token={secret}",
               "observations":[
@@ -951,7 +1078,7 @@ mod tests {
     #[test]
     fn ignores_unknown_or_malformed_optional_observations() {
         let input = r#"{
-          "schema_version":1,"session_id":"s","repository_id":"r",
+          "schema_version":1,
           "ended_at":"2026-05-17T14:30:00Z",
           "observations":[
             {"kind":"tool_output","content":"not admitted"},
@@ -968,7 +1095,7 @@ mod tests {
     fn prose_and_unmatched_resolution_cannot_assert_outcomes() {
         let only_prose = parse(
             r#"{
-          "schema_version":1,"session_id":"s","repository_id":"r",
+          "schema_version":1,
           "ended_at":"2026-05-17T14:30:00Z",
           "final_summary":"All tests passed and compiler error is resolved."
         }"#,
@@ -977,7 +1104,7 @@ mod tests {
 
         let unmatched = parse(&format!(
             r#"{{
-          "schema_version":1,"session_id":"s","repository_id":"r",
+          "schema_version":1,
           "ended_at":"2026-05-17T14:30:00Z",
           "observations":[{{"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"resolved"}}]
         }}"#
@@ -991,13 +1118,13 @@ mod tests {
     fn future_timestamp_is_clamped_and_unknown_envelope_fields_are_rejected() {
         let clamped = parse(
             r#"{
-          "schema_version":1,"session_id":"s","repository_id":"r",
+          "schema_version":1,
           "ended_at":"2099-01-01T00:00:00Z"
         }"#,
         );
         assert_eq!(clamped.ended_at, received_at());
         let invalid = r#"{
-          "schema_version":1,"session_id":"s","repository_id":"r",
+          "schema_version":1,
           "ended_at":"2026-05-17T14:30:00Z","transcript_path":"/tmp/agent.jsonl"
         }"#;
         assert_eq!(
