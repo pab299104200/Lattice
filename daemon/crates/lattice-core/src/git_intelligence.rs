@@ -357,24 +357,64 @@ impl Default for GitHistoryMiner {
 /// wrapper repeats the report for callers which only need to record or surface
 /// refresh health without traversing the signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RepositoryGitMiningResult {
+pub struct RepositoryGitMiningResult {
     pub snapshot: GitIntelligenceSnapshot,
     pub report: GitMiningReport,
 }
 
+/// Failure while opening or reading a repository for history mining.
+///
+/// The adapter remains an implementation detail; callers receive this stable
+/// facade error instead of depending on the private `git2` extraction layer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GitMiningError {
+    #[error("could not open Git repository at {path}: {message}")]
+    Open { path: String, message: String },
+    #[error("could not walk Git history: {message}")]
+    Walk { message: String },
+    #[error("could not read commit {commit}: {message}")]
+    Commit { commit: String, message: String },
+    #[error("could not diff commit {commit}: {message}")]
+    Diff { commit: String, message: String },
+}
+
+impl From<GitHistoryAdapterError> for GitMiningError {
+    fn from(error: GitHistoryAdapterError) -> Self {
+        match error {
+            GitHistoryAdapterError::Open { path, source } => Self::Open {
+                path,
+                message: source.to_string(),
+            },
+            GitHistoryAdapterError::Walk(source) => Self::Walk {
+                message: source.to_string(),
+            },
+            GitHistoryAdapterError::Commit { commit, source } => Self::Commit {
+                commit,
+                message: source.to_string(),
+            },
+            GitHistoryAdapterError::Diff { commit, source } => Self::Diff {
+                commit,
+                message: source.to_string(),
+            },
+        }
+    }
+}
+
 /// Reads and aggregates the bounded history reachable from `repository_path`.
 ///
-/// This is the crate-internal integration seam between the pure miner and the
-/// local `git2` adapter. It deliberately performs no storage, scheduling, or
-/// ranking work. The configured limits are normalized once before extraction
-/// and then used for aggregation, so the returned report always records the
-/// effective limits that actually constrained repository traversal.
-pub(crate) fn mine_repository(
+/// This is the public integration seam between the pure miner and the local
+/// `git2` adapter. It deliberately performs no storage, scheduling, or ranking
+/// work. The configured limits are normalized once before extraction and then
+/// used for aggregation, so the returned report always records the effective
+/// limits that actually constrained repository traversal.
+pub fn mine_repository(
     repository_path: &Path,
     limits: GitMiningLimits,
-) -> Result<RepositoryGitMiningResult, GitHistoryAdapterError> {
+) -> Result<RepositoryGitMiningResult, GitMiningError> {
     let miner = GitHistoryMiner::with_limits(limits);
-    let samples = GitHistoryAdapter::new(miner.limits()).collect(repository_path)?;
+    let samples = GitHistoryAdapter::new(miner.limits())
+        .collect(repository_path)
+        .map_err(GitMiningError::from)?;
     let snapshot = miner.mine(samples);
     let report = snapshot.report.clone();
     Ok(RepositoryGitMiningResult { snapshot, report })
@@ -792,7 +832,21 @@ mod tests {
         let missing = directory.path().join("missing-repository");
         let error = mine_repository(&missing, GitMiningLimits::default())
             .expect_err("missing repository must preserve the adapter open error");
-        assert!(matches!(error, GitHistoryAdapterError::Open { .. }));
+        assert!(matches!(&error, GitMiningError::Open { .. }));
+        assert!(error.to_string().contains("missing-repository"));
+    }
+
+    #[test]
+    fn public_facade_error_keeps_operation_context_without_exposing_adapter_types() {
+        let error = GitMiningError::Commit {
+            commit: "deadbeef".to_owned(),
+            message: "object not found".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "could not read commit deadbeef: object not found"
+        );
     }
 
     #[test]
