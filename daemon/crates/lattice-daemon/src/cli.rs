@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -13,6 +15,15 @@ use crate::install::{
 use crate::proxy::{daemon_addr, ProxyHello};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const EXPECTED_MCP_TOOL_COUNT: usize = 8;
+
+const INSTALLED_HOOKS: [(&str, &str); 4] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct CliRequest {
@@ -370,7 +381,350 @@ fn verify_install_config(
             path.display()
         ));
     }
+
+    match command.target {
+        InstallTarget::Mcp => verify_configured_mcp_server(&actual, path)?,
+        InstallTarget::ClaudeCode | InstallTarget::Codex => {
+            let client = if command.target == InstallTarget::ClaudeCode {
+                HookClient::ClaudeCode
+            } else {
+                HookClient::Codex
+            };
+            verify_configured_hooks(&actual, path, client, config_workspace(command), runtime)?;
+        }
+    }
     Ok(())
+}
+
+fn config_workspace(command: &InstallCommand) -> &Path {
+    command
+        .workspaces
+        .first()
+        .expect("install parser guarantees a workspace")
+}
+
+/// Exercise the command written to `.mcp.json`, rather than merely checking
+/// that it looks plausible. A broken binary, invalid argument list, protocol
+/// failure, or tool-surface drift makes `install --verify` fail.
+fn verify_configured_mcp_server(config: &Value, config_path: &Path) -> Result<()> {
+    let server = config
+        .pointer("/mcpServers/lattice")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed: `{}` has no mcpServers.lattice object",
+                config_path.display()
+            )
+        })?;
+    let executable = server
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed: `{}` has no Lattice MCP command",
+                config_path.display()
+            )
+        })?;
+    let args = server
+        .get("args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed: `{}` has no Lattice MCP arguments",
+                config_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                anyhow!(
+                    "verification failed: `{}` has a non-string Lattice MCP argument",
+                    config_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !args.iter().any(|argument| argument == "--stdio") {
+        return Err(anyhow!(
+            "verification failed: `{}` Lattice MCP command is missing --stdio",
+            config_path.display()
+        ));
+    }
+
+    let output = run_fixture_process(
+        Path::new(executable),
+        &args,
+        &mcp_verification_payload(),
+        None,
+        "configured MCP command",
+    )?;
+    let responses = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line).with_context(|| {
+                format!(
+                    "verification failed: configured MCP command emitted non-JSON response `{line}`"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let initialize = json_rpc_result_for(&responses, 1, "initialize")?;
+    if initialize.is_null() {
+        return Err(anyhow!(
+            "verification failed: configured MCP command returned a null initialize result"
+        ));
+    }
+    let tools = json_rpc_result_for(&responses, 2, "tools/list")?
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("verification failed: tools/list returned no tools array"))?;
+    if tools.len() != EXPECTED_MCP_TOOL_COUNT {
+        return Err(anyhow!(
+            "verification failed: tools/list returned {} tools, expected {EXPECTED_MCP_TOOL_COUNT}",
+            tools.len()
+        ));
+    }
+    Ok(())
+}
+
+fn mcp_verification_payload() -> String {
+    format!(
+        "{}\n{}\n{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "lattice-install-verify", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+}
+
+fn json_rpc_result_for<'a>(responses: &'a [Value], id: u64, method: &str) -> Result<&'a Value> {
+    let response = responses
+        .iter()
+        .find(|response| response.get("id") == Some(&json!(id)))
+        .ok_or_else(|| {
+            anyhow!("verification failed: configured MCP command returned no {method} response")
+        })?;
+    if let Some(error) = response.get("error") {
+        return Err(anyhow!(
+            "verification failed: configured MCP command {method} response contained an error: {error}"
+        ));
+    }
+    response.get("result").ok_or_else(|| {
+        anyhow!("verification failed: configured MCP command {method} response has no result")
+    })
+}
+
+/// Run every configured hook with a representative client payload. Session
+/// startup is required to emit context; prompt and impact hooks may correctly
+/// emit nothing when no result clears their relevance thresholds; Stop is an
+/// acknowledgement hook and must be silent. All four must run successfully.
+fn verify_configured_hooks(
+    config: &Value,
+    config_path: &Path,
+    client: HookClient,
+    workspace: &Path,
+    runtime: &InstallRuntime,
+) -> Result<()> {
+    for (event, script) in INSTALLED_HOOKS {
+        let command = configured_hook_command(config, config_path, script)?;
+        let output = run_fixture_process(
+            &command,
+            &[],
+            hook_fixture_payload(event),
+            Some(HookProcessContext {
+                workspace,
+                executable: &runtime.executable,
+            }),
+            &format!("configured {event} hook"),
+        )?;
+        verify_hook_stdout(client, event, &output)?;
+    }
+    Ok(())
+}
+
+fn configured_hook_command(config: &Value, config_path: &Path, script: &str) -> Result<PathBuf> {
+    let entries = config
+        .pointer("/hooks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed: `{}` has no hooks object",
+                config_path.display()
+            )
+        })?;
+    let commands = entries
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .filter(|command| {
+            Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(script)
+        })
+        .collect::<Vec<_>>();
+    match commands.as_slice() {
+        [command] if !command.trim().is_empty() => Ok(PathBuf::from(command)),
+        [] => Err(anyhow!(
+            "verification failed: `{}` has no configured `{script}` hook",
+            config_path.display()
+        )),
+        _ => Err(anyhow!(
+            "verification failed: `{}` has multiple configured `{script}` hooks",
+            config_path.display()
+        )),
+    }
+}
+
+fn hook_fixture_payload(event: &str) -> &'static str {
+    match event {
+        "SessionStart" => r#"{"source":"startup"}"#,
+        "UserPromptSubmit" => r#"{"prompt":"verify Lattice hook configuration"}"#,
+        "PostToolUse" => r#"{"tool_name":"apply_patch","file_path":"README.md"}"#,
+        "Stop" => r#"{"edited_files":["README.md"]}"#,
+        _ => "{}",
+    }
+}
+
+fn verify_hook_stdout(client: HookClient, event: &str, output: &str) -> Result<()> {
+    if event == "Stop" {
+        if !output.trim().is_empty() {
+            return Err(anyhow!(
+                "verification failed: Stop hook must not write stdout, got `{}`",
+                output.trim()
+            ));
+        }
+        return Ok(());
+    }
+    if event == "SessionStart" && output.trim().is_empty() {
+        return Err(anyhow!(
+            "verification failed: SessionStart hook produced no context"
+        ));
+    }
+    if output.trim().is_empty() {
+        return Ok(());
+    }
+    if client == HookClient::ClaudeCode {
+        let envelope: Value = serde_json::from_str(output.trim())
+            .context("verification failed: Claude Code hook emitted invalid JSON")?;
+        let actual_event = envelope
+            .pointer("/hookSpecificOutput/hookEventName")
+            .and_then(Value::as_str);
+        let context = envelope
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        if actual_event != Some(event) || context.is_none() {
+            return Err(anyhow!(
+                "verification failed: Claude Code {event} hook emitted an invalid context envelope"
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct HookProcessContext<'a> {
+    workspace: &'a Path,
+    executable: &'a Path,
+}
+
+/// The verifier deliberately has a deadline: a broken hook must make install
+/// fail, not leave the invoking agent blocked forever.
+fn run_fixture_process(
+    program: &Path,
+    args: &[String],
+    input: &str,
+    hook_context: Option<HookProcessContext<'_>>,
+    label: &str,
+) -> Result<String> {
+    let mut process = Command::new(program);
+    process
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(context) = hook_context {
+        process
+            .current_dir(context.workspace)
+            .env("LATTICE_BIN", context.executable)
+            .env("LATTICE_SKIP_METRICS", "1");
+    }
+    let mut child = process.spawn().with_context(|| {
+        format!(
+            "verification failed: could not spawn {label} `{}`",
+            program.display()
+        )
+    })?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            anyhow!(
+                "verification failed: {label} `{}` has no stdin",
+                program.display()
+            )
+        })?;
+        stdin.write_all(input.as_bytes())?;
+    }
+    // Closing stdin lets stdio proxies terminate after processing the fixture.
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        anyhow!(
+            "verification failed: {label} `{}` has no stdout",
+            program.display()
+        )
+    })?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        let result = std::io::BufReader::new(stdout)
+            .read_to_string(&mut output)
+            .map(|_| output);
+        let _ = sender.send(result);
+    });
+
+    let deadline = Instant::now() + INSTALL_VERIFY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = receiver
+                .recv_timeout(Duration::from_millis(250))
+                .map_err(|_| {
+                    anyhow!("verification failed: {label} closed without readable stdout")
+                })??;
+            if !status.success() {
+                let mut stderr = String::new();
+                if let Some(mut stream) = child.stderr.take() {
+                    let _ = stream.read_to_string(&mut stderr);
+                }
+                return Err(anyhow!(
+                    "verification failed: {label} exited with {status}: {}",
+                    stderr.trim()
+                ));
+            }
+            return Ok(output);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "verification failed: {label} exceeded {} seconds",
+                INSTALL_VERIFY_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 async fn run_request(request: CliRequest) -> i32 {
@@ -1043,33 +1397,60 @@ fn compact_value(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static INSTALL_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn install_fixture() -> (PathBuf, PathBuf, InstallRuntime) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("lattice-cli-install-{nonce}"));
+        let sequence = INSTALL_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("lattice-cli-install-{nonce}-{sequence}"));
         let workspace = root.join("workspace");
         fs::create_dir_all(workspace.join(".git")).unwrap();
         for client in ["claude-code", "codex"] {
             let hooks = root.join("integrations").join(client).join("hooks");
             fs::create_dir_all(&hooks).unwrap();
-            for script in [
-                "session-start.sh",
-                "user-prompt-submit.sh",
-                "post-tool-use.sh",
-                "stop.sh",
-            ] {
-                fs::write(hooks.join(script), "#!/bin/sh\nexit 0\n").unwrap();
+            for (event, script) in INSTALLED_HOOKS {
+                let output = if event == "Stop" {
+                    ""
+                } else if client == "claude-code" {
+                    &format!(
+                        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"{event}\",\"additionalContext\":\"fixture\"}}}}"
+                    )
+                } else {
+                    "fixture context"
+                };
+                write_executable(
+                    &hooks.join(script),
+                    &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"),
+                );
             }
         }
+        let executable = root.join("bin/lattice");
+        write_executable(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{}, {}, {}, {}, {}, {}, {}, {}]}}'\n",
+        );
         let runtime = InstallRuntime {
-            executable: PathBuf::from("/opt/lattice/bin/lattice"),
+            executable,
             asset_root: root.clone(),
         };
         (root, workspace, runtime)
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -1165,7 +1546,7 @@ mod tests {
         assert_eq!(config["mcpServers"]["other"]["command"], "other");
         assert_eq!(
             config["mcpServers"]["lattice"]["command"],
-            "/opt/lattice/bin/lattice"
+            runtime.executable.to_string_lossy().as_ref()
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1204,6 +1585,53 @@ mod tests {
                 .display()
                 .to_string()
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_fails_loudly_for_a_broken_configured_mcp_binary() {
+        let (root, _workspace, runtime) = install_fixture();
+        write_executable(&runtime.executable, "#!/bin/sh\nexit 23\n");
+        let config = json!({
+            "mcpServers": {
+                "lattice": {
+                    "type": "stdio",
+                    "command": runtime.executable,
+                    "args": ["--stdio"]
+                }
+            }
+        });
+
+        let error = verify_configured_mcp_server(&config, Path::new("/fixture/.mcp.json"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("configured MCP command exited"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_rejects_tool_surface_drift() {
+        let (root, _workspace, runtime) = install_fixture();
+        write_executable(
+            &runtime.executable,
+            "#!/bin/sh\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{}]}}'\n",
+        );
+        let config = json!({
+            "mcpServers": {
+                "lattice": {
+                    "type": "stdio",
+                    "command": runtime.executable,
+                    "args": ["--stdio"]
+                }
+            }
+        });
+
+        let error = verify_configured_mcp_server(&config, Path::new("/fixture/.mcp.json"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("returned 1 tools, expected 8"));
         fs::remove_dir_all(root).unwrap();
     }
 
