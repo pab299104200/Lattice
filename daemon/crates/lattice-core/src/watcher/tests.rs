@@ -5,6 +5,8 @@ fn test_should_index_typescript() {
     assert!(should_index_file("src/app.ts"));
     assert!(should_index_file("components/Button.tsx"));
     assert!(should_index_file("lib/utils.js"));
+    assert!(should_index_file("lib/runtime.mjs"));
+    assert!(should_index_file("lib/config.cjs"));
 }
 
 #[test]
@@ -20,6 +22,18 @@ fn test_should_not_index_non_code() {
     assert!(!should_index_file("package.json"));
     assert!(!should_index_file("logo.png"));
     assert!(!should_index_file(".env"));
+    for path in [
+        "native.c",
+        "native.cpp",
+        "native.h",
+        "native.hpp",
+        "docs/guide.mdx",
+    ] {
+        assert!(
+            !should_index_file(path),
+            "unsupported path should be excluded: {path}"
+        );
+    }
 }
 
 #[test]

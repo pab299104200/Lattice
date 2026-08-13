@@ -29,18 +29,6 @@ pub(crate) struct IncrementalIndexResult {
     pub(crate) removed_count: usize,
 }
 
-impl IncrementalIndexResult {
-    pub(crate) fn empty() -> Self {
-        Self {
-            graph: Arc::new(CodeGraph::new()),
-            parsed_files: HashMap::new(),
-            file_index: Vec::new(),
-            changed_count: 0,
-            removed_count: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct SourceFileRecord {
     indexed_path: String,
@@ -63,25 +51,33 @@ pub(crate) fn background_vector_sync_enabled() -> bool {
 pub(crate) async fn load_incremental_cache(
     graph_store: &Arc<Mutex<GraphStore>>,
 ) -> (HashMap<String, FileIndexEntry>, HashMap<String, ParsedFile>) {
-    let store = graph_store.lock().await;
-    let manifest = store.load_file_index().unwrap_or_else(|err| {
-        tracing::warn!("Failed to load file index manifest: {}", err);
-        HashMap::new()
-    });
-    let max_cached_files = max_cached_parsed_files();
-    if manifest.len() > max_cached_files {
-        tracing::warn!(
-            cached_files = manifest.len(),
-            max_cached_files,
-            "Skipping persisted parsed-file cache because it exceeds the safety limit"
-        );
-        return (HashMap::new(), HashMap::new());
-    }
-    let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
-        tracing::warn!("Failed to load cached parsed files: {}", err);
-        HashMap::new()
-    });
-    (manifest, parsed_files)
+    let graph_store = Arc::clone(graph_store);
+    tokio::task::spawn_blocking(move || {
+        let store = graph_store.blocking_lock();
+        let manifest = store.load_file_index().unwrap_or_else(|err| {
+            tracing::warn!("Failed to load file index manifest: {}", err);
+            HashMap::new()
+        });
+        let max_cached_files = max_cached_parsed_files();
+        if manifest.len() > max_cached_files {
+            tracing::warn!(
+                cached_files = manifest.len(),
+                max_cached_files,
+                "Skipping persisted parsed-file cache because it exceeds the safety limit"
+            );
+            return (HashMap::new(), HashMap::new());
+        }
+        let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
+            tracing::warn!("Failed to load cached parsed files: {}", err);
+            HashMap::new()
+        });
+        (manifest, parsed_files)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "Incremental cache load worker failed");
+        (HashMap::new(), HashMap::new())
+    })
 }
 
 pub(crate) fn max_warm_graph_files() -> usize {
@@ -100,26 +96,30 @@ pub(crate) fn max_warm_graph_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_WARM_GRAPH_BYTES)
 }
 
-pub(crate) fn effective_indexable_file_count(roots: &[PathBuf]) -> usize {
-    collect_indexable_file_records(roots).len()
-}
-
 pub(crate) async fn persist_incremental_cache(
     graph_store: &Arc<Mutex<GraphStore>>,
-    graph: &CodeGraph,
-    file_index: &[FileIndexEntry],
-    parsed_files: &HashMap<String, ParsedFile>,
-) {
-    let store = graph_store.lock().await;
-    if let Err(err) = store.save_graph(graph) {
-        tracing::warn!("Failed to save graph: {}", err);
-    }
-    if let Err(err) = store.save_file_index(file_index) {
-        tracing::warn!("Failed to save file index manifest: {}", err);
-    }
-    if let Err(err) = store.save_parsed_files(parsed_files) {
-        tracing::warn!("Failed to save cached parsed files: {}", err);
-    }
+    incremental: IncrementalIndexResult,
+) -> Option<IncrementalIndexResult> {
+    let graph_store = Arc::clone(graph_store);
+    tokio::task::spawn_blocking(move || {
+        let store = graph_store.blocking_lock();
+        if let Err(err) = store.save_graph(&incremental.graph) {
+            tracing::warn!("Failed to save graph: {}", err);
+        }
+        if let Err(err) = store.save_file_index(&incremental.file_index) {
+            tracing::warn!("Failed to save file index manifest: {}", err);
+        }
+        if let Err(err) = store.save_parsed_files(&incremental.parsed_files) {
+            tracing::warn!("Failed to save cached parsed files: {}", err);
+        }
+        incremental
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "Incremental cache persistence worker failed; keeping the previously published graph");
+        error
+    })
+    .ok()
 }
 
 pub(crate) fn build_incremental_index_for_roots(
@@ -259,8 +259,7 @@ fn collect_indexable_file_records(roots: &[PathBuf]) -> Vec<SourceFileRecord> {
     let mut records = Vec::new();
     for root in roots {
         let security_filter = SecurityFilter::new(root);
-        let mut files = collect_indexable_files(root, &security_filter);
-        prioritize_indexable_paths(root, &mut files);
+        let files = collect_indexable_files(root, &security_filter);
         let repo_name = repo_name_for_root(root);
         for path in files {
             let rel_path = path
@@ -370,30 +369,10 @@ fn collect_files_recursive(
 
         if path.is_dir() {
             collect_files_recursive(&path, root, security_filter, out);
-        } else if path.is_file() && is_indexable_extension(&path) {
+        } else if path.is_file() && lattice_core::watcher::should_index_file(&rel_path) {
             out.push(path);
         }
     }
-}
-
-fn is_indexable_extension(path: &Path) -> bool {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    matches!(
-        ext,
-        "rs" | "py"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "java"
-            | "c"
-            | "cpp"
-            | "h"
-            | "hpp"
-            | "go"
-            | "md"
-            | "mdx"
-    )
 }
 
 fn repo_name_for_root(root: &Path) -> String {
