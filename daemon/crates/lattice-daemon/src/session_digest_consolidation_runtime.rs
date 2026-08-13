@@ -19,7 +19,9 @@ use lattice_core::consolidation::llm::{
 };
 use lattice_core::consolidation::{ConsolidationConfig, ConsolidationJobRuntime};
 use lattice_core::events::EventWriter;
-use lattice_core::memory::MemoryStore;
+use lattice_core::memory::session_capture::SessionCaptureRetentionPolicy;
+use lattice_core::memory::{MemoryQueryAuthority, MemoryStore, MemoryStoreRouter};
+use lattice_core::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -46,6 +48,17 @@ const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+// Automatic capture retention is deliberately independent from opt-in LLM
+// consolidation. These are repository-local bounds: every daemon workspace
+// gets a scheduler unless its retention configuration is invalid.
+const DEFAULT_CAPTURE_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const MAX_CAPTURE_RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_CAPTURE_RETENTION_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_CAPTURE_RETENTION_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const DEFAULT_CAPTURE_RETENTION_MAX_CAPTURES: usize = 1_024;
+const MAX_CAPTURE_RETENTION_MAX_CAPTURES: usize = 100_000;
+const CAPTURE_RETENTION_LEASE: Duration = Duration::from_secs(5 * 60);
+
 pub(crate) const ENABLE_ENV: &str = "LATTICE_ENABLE_SESSION_DIGEST_CONSOLIDATION";
 pub(crate) const PROVIDER_ENV: &str = "LATTICE_SESSION_DIGEST_CONSOLIDATION_PROVIDER";
 pub(crate) const MODEL_ENV: &str = "LATTICE_SESSION_DIGEST_CONSOLIDATION_MODEL";
@@ -59,6 +72,12 @@ pub(crate) const MAX_PROPOSALS_ENV: &str =
 pub(crate) const MAX_PENDING_ENV: &str =
     "LATTICE_SESSION_DIGEST_CONSOLIDATION_MAX_PENDING_PROPOSALS";
 pub(crate) const MAX_RESPONSE_ENV: &str = "LATTICE_SESSION_DIGEST_CONSOLIDATION_MAX_RESPONSE_BYTES";
+pub(crate) const CAPTURE_RETENTION_INTERVAL_ENV: &str =
+    "LATTICE_SESSION_CAPTURE_RETENTION_INTERVAL_SECS";
+pub(crate) const CAPTURE_RETENTION_MAX_AGE_ENV: &str =
+    "LATTICE_SESSION_CAPTURE_RETENTION_MAX_AGE_SECS";
+pub(crate) const CAPTURE_RETENTION_MAX_CAPTURES_ENV: &str =
+    "LATTICE_SESSION_CAPTURE_RETENTION_MAX_CAPTURES";
 
 #[derive(Clone)]
 struct Secret(String);
@@ -439,6 +458,245 @@ impl SessionDigestConsolidationHandle {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionCaptureRetentionRuntimeConfig {
+    interval: Duration,
+    max_age: Duration,
+    max_captures: usize,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum SessionCaptureRetentionConfigError {
+    #[error("session capture retention {0} must be a positive integer")]
+    InvalidPositive(&'static str),
+    #[error("session capture retention {0} exceeds its safety bound")]
+    ExceedsBound(&'static str),
+}
+
+impl SessionCaptureRetentionRuntimeConfig {
+    fn from_environment() -> Result<Self, SessionCaptureRetentionConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, SessionCaptureRetentionConfigError> {
+        let interval = capture_retention_duration(
+            "interval",
+            lookup(CAPTURE_RETENTION_INTERVAL_ENV),
+            DEFAULT_CAPTURE_RETENTION_INTERVAL,
+        )?;
+        if interval > MAX_CAPTURE_RETENTION_INTERVAL {
+            return Err(SessionCaptureRetentionConfigError::ExceedsBound("interval"));
+        }
+        let max_age = capture_retention_duration(
+            "maximum age",
+            lookup(CAPTURE_RETENTION_MAX_AGE_ENV),
+            DEFAULT_CAPTURE_RETENTION_MAX_AGE,
+        )?;
+        if max_age > MAX_CAPTURE_RETENTION_MAX_AGE {
+            return Err(SessionCaptureRetentionConfigError::ExceedsBound(
+                "maximum age",
+            ));
+        }
+        let max_captures = capture_retention_usize(
+            "capture limit",
+            lookup(CAPTURE_RETENTION_MAX_CAPTURES_ENV),
+            DEFAULT_CAPTURE_RETENTION_MAX_CAPTURES,
+        )?;
+        if max_captures > MAX_CAPTURE_RETENTION_MAX_CAPTURES {
+            return Err(SessionCaptureRetentionConfigError::ExceedsBound(
+                "capture limit",
+            ));
+        }
+        Ok(Self {
+            interval,
+            max_age,
+            max_captures,
+        })
+    }
+
+    fn policy(&self) -> Result<SessionCaptureRetentionPolicy, String> {
+        SessionCaptureRetentionPolicy::new(self.max_age, self.max_captures)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    fn test(interval: Duration, max_age: Duration, max_captures: usize) -> Self {
+        Self {
+            interval,
+            max_age,
+            max_captures,
+        }
+    }
+}
+
+fn capture_retention_duration(
+    name: &'static str,
+    value: Option<String>,
+    fallback: Duration,
+) -> Result<Duration, SessionCaptureRetentionConfigError> {
+    value
+        .map(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(Duration::from_secs)
+                .ok_or(SessionCaptureRetentionConfigError::InvalidPositive(name))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(fallback))
+}
+
+fn capture_retention_usize(
+    name: &'static str,
+    value: Option<String>,
+    fallback: usize,
+) -> Result<usize, SessionCaptureRetentionConfigError> {
+    value
+        .map(|raw| {
+            raw.parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(SessionCaptureRetentionConfigError::InvalidPositive(name))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(fallback))
+}
+
+pub(crate) struct SessionCaptureRetentionHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl SessionCaptureRetentionHandle {
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+struct SessionCaptureRetentionWorker {
+    repository_id: String,
+    checkout_id: String,
+    memory_path: PathBuf,
+    state_path: PathBuf,
+    owner: String,
+    config: SessionCaptureRetentionRuntimeConfig,
+}
+
+impl SessionCaptureRetentionWorker {
+    fn run_once(
+        &self,
+    ) -> Result<lattice_core::memory::session_capture::SessionCaptureDeletionResult, String> {
+        if !self.claim_lease()? {
+            return Ok(Default::default());
+        }
+        let result = self.prune();
+        let release = self.release_lease();
+        match (result, release) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(prune_error), Err(release_error)) => Err(format!(
+                "session capture retention failed ({prune_error}) and could not release its lease ({release_error})"
+            )),
+        }
+    }
+
+    fn prune(
+        &self,
+    ) -> Result<lattice_core::memory::session_capture::SessionCaptureDeletionResult, String> {
+        let store = MemoryStore::open(&self.memory_path).map_err(|error| error.to_string())?;
+        // Retention has no shared-memory target. Constructing the router with
+        // the daemon's repository and checkout identity makes the repository
+        // qualifier a strict lease before the core deletion path is reached.
+        let authority = MemoryQueryAuthority::new(
+            self.repository_id.clone(),
+            self.checkout_id.clone(),
+            None,
+            "session-capture-retention".to_string(),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let router =
+            MemoryStoreRouter::new(&store, None, authority).map_err(|error| error.to_string())?;
+        router
+            .prune_session_captures(
+                self.config.policy()?,
+                DateTime::<Utc>::from_unix_seconds(now_seconds()),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn open_state(&self) -> Result<Connection, String> {
+        let connection = Connection::open(&self.state_path).map_err(|error| error.to_string())?;
+        connection
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS retention_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    lease_owner TEXT,
+                    lease_expires_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO retention_state(singleton) VALUES (1);",
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(connection)
+    }
+
+    fn claim_lease(&self) -> Result<bool, String> {
+        let mut connection = self.open_state()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let now = now_seconds();
+        let lease_expires_at = transaction
+            .query_row(
+                "SELECT lease_expires_at FROM retention_state WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if lease_expires_at > now {
+            return Ok(false);
+        }
+        let lease_seconds = CAPTURE_RETENTION_LEASE.as_secs().min(i64::MAX as u64) as i64;
+        let changed = transaction
+            .execute(
+                "UPDATE retention_state
+                 SET lease_owner = ?1, lease_expires_at = ?2
+                 WHERE singleton = 1 AND lease_expires_at <= ?3",
+                params![self.owner, now.saturating_add(lease_seconds), now],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+
+    fn release_lease(&self) -> Result<(), String> {
+        let connection = self.open_state()?;
+        let now = now_seconds();
+        let changed = connection
+            .execute(
+                "UPDATE retention_state
+                 SET lease_owner = NULL, lease_expires_at = 0
+                 WHERE singleton = 1 AND lease_owner = ?1 AND lease_expires_at > ?2",
+                params![self.owner, now],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("session capture retention lease is no longer held".to_string());
+        }
+        Ok(())
+    }
+}
+
 struct RuntimeWorker {
     repository_id: String,
     memory_path: PathBuf,
@@ -732,6 +990,83 @@ struct CaptureWatermark {
     delivery_keys: Vec<String>,
 }
 
+/// Start repository-local automatic capture retention. This intentionally has
+/// no relationship to opt-in session-digest consolidation or LLM credentials.
+pub(crate) fn start_capture_retention(
+    repository_id: String,
+    checkout_id: String,
+    memory_path: PathBuf,
+) -> Option<SessionCaptureRetentionHandle> {
+    let config = match SessionCaptureRetentionRuntimeConfig::from_environment() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "session capture retention runtime disabled due to invalid configuration");
+            return None;
+        }
+    };
+    Some(spawn_capture_retention_worker(
+        repository_id,
+        checkout_id,
+        memory_path,
+        config,
+    ))
+}
+
+fn spawn_capture_retention_worker(
+    repository_id: String,
+    checkout_id: String,
+    memory_path: PathBuf,
+    config: SessionCaptureRetentionRuntimeConfig,
+) -> SessionCaptureRetentionHandle {
+    let state_path = memory_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("session_capture_retention_runtime.db");
+    let worker = Arc::new(SessionCaptureRetentionWorker {
+        repository_id,
+        checkout_id,
+        memory_path,
+        state_path,
+        owner: format!("{}-{}", std::process::id(), now_micros()),
+        config: config.clone(),
+    });
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(config.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = interval.tick() => {
+                    let run_worker = Arc::clone(&worker);
+                    match tokio::task::spawn_blocking(move || run_worker.run_once()).await {
+                        Ok(Ok(result)) if result.deleted_capture_ids.is_empty() => {}
+                        Ok(Ok(result)) => {
+                            tracing::info!(
+                                deleted_capture_count = result.deleted_capture_ids.len(),
+                                deleted_memory_count = result.deleted_memory_count,
+                                retained_derived_memory_count = result.retained_derived_memory_count,
+                                retained_proposal_count = result.retained_proposal_count,
+                                "session capture retention pruned repository-local captures"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "session capture retention run failed; scheduler remains active");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "session capture retention worker failed; scheduler remains active");
+                        }
+                    }
+                }
+            }
+        }
+    });
+    SessionCaptureRetentionHandle {
+        shutdown: Some(shutdown_tx),
+        task,
+    }
+}
+
 pub(crate) fn start(
     repository_id: String,
     memory_path: PathBuf,
@@ -972,6 +1307,185 @@ mod tests {
                 event_writer: Arc::clone(&self.event_writer),
             }
         }
+
+        fn retention_worker(
+            &self,
+            config: SessionCaptureRetentionRuntimeConfig,
+        ) -> SessionCaptureRetentionWorker {
+            SessionCaptureRetentionWorker {
+                repository_id: REPOSITORY.to_string(),
+                checkout_id: "checkout-main".to_string(),
+                memory_path: self.memory_path.clone(),
+                state_path: self._dir.path().join("capture-retention.db"),
+                owner: format!("retention-test-{}", now_micros()),
+                config,
+            }
+        }
+    }
+
+    fn table_count(path: &Path, table: &str) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    async fn wait_for_table_count(path: &Path, table: &str, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if table_count(path, table) == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {table} to reach {expected} rows"));
+    }
+
+    #[test]
+    fn capture_retention_defaults_are_bounded_without_provider_configuration() {
+        let config = SessionCaptureRetentionRuntimeConfig::from_lookup(|_| None).unwrap();
+
+        assert_eq!(config.interval, DEFAULT_CAPTURE_RETENTION_INTERVAL);
+        assert_eq!(config.max_age, DEFAULT_CAPTURE_RETENTION_MAX_AGE);
+        assert_eq!(config.max_captures, DEFAULT_CAPTURE_RETENTION_MAX_CAPTURES);
+        assert!(config.policy().is_ok());
+    }
+
+    #[test]
+    fn capture_retention_rejects_unbounded_configuration() {
+        let environment = std::collections::HashMap::from([
+            (CAPTURE_RETENTION_INTERVAL_ENV, "86401"),
+            (CAPTURE_RETENTION_MAX_AGE_ENV, "1"),
+            (CAPTURE_RETENTION_MAX_CAPTURES_ENV, "1"),
+        ]);
+        assert_eq!(
+            SessionCaptureRetentionRuntimeConfig::from_lookup(|name| {
+                environment.get(name).map(|value| (*value).to_string())
+            })
+            .unwrap_err(),
+            SessionCaptureRetentionConfigError::ExceedsBound("interval")
+        );
+    }
+
+    #[test]
+    fn retention_worker_prunes_by_repository_router_and_records_tombstones() {
+        let fixture = Fixture::new();
+        fixture.capture_at("expired-capture", now_seconds().saturating_sub(10));
+        fixture.capture_at("newest-capture", now_seconds());
+        let worker = fixture.retention_worker(SessionCaptureRetentionRuntimeConfig::test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+        ));
+        let memory_count_before = table_count(&fixture.memory_path, "memories");
+
+        let result = worker.run_once().unwrap();
+
+        assert_eq!(result.deleted_capture_ids.len(), 1);
+        assert!(result.deleted_memory_count > 0);
+        assert_eq!(
+            table_count(&fixture.memory_path, "session_digest_deliveries"),
+            1
+        );
+        assert_eq!(
+            table_count(&fixture.memory_path, "memories"),
+            memory_count_before - result.deleted_memory_count as i64
+        );
+        assert_eq!(
+            table_count(&fixture.memory_path, "session_capture_tombstones"),
+            1
+        );
+        let tombstone: (String, String) = Connection::open(&fixture.memory_path)
+            .unwrap()
+            .query_row(
+                "SELECT repository_id, deletion_reason FROM session_capture_tombstones",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tombstone, (REPOSITORY.to_string(), "retention".to_string()));
+    }
+
+    #[test]
+    fn retention_lease_prevents_a_second_worker_from_pruning_the_same_repository() {
+        let fixture = Fixture::new();
+        fixture.capture_at("leased-capture", now_seconds().saturating_sub(10));
+        let config = SessionCaptureRetentionRuntimeConfig::test(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+        );
+        let first = fixture.retention_worker(config.clone());
+        let mut second = fixture.retention_worker(config);
+        second.state_path = first.state_path.clone();
+
+        assert!(first.claim_lease().unwrap());
+        assert!(second.run_once().unwrap().deleted_capture_ids.is_empty());
+        assert_eq!(
+            table_count(&fixture.memory_path, "session_capture_tombstones"),
+            0
+        );
+        first.release_lease().unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_retention_runs_without_consolidation_or_a_provider_and_stays_repo_local() {
+        let fixture = Fixture::new();
+        fixture.capture_at("repo-a-expired", now_seconds().saturating_sub(10));
+
+        let other_directory = tempdir().unwrap();
+        let other_path = other_directory.path().join("memories.db");
+        let other_store = MemoryStore::open(&other_path).unwrap();
+        let other_authority =
+            MemoryQueryAuthority::new("repo-other", "checkout-other", None, "other-session", None)
+                .unwrap();
+        let other_router = MemoryStoreRouter::new(&other_store, None, other_authority).unwrap();
+        let now = DateTime::<Utc>::from_unix_seconds(now_seconds());
+        let other_digest = SessionDigest {
+            schema_version: lattice_core::memory::SESSION_DIGEST_SCHEMA_VERSION,
+            session_id: "other-session".to_string(),
+            repository_id: "repo-other".to_string(),
+            checkout_id: Some("checkout-other".to_string()),
+            branch: None,
+            revision: "other-revision".to_string(),
+            segment: 0,
+            ended_at: now,
+            received_at: now,
+            edited_paths: vec!["src/other.rs".to_string()],
+            final_summary: Some("Other repository capture".to_string()),
+            observations: Vec::new(),
+            payload_hash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            dropped_observation_count: 0,
+        };
+        let other_candidates = extract_default_session_digest_candidates(&other_digest);
+        other_router
+            .capture_session_digest_candidate_batch(&other_digest, &other_candidates)
+            .unwrap();
+
+        let handle = spawn_capture_retention_worker(
+            REPOSITORY.to_string(),
+            "checkout-main".to_string(),
+            fixture.memory_path.clone(),
+            SessionCaptureRetentionRuntimeConfig::test(
+                Duration::from_millis(10),
+                Duration::from_secs(1),
+                1,
+            ),
+        );
+        wait_for_table_count(&fixture.memory_path, "session_capture_tombstones", 1).await;
+        handle.shutdown().await;
+
+        assert_eq!(
+            table_count(&fixture.memory_path, "session_digest_deliveries"),
+            0
+        );
+        assert_eq!(table_count(&other_path, "session_digest_deliveries"), 1);
+        assert_eq!(table_count(&other_path, "session_capture_tombstones"), 0);
     }
 
     #[test]
