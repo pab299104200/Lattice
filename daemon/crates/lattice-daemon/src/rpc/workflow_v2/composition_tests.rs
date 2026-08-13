@@ -46,7 +46,8 @@ async fn prepare_plan_patch_and_manual_outcome_emit_expected_sequence() {
                 "arguments": {
                     "query": "Investigate login workflow",
                     "entry_files": ["src/auth.ts"],
-                    "entry_symbols": ["loginUser"]
+                    "entry_symbols": ["loginUser"],
+                    "render": "json"
                 }
             }),
         )
@@ -61,7 +62,8 @@ async fn prepare_plan_patch_and_manual_outcome_emit_expected_sequence() {
                 "arguments": {
                     "query": "Investigate login workflow",
                     "entry_files": ["src/auth.ts"],
-                    "entry_symbols": ["loginUser"]
+                    "entry_symbols": ["loginUser"],
+                    "render": "json"
                 }
             }),
         )
@@ -126,7 +128,8 @@ async fn get_context_capsule_and_expand_context_backlink_to_origin_without_redun
             json!({
                 "name": "get_context_capsule",
                 "arguments": {
-                    "query": "Investigate login workflow"
+                    "query": "Investigate login workflow",
+                    "render": "json"
                 }
             }),
         )
@@ -195,7 +198,8 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
                 "name": "diagnose_failure",
                 "arguments": {
                     "input": "thread panicked at src/auth.ts:12: loginUser failed",
-                    "kind": "test"
+                    "kind": "test",
+                    "render": "json"
                 }
             }),
         )
@@ -214,7 +218,8 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
                 "arguments": {
                     "query": "Fix the login failure",
                     "entry_files": [anchor_file],
-                    "entry_symbols": ["loginUser"]
+                    "entry_symbols": ["loginUser"],
+                    "render": "json"
                 }
             }),
         )
