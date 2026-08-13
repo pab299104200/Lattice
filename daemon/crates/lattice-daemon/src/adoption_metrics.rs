@@ -14,6 +14,8 @@ const RETENTION_DAYS: u64 = 90;
 const FOLLOW_THROUGH_WINDOW_SECS: u64 = 60 * 60;
 const MAX_SUGGESTED_FILES: usize = 32;
 const SECS_PER_DAY: u64 = 86_400;
+const MAX_CAPTURE_SCHEMA_VERSION: u32 = 64;
+const MAX_CAPTURE_EXTRACTOR_VERSION: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallSource {
@@ -73,6 +75,66 @@ pub(crate) struct MemoryInjectionActionRecord {
     pub(crate) acted_count: u64,
 }
 
+/// Content-free terminal or deferred state for one session-capture attempt.
+/// These names are deliberately a fixed allowlist so capture telemetry cannot
+/// become an unbounded diagnostic or payload channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CaptureOutcome {
+    Captured,
+    PartiallyCaptured,
+    Rejected,
+    DaemonUnavailable,
+    StoreUnavailable,
+    Queued,
+    Skipped,
+}
+
+impl CaptureOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Captured => "captured",
+            Self::PartiallyCaptured => "partially_captured",
+            Self::Rejected => "rejected",
+            Self::DaemonUnavailable => "daemon_unavailable",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::Queued => "queued",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// The only dimensions persisted for capture observability. It intentionally
+/// excludes session or delivery identity, payload values, paths, error text,
+/// capability material, and hashes/fingerprints.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureMetricRecord {
+    pub(crate) integration: String,
+    pub(crate) schema_version: u32,
+    pub(crate) extractor_version: u32,
+    pub(crate) outcome: CaptureOutcome,
+}
+
+/// A content-free aggregate suitable for doctor output. Individual capture
+/// events are never surfaced through this type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CaptureHealth {
+    pub(crate) total_attempts: u64,
+    pub(crate) outcomes: BTreeMap<String, u64>,
+}
+
+impl CaptureHealth {
+    pub(crate) fn has_concerning_outcomes(&self) -> bool {
+        self.outcomes.iter().any(|(outcome, count)| {
+            *count > 0
+                && matches!(
+                    outcome.as_str(),
+                    "partially_captured" | "rejected" | "daemon_unavailable" | "store_unavailable"
+                )
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AdoptionMetricsStore {
     path: PathBuf,
@@ -102,6 +164,8 @@ pub(crate) struct AdoptionCounter {
 struct AdoptionLedger {
     version: u32,
     days: BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, AdoptionCounter>>>>,
+    #[serde(default)]
+    capture: CaptureLedger,
 }
 
 impl Default for AdoptionLedger {
@@ -109,8 +173,19 @@ impl Default for AdoptionLedger {
         Self {
             version: LEDGER_VERSION,
             days: BTreeMap::new(),
+            capture: CaptureLedger::default(),
         }
     }
+}
+
+/// Bounded capture counters. Integrations collapse to a fixed vocabulary and
+/// unsupported schema/extractor versions collapse to `other`, so untrusted
+/// hook input cannot create unbounded metric cardinality.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CaptureLedger {
+    total_attempts: u64,
+    outcomes: BTreeMap<String, u64>,
+    by_integration: BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +238,13 @@ enum AdoptionEvent {
         metric_id: Option<String>,
         injection_id: String,
         acted_count: u64,
+    },
+    CaptureOutcome {
+        timestamp_secs: u64,
+        integration: String,
+        schema_version: u32,
+        extractor_version: u32,
+        outcome: CaptureOutcome,
     },
 }
 
@@ -370,6 +452,34 @@ impl AdoptionMetricsStore {
         )
     }
 
+    /// Records one content-free capture outcome when its authenticated
+    /// delivery was new. The registry's replay bit is deliberately supplied
+    /// separately: persisting a delivery/session identity just to deduplicate
+    /// metrics would violate the capture telemetry boundary.
+    pub(crate) fn record_capture_outcome(
+        &self,
+        record: CaptureMetricRecord,
+        idempotent_replay: bool,
+    ) -> Result<bool> {
+        if idempotent_replay {
+            return Ok(false);
+        }
+        self.append_event(AdoptionEvent::CaptureOutcome {
+            timestamp_secs: now_secs(),
+            integration: capture_integration(&record.integration),
+            schema_version: bounded_capture_version(
+                record.schema_version,
+                MAX_CAPTURE_SCHEMA_VERSION,
+            ),
+            extractor_version: bounded_capture_version(
+                record.extractor_version,
+                MAX_CAPTURE_EXTRACTOR_VERSION,
+            ),
+            outcome: record.outcome,
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn render_table(&self, days: usize) -> Result<String> {
         let ledger = self.read_ledger()?;
         Ok(render_table_from_ledger(&ledger, days))
@@ -378,6 +488,14 @@ impl AdoptionMetricsStore {
     pub(crate) fn read_json(&self) -> Result<serde_json::Value> {
         let ledger = self.read_ledger()?;
         serde_json::to_value(ledger).map_err(Into::into)
+    }
+
+    fn capture_health(&self) -> Result<CaptureHealth> {
+        let ledger = self.read_ledger()?;
+        Ok(CaptureHealth {
+            total_attempts: ledger.capture.total_attempts,
+            outcomes: ledger.capture.outcomes,
+        })
     }
 
     fn append_event(&self, event: AdoptionEvent) -> Result<()> {
@@ -767,6 +885,16 @@ pub(crate) fn render_metrics_for_workspace(
     store.render_table(days)
 }
 
+/// Loads the content-free capture aggregate for operational health checks.
+/// The returned value never exposes per-delivery identity or capture content.
+pub(crate) fn capture_health_for_workspace(workspace: &Path) -> Result<CaptureHealth> {
+    let store = AdoptionMetricsStore::new(workspace);
+    if !store.path.exists() {
+        return Ok(CaptureHealth::default());
+    }
+    store.capture_health()
+}
+
 fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
     let mut ledger = AdoptionLedger::default();
     let mut pending = Vec::new();
@@ -916,6 +1044,31 @@ fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
                 counter_for_key(&mut ledger, &injection.counter_key).memory_injection_actions +=
                     credited;
             }
+            AdoptionEvent::CaptureOutcome {
+                integration,
+                schema_version,
+                extractor_version,
+                outcome,
+                ..
+            } => {
+                let schema = capture_version_label(*schema_version, MAX_CAPTURE_SCHEMA_VERSION);
+                let extractor =
+                    capture_version_label(*extractor_version, MAX_CAPTURE_EXTRACTOR_VERSION);
+                let outcome = outcome.label().to_string();
+                ledger.capture.total_attempts += 1;
+                *ledger.capture.outcomes.entry(outcome.clone()).or_default() += 1;
+                *ledger
+                    .capture
+                    .by_integration
+                    .entry(capture_integration(integration))
+                    .or_default()
+                    .entry(schema)
+                    .or_default()
+                    .entry(extractor)
+                    .or_default()
+                    .entry(outcome)
+                    .or_default() += 1;
+            }
         }
     }
     ledger
@@ -953,7 +1106,35 @@ fn event_timestamp(event: &AdoptionEvent) -> u64 {
         | AdoptionEvent::MemoryRetrieval { timestamp_secs, .. }
         | AdoptionEvent::MemoryUse { timestamp_secs, .. }
         | AdoptionEvent::MemoryInjection { timestamp_secs, .. }
-        | AdoptionEvent::MemoryInjectionAction { timestamp_secs, .. } => *timestamp_secs,
+        | AdoptionEvent::MemoryInjectionAction { timestamp_secs, .. }
+        | AdoptionEvent::CaptureOutcome { timestamp_secs, .. } => *timestamp_secs,
+    }
+}
+
+fn capture_integration(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "codex" => "codex".to_string(),
+        "claude" | "claude-code" | "claude_code" => "claude_code".to_string(),
+        "cursor" => "cursor".to_string(),
+        "generic" => "generic".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+fn bounded_capture_version(version: u32, maximum: u32) -> u32 {
+    if (1..=maximum).contains(&version) {
+        version
+    } else {
+        0
+    }
+}
+
+fn capture_version_label(version: u32, maximum: u32) -> String {
+    let version = bounded_capture_version(version, maximum);
+    if version == 0 {
+        "other".to_string()
+    } else {
+        version.to_string()
     }
 }
 
@@ -1431,6 +1612,118 @@ mod tests {
     }
 
     #[test]
+    fn capture_outcomes_are_content_free_bounded_and_replay_safe() {
+        let root = unique_root("capture-outcomes");
+        let store = AdoptionMetricsStore::new(&root);
+        let captured = CaptureMetricRecord {
+            integration: "codex".to_string(),
+            schema_version: 1,
+            extractor_version: 2,
+            outcome: CaptureOutcome::Captured,
+        };
+        assert!(store
+            .record_capture_outcome(captured.clone(), false)
+            .expect("new capture outcome"));
+        assert!(!store
+            .record_capture_outcome(captured, true)
+            .expect("replayed capture outcome"));
+        assert!(store
+            .record_capture_outcome(
+                CaptureMetricRecord {
+                    integration: "untrusted-integration-value".to_string(),
+                    schema_version: MAX_CAPTURE_SCHEMA_VERSION + 1,
+                    extractor_version: MAX_CAPTURE_EXTRACTOR_VERSION + 1,
+                    outcome: CaptureOutcome::StoreUnavailable,
+                },
+                false,
+            )
+            .expect("failed capture outcome"));
+
+        let json = store.read_json().expect("capture ledger");
+        assert_eq!(json["capture"]["total_attempts"], 2);
+        assert_eq!(json["capture"]["outcomes"]["captured"], 1);
+        assert_eq!(json["capture"]["outcomes"]["store_unavailable"], 1);
+        assert_eq!(
+            json["capture"]["by_integration"]["other"]["other"]["other"]["store_unavailable"],
+            1
+        );
+        assert!(!json.to_string().contains("untrusted-integration-value"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_ledger_counts_each_supported_outcome() {
+        let outcomes = [
+            CaptureOutcome::Captured,
+            CaptureOutcome::PartiallyCaptured,
+            CaptureOutcome::Rejected,
+            CaptureOutcome::DaemonUnavailable,
+            CaptureOutcome::StoreUnavailable,
+            CaptureOutcome::Queued,
+            CaptureOutcome::Skipped,
+        ];
+        let events = outcomes
+            .into_iter()
+            .map(|outcome| capture(1, "codex", 1, 1, outcome))
+            .collect::<Vec<_>>();
+
+        let ledger = ledger_from_events(&events);
+
+        assert_eq!(ledger.capture.total_attempts, 7);
+        for outcome in outcomes {
+            assert_eq!(ledger.capture.outcomes[outcome.label()], 1);
+        }
+    }
+
+    #[test]
+    fn capture_metric_events_obey_ninety_day_retention() {
+        let root = unique_root("capture-retention");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().expect("metrics parent");
+        let old = capture(
+            now_secs().saturating_sub((RETENTION_DAYS + 1) * SECS_PER_DAY),
+            "codex",
+            1,
+            1,
+            CaptureOutcome::Rejected,
+        );
+        fs::write(
+            &store.path,
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .expect("seed old capture event");
+
+        store
+            .record_capture_outcome(
+                CaptureMetricRecord {
+                    integration: "codex".to_string(),
+                    schema_version: 1,
+                    extractor_version: 1,
+                    outcome: CaptureOutcome::Captured,
+                },
+                false,
+            )
+            .expect("append current capture event");
+
+        let contents = fs::read_to_string(&store.path).expect("read log");
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("captured"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_health_read_does_not_create_metrics_state() {
+        let root = unique_root("capture-health-empty");
+
+        assert_eq!(
+            capture_health_for_workspace(&root).expect("empty capture health"),
+            CaptureHealth::default()
+        );
+        assert!(!root.join(".lattice").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stable_metric_append_discards_a_torn_final_jsonl_record_before_deduping() {
         let root = unique_root("torn-metric-id-append");
         let store = AdoptionMetricsStore::new(&root);
@@ -1533,6 +1826,22 @@ mod tests {
             metric_id: None,
             injection_id: injection_id.to_string(),
             acted_count,
+        }
+    }
+
+    fn capture(
+        timestamp: u64,
+        integration: &str,
+        schema_version: u32,
+        extractor_version: u32,
+        outcome: CaptureOutcome,
+    ) -> AdoptionEvent {
+        AdoptionEvent::CaptureOutcome {
+            timestamp_secs: timestamp,
+            integration: integration.to_string(),
+            schema_version,
+            extractor_version,
+            outcome,
         }
     }
 

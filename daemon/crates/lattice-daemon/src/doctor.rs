@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::adoption_metrics::{capture_health_for_workspace, CaptureHealth};
 use crate::proxy::daemon_addr;
 use crate::rpc::server::read_message_sync;
 use crate::transport::{self, ClientKind, ProxyRequest};
@@ -108,6 +109,21 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
                 println!("FAIL workspace {} status: {}", root.display(), error);
             }
         }
+        match capture_health_for_workspace(root) {
+            Ok(health) => {
+                let line = format_capture_health(&health);
+                if health.has_concerning_outcomes() {
+                    warnings += 1;
+                }
+                println!("{line}");
+            }
+            Err(_) => {
+                warnings += 1;
+                // Capture payloads and paths are intentionally absent from
+                // doctor output, including when the aggregate cannot load.
+                println!("WARN capture health unavailable");
+            }
+        }
     }
 
     match self_handshake(workspace_roots.first()) {
@@ -199,6 +215,27 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
         serde_json::to_string(&DoctorSummary { failures, warnings })?
     );
     Ok(failures == 0)
+}
+
+fn format_capture_health(health: &CaptureHealth) -> String {
+    if health.total_attempts == 0 {
+        return "PASS capture health no attempts recorded".to_string();
+    }
+    let outcomes = health
+        .outcomes
+        .iter()
+        .map(|(outcome, count)| format!("{outcome}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let level = if health.has_concerning_outcomes() {
+        "WARN"
+    } else {
+        "PASS"
+    };
+    format!(
+        "{level} capture health attempts={} {outcomes}",
+        health.total_attempts
+    )
 }
 
 fn daemon_ping(workspace_roots: &[PathBuf]) -> Result<(u128, transport::ConnectionMetadata)> {
@@ -994,6 +1031,36 @@ mod tests {
         assert_eq!(
             output,
             "WARN workspace /workspace status=ready files=42 index=partial parse_failures=2 failed_files=src/a.rs,src/z.rs"
+        );
+    }
+
+    #[test]
+    fn capture_health_reports_aggregate_outcomes_without_sensitive_identifiers() {
+        let health = CaptureHealth {
+            total_attempts: 3,
+            outcomes: BTreeMap::from([
+                ("captured".to_string(), 1),
+                ("daemon_unavailable".to_string(), 1),
+                ("queued".to_string(), 1),
+            ]),
+        };
+
+        let output = format_capture_health(&health);
+
+        assert_eq!(
+            output,
+            "WARN capture health attempts=3 captured=1 daemon_unavailable=1 queued=1"
+        );
+        for forbidden in ["capability", "session", "/workspace", "delivery"] {
+            assert!(!output.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn capture_health_reports_no_attempts_as_healthy() {
+        assert_eq!(
+            format_capture_health(&CaptureHealth::default()),
+            "PASS capture health no attempts recorded"
         );
     }
 
