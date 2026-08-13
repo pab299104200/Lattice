@@ -6,8 +6,11 @@
 //! testable without shelling out or depending on the caller's repository state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::git_intelligence_adapter::{GitHistoryAdapter, GitHistoryAdapterError};
 
 /// The maximum history window read during one refresh.
 pub const DEFAULT_HISTORY_LIMIT: usize = 500;
@@ -347,6 +350,36 @@ impl Default for GitHistoryMiner {
     }
 }
 
+/// The result of one bounded repository-history read and aggregation pass.
+///
+/// The snapshot owns the complete report so a caller cannot accidentally pair
+/// signals from one generation with completeness evidence from another. This
+/// wrapper repeats the report for callers which only need to record or surface
+/// refresh health without traversing the signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryGitMiningResult {
+    pub snapshot: GitIntelligenceSnapshot,
+    pub report: GitMiningReport,
+}
+
+/// Reads and aggregates the bounded history reachable from `repository_path`.
+///
+/// This is the crate-internal integration seam between the pure miner and the
+/// local `git2` adapter. It deliberately performs no storage, scheduling, or
+/// ranking work. The configured limits are normalized once before extraction
+/// and then used for aggregation, so the returned report always records the
+/// effective limits that actually constrained repository traversal.
+pub(crate) fn mine_repository(
+    repository_path: &Path,
+    limits: GitMiningLimits,
+) -> Result<RepositoryGitMiningResult, GitHistoryAdapterError> {
+    let miner = GitHistoryMiner::with_limits(limits);
+    let samples = GitHistoryAdapter::new(miner.limits()).collect(repository_path)?;
+    let snapshot = miner.mine(samples);
+    let report = snapshot.report.clone();
+    Ok(RepositoryGitMiningResult { snapshot, report })
+}
+
 impl GitHistoryMiner {
     pub fn new(history_limit: usize) -> Self {
         Self::with_limits(GitMiningLimits {
@@ -643,7 +676,55 @@ pub fn canonical_repository_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+
     use super::*;
+
+    fn repository_fixture() -> (TempDir, Repository) {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let repository = Repository::init(directory.path()).expect("initialize fixture repository");
+        (directory, repository)
+    }
+
+    fn commit_fixture_file(repository: &Repository, path: &str, contents: &str, subject: &str) {
+        let workdir = repository.workdir().expect("fixture has workdir");
+        let file = workdir.join(path);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        fs::write(file, contents).expect("write fixture file");
+
+        let mut index = repository.index().expect("open fixture index");
+        index
+            .add_all([path], IndexAddOption::DEFAULT, None)
+            .expect("stage fixture file");
+        index.write().expect("write fixture index");
+        let tree_id = index.write_tree().expect("write fixture tree");
+        let tree = repository.find_tree(tree_id).expect("read fixture tree");
+        let signature = Signature::now("Facade Fixture", "facade@example.test")
+            .expect("create fixture signature");
+        let parents = repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repository.find_commit(oid).ok())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                subject,
+                &tree,
+                &parent_refs,
+            )
+            .expect("create fixture commit");
+    }
 
     fn change(path: &str, symbols: &[&str]) -> PathChange {
         PathChange {
@@ -664,6 +745,54 @@ mod tests {
             subject: subject.to_owned(),
             changes,
         }
+    }
+
+    #[test]
+    fn repository_facade_uses_effective_limits_and_preserves_adapter_errors() {
+        let (directory, repository) = repository_fixture();
+        commit_fixture_file(
+            &repository,
+            "src/first.rs",
+            "first",
+            "Initial implementation",
+        );
+        commit_fixture_file(
+            &repository,
+            "src/second.rs",
+            "second",
+            "Fix parser regression",
+        );
+
+        let result = mine_repository(
+            directory.path(),
+            GitMiningLimits {
+                history_limit: 1,
+                paths_per_commit: usize::MAX,
+                symbols_per_commit: usize::MAX,
+                co_change_width: usize::MAX,
+                co_change_pairs: usize::MAX,
+            },
+        )
+        .expect("mine fixture repository");
+
+        assert_eq!(result.report, result.snapshot.report);
+        assert_eq!(result.report.limits.history_limit, 1);
+        assert_eq!(result.report.limits.paths_per_commit, MAX_PATHS_PER_COMMIT);
+        assert_eq!(
+            result.report.limits.symbols_per_commit,
+            MAX_SYMBOLS_PER_COMMIT
+        );
+        assert_eq!(result.report.limits.co_change_width, MAX_CO_CHANGE_WIDTH);
+        assert_eq!(result.report.limits.co_change_pairs, MAX_CO_CHANGE_PAIRS);
+        assert_eq!(result.snapshot.processed_commits.len(), 1);
+        assert_eq!(result.snapshot.files.len(), 1);
+        assert_eq!(result.snapshot.files[0].path, "src/second.rs");
+        assert_eq!(result.snapshot.files[0].bug_fix_commits, 1);
+
+        let missing = directory.path().join("missing-repository");
+        let error = mine_repository(&missing, GitMiningLimits::default())
+            .expect_err("missing repository must preserve the adapter open error");
+        assert!(matches!(error, GitHistoryAdapterError::Open { .. }));
     }
 
     #[test]
