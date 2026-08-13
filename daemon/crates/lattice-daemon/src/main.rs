@@ -4,7 +4,9 @@ mod adoption_metrics;
 mod cli;
 mod doctor;
 mod git_intelligence_runtime;
+mod hook_adapter;
 mod hook_session_binding;
+mod hook_session_client;
 mod hook_session_registry;
 mod hook_session_route;
 mod index_health;
@@ -65,6 +67,11 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+
+    if hook_adapter::is_hook_adapter_command() {
+        hook_adapter::run_from_env().await;
+        return Ok(());
+    }
 
     if is_memory_migrate_command() {
         return run_memory_migrate_cli();

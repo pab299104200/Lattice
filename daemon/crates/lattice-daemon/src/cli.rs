@@ -690,10 +690,9 @@ fn json_rpc_result_for<'a>(responses: &'a [Value], id: u64, method: &str) -> Res
     })
 }
 
-/// Run every configured hook with a representative client payload. Session
-/// startup is required to emit context; prompt and impact hooks may correctly
-/// emit nothing when no result clears their relevance thresholds; Stop is an
-/// acknowledgement hook and must be silent. All four must run successfully.
+/// Run every configured hook with a representative client payload. Protected
+/// capture adapters are silent and best-effort, but every installed wrapper
+/// must execute successfully and must not leak host-envelope content.
 fn verify_configured_hooks(
     config: &Value,
     config_path: &Path,
@@ -757,47 +756,23 @@ fn configured_hook_command(config: &Value, config_path: &Path, script: &str) -> 
 
 fn hook_fixture_payload(event: &str) -> &'static str {
     match event {
-        "SessionStart" => r#"{"source":"startup"}"#,
-        "UserPromptSubmit" => r#"{"prompt":"verify Lattice hook configuration"}"#,
-        "PostToolUse" => r#"{"tool_name":"apply_patch","file_path":"README.md"}"#,
-        "Stop" => r#"{"edited_files":["README.md"]}"#,
+        "SessionStart" => r#"{"session_id":"install-verification","source":"startup"}"#,
+        "UserPromptSubmit" => {
+            r#"{"session_id":"install-verification","prompt":"verify Lattice hook configuration"}"#
+        }
+        "PostToolUse" => {
+            r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md"}"#
+        }
+        "Stop" => r#"{"session_id":"install-verification","edited_files":["README.md"]}"#,
         _ => "{}",
     }
 }
 
-fn verify_hook_stdout(client: HookClient, event: &str, output: &str) -> Result<()> {
-    if event == "Stop" {
-        if !output.trim().is_empty() {
-            return Err(anyhow!(
-                "verification failed: Stop hook must not write stdout, got `{}`",
-                output.trim()
-            ));
-        }
-        return Ok(());
-    }
-    if event == "SessionStart" && output.trim().is_empty() {
+fn verify_hook_stdout(_client: HookClient, event: &str, output: &str) -> Result<()> {
+    if !output.trim().is_empty() {
         return Err(anyhow!(
-            "verification failed: SessionStart hook produced no context"
+            "verification failed: {event} capture hook must not write stdout"
         ));
-    }
-    if output.trim().is_empty() {
-        return Ok(());
-    }
-    if client == HookClient::ClaudeCode {
-        let envelope: Value = serde_json::from_str(output.trim())
-            .context("verification failed: Claude Code hook emitted invalid JSON")?;
-        let actual_event = envelope
-            .pointer("/hookSpecificOutput/hookEventName")
-            .and_then(Value::as_str);
-        let context = envelope
-            .pointer("/hookSpecificOutput/additionalContext")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        if actual_event != Some(event) || context.is_none() {
-            return Err(anyhow!(
-                "verification failed: Claude Code {event} hook emitted an invalid context envelope"
-            ));
-        }
     }
     Ok(())
 }
@@ -1695,20 +1670,8 @@ mod tests {
         for client in ["claude-code", "codex"] {
             let hooks = root.join("integrations").join(client).join("hooks");
             fs::create_dir_all(&hooks).unwrap();
-            for (event, script) in INSTALLED_HOOKS {
-                let output = if event == "Stop" {
-                    ""
-                } else if client == "claude-code" {
-                    &format!(
-                        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"{event}\",\"additionalContext\":\"fixture\"}}}}"
-                    )
-                } else {
-                    "fixture context"
-                };
-                write_executable(
-                    &hooks.join(script),
-                    &format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n"),
-                );
+            for (_event, script) in INSTALLED_HOOKS {
+                write_executable(&hooks.join(script), "#!/bin/sh\nexit 0\n");
             }
         }
         let executable = root.join("bin/lattice");
