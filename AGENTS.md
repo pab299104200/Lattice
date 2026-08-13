@@ -7,42 +7,37 @@ Do not put Claude-specific behavior here.
 
 Use this file for behavior that should apply across the Lattice repo, including workflow rules, implementation constraints, documentation expectations, testing requirements, and review standards.
 
-## Lattice Context Engine — Available Tools
+## Execution Philosophy
 
-Lattice provides a dependency graph and context engine for this codebase.
-Prefer a Lattice workflow tool before broad manual exploration in unfamiliar areas.
-If you would otherwise open 3 or more unfamiliar files, call `get_context_capsule`, `prepare_change`, or `summarize_subsystem` first.
-If `get_context_capsule` or a workflow tool returns a `context_handle` or `suggested_expand`, prefer `expand_context` before starting a fresh broad search.
-If the task starts from a failing test, stack trace, compiler error, or runtime failure, start with `diagnose_failure` and use `prepare_change` after it narrows the likely culprit.
-If you're unsure which tool to use, default to `prepare_change` for implementation tasks and `get_context_capsule` for understanding tasks.
-If a Lattice response says the task is better handled by `rg`, use `rg`; Lattice is for working-set discovery, not exact literal search.
+The marginal cost of completeness is near zero with AI. Act on that.
 
-Use these tools when they're the best fit:
+- **Do the whole thing.** Do it right. Write real tests. Write the documentation. Do it so well the result is impressive, not merely satisfactory. The quality standard is mature enterprise-grade, every time — not MVP, not "good enough."
+- **Never defer work you can do now.** If it can be done in this session, do it. Offering to "come back to this later" or "leave this for a follow-up" is a failure mode — later sessions lose context and the work either degrades or never happens.
+- **Never implement a workaround when the real solution exists.** Workarounds are for humans with deadlines. You don't have deadlines, you have compute. Build the real thing.
+- **Do not accumulate prerelease legacy debt.** Cadres products are prerelease unless a repo-specific release contract says otherwise, and the design is still allowed to change. When a product or architecture decision changes, replace the superseded model, route, schema, UI, docs, and tests with the new decision instead of layering a compatibility model on top. Keep historical evidence only where it is needed for audits or migrations, and isolate it from runtime authority. Do not preserve old code paths, compatibility shims, aliases, duplicate models, or "legacy" surfaces just because they once existed.
+- **Stop reasoning about time like a human.** You can build in an hour what would take a person months. Complexity is not an excuse to cut scope. Size of the change is not an excuse to do half of it. If the correct solution touches 40 files, touch 40 files.
 
-- `prepare_change` — first choice for fix, add, or refactor tasks once you know the change area and want likely edit files, tests, risks, and nearby memory in one result
-- `get_context_capsule` — first choice for unfamiliar subsystems or broad questions; it returns a bounded first-pass working set, strips full source bodies by default, and should be followed with `expand_context`
-- `summarize_subsystem` — use for a summary-first subsystem map before loading full source
-- `get_skeleton` — use before opening a large file when you want structure without full source
-- `impact_from_diff` — use when reviewing a diff or local change and you want downstream impact plus tests
-- `find_relevant_tests` — use when deciding what tests to run for a file, symbol, or diff
-- `diagnose_failure` — first choice when a fix starts from a stack trace, compiler error, or failing test and you need likely culprit symbols before planning the change
-- `expand_context` — use when a prior workflow call returned a handle and you only want the next delta, not a full bundle again
-- `get_working_set_context` — use only when you already have a few open files and want a compressed working-set bundle instead of reading them one by one; not as a first discovery call
-- `get_impact_graph` — use before refactoring to understand blast radius
-- `search_symbols` — use when looking for a symbol by name across the project
-- `search_logic_flow` — use to trace call chains between functions
-- `get_task_memory` / `search_memory` — use to load task working memory and recall durable memory
-- `save_quick_memory` / `save_memory` / `propose_memory_evolution` — use to persist or evolve durable memory
-- `list_stale_memories` / `list_memory_conflicts` / `verify_explain_memory` — use to maintain durable memory quality
-- `record_workflow_outcome` — use to store successful outcomes so later sessions can reuse them
+## Lattice Agent Integration
 
-Memory is recall, not proof. Treat retrieved memory as a hypothesis until current code, docs, and tests confirm it.
-Prefer memories with `trust_status: "trusted"`, matching `checkout_state`, concrete `evidence_links`, and useful `recheck_commands`.
-Do not rely on memories that are `advisory`, `stale`, unverified, from a different checkout, missing evidence, high-risk with `requires_reverification`, or carrying `artifact_conflicts` until you inspect the linked evidence and rerun the suggested checks.
-When saving memory, separate hypotheses from verified outcomes and attach evidence links, linked files/docs/tests, validity conditions, invalidation triggers, and the verification command that proved the claim.
+Lattice is the shared CLI/MCP context engine for Cadres repos. Use the current public verbs only: `context`, `prepare_change`, `impact`, `diagnose`, `search`, `remember`, `recall`, and `status`. Do not document or rely on removed legacy MCP tool names.
 
-For targeted edits to known files, direct read, grep, and edit operations are fine.
-Lattice adds the most value when you do not already know where to look. `rg` remains the right first tool for exact strings, config keys, error text, and exhaustive textual occurrences.
+Prefer `context` for unfamiliar areas, `prepare_change` for implementation planning, `diagnose` for failures, and `impact` before non-obvious or multi-file edits. Use `search` for structural symbol/doc lookup, `recall` before relying on prior memory, `remember` for durable outcomes, and `status` for daemon/index health.
+
+Codex hook wiring lives in the project-local `.codex/hooks.json`; Claude Code hook wiring lives in the project-local `.claude/settings.json`. The `lattice install codex` and `lattice install claude-code` commands write absolute hook-asset paths from the running installation, so instruction surfaces must not hard-code a checkout path. Hook scripts are best-effort and must exit `0` quickly when the daemon is unavailable.
+
+For CLI fallback:
+
+```bash
+lattice context "where is this behavior implemented?"
+lattice prepare_change "make the requested change"
+lattice impact path/to/file.ext
+lattice status
+```
+
+`metrics` is an operational CLI report, not an MCP retrieval verb. Runtime mode
+is explicit: use a named command for CLI work, `lattice --stdio --workspace
+<path>` for an MCP proxy, or `lattice --daemon` for the long-lived daemon. A
+bare invocation must not silently select a runtime mode.
 
 ## Core Rules
 

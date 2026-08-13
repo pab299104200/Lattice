@@ -1,10 +1,45 @@
 # Lattice Codex Integration
 
-Codex can use Lattice through MCP with a single workspace registration:
+This package installs Codex hooks that deliver Lattice context and session capture without relying on the model to choose an MCP tool.
+
+Build the release binary, then install the project-local Codex hooks from the
+workspace root:
+
+```bash
+cd daemon && cargo build --release
+./target/release/lattice install codex --workspace "$PWD/.."
+```
+
+The Rust installer reconciles Lattice entries in the workspace's
+`.codex/hooks.json` without editing global Codex configuration. It replaces
+stale Lattice command paths and duplicate entries in place while preserving
+unrelated hooks. Use `--verify` to fail if the resulting configuration or
+required hook assets cannot be validated:
+
+```bash
+./target/release/lattice install codex --workspace "$PWD/.." --verify
+```
+
+Codex requires project `.codex/` layers to be trusted before project-local hooks run. Use `/hooks` in Codex to review and trust changed hook definitions.
+
+## Hooks
+
+- `SessionStart`: calls `lattice recall "session start" --mode task --json` and `lattice context "repo rules and operator workflow" --mode rules`, then prints compact markdown for Codex to consume when hook stdout is supported.
+- `UserPromptSubmit`: extracts the prompt from the hook payload, calls `lattice context "<prompt>" --mode auto --min-relevance 0.25`, and emits nothing when the result is too small or not relevant.
+- `PostToolUse`: for `apply_patch|Edit|Write`, extracts the edited file, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
+- `Stop`: extracts edited files from the hook payload and calls `lattice remember --kind outcome` so later sessions can recall the work.
+
+Every script first checks whether the Lattice binary exists and whether the daemon answers `lattice status` within `LATTICE_HOOK_PROBE_TIMEOUT` seconds. If either check fails, the script exits `0` without output so hooks never break a Codex session. This is deliberately a no-injection result, not evidence that the hook configuration is absent: diagnose it with `lattice status --timeout 2` after the session is responsive. Session recall and rule lookup run concurrently. The installer records a five-second outer timeout for every hook; this exceeds the shipped session/prompt query deadline (3.5 seconds) and edit/stop deadline (2.5 seconds), leaving process overhead for extraction and output.
+
+Actual hook calls set `LATTICE_CLIENT_NAME=codex` and `LATTICE_CLIENT_CHANNEL=hook` before invoking the CLI. Readiness probes set `LATTICE_SKIP_METRICS=1`, so `lattice metrics` measures delivered hook value instead of probe noise.
+
+## MCP
+
+Codex can also use Lattice through MCP with a single workspace registration:
 
 ```toml
 [mcp_servers.lattice]
-command = "/home/pete/cadres/lattice/daemon/target/release/lattice"
+command = "/absolute/path/to/lattice"
 args = ["--stdio", "--workspace", "/path/to/workspace"]
 cwd = "/path/to/workspace"
 ```
@@ -14,7 +49,19 @@ Use one `lattice` registration per scope. Do not point a workspace at `$HOME`; u
 The CLI twins from Phase 3 also work directly from Codex shell commands without MCP configuration:
 
 ```bash
-/home/pete/cadres/lattice/daemon/target/release/lattice context "where is memory verification handled?"
-/home/pete/cadres/lattice/daemon/target/release/lattice prepare_change "add adoption metrics to CLI"
-/home/pete/cadres/lattice/daemon/target/release/lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
+/absolute/path/to/lattice context "where is memory verification handled?"
+/absolute/path/to/lattice prepare_change "add adoption metrics to CLI"
+/absolute/path/to/lattice impact daemon/crates/lattice-daemon/src/rpc/mcp.rs --no-tests
 ```
+
+## Controls
+
+- Set `LATTICE_BIN=/absolute/path/to/lattice` to force a binary path.
+- Set `LATTICE_HOOK_PROBE_TIMEOUT` to tune the readiness probe timeout; the default is `0.5` seconds.
+- Set `LATTICE_HOOK_MIN_RELEVANCE` to tune prompt context filtering.
+- Set `LATTICE_HOOK_MIN_DEPENDENTS` to tune PostToolUse noise filtering.
+- Disable a hook by removing its entry from `.codex/hooks.json`.
+
+Run the Rust installer tests with `cd daemon && cargo test -p lattice-daemon cli::tests`,
+then run `integrations/codex/tests/hooks_test.sh` to verify hook output, command
+budgets, and the daemon-unavailable no-op contract.
