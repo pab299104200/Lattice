@@ -202,10 +202,9 @@ impl fmt::Debug for HookRepositoryState {
 
 impl HookRepositoryState {
     pub fn new(
-        branch: Option<impl Into<String>>,
+        branch: Option<String>,
         revision: impl Into<String>,
     ) -> Result<Self, HookSessionError> {
-        let branch = branch.map(Into::into);
         if let Some(branch) = &branch {
             validate_bounded_identity(branch, MAX_BRANCH_BYTES)?;
         }

@@ -1,10 +1,11 @@
-//! Durable, content-free state for trusted hook-session delivery.
+//! Durable, capture-content-free state for trusted hook-session delivery.
 //!
 //! The registry is deliberately not a capture store. It persists opaque
-//! authority fingerprints, delivery hashes, ordering metadata, receipts, and
-//! an outbox marker. It has no field capable of holding an event envelope,
-//! transcript, command, summary, path, or other capture payload. Sanitized
-//! facts belong in the repository store that owns them.
+//! host-tuple fingerprints, daemon-resolved binding identity and Git-start
+//! metadata, delivery hashes, ordering metadata, receipts, and an outbox
+//! marker. It has no field capable of holding an event envelope, transcript,
+//! command, summary, edited path, or other capture payload. Sanitized facts
+//! belong in the repository store that owns them.
 
 use std::fmt;
 use std::path::Path;
@@ -461,7 +462,8 @@ impl HookSessionRegistry {
     }
 
     /// Atomically opens a new durable binding or verifies and resumes the one
-    /// open binding for the exact integration/host-session/checkout tuple.
+    /// open binding for the exact integration/host-session/repository/checkout
+    /// tuple.
     ///
     /// This is the sole binding-creation seam: callers cannot supply verifier
     /// hashes, tuple fingerprints, internal session IDs, or generations.
@@ -600,8 +602,9 @@ impl HookSessionRegistry {
     }
 
     /// Verifies durable session authority and renews its idle lease in the same
-    /// transaction. Event/close services call this before accepting content;
-    /// they receive only daemon-owned persisted authority in return.
+    /// transaction. Callers use this only after an activity has passed its
+    /// content-independent admission checks; malformed traffic must not renew
+    /// a binding. The result contains only daemon-owned persisted authority.
     pub fn verify_and_renew(
         &mut self,
         cryptography: &HookSessionCryptography,
@@ -1497,7 +1500,8 @@ mod tests {
             integration: HookIntegrationId::new("codex/v1").unwrap(),
             host_session_id: HostSessionId::new("opaque-host-session").unwrap(),
             checkout: HookCheckoutIdentity::new("repository-A", "checkout-A").unwrap(),
-            repository_state: HookRepositoryState::new(Some("feature/d3"), "abc123").unwrap(),
+            repository_state: HookRepositoryState::new(Some("feature/d3".to_string()), "abc123")
+                .unwrap(),
             resume,
             now_ms,
             idle_ttl_ms: 100,
