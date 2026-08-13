@@ -29,7 +29,7 @@ lattice install codex --workspace /path/to/workspace --verify
 lattice doctor --workspace /path/to/workspace
 ```
 
-`install mcp` writes `.mcp.json`; hook targets write `.claude/settings.json` and `.codex/hooks.json`. Installation is idempotent, preserves unrelated configuration, removes duplicate Lattice entries, and rejects invalid targets or more than one workspace for a hook package. Use `LATTICE_ASSET_ROOT` when the executable cannot discover the directory containing `integrations/`. `--verify` re-reads the file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or all four configured hooks with representative input. It fails loudly on protocol errors, tool-surface drift, missing assets, broken hooks, or invalid output.
+`install mcp` writes `.mcp.json`; hook targets write `.claude/settings.json` and `.codex/hooks.json`. Installation is idempotent, preserves unrelated configuration, removes duplicate Lattice entries, and rejects invalid targets or more than one workspace for a hook package. Use `LATTICE_ASSET_ROOT` when the executable cannot discover the directory containing `integrations/`. `--verify` re-reads the file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or all four configured hooks with bounded fixture input. Hook verification uses a disposable protected state root, an unavailable loopback endpoint, and checks that no fixture prompt, tool payload, or transcript sentinel was retained; it cannot create live capture state. It fails loudly on protocol errors, tool-surface drift, missing assets, broken hooks, or invalid output.
 
 ## Claude Code Hooks
 
@@ -46,7 +46,9 @@ The installed hooks are:
 - `SessionStart`: injects task memory and repo rules from `lattice recall --mode task --json`.
 - `UserPromptSubmit`: injects `lattice context "<prompt>" --mode auto` only when the relevance threshold is met.
 - `PostToolUse` on `Edit|Write`: injects a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
-- `Stop`: records edited files with `lattice remember --kind outcome`.
+- `Stop`: makes a best-effort protected close-marker attempt for the current
+  host session. It does not write an ordinary outcome memory or read a
+  transcript; unavailable capture is silent and never blocks shutdown.
 
 All hooks exit `0` without output if the binary is missing or the daemon is down. Hook failures must never block a coding session.
 
@@ -67,9 +69,32 @@ The installed hooks are:
 - `SessionStart`: runs task-memory recall and repo-rule context concurrently, then prints their bounded results.
 - `UserPromptSubmit`: prints `lattice context "<prompt>" --mode auto` only when the relevance threshold is met and hook stdout is supported.
 - `PostToolUse` on `apply_patch|Edit|Write`: prints a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
-- `Stop`: records edited files with `lattice remember --kind outcome`.
+- `Stop`: makes a best-effort protected close-marker attempt for the current
+  host session. It does not write an ordinary outcome memory or read a
+  transcript; unavailable capture is silent and never blocks shutdown.
 
 All hooks exit `0` without output if the binary is missing, the daemon is down, or its bounded readiness probe does not answer in time. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for session/prompt context and four seconds for post-edit/stop work; internal calls have smaller budgets so shell and serialization overhead cannot consume the entire outer deadline.
+
+### D3a session boundary
+
+The installed adapters accept only bounded structured host fields. `SessionStart`
+uses the opaque host session identifier; an edit event uses the allowlisted
+tool kind and dedicated file path; `Stop` carries only a close marker because
+the supported hosts do not currently provide an admitted final-summary field.
+The adapter ignores `cwd`, repository/checkout/scope claims, prompts,
+transcripts, tool input/output, commands, terminal output, and environment
+values. It never opens a host `transcript_path`.
+
+D3a state is repository-local and bound to the exact canonical checkout by a
+daemon-minted capability. The short-lived adapter stores only protected
+capability metadata and sanitized pending deliveries under the user's private
+state directory; delivery IDs make retries idempotent, and bounded pending
+state is pruned after acknowledgement, expiry, or the retry grace period. A
+verified Stop close is reduced into deterministic repository-local session
+memories and is available to task-scoped recall; a failed or unavailable Stop
+is not reported as a successful capture. No LLM call is made by default; the
+separate consolidation workflow is explicit, repository-scoped, and
+proposal-only.
 
 ## Codex MCP And CLI
 

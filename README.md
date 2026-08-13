@@ -91,7 +91,22 @@ lattice install --with-embeddings
 lattice doctor --workspace /path/to/your/project
 ```
 
-`install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. Installation preserves unrelated configuration and removes duplicate Lattice entries. `--verify` re-reads the written file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or each configured hook with representative input. A failed protocol, hook, or tool-surface check is reported as an error. The standalone packages under `integrations/` remain available for package-level installation and testing.
+`install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. Installation preserves unrelated configuration and removes duplicate Lattice entries. `--verify` re-reads the written file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or each configured hook with bounded structured fixture input. Hook verification redirects protected state to a disposable directory, uses an unavailable loopback endpoint, and rejects retention of prompt, tool-payload, or transcript sentinels; it does not create live capture state. A failed protocol, hook, or tool-surface check is reported as an error. The standalone packages under `integrations/` remain available for package-level installation and testing.
+
+Installed hook adapters implement the D3a boundary, not a transcript recorder.
+They accept an opaque host session ID, allowlisted edit metadata, and a
+best-effort `Stop` close marker. They do not read `transcript_path` or retain
+prompts, raw tool input/output, commands, terminal output, environment values,
+or caller-supplied repository, checkout, branch, or organization scope. The
+protected capability record and bounded retry queue are repository-local and
+exact-checkout-bound; retries reuse delivery IDs, and expired/acknowledged
+state is pruned. The transport/state primitives are implemented, while
+verified `Stop` close is reduced into deterministic repository-local session
+memories for task-scoped recall; a failed or unavailable `Stop` is never
+reported as a successful capture. Capture is best-effort and never blocks
+agent shutdown. Deterministic capture has no LLM dependency; the separate
+consolidation workflow is explicit opt-in, repository-scoped, and
+proposal-only.
 
 `lattice install --with-embeddings` provisions Lattice's pinned ONNX MiniLM model once for the current user, at `~/.lattice/models/all-minilm-l6-v2-1110a243/` (or `LATTICE_EMBEDDING_MODEL_DIR`). The installer stages both the model and tokenizer, verifies their SHA-256 digests, and atomically activates the completed bundle. It is idempotent; a missing or invalid bundle simply leaves semantic search disabled while normal lexical recall continues. The flag can also accompany a client installation, for example `lattice install mcp --with-embeddings --workspace /path/to/your/project`.
 

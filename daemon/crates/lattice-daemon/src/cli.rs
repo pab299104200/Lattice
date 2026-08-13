@@ -700,19 +700,95 @@ fn verify_configured_hooks(
     workspace: &Path,
     runtime: &InstallRuntime,
 ) -> Result<()> {
-    for (event, script) in INSTALLED_HOOKS {
-        let command = configured_hook_command(config, config_path, script)?;
-        let output = run_fixture_process(
-            &command,
-            &[],
-            hook_fixture_payload(event),
-            Some(HookProcessContext {
-                workspace,
-                executable: &runtime.executable,
-            }),
-            &format!("configured {event} hook"),
-        )?;
-        verify_hook_stdout(client, event, &output)?;
+    // Verification must never create a binding, queue a delivery, or connect
+    // to the operator's running daemon. The hook wrappers still execute with
+    // representative structured host fields, but all protected state is
+    // redirected to a disposable root and the loopback endpoint is reserved
+    // (port zero), so this check cannot persist capture data.
+    let state_root = install_verify_state_root()?;
+    let result = (|| {
+        for (event, script) in INSTALLED_HOOKS {
+            let command = configured_hook_command(config, config_path, script)?;
+            let output = run_fixture_process(
+                &command,
+                &[],
+                hook_fixture_payload(event),
+                Some(HookProcessContext {
+                    workspace,
+                    executable: &runtime.executable,
+                    state_root: &state_root,
+                }),
+                &format!("configured {event} hook"),
+            )?;
+            verify_hook_stdout(client, event, &output)?;
+        }
+        verify_hook_state_contains_no_fixture_data(&state_root)
+    })();
+    let cleanup = std::fs::remove_dir_all(&state_root);
+    result.and(cleanup.with_context(|| {
+        format!(
+            "verification failed: remove temporary hook state `{}`",
+            state_root.display()
+        )
+    }))
+}
+
+fn install_verify_state_root() -> Result<PathBuf> {
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("read clock for temporary hook verification state")?
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(format!("lattice-install-verify-{nonce}"));
+    std::fs::create_dir(&root).with_context(|| {
+        format!(
+            "create temporary hook verification state `{}`",
+            root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&root)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&root, permissions)?;
+    }
+    Ok(root)
+}
+
+fn verify_hook_state_contains_no_fixture_data(root: &Path) -> Result<()> {
+    const FORBIDDEN: [&str; 4] = [
+        "lattice-install-verification-transcript",
+        "lattice-install-verification-prompt",
+        "lattice-install-verification-tool-input",
+        "lattice-install-verification-tool-output",
+    ];
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("read temporary hook state `{}`", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path)?;
+                if FORBIDDEN.iter().any(|needle| {
+                    bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes())
+                }) {
+                    return Err(anyhow!(
+                        "verification failed: hook state retained raw fixture or transcript data"
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -756,14 +832,18 @@ fn configured_hook_command(config: &Value, config_path: &Path, script: &str) -> 
 
 fn hook_fixture_payload(event: &str) -> &'static str {
     match event {
-        "SessionStart" => r#"{"session_id":"install-verification","source":"startup"}"#,
+        "SessionStart" => {
+            r#"{"session_id":"install-verification","source":"startup","transcript_path":"/tmp/lattice-install-verification-transcript"}"#
+        }
         "UserPromptSubmit" => {
-            r#"{"session_id":"install-verification","prompt":"verify Lattice hook configuration"}"#
+            r#"{"session_id":"install-verification","prompt":"lattice-install-verification-prompt"}"#
         }
         "PostToolUse" => {
-            r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md"}"#
+            r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md","tool_input":"lattice-install-verification-tool-input","tool_response":"lattice-install-verification-tool-output","transcript_path":"/tmp/lattice-install-verification-transcript"}"#
         }
-        "Stop" => r#"{"session_id":"install-verification","edited_files":["README.md"]}"#,
+        "Stop" => {
+            r#"{"session_id":"install-verification","transcript_path":"/tmp/lattice-install-verification-transcript","final_summary":"lattice-install-verification-prompt"}"#
+        }
         _ => "{}",
     }
 }
@@ -780,6 +860,7 @@ fn verify_hook_stdout(_client: HookClient, event: &str, output: &str) -> Result<
 struct HookProcessContext<'a> {
     workspace: &'a Path,
     executable: &'a Path,
+    state_root: &'a Path,
 }
 
 /// The verifier deliberately has a deadline: a broken hook must make install
@@ -801,7 +882,9 @@ fn run_fixture_process(
         process
             .current_dir(context.workspace)
             .env("LATTICE_BIN", context.executable)
-            .env("LATTICE_SKIP_METRICS", "1");
+            .env("LATTICE_SKIP_METRICS", "1")
+            .env("XDG_STATE_HOME", context.state_root)
+            .env("LATTICE_DAEMON_ADDR", "127.0.0.1:0");
     }
     let mut child = process.spawn().with_context(|| {
         format!(

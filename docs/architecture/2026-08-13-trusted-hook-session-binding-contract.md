@@ -9,16 +9,16 @@ session-digest capture across the stdio proxy, CLI, long-lived daemon, and Git
 worktrees.
 
 **Implementation status (2026-08-13):** D3a's authenticated loopback
-transport is implemented for the ordinary stdio proxy, CLI, and doctor paths:
-protected boot credentials, loopback/epoch/token checks, versioned hello/ack,
-and connection metadata are live. The hook-session capability state machine is
-implemented and tested as a library primitive. The SQLite binding
-registry/receipt/outbox is implemented and tested as a durable, payload-free
-primitive. The hook adapter, `hook/session_open`, `hook/event`,
-`hook/session_close`, client capability-file lifecycle, and daemon wiring that
-combines these pieces with digest parsing and memory writes are **not yet
-integrated**. No installed Codex or Claude Code hook currently creates or
-delivers a bound session digest.
+transport is implemented for the ordinary stdio proxy, CLI, doctor, and hook
+adapter paths: protected boot credentials, loopback/epoch/token checks,
+versioned hello/ack, and connection metadata are live. The hook-session
+capability state machine, protected client capability-file lifecycle, and the
+SQLite binding/receipt/outbox are implemented and tested as payload-free
+primitives. Installed Codex and Claude Code adapters now open/resume a binding
+and queue sanitized edit facts or a Stop close marker with bounded retry state.
+The daemon hook routes reduce these facts into deterministic repository-store
+session-digest memories on an authenticated close. No installed hook creates
+an organization or cross-checkout memory.
 
 This note narrows and completes the identity boundary in the
 [Deterministic Session-Digest Capture Contract](./2026-08-13-session-digest-capture-contract.md).
@@ -310,14 +310,14 @@ an explicitly documented crash-recovery policy later defines otherwise.
 ## Daemon, proxy, and shard lifecycle
 
 The implemented `HookSessionRegistry` is a small versioned SQLite state
-registry suitable for `~/.lattice/state/`; it stores authority fingerprints,
-capability verifiers, delivery hashes/order/receipts, and a payload-free
-outbox marker. It has no event envelope, transcript, summary, path, or command
-field. It is not yet opened or wired by the daemon lifecycle. Once integrated,
-hook-session bindings and receipts must live there—not in an in-memory
-`McpHandler`, TCP connection, logical view, or evictable shard—and registry
-admission plus memory extraction must be coordinated so crash recovery uses
-receipt/idempotency replay rather than guessing whether a write happened.
+registry under the user's private Lattice state; it stores authority
+fingerprints, capability verifiers, delivery hashes/order/receipts, and a
+payload-free outbox marker. It has no event envelope, transcript, summary,
+path, or command field. Hook-session bindings and receipts live there—not in
+an in-memory `McpHandler`, TCP connection, logical view, or evictable shard.
+Registry admission, the repository-local capture journal, and deterministic
+memory extraction are coordinated so crash recovery uses receipt/idempotency
+replay rather than guessing whether a write happened.
 
 A TCP disconnect destroys its connection grant but not an open hook binding.
 Proxy idle exit, shard eviction, index rebuild, daemon idle exit, and daemon
@@ -342,12 +342,12 @@ repository deployment contract already requires.
 
 ## Public and internal surfaces
 
-The following hook routes are contract surfaces only; they are not currently
-registered by the daemon or callable through the installed hook packages:
-`hook/session_open`, `hook/event`, and `hook/session_close`. Consequently the
-capture command described in the digest contract must not be documented or
-treated as operational until an adapter presents a capability and the daemon
-connects parsing, registry admission/outbox completion, authority binding, and
+The following authenticated hook routes are daemon-internal integration
+surfaces, not MCP tools: `hook/session_open`, `hook/event`, and
+`hook/session_close`. They are callable only by the hook-adapter client kind;
+ordinary CLI/MCP clients receive method-not-found. The installed adapters
+present the capability, and the daemon connects parsing, registry
+admission/outbox completion, authority binding, capture-journal reduction, and
 repository-store writes end to end.
 
 The assistant-facing public verbs remain `context`, `prepare_change`, `impact`,
@@ -355,23 +355,26 @@ The assistant-facing public verbs remain `context`, `prepare_change`, `impact`,
 are an integration transport surface, not MCP tools and not a new unscoped
 memory API.
 
-If `lattice remember --kind session-digest` remains the installed hook entry
-point, it is only a client adapter: it must load and present a valid binding
-capability and send the normalized event over the hook transport. The same
-command without an active binding fails. Supplying `session_id`, `_lattice_*`
-metadata, `--workspace`, or a session-shaped JSON document does not create
-authority. Direct ordinary `remember --kind outcome` remains an explicit user
-write and must not be labeled, ranked, or audited as automatic session capture.
+The installed hook entry point is the private `__hook-adapter`; it loads and
+presents a valid binding capability and sends normalized events over the hook
+transport. There is no public `remember --kind session-digest` command.
+Supplying `session_id`, `_lattice_*` metadata, `--workspace`, or a
+session-shaped JSON document does not create authority. Direct ordinary
+`remember --kind outcome` remains an explicit user write and is not labeled,
+ranked, or audited as automatic session capture.
 
 ## Observability and failure behavior
 
 Hook commands remain best-effort for the host and exit zero after a short
-deadline, but Lattice records truthful content-free outcomes such as
+deadline. Lattice records truthful content-free outcomes such as
 `binding_opened`, `binding_missing`, `transport_auth_failed`,
 `checkout_mismatch`, `replay_rejected`, `capture_committed`,
-`capture_partially_committed`, `registry_unavailable`, and `daemon_unavailable`.
-Best-effort means the host session is not blocked; it does not mean a failed
-capture is counted as success.
+`capture_partially_committed`, `registry_unavailable`, and
+`daemon_unavailable`. Best-effort means the host session is not blocked; it
+does not mean a failed capture is counted as success. A successful close is
+the only path that seals the binding and commits deterministic session-digest
+candidates; no close is inferred from process exit, silence, a later check, or
+transcript text.
 
 Status and doctor expose protocol version, token-file safety, registry schema
 and health, counts of open/expired bindings, oldest pending age, replay
@@ -380,32 +383,27 @@ host or internal session ID, keyed session digest, edited path, summary,
 observation, payload hash, or reconstructable fingerprint. Logs apply the same
 rule.
 
-## Migration and implementation order
+## Delivered D3a invariants
 
-1. Add the authenticated hello/ack, protected transport credential lifecycle,
-   protocol versioning, and negative tests. Remove the unauthenticated hello in
-   the same change.
-2. Add the persistent binding registry and request-scoped authority. Reclassify
-   the existing handler-generated session ID as runtime identity and remove it
-   from client-session authority paths.
-3. Add exact-checkout `hook/session_open`, `hook/event`, and
-   `hook/session_close` handling before logical-view routing. Wire capture to a
-   repository-role `MemoryStoreRouter` built from the binding.
-4. Replace both bundled Stop hooks' generic `"Session edited files: ..."`
-   outcome write with the versioned bound event flow. Add SessionStart binding
-   and bounded sanitized event delivery for each supported integration. Do not
-   retain the loose automatic-capture path as an alias.
-5. Quarantine or invalidate pre-contract automatic outcomes identifiable by
-   the old hook provenance/prefix. They were not session-bound and must not be
-   relabeled as trusted digests. Migration records counts only and is
-   idempotent.
-6. Install matching hooks and binary, restart daemon/proxies, and prune stale
-   old-format credential/capability files only after ownership/type validation.
+The shipped path now enforces the following invariants at the adapter and
+daemon boundaries:
 
-General explicit `remember` records are not migrated or deleted. Existing
-deterministic session-digest records may remain only if they already carry
-verifiable bound-session provenance; otherwise they are quarantined from
-automatic-capture recall and consolidation.
+- authenticated hello/ack and protected transport credentials are required;
+  unauthenticated compatibility hello is rejected;
+- binding authority is derived from the exact checkout and repository role,
+  while the handler runtime ID remains distinct from hook-session identity;
+- `hook/session_open`, `hook/event`, and `hook/session_close` are accepted only
+  from the hook-adapter client kind and are routed before ordinary MCP tools;
+- capability files, pending deliveries, registry receipts, and the capture
+  journal are protected, bounded, replay-safe, and payload-limited;
+- the Stop flow seals only on an authenticated close and writes deterministic
+  repository-local candidates through `MemoryStoreRouter`; it has no shared or
+  organization-store fallback; and
+- explicit `remember` records are independent of automatic capture and are not
+  relabeled as session digests.
+
+Any future schema or host integration must preserve these invariants and add
+tests before changing the allowlist, retention, authority, or LLM behavior.
 
 ## Required verification
 
@@ -441,9 +439,9 @@ and real-package tests prove:
 - crash points before receipt, after receipt, during memory commit, and after
   close converge to one deterministic result on retry; and
 - the installed Codex and Claude Code packages complete a scripted
-  SessionStart/edit/structured-check/Stop session, produce task-recallable
-  bounded memories, remain successful when capture is unavailable, and make no
-  LLM call by default.
+  SessionStart/structured-edit/Stop session, produce task-recallable bounded
+  memories, remain successful when capture is unavailable, and make no LLM
+  call by default.
 
 The release acceptance artifact must include a wire-level assertion that no
 raw host hook envelope crosses the adapter boundary and a structural test that

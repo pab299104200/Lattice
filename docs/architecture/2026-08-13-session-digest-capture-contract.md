@@ -7,22 +7,25 @@
 **Scope:** Ambient, repository-local capture of bounded session outcomes. The [Shared Memory Architecture](./2026-08-12-shared-memory-architecture.md) remains authoritative for routing, identity, store roles, and promotion.
 
 **Implementation status (2026-08-13):** The authority-free v1 parser,
-normalizer, sanitizer, deterministic extractor, and their unit tests are
-implemented in `lattice-core`. They are library-only at present: no CLI
-`remember --kind session-digest` admission path, hook event route, automatic
-memory-store write, task-recall integration, retention job, or opt-in LLM
-consolidation is wired to this contract. The authenticated D3a transport and
-the capability/registry primitives are implemented separately; they do not
-make capture live by themselves.
+normalizer, sanitizer, deterministic extractor, authenticated D3a transport,
+protected client state, payload-free registry, capture journal, and
+repository-store admission are implemented and tested. Installed adapters
+open/resume a protected binding, queue sanitized edit facts or a close marker,
+retry delivery by ID, and reduce a verified close into deterministic
+repository-local session-digest memories. There is no automatic LLM step: the
+separate consolidation workflow remains explicit and proposal-only.
 
 ## Decision
 
-Lattice is designed to capture a small structured `session-digest` when an
-agent session stops. The hook will send sanitized content containing
-repository-relative edited paths, a bounded final summary, and typed outcome
-observations. Trusted session/repository/checkout authority is bound outside
-the payload. The daemon will deterministically extract `WorkflowOutcome` and
-`FailurePattern` memories with evidence once the capture route is integrated.
+Lattice captures a small structured `session-digest` when an agent session
+stops. D3a currently sends only the structured facts that the installed hosts
+expose safely: an opaque session identifier at start, repository-relative
+edited paths from an allowlisted edit event, and a close marker at Stop. A
+future host adapter may add typed checks, typed errors, and a dedicated
+final-summary field only through an explicit schema change. Trusted
+session/repository/checkout authority is bound outside the payload. The daemon
+deterministically extracts and writes repository-local `WorkflowOutcome` and
+`FailurePattern` memories with evidence in one idempotent batch.
 
 The system never stores or forwards a raw transcript, transcript path, prompt, tool input/output, command line, terminal output, environment, editor buffer, or diff as session memory. The stop hook is best-effort and fast: capture failure does not fail or delay agent shutdown. The daemon enforces all policy, including for direct or malformed CLI callers.
 
@@ -43,25 +46,25 @@ It does not archive agent conversations, act as telemetry, infer secrets, promot
 
 ## Payload boundary
 
-The bundled Stop hook invokes an explicit public entry point:
+The bundled Stop hook invokes the private `__hook-adapter` entry point. This is
+an implemented best-effort transport adapter, not a user-facing memory-write
+command: it opens/resumes a capability binding, queues a sanitized close
+marker, and the authenticated daemon route reduces the complete bound journal
+into repository-local memories. There is no public
+`remember --kind session-digest` admission command. The parser accepts content
+only; it rejects identity fields as unknown input. The capture handler binds
+parsed content to the capability before persistence and never treats a
+caller-provided `session_id`, repository, checkout, branch, or scope as
+authority.
 
-```text
-lattice remember --kind session-digest --input <sanitized-json>
-```
-
-This is the planned public adapter surface, not an implemented capture route.
-The implemented parser accepts content only; it rejects identity fields as
-unknown input. A future adapter must present a valid hook capability over the
-authenticated transport and the daemon must bind the parsed content to that
-capability before persistence. It must not treat a caller-provided
-`session_id`, repository, checkout, branch, or scope as authority.
-
-Stdin is preferred so payloads do not appear in process listings. The planned
+Stdin is preferred so payloads do not appear in process listings. The D3a
 adapter accepts a versioned content envelope, not a transcript path. An
 integration must not inspect, open, hash, or forward a transcript path to make
 the envelope; hosts that do not expose safe structured facts omit them.
 
-Version 1 has this logical shape; exact public field names are set with the CLI schema implementation:
+The future digest schema has this logical shape; it is not the payload emitted
+by today's Stop hook and exact public field names require a versioned adapter
+change:
 
 ```json
 {
@@ -77,13 +80,33 @@ Version 1 has this logical shape; exact public field names are set with the CLI 
 }
 ```
 
-The hook is not an authority for repository, checkout, branch, session, scope,
+The D3a hook is not an authority for repository, checkout, branch, session, scope,
 or organization. The parser is intentionally authority-free: it performs
-bounded lexical/path normalization and sanitization only. The future capture
-handler must derive repository and exact-checkout authority from the verified
+bounded lexical/path normalization and sanitization only. The capture handler
+derives repository and exact-checkout authority from the verified
 hook capability and construct `MemoryQueryAuthority` there; the payload cannot
 select or override it. This endpoint always produces repository-local session
 capture. It cannot accept `scope: organization`.
+
+### D3a adapter facts
+
+The live adapters have a narrower contract than the future digest shape above:
+
+- `SessionStart` admits only the host's opaque `session_id` for binding lookup.
+- `PostToolUse` admits `tool_name` when it is one of `apply_patch`, `Edit`,
+  `Write`, or `NotebookEdit`, plus the dedicated `file_path` (or the typed
+  `tool_input.file_path` fallback). It emits only a normalized repository-
+  relative `edited_path` fact; command arguments, tool input/output, and
+  terminal text are discarded.
+- `Stop` admits the host `session_id` and emits only a close marker. The
+  installed adapters do not admit `edited_files`, a prompt, a transcript path,
+  or a final summary from the host envelope.
+
+Every adapter requires bounded JSON, drops unknown keys before transport, and
+never opens a path named by the envelope. Repository, checkout, branch, and
+scope are derived by the daemon from the authenticated capability and current
+working tree. A host that cannot provide a safe structured field causes that
+fact to be omitted, not reconstructed from transcript or raw tool data.
 
 ## Admission, normalization, and privacy
 
@@ -127,16 +150,16 @@ Each candidate has extractor-versioned assertion and claim fingerprints. Its ide
 
 ## Storage, scope, and recall
 
-When integrated, capture will use `MemoryStoreRouter::remember` with
+The capture handler uses `MemoryStoreRouter::remember` with
 daemon-derived repository, checkout, branch, and session authority. The
 current parser and extractor do not receive a store handle and perform no
-persistence. The future handler must receive no admin/unscoped query
+persistence. The handler receives no admin/unscoped query
 capability; router/store role checks must reject capture into the organization
 store.
 
 Every record preserves integration/version, schema version, sanitized-payload hash, extractor version, opaque session ID, receipt time, repository/check-out identity, branch, repository-relative evidence paths, and typed observation evidence. It preserves no raw command/output/transcript.
 
-Captured records are advisory observations, not fresh verification of the current checkout. Default applicability remains the captured repository and branch/session. `recall --mode task` can return compact same-repository digests with provenance, but session/branch data must not cross repositories, unrelated checkouts, expansion handles, or the shared-memory tier.
+Captured records are advisory observations, not fresh verification of the current checkout. Default applicability remains the captured repository and branch/session. `recall --mode task` can return compact same-repository digests with provenance; session/branch data must not cross repositories, unrelated checkouts, expansion handles, or the shared-memory tier.
 
 ## Opt-in LLM consolidation
 
@@ -153,15 +176,36 @@ Absent opt-in, provider/key, or queue capacity means no LLM call. The daemon rec
 
 ## Failure handling, retention, and observability
 
-The Stop hook uses a short deadline and exits zero after best-effort diagnostics without printing payload content. Internal outcomes distinguish `captured`, `partially_captured`, `rejected`, `daemon_unavailable`, `store_unavailable`, and `llm_skipped`. Writes are transactional: crashes before commit leave no record; same-key retries are safe. Partial capture reports committed/rejected counts and never claims full success. Store unavailability is neither a successful no-op nor an empty session.
+The Stop hook has a short deadline and exits zero after best-effort diagnostics
+without printing payload content. Today, a missing daemon, missing binding, or
+unavailable registry prevents delivery; it is not reported as a successful
+memory write. Capture admission is transactional, and internal outcomes must
+distinguish `captured`, `partially_captured`, `rejected`, `daemon_unavailable`,
+`store_unavailable`, and `llm_skipped`. Writes must be transactional: crashes
+before commit leave no record; same-key retries are safe. Partial capture must
+report committed/rejected counts and never claim full success.
 
 Status, doctor, and metrics expose bounded aggregate counters by integration, schema/extractor version, outcome/rejection class, and queue state. They must not expose summaries, paths, error text, reconstructable fingerprints, or session IDs.
 
-Session digests require an explicit repository-local age-and-count retention policy before release. Pruning/deletion transactionally removes dependent capture evidence, links, and queued jobs. It must not delete review proposals or durable records derived from the digest; those keep content-free provenance of the deleted opaque source ID and deletion time. Operator deletion by session ID uses the same path and audits no content.
+The implemented D3a client state already has finite protected retention: at
+most 256 pending deliveries/256 KiB, a 24-hour pending age, and a five-minute
+close retry grace. Acknowledged, expired, or conclusively closed capability
+records and pending deliveries are pruned without logging their content. The
+registry primitive likewise retains only opaque authority/receipt metadata and
+must prune expired bindings and receipts after its configured
+audit/idempotency windows; it stores no digest content. Session-digest records
+use an explicit repository-local age-and-count retention policy. That policy
+must transactionally remove
+dependent evidence, links, and queued jobs, while preserving review proposals
+or durable records derived from a digest with content-free provenance and
+deletion time. The current daemon capture journal and registry receipt window
+is seven days. Operator deletion by repository-scoped session ID uses the same
+transactional path and audits no content; it cannot widen authority to an
+organization store or another checkout.
 
-## Required verification (future integration)
+## Required verification
 
-Implementation must prove all of the following through direct daemon/CLI tests and the real bundled Stop-hook package:
+The implementation and bundled Stop-hook package must prove all of the following through direct daemon/CLI tests:
 
 - a scripted fixture session yields task-recallable `WorkflowOutcome` and `FailurePattern` records with typed evidence;
 - delivery retry is idempotent and output ordering is deterministic;

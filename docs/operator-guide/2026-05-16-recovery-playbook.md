@@ -2,6 +2,59 @@
 
 This playbook covers recovery, replay, rollback, and incident communication for the cognitive workspace successor. It is the failure-path companion to the daily [Operator Runbook](./2026-05-16-runbook.md#daily-operations). The governing contracts are [## Storage Design](../plans/2026-05-16-cognitive-workspace-fork-plan.md#storage-design), [### 3. Event Log](../plans/2026-05-16-cognitive-workspace-fork-plan.md#3-event-log), and [## Phase 11: Hardening](../plans/2026-05-16-cognitive-workspace-fork-plan.md#phase-11-hardening), plus the snapshot and rollback details in [Storage Migration Policy](../architecture/2026-05-16-storage-migration-policy.md#compaction-snapshot-policy).
 
+## D3a hook-session capture recovery
+
+D3a capture is repository-local and exact-checkout-bound. The adapter admits
+only an opaque host session ID, an allowlisted structured edit path, and a
+close marker. It never opens `transcript_path` and never forwards prompts, raw
+tool input/output, commands, terminal output, environment values, or caller
+scope/repository claims. A successful authenticated close reduces the bounded
+journal into deterministic repository-store memories; a failed Stop is a
+truthful best-effort failure and does not block agent shutdown.
+
+If capture is missing from task recall, first check that the host supplied the
+same session ID to `SessionStart`, the edit hook ran inside the intended
+checkout, and `lattice status --scope index --json` reports a healthy daemon.
+Then inspect the daemon's content-free hook health/log outcomes for
+`binding_missing`, `checkout_mismatch`, `daemon_unavailable`, or
+`registry_unavailable`. Do not inspect or recover a transcript path: it is not
+part of the capture contract. Re-run the next session after the daemon and
+workspace are healthy; a later Stop cannot silently rebind or infer the missed
+session.
+
+Protected state is bounded and retry-safe. The client stores capability
+metadata and sanitized pending deliveries under the user's private
+`$XDG_STATE_HOME/lattice/hook-bindings` (or
+`~/.local/state/lattice/hook-bindings`) directory. It caps pending state at 256
+deliveries/256 KiB, expires pending entries after 24 hours, and retains a
+close retry for five minutes. Delivery IDs are reused on retry; never copy or
+edit capability files. The daemon binding registry uses 30-minute idle and
+12-hour absolute lifetimes, retains receipt/audit metadata for seven days, and
+the repository `.lattice/hook-capture.db` journal prunes rows older than seven
+days. These stores contain normalized facts or opaque metadata only—never raw
+host envelopes.
+
+For suspected protected-state corruption, stop the daemon, preserve the exact
+state directory with ownership/mode metadata, and move only the affected
+binding record or registry after confirming it is not a symlink. Do not delete
+`memories.db` or `.lattice/hook-capture.db` as a first response. A fresh
+authenticated `SessionStart` creates a new binding; an old Stop cannot reopen
+one. If a capture journal or memory transaction is unavailable, the close is
+retried by delivery ID and either commits once or reports a typed failure.
+
+Capture deletion is repository-scoped and transactional. The memory-store
+deletion path removes capture evidence, links, idempotency rows, and queued
+capture work, while retaining derived durable records as content-free
+tombstone provenance and preserving required audit history. There is no
+transcript deletion or transcript recovery step. Use the repository-scoped
+session-capture deletion workflow when exposed by the operator tooling; never
+delete by a caller-supplied organization or sibling-checkout identity.
+
+Deterministic D3a capture makes no LLM call. The separate consolidation tools
+are explicit and proposal-only; they do not run as a Stop side effect. A
+capture incident therefore requires no provider/key investigation unless an
+operator explicitly invoked consolidation.
+
 ## Recovery procedures
 
 ### Derived graph corruption
