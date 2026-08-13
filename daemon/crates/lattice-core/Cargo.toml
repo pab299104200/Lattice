@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "cognitive_workspace_benchmark"
 harness = false
+
+[[bench]]
+name = "incremental_graph_maintenance"
+harness = false
