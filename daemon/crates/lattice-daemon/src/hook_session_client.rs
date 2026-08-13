@@ -1354,8 +1354,17 @@ mod tests {
         )
         .unwrap();
         client.refresh_binding(&key, &renewed).unwrap();
-        assert_eq!(client.load_binding(&key, 11_000).unwrap().idle_deadline_ms(), 15_000);
-        assert_eq!(client.pending(&key).unwrap()[0].delivery_id, delivery.delivery_id);
+        assert_eq!(
+            client
+                .load_binding(&key, 11_000)
+                .unwrap()
+                .idle_deadline_ms(),
+            15_000
+        );
+        assert_eq!(
+            client.pending(&key).unwrap()[0].delivery_id,
+            delivery.delivery_id
+        );
         let replaced = HookClientBinding::new(
             HookClientOpaqueId::new("other-binding-private").unwrap(),
             original.capability.clone(),
