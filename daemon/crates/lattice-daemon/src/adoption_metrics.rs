@@ -31,6 +31,46 @@ pub(crate) struct ToolCallRecord {
     pub(crate) suggested_files: Vec<String>,
 }
 
+/// A durable, append-only observation that a memory retrieval returned one or
+/// more records to an assistant. `retrieval_id` is supplied by the memory
+/// layer so a later citation/use can be joined without guessing from prose.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryRetrievalRecord {
+    pub(crate) session_id: String,
+    pub(crate) client: String,
+    pub(crate) channel: String,
+    pub(crate) retrieval_id: String,
+    pub(crate) retrieved_count: u64,
+}
+
+/// A durable observation that one or more records from a prior retrieval were
+/// used. The caller must supply the retrieval id returned at retrieval time;
+/// this deliberately prevents unrelated later actions from being credited.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryUseRecord {
+    pub(crate) retrieval_id: String,
+    pub(crate) used_count: u64,
+}
+
+/// A durable observation that a hook or workflow presented memories to an
+/// assistant. The injection id lets a subsequent action be attributed to the
+/// exact presentation rather than to all memories in a session.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryInjectionRecord {
+    pub(crate) session_id: String,
+    pub(crate) client: String,
+    pub(crate) channel: String,
+    pub(crate) injection_id: String,
+    pub(crate) shown_count: u64,
+}
+
+/// A durable observation that an assistant acted on a prior injection.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryInjectionActionRecord {
+    pub(crate) injection_id: String,
+    pub(crate) acted_count: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct AdoptionMetricsStore {
     path: PathBuf,
@@ -48,6 +88,12 @@ pub(crate) struct AdoptionCounter {
     pub(crate) total_latency_ms: u64,
     pub(crate) max_latency_ms: u64,
     pub(crate) follow_through_edits: u64,
+    pub(crate) memory_retrievals: u64,
+    pub(crate) memory_retrieved_items: u64,
+    pub(crate) memory_used_items: u64,
+    pub(crate) memory_injections: u64,
+    pub(crate) memory_injected_items: u64,
+    pub(crate) memory_injection_actions: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +128,32 @@ enum AdoptionEvent {
         session_id: String,
         file: String,
     },
+    MemoryRetrieval {
+        timestamp_secs: u64,
+        session_id: String,
+        client: String,
+        channel: String,
+        retrieval_id: String,
+        retrieved_count: u64,
+    },
+    MemoryUse {
+        timestamp_secs: u64,
+        retrieval_id: String,
+        used_count: u64,
+    },
+    MemoryInjection {
+        timestamp_secs: u64,
+        session_id: String,
+        client: String,
+        channel: String,
+        injection_id: String,
+        shown_count: u64,
+    },
+    MemoryInjectionAction {
+        timestamp_secs: u64,
+        injection_id: String,
+        acted_count: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +171,20 @@ struct CounterKey {
     client: String,
     channel: String,
     tool: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMemoryRetrieval {
+    counter_key: CounterKey,
+    retrieved_count: u64,
+    used_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMemoryInjection {
+    counter_key: CounterKey,
+    shown_count: u64,
+    acted_count: u64,
 }
 
 impl AdoptionMetricsStore {
@@ -130,6 +216,53 @@ impl AdoptionMetricsStore {
             timestamp_secs: now_secs(),
             session_id: clean_key(session_id, "unknown-session"),
             file: clean_file(file).unwrap_or_default(),
+        })
+    }
+
+    /// Records a memory retrieval in the same 90-day append-only ledger as
+    /// adoption events. Empty retrievals are retained: they are an important
+    /// distinction from an unavailable metric and make recall misses visible.
+    pub(crate) fn record_memory_retrieval(&self, record: MemoryRetrievalRecord) -> Result<()> {
+        self.append_event(AdoptionEvent::MemoryRetrieval {
+            timestamp_secs: now_secs(),
+            session_id: clean_key(&record.session_id, "unknown-session"),
+            client: clean_key(&record.client, "unknown-client"),
+            channel: clean_key(&record.channel, "unknown-channel"),
+            retrieval_id: clean_identifier(&record.retrieval_id, "unknown-retrieval"),
+            retrieved_count: record.retrieved_count,
+        })
+    }
+
+    /// Attributes use to a previously recorded retrieval. The replay path
+    /// rejects unknown ids, so a malformed or stale producer cannot inflate
+    /// memory-value metrics.
+    pub(crate) fn record_memory_use(&self, record: MemoryUseRecord) -> Result<()> {
+        self.append_event(AdoptionEvent::MemoryUse {
+            timestamp_secs: now_secs(),
+            retrieval_id: clean_identifier(&record.retrieval_id, "unknown-retrieval"),
+            used_count: record.used_count,
+        })
+    }
+
+    pub(crate) fn record_memory_injection(&self, record: MemoryInjectionRecord) -> Result<()> {
+        self.append_event(AdoptionEvent::MemoryInjection {
+            timestamp_secs: now_secs(),
+            session_id: clean_key(&record.session_id, "unknown-session"),
+            client: clean_key(&record.client, "unknown-client"),
+            channel: clean_key(&record.channel, "unknown-channel"),
+            injection_id: clean_identifier(&record.injection_id, "unknown-injection"),
+            shown_count: record.shown_count,
+        })
+    }
+
+    pub(crate) fn record_memory_injection_action(
+        &self,
+        record: MemoryInjectionActionRecord,
+    ) -> Result<()> {
+        self.append_event(AdoptionEvent::MemoryInjectionAction {
+            timestamp_secs: now_secs(),
+            injection_id: clean_identifier(&record.injection_id, "unknown-injection"),
+            acted_count: record.acted_count,
         })
     }
 
@@ -294,6 +427,8 @@ pub(crate) fn render_metrics_for_workspace(
 fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
     let mut ledger = AdoptionLedger::default();
     let mut pending = Vec::new();
+    let mut memory_retrievals = BTreeMap::new();
+    let mut memory_injections = BTreeMap::new();
     for event in events {
         match event {
             AdoptionEvent::ToolCall {
@@ -360,15 +495,122 @@ fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
                     counter.follow_through_edits += 1;
                 }
             }
+            AdoptionEvent::MemoryRetrieval {
+                timestamp_secs,
+                client,
+                channel,
+                retrieval_id,
+                retrieved_count,
+                ..
+            } => {
+                let counter_key = memory_counter_key(*timestamp_secs, client, channel);
+                let counter = counter_for_key(&mut ledger, &counter_key);
+                counter.memory_retrievals += 1;
+                counter.memory_retrieved_items += retrieved_count;
+                // A retrieval id must identify exactly one retrieval. Preserve
+                // the first event so a duplicate append cannot redirect a
+                // later use record to a different day or source.
+                memory_retrievals
+                    .entry(retrieval_id.clone())
+                    .or_insert(PendingMemoryRetrieval {
+                        counter_key,
+                        retrieved_count: *retrieved_count,
+                        used_count: 0,
+                    });
+            }
+            AdoptionEvent::MemoryUse {
+                retrieval_id,
+                used_count,
+                ..
+            } => {
+                let Some(retrieval) = memory_retrievals.get_mut(retrieval_id) else {
+                    continue;
+                };
+                let remaining = retrieval
+                    .retrieved_count
+                    .saturating_sub(retrieval.used_count);
+                let credited = (*used_count).min(remaining);
+                if credited == 0 {
+                    continue;
+                }
+                retrieval.used_count += credited;
+                counter_for_key(&mut ledger, &retrieval.counter_key).memory_used_items += credited;
+            }
+            AdoptionEvent::MemoryInjection {
+                timestamp_secs,
+                client,
+                channel,
+                injection_id,
+                shown_count,
+                ..
+            } => {
+                let counter_key = memory_counter_key(*timestamp_secs, client, channel);
+                let counter = counter_for_key(&mut ledger, &counter_key);
+                counter.memory_injections += 1;
+                counter.memory_injected_items += shown_count;
+                memory_injections
+                    .entry(injection_id.clone())
+                    .or_insert(PendingMemoryInjection {
+                        counter_key,
+                        shown_count: *shown_count,
+                        acted_count: 0,
+                    });
+            }
+            AdoptionEvent::MemoryInjectionAction {
+                injection_id,
+                acted_count,
+                ..
+            } => {
+                let Some(injection) = memory_injections.get_mut(injection_id) else {
+                    continue;
+                };
+                let remaining = injection.shown_count.saturating_sub(injection.acted_count);
+                let credited = (*acted_count).min(remaining);
+                if credited == 0 {
+                    continue;
+                }
+                injection.acted_count += credited;
+                counter_for_key(&mut ledger, &injection.counter_key).memory_injection_actions +=
+                    credited;
+            }
         }
     }
     ledger
 }
 
+fn memory_counter_key(timestamp_secs: u64, client: &str, channel: &str) -> CounterKey {
+    CounterKey {
+        day: date_key_from_epoch_day(timestamp_secs / SECS_PER_DAY),
+        client: client.to_string(),
+        channel: channel.to_string(),
+        tool: "memory".to_string(),
+    }
+}
+
+fn counter_for_key<'a>(
+    ledger: &'a mut AdoptionLedger,
+    key: &CounterKey,
+) -> &'a mut AdoptionCounter {
+    ledger
+        .days
+        .entry(key.day.clone())
+        .or_default()
+        .entry(key.client.clone())
+        .or_default()
+        .entry(key.channel.clone())
+        .or_default()
+        .entry(key.tool.clone())
+        .or_default()
+}
+
 fn event_timestamp(event: &AdoptionEvent) -> u64 {
     match event {
         AdoptionEvent::ToolCall { timestamp_secs, .. }
-        | AdoptionEvent::ObservedEdit { timestamp_secs, .. } => *timestamp_secs,
+        | AdoptionEvent::ObservedEdit { timestamp_secs, .. }
+        | AdoptionEvent::MemoryRetrieval { timestamp_secs, .. }
+        | AdoptionEvent::MemoryUse { timestamp_secs, .. }
+        | AdoptionEvent::MemoryInjection { timestamp_secs, .. }
+        | AdoptionEvent::MemoryInjectionAction { timestamp_secs, .. } => *timestamp_secs,
     }
 }
 
@@ -452,18 +694,24 @@ fn render_table_from_ledger(ledger: &AdoptionLedger, days: usize) -> String {
                         counter.follow_through_edits as f64 / counter.calls as f64
                     };
                     rows.push(format!(
-                        "{day} | {client} | {channel} | {tool} | {} | {avg} | {} | {:.0}%",
+                        "{day} | {client} | {channel} | {tool} | {} | {avg} | {} | {:.0}% | {} | {} | {} | {}",
                         counter.calls,
                         counter.max_latency_ms,
-                        rate * 100.0
+                        rate * 100.0,
+                        counter.memory_retrieved_items,
+                        counter.memory_used_items,
+                        counter.memory_injected_items,
+                        counter.memory_injection_actions,
                     ));
                 }
             }
         }
     }
     let mut out =
-        String::from("day | client | channel | tool | calls | avg_ms | max_ms | follow_through\n");
-    out.push_str("--- | --- | --- | --- | ---: | ---: | ---: | ---:\n");
+        String::from(
+            "day | client | channel | tool | calls | avg_ms | max_ms | follow_through | memories_returned | memories_used | memories_shown | injection_actions\n",
+        );
+    out.push_str("--- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---:\n");
     if rows.is_empty() {
         out.push_str("_no adoption metrics recorded_\n");
     } else {
@@ -485,6 +733,16 @@ fn clean_key(value: &str, fallback: &str) -> String {
             .map(|ch| if ch.is_control() { '_' } else { ch })
             .collect()
     }
+}
+
+fn clean_identifier(value: &str, fallback: &str) -> String {
+    let key = clean_key(value, fallback);
+    key.chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\n' | '\r' => '_',
+            _ => ch,
+        })
+        .collect()
 }
 
 fn now_secs() -> u64 {
@@ -637,6 +895,60 @@ mod tests {
         assert_eq!(files, vec!["src/auth.rs".to_string()]);
     }
 
+    #[test]
+    fn memory_value_metrics_join_only_known_ids_and_cap_each_item_once() {
+        let events = vec![
+            memory_retrieval(10, "retrieval-a", 3),
+            memory_use(11, "unknown-retrieval", 99),
+            memory_use(12, "retrieval-a", 2),
+            memory_use(13, "retrieval-a", 2),
+            memory_injection(14, "injection-a", 2),
+            memory_injection_action(15, "unknown-injection", 99),
+            memory_injection_action(16, "injection-a", 1),
+            memory_injection_action(17, "injection-a", 2),
+        ];
+
+        let ledger = ledger_from_events(&events);
+        let memory = &day_tools(&ledger, "hook")["memory"];
+        assert_eq!(memory.memory_retrievals, 1);
+        assert_eq!(memory.memory_retrieved_items, 3);
+        assert_eq!(memory.memory_used_items, 3);
+        assert_eq!(memory.memory_injections, 1);
+        assert_eq!(memory.memory_injected_items, 2);
+        assert_eq!(memory.memory_injection_actions, 2);
+    }
+
+    #[test]
+    fn memory_metric_events_obey_the_same_ninety_day_retention() {
+        let root = unique_root("memory-retention");
+        let store = AdoptionMetricsStore::new(&root);
+        let old = memory_retrieval(
+            now_secs().saturating_sub((RETENTION_DAYS + 1) * SECS_PER_DAY),
+            "retrieval-old",
+            1,
+        );
+        store.ensure_parent_dir().expect("metrics parent");
+        fs::write(
+            &store.path,
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .expect("seed old event");
+        store
+            .record_memory_retrieval(MemoryRetrievalRecord {
+                session_id: "session-a".to_string(),
+                client: "codex".to_string(),
+                channel: "hook".to_string(),
+                retrieval_id: "retrieval-current".to_string(),
+                retrieved_count: 1,
+            })
+            .expect("append memory retrieval");
+
+        let contents = fs::read_to_string(&store.path).expect("read log");
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("retrieval-current"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn call(timestamp: u64, session: &str, tool: &str, files: &[&str]) -> AdoptionEvent {
         AdoptionEvent::ToolCall {
             timestamp_secs: timestamp,
@@ -657,6 +969,48 @@ mod tests {
         }
     }
 
+    fn memory_retrieval(timestamp: u64, retrieval_id: &str, retrieved_count: u64) -> AdoptionEvent {
+        AdoptionEvent::MemoryRetrieval {
+            timestamp_secs: timestamp,
+            session_id: "session-a".to_string(),
+            client: "codex".to_string(),
+            channel: "hook".to_string(),
+            retrieval_id: retrieval_id.to_string(),
+            retrieved_count,
+        }
+    }
+
+    fn memory_use(timestamp: u64, retrieval_id: &str, used_count: u64) -> AdoptionEvent {
+        AdoptionEvent::MemoryUse {
+            timestamp_secs: timestamp,
+            retrieval_id: retrieval_id.to_string(),
+            used_count,
+        }
+    }
+
+    fn memory_injection(timestamp: u64, injection_id: &str, shown_count: u64) -> AdoptionEvent {
+        AdoptionEvent::MemoryInjection {
+            timestamp_secs: timestamp,
+            session_id: "session-a".to_string(),
+            client: "codex".to_string(),
+            channel: "hook".to_string(),
+            injection_id: injection_id.to_string(),
+            shown_count,
+        }
+    }
+
+    fn memory_injection_action(
+        timestamp: u64,
+        injection_id: &str,
+        acted_count: u64,
+    ) -> AdoptionEvent {
+        AdoptionEvent::MemoryInjectionAction {
+            timestamp_secs: timestamp,
+            injection_id: injection_id.to_string(),
+            acted_count,
+        }
+    }
+
     fn call_record(session: &str, tool: &str, files: &[&str]) -> ToolCallRecord {
         ToolCallRecord {
             session_id: session.to_string(),
@@ -669,13 +1023,20 @@ mod tests {
     }
 
     fn today_tools(ledger: &AdoptionLedger) -> &BTreeMap<String, AdoptionCounter> {
+        day_tools(ledger, "mcp")
+    }
+
+    fn day_tools<'a>(
+        ledger: &'a AdoptionLedger,
+        channel: &str,
+    ) -> &'a BTreeMap<String, AdoptionCounter> {
         ledger
             .days
             .get(&date_key_from_epoch_day(0))
             .expect("event day")
             .get("codex")
             .expect("client")
-            .get("mcp")
+            .get(channel)
             .expect("channel")
     }
 
