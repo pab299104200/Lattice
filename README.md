@@ -87,10 +87,13 @@ The built-in installer reconciles client configuration without deleting unrelate
 lattice install mcp --workspace /path/to/your/project --verify
 lattice install claude-code --workspace /path/to/your/project --verify
 lattice install codex --workspace /path/to/your/project --verify
+lattice install --with-embeddings
 lattice doctor --workspace /path/to/your/project
 ```
 
 `install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. Installation preserves unrelated configuration and removes duplicate Lattice entries. `--verify` re-reads the written file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or each configured hook with representative input. A failed protocol, hook, or tool-surface check is reported as an error. The standalone packages under `integrations/` remain available for package-level installation and testing.
+
+`lattice install --with-embeddings` provisions Lattice's pinned ONNX MiniLM model once for the current user, at `~/.lattice/models/all-minilm-l6-v2-1110a243/` (or `LATTICE_EMBEDDING_MODEL_DIR`). The installer stages both the model and tokenizer, verifies their SHA-256 digests, and atomically activates the completed bundle. It is idempotent; a missing or invalid bundle simply leaves semantic search disabled while normal lexical recall continues. The flag can also accompany a client installation, for example `lattice install mcp --with-embeddings --workspace /path/to/your/project`.
 
 The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. Proxy processes use a cross-process startup lock, so concurrent hooks and MCP clients recheck and reuse one daemon instead of racing to spawn several. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.
 

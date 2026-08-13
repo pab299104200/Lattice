@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use index_health::IndexHealth;
 use index_work::{IndexReadiness, IndexWorkCoordinator};
-use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::embeddings::{verified_shared_embedding_model_path, EmbeddingEngine};
 use lattice_core::events::{
     CompactionConfig, Compactor, EventStore, EventWriter, FlushPolicy, SchedulerHandle,
 };
@@ -340,8 +340,7 @@ async fn main() -> Result<()> {
             }
 
             // Try to load ONNX embedding model
-            let model_path = lattice_dir_bg.join("models").join("model.onnx");
-            if model_path.exists() {
+            if let Some(model_path) = verified_shared_embedding_model_path() {
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
@@ -394,6 +393,10 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         tracing::info!("No ONNX model: {}", e);
                     }
+            } else {
+                tracing::info!(
+                    "No valid shared embedding model installed; semantic search disabled and lexical recall remains available"
+                );
                 }
             }
 
@@ -706,8 +709,7 @@ pub(crate) async fn build_workspace_runtime(
                 eng.update_graph_arc(new_graph);
             }
 
-            let model_path = lattice_dir_bg.join("models").join("model.onnx");
-            if model_path.exists() {
+            if let Some(model_path) = verified_shared_embedding_model_path() {
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
@@ -740,6 +742,10 @@ pub(crate) async fn build_workspace_runtime(
                     }
                     Err(e) => tracing::info!("No ONNX model: {}", e),
                 }
+            } else {
+                tracing::info!(
+                    "No valid shared embedding model installed; semantic search disabled and lexical recall remains available"
+                );
             }
 
             indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);

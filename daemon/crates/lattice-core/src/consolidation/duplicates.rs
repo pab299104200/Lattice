@@ -14,31 +14,16 @@ use super::{
     capture_memory_state, encode_memory_state, ConsolidationJobMode, ConsolidationJobRuntime,
     PendingProposalSpec, ProposalKind, ScanError, ScanReport,
 };
-use crate::embeddings::{cosine_similarity, fingerprint_text};
 use crate::memory::{Memory, MemoryStore};
-use crate::storage::VectorStore;
-
-const DEFAULT_DUPLICATE_THRESHOLD: f32 = 0.92;
-const TOP_K_NEIGHBORS: usize = 6;
 
 pub struct DuplicateDetector<'a> {
     store: &'a MemoryStore,
     runtime: &'a mut ConsolidationJobRuntime,
-    threshold: f32,
 }
 
 impl<'a> DuplicateDetector<'a> {
     pub fn new(store: &'a MemoryStore, runtime: &'a mut ConsolidationJobRuntime) -> Self {
-        Self {
-            store,
-            runtime,
-            threshold: DEFAULT_DUPLICATE_THRESHOLD,
-        }
-    }
-
-    pub fn with_threshold(mut self, threshold: f32) -> Self {
-        self.threshold = threshold;
-        self
+        Self { store, runtime }
     }
 
     pub fn scan(
@@ -60,34 +45,10 @@ impl<'a> DuplicateDetector<'a> {
 
         let mut proposals_enqueued = 0u32;
         let mut skipped = 0u32;
-        let mut seen_pairs = BTreeSet::new();
-
         for bucket in bucket_memories(&memories).into_values() {
-            let index = build_index(&bucket)?;
-            for memory in &bucket {
-                let query = fingerprint_text(&memory.content);
-                let neighbors = index
-                    .search(&query, TOP_K_NEIGHBORS)
-                    .map_err(ScanError::from)?;
-                for (_, neighbor_id, _, _) in neighbors {
-                    if memory.id == neighbor_id {
-                        continue;
-                    }
-                    let Some(candidate) = bucket.iter().find(|entry| entry.id == neighbor_id)
-                    else {
-                        continue;
-                    };
-                    let pair_key = ordered_pair(&memory.id, &candidate.id);
-                    if !seen_pairs.insert(pair_key) {
-                        continue;
-                    }
+            for (left_index, memory) in bucket.iter().enumerate() {
+                for candidate in bucket.iter().skip(left_index + 1) {
                     if !shares_typed_evidence(memory, candidate) {
-                        skipped += 1;
-                        continue;
-                    }
-                    let similarity =
-                        cosine_similarity(&query, &fingerprint_text(&candidate.content));
-                    if similarity < self.threshold {
                         skipped += 1;
                         continue;
                     }
@@ -145,9 +106,9 @@ impl<'a> DuplicateDetector<'a> {
                             proposed_state: encode_memory_state(&proposed_state),
                             evidence: json!({
                                 "source_memory_ids": [older.id.clone(), newer.id.clone()],
-                                "similarity": similarity,
                                 "shared_files": shared_values(&older.linked_files, &newer.linked_files),
                                 "shared_symbols": shared_values(&older.linked_symbols, &newer.linked_symbols),
+                                "decision_basis": "typed_evidence_overlap",
                             }),
                             provenance: None,
                         },
@@ -178,24 +139,6 @@ fn bucket_memories(memories: &[Memory]) -> BTreeMap<(String, String), Vec<Memory
             .push(memory.clone());
     }
     buckets
-}
-
-fn build_index(memories: &[Memory]) -> Result<VectorStore, ScanError> {
-    let index = VectorStore::open_in_memory()?;
-    index.initialize(64)?;
-    for memory in memories {
-        let vector = fingerprint_text(&memory.content);
-        index.upsert_vector(&memory.id, "memory", 0, &vector)?;
-    }
-    Ok(index)
-}
-
-fn ordered_pair(left: &str, right: &str) -> (String, String) {
-    if left <= right {
-        (left.to_string(), right.to_string())
-    } else {
-        (right.to_string(), left.to_string())
-    }
 }
 
 fn older_memory<'a>(left: &'a Memory, right: &'a Memory) -> &'a Memory {

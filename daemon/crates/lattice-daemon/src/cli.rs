@@ -15,6 +15,7 @@ use crate::install::{
 };
 use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
+use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelInstallStatus};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,7 +90,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  install <mcp|claude-code|codex>\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -142,6 +143,7 @@ struct InstallCommand {
     target: InstallTarget,
     workspaces: Vec<PathBuf>,
     verify: bool,
+    with_embeddings: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +154,9 @@ struct InstallRuntime {
 
 fn run_install_command(args: Vec<String>) -> i32 {
     let result = (|| {
+        if is_embeddings_only_install(&args) {
+            return install_embeddings_message();
+        }
         let command = parse_install_command(args)?;
         let runtime = resolve_install_runtime()?;
         run_install_command_with(command, &runtime)
@@ -168,6 +173,24 @@ fn run_install_command(args: Vec<String>) -> i32 {
     }
 }
 
+fn is_embeddings_only_install(args: &[String]) -> bool {
+    args.len() == 3 && args.get(2).map(String::as_str) == Some("--with-embeddings")
+}
+
+fn install_embeddings_message() -> Result<String> {
+    let status = install_shared_embedding_model()?;
+    Ok(match status {
+        EmbeddingModelInstallStatus::Installed(path) => format!(
+            "installed checksum-verified shared embedding model at {}",
+            path.display()
+        ),
+        EmbeddingModelInstallStatus::AlreadyInstalled(path) => format!(
+            "shared checksum-verified embedding model is already installed at {}",
+            path.display()
+        ),
+    })
+}
+
 fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
     let target = args
         .get(2)
@@ -175,10 +198,12 @@ fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
         .and_then(|target| InstallTarget::parse(target))?;
     let mut workspaces = Vec::new();
     let mut verify = false;
+    let mut with_embeddings = false;
     let mut index = 3;
     while index < args.len() {
         match args[index].as_str() {
             "--verify" => verify = true,
+            "--with-embeddings" => with_embeddings = true,
             "--workspace" | "-w" => {
                 let value = args
                     .get(index + 1)
@@ -203,6 +228,7 @@ fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
         target,
         workspaces,
         verify,
+        with_embeddings,
     })
 }
 
@@ -244,6 +270,11 @@ fn stable_asset_root(executable: &Path) -> Result<PathBuf> {
 }
 
 fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -> Result<String> {
+    let embedding_message = if command.with_embeddings {
+        Some(install_embeddings_message()?)
+    } else {
+        None
+    };
     let config_workspace = command
         .workspaces
         .first()
@@ -271,7 +302,7 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
     if command.verify {
         verify_install_config(&config_path, &command, runtime)?;
     }
-    Ok(format!(
+    let installed = format!(
         "installed Lattice {} configuration at {}",
         match command.target {
             InstallTarget::Mcp => "MCP",
@@ -279,7 +310,11 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
             InstallTarget::Codex => "Codex hook",
         },
         config_path.display()
-    ))
+    );
+    Ok(match embedding_message {
+        Some(message) => format!("{installed}\n{message}"),
+        None => installed,
+    })
 }
 
 fn read_install_config(path: &Path) -> Result<Value> {
@@ -1840,6 +1875,7 @@ mod tests {
             target: InstallTarget::Mcp,
             workspaces: vec![workspace.clone()],
             verify: true,
+            with_embeddings: false,
         };
 
         run_install_command_with(command.clone(), &runtime).unwrap();
@@ -1870,6 +1906,7 @@ mod tests {
             target: InstallTarget::Codex,
             workspaces: vec![workspace.clone()],
             verify: true,
+            with_embeddings: false,
         };
 
         run_install_command_with(command.clone(), &runtime).unwrap();
@@ -2004,6 +2041,28 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("exactly one --workspace"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_parser_accepts_embedding_provisioning_without_network_access() {
+        assert!(is_embeddings_only_install(&[
+            "lattice".to_string(),
+            "install".to_string(),
+            "--with-embeddings".to_string(),
+        ]));
+
+        let (root, workspace, _) = install_fixture();
+        let command = parse_install_command(vec![
+            "lattice".into(),
+            "install".into(),
+            "mcp".into(),
+            "--with-embeddings".into(),
+            "--workspace".into(),
+            workspace.display().to_string(),
+        ])
+        .unwrap();
+        assert!(command.with_embeddings);
         fs::remove_dir_all(root).unwrap();
     }
 }

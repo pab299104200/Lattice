@@ -54,6 +54,36 @@ fn duplicate_detector_emits_supersession_proposal() {
 }
 
 #[test]
+fn duplicate_detector_uses_typed_evidence_without_hash_similarity() {
+    let fixture = Fixture::new();
+    fixture.seed_memory(
+        "Authentication failures are returned as HTTP 401.",
+        vec!["src/auth.ts"],
+        vec!["loginUser"],
+        10,
+    );
+    fixture.seed_memory(
+        "The login handler records an audit event after a successful request.",
+        vec!["src/auth.ts"],
+        vec!["loginUser"],
+        20,
+    );
+
+    let mut runtime = fixture.runtime();
+    let report = DuplicateDetector::new(&fixture.memory_store, &mut runtime)
+        .scan("workspace-main", Some(ProposalKind::Supersede))
+        .unwrap();
+
+    assert_eq!(report.proposals_enqueued, 1);
+    let proposal = fixture.load_only_proposal();
+    assert_eq!(
+        proposal.evidence["decision_basis"],
+        "typed_evidence_overlap"
+    );
+    assert!(proposal.evidence.get("similarity").is_none());
+}
+
+#[test]
 fn stale_marker_emits_mark_stale_proposal_for_deleted_anchor_file() {
     let fixture = Fixture::new();
     let memory_id = fixture.seed_memory("Auth notes", vec!["src/auth.ts"], vec![], 10);

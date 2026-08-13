@@ -1,6 +1,95 @@
 #[cfg(test)]
 mod tests {
-    use crate::embeddings::EmbeddingEngine;
+    use anyhow::{bail, Result};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    use crate::embeddings::{
+        install_embedding_model_at, EmbeddingEngine, EmbeddingModelAsset, EmbeddingModelDownloader,
+        EmbeddingModelInstallStatus, EmbeddingModelManifest,
+    };
+
+    const FIXTURE_ASSETS: [EmbeddingModelAsset; 2] = [
+        EmbeddingModelAsset {
+            file_name: "model.onnx",
+            source_url: "fixture://model",
+            sha256: "85859949cad0dc38d596699174004f0b75944afc8fd7228caedbaa552fc7701d",
+        },
+        EmbeddingModelAsset {
+            file_name: "tokenizer.json",
+            source_url: "fixture://tokenizer",
+            sha256: "faabab27305405b709c315f83e7fc0e1bbf3204b09d10e1a2efb37f4b2c109b4",
+        },
+    ];
+    const FIXTURE_MANIFEST: EmbeddingModelManifest = EmbeddingModelManifest {
+        version: "fixture-minilm",
+        assets: &FIXTURE_ASSETS,
+    };
+
+    struct FixtureDownloader;
+
+    impl EmbeddingModelDownloader for FixtureDownloader {
+        fn download(&self, source_url: &str, destination: &Path) -> Result<()> {
+            let bytes = match source_url {
+                "fixture://model" => b"model fixture\n".as_slice(),
+                "fixture://tokenizer" => b"tokenizer fixture\n".as_slice(),
+                other => bail!("unexpected local fixture URL {other}"),
+            };
+            fs::write(destination, bytes)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn local_fixture_installer_is_atomic_verified_and_idempotent() {
+        let root = tempdir().unwrap();
+        let destination = root.path().join("models/fixture-minilm");
+
+        let first = install_embedding_model_at(&destination, &FIXTURE_MANIFEST, &FixtureDownloader)
+            .unwrap();
+        assert_eq!(
+            first,
+            EmbeddingModelInstallStatus::Installed(destination.clone())
+        );
+        assert_eq!(
+            fs::read(destination.join("model.onnx")).unwrap(),
+            b"model fixture\n"
+        );
+
+        let second =
+            install_embedding_model_at(&destination, &FIXTURE_MANIFEST, &FixtureDownloader)
+                .unwrap();
+        assert_eq!(
+            second,
+            EmbeddingModelInstallStatus::AlreadyInstalled(destination)
+        );
+    }
+
+    #[test]
+    fn local_fixture_installer_replaces_corrupt_bundle_only_after_verification() {
+        let root = tempdir().unwrap();
+        let destination = root.path().join("models/fixture-minilm");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("model.onnx"), b"corrupt").unwrap();
+        fs::write(destination.join("tokenizer.json"), b"corrupt").unwrap();
+
+        let result =
+            install_embedding_model_at(&destination, &FIXTURE_MANIFEST, &FixtureDownloader)
+                .unwrap();
+        assert_eq!(
+            result,
+            EmbeddingModelInstallStatus::Installed(destination.clone())
+        );
+        assert_eq!(
+            fs::read(destination.join("tokenizer.json")).unwrap(),
+            b"tokenizer fixture\n"
+        );
+        assert!(fs::read_dir(root.path().join("models"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt")));
+    }
 
     #[test]
     #[ignore] // Requires ONNX model file
