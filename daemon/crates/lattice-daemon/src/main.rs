@@ -3,6 +3,7 @@
 mod adoption_metrics;
 mod cli;
 mod doctor;
+mod install;
 mod index_health;
 mod index_work;
 mod lifecycle_log;
