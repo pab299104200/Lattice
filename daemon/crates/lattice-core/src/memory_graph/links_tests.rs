@@ -3,7 +3,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
-use super::accesses::{list_accesses_for, mark_used, record_access, MemoryAccess, MemoryAccessId};
+use super::accesses::{
+    list_accesses_for, mark_used, record_access, MemoryAccess, MemoryAccessError, MemoryAccessId,
+};
 use super::classes::{AssertionType, FreshnessKind, FreshnessPolicy, MemoryClass, MemoryScope};
 use super::evidence::{
     get_evidence_for, insert_evidence, EvidenceAnchor, MemoryEvidence, MemoryEvidenceId,
@@ -222,6 +224,134 @@ fn accesses_can_be_marked_used_after_the_fact() {
         accesses[0].downstream_outcome_event,
         Some(event_id("outcome"))
     );
+}
+
+#[test]
+fn access_outcome_resolution_is_idempotent_but_never_overwrites_first_decision() {
+    let conn = open_schema();
+    let memory = memory_id("memory");
+    insert_memory_row(&conn, &memory);
+    let access = MemoryAccess {
+        access_id: MemoryAccessId("access-immutable-outcome".to_string()),
+        memory_id: memory.clone(),
+        accessed_at: timestamp(41),
+        accessed_in_event: event_id("retrieval"),
+        accessor: Actor::Daemon,
+        inclusion_reason: "selected for response".to_string(),
+        was_used: None,
+        downstream_outcome_event: None,
+    };
+    record_access(&conn, &access).unwrap();
+
+    let outcome = event_id("response-complete");
+    mark_used(&conn, &access.access_id, true, Some(&outcome)).unwrap();
+    mark_used(&conn, &access.access_id, true, Some(&outcome)).unwrap();
+
+    let error = mark_used(
+        &conn,
+        &access.access_id,
+        false,
+        Some(&event_id("different-response")),
+    )
+    .unwrap_err();
+    assert!(matches!(error, MemoryAccessError::OutcomeConflict { .. }));
+
+    let stored = list_accesses_for(&conn, &memory).unwrap();
+    assert_eq!(stored[0].was_used, Some(true));
+    assert_eq!(stored[0].downstream_outcome_event, Some(outcome));
+}
+
+#[test]
+fn access_outcomes_require_a_distinct_same_workspace_event() {
+    let conn = open_schema();
+    let memory = memory_id("memory");
+    insert_memory_row(&conn, &memory);
+    let access = MemoryAccess {
+        access_id: MemoryAccessId("access-outcome-validation".to_string()),
+        memory_id: memory.clone(),
+        accessed_at: timestamp(42),
+        accessed_in_event: event_id("retrieval"),
+        accessor: Actor::Daemon,
+        inclusion_reason: "selected for response".to_string(),
+        was_used: None,
+        downstream_outcome_event: None,
+    };
+    record_access(&conn, &access).unwrap();
+
+    let missing = mark_used(&conn, &access.access_id, false, None).unwrap_err();
+    assert!(matches!(
+        missing,
+        MemoryAccessError::OutcomeEventRequired { .. }
+    ));
+
+    let same_event = mark_used(
+        &conn,
+        &access.access_id,
+        true,
+        Some(&access.accessed_in_event),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        same_event,
+        MemoryAccessError::OutcomeMustFollowAccess { .. }
+    ));
+
+    let foreign_event = EventId {
+        workspace_id: "other-workspace".to_string(),
+        ulid: stable_ulid("foreign-outcome"),
+    };
+    let wrong_workspace =
+        mark_used(&conn, &access.access_id, true, Some(&foreign_event)).unwrap_err();
+    assert!(matches!(
+        wrong_workspace,
+        MemoryAccessError::WorkspaceMismatch {
+            field: "downstream_outcome_event",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn initial_access_must_be_unresolved_and_workspace_scoped() {
+    let conn = open_schema();
+    let memory = memory_id("memory");
+    insert_memory_row(&conn, &memory);
+
+    let already_resolved = MemoryAccess {
+        access_id: MemoryAccessId("access-resolved-on-insert".to_string()),
+        memory_id: memory.clone(),
+        accessed_at: timestamp(43),
+        accessed_in_event: event_id("retrieval"),
+        accessor: Actor::Daemon,
+        inclusion_reason: "selected for response".to_string(),
+        was_used: Some(true),
+        downstream_outcome_event: Some(event_id("response")),
+    };
+    assert!(matches!(
+        record_access(&conn, &already_resolved),
+        Err(MemoryAccessError::OutcomeConflict { .. })
+    ));
+
+    let foreign_access_event = MemoryAccess {
+        access_id: MemoryAccessId("access-foreign-event".to_string()),
+        memory_id: memory,
+        accessed_at: timestamp(44),
+        accessed_in_event: EventId {
+            workspace_id: "other-workspace".to_string(),
+            ulid: stable_ulid("foreign-access"),
+        },
+        accessor: Actor::Daemon,
+        inclusion_reason: "selected for response".to_string(),
+        was_used: None,
+        downstream_outcome_event: None,
+    };
+    assert!(matches!(
+        record_access(&conn, &foreign_access_event),
+        Err(MemoryAccessError::WorkspaceMismatch {
+            field: "accessed_in_event",
+            ..
+        })
+    ));
 }
 
 #[test]

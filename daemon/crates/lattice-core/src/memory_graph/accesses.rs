@@ -40,6 +40,26 @@ pub struct MemoryAccess {
 pub enum MemoryAccessError {
     #[error("memory access `{access_id}` does not exist")]
     NotFound { access_id: String },
+    #[error("memory access id must not be empty")]
+    EmptyAccessId,
+    #[error("memory access inclusion reason must not be empty")]
+    EmptyInclusionReason,
+    #[error(
+        "memory access {field} workspace `{actual}` does not match memory workspace `{expected}`"
+    )]
+    WorkspaceMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("memory access `{access_id}` requires a downstream outcome event to record use")]
+    OutcomeEventRequired { access_id: String },
+    #[error(
+        "memory access `{access_id}` cannot use its retrieval event as its downstream outcome"
+    )]
+    OutcomeMustFollowAccess { access_id: String },
+    #[error("memory access `{access_id}` was already resolved with a different use outcome")]
+    OutcomeConflict { access_id: String },
     #[error(transparent)]
     Parse(#[from] MemoryGraphParseError),
     #[error("memory access SQLite error: {0}")]
@@ -48,6 +68,7 @@ pub enum MemoryAccessError {
 
 pub fn record_access(conn: &Connection, access: &MemoryAccess) -> Result<(), MemoryAccessError> {
     let _span = trace_span!("memory_graph.record_access").entered();
+    validate_new_access(access)?;
     let (accessor_kind, accessor_detail) = encode_actor(&access.accessor);
     let memory_id = encode_identity_text(&Identity::Memory(access.memory_id.clone()));
     let result = conn.execute(
@@ -166,22 +187,112 @@ pub fn mark_used(
     downstream_outcome_event: Option<&EventId>,
 ) -> Result<(), MemoryAccessError> {
     let _span = trace_span!("memory_graph.mark_used").entered();
-    let updated = conn.execute(
-        "UPDATE memory_accesses
-         SET was_used = ?2, downstream_outcome_event = ?3
-         WHERE access_id = ?1",
-        params![
-            access_id.as_str(),
-            bool_to_i64(was_used),
-            downstream_outcome_event.map(encode_event_id),
-        ],
-    )?;
-    if updated == 0 {
-        return Err(MemoryAccessError::NotFound {
+    let outcome_event =
+        downstream_outcome_event.ok_or_else(|| MemoryAccessError::OutcomeEventRequired {
+            access_id: access_id.to_string(),
+        })?;
+
+    let existing = conn
+        .query_row(
+            "SELECT was_used, downstream_outcome_event, accessed_in_event
+             FROM memory_accesses
+             WHERE access_id = ?1",
+            params![access_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => MemoryAccessError::NotFound {
+                access_id: access_id.to_string(),
+            },
+            other => MemoryAccessError::Sqlite(other),
+        })?;
+
+    let accessed_in_event = decode_event_id(&existing.2, "accessed_in_event")?;
+    if accessed_in_event.workspace_id != outcome_event.workspace_id {
+        return Err(MemoryAccessError::WorkspaceMismatch {
+            field: "downstream_outcome_event",
+            expected: accessed_in_event.workspace_id,
+            actual: outcome_event.workspace_id.clone(),
+        });
+    }
+    if accessed_in_event == *outcome_event {
+        return Err(MemoryAccessError::OutcomeMustFollowAccess {
             access_id: access_id.to_string(),
         });
     }
-    Ok(())
+
+    let encoded_outcome = encode_event_id(outcome_event);
+    if let Some(existing_used) = existing.0 {
+        let existing_outcome = existing.1.as_deref();
+        if (existing_used != 0) == was_used && existing_outcome == Some(encoded_outcome.as_str()) {
+            return Ok(());
+        }
+        return Err(MemoryAccessError::OutcomeConflict {
+            access_id: access_id.to_string(),
+        });
+    }
+    if existing.1.is_some() {
+        return Err(MemoryAccessError::OutcomeConflict {
+            access_id: access_id.to_string(),
+        });
+    }
+
+    let updated = conn.execute(
+        "UPDATE memory_accesses
+         SET was_used = ?2, downstream_outcome_event = ?3
+         WHERE access_id = ?1 AND was_used IS NULL AND downstream_outcome_event IS NULL",
+        params![access_id.as_str(), bool_to_i64(was_used), encoded_outcome],
+    )?;
+    if updated == 1 {
+        return Ok(());
+    }
+
+    // A concurrent resolver won the race. Re-read through this same state
+    // machine so equal retries remain idempotent while conflicting outcomes
+    // never overwrite the first observed decision.
+    mark_used(conn, access_id, was_used, Some(outcome_event))
+}
+
+fn validate_new_access(access: &MemoryAccess) -> Result<(), MemoryAccessError> {
+    if access.access_id.as_str().trim().is_empty() {
+        return Err(MemoryAccessError::EmptyAccessId);
+    }
+    if access.inclusion_reason.trim().is_empty() {
+        return Err(MemoryAccessError::EmptyInclusionReason);
+    }
+    if access.memory_id.workspace_id != access.accessed_in_event.workspace_id {
+        return Err(MemoryAccessError::WorkspaceMismatch {
+            field: "accessed_in_event",
+            expected: access.memory_id.workspace_id.clone(),
+            actual: access.accessed_in_event.workspace_id.clone(),
+        });
+    }
+    if let Some(outcome_event) = &access.downstream_outcome_event {
+        if access.memory_id.workspace_id != outcome_event.workspace_id {
+            return Err(MemoryAccessError::WorkspaceMismatch {
+                field: "downstream_outcome_event",
+                expected: access.memory_id.workspace_id.clone(),
+                actual: outcome_event.workspace_id.clone(),
+            });
+        }
+        if access.accessed_in_event == *outcome_event {
+            return Err(MemoryAccessError::OutcomeMustFollowAccess {
+                access_id: access.access_id.to_string(),
+            });
+        }
+    }
+    match (access.was_used, access.downstream_outcome_event.as_ref()) {
+        (None, None) => Ok(()),
+        _ => Err(MemoryAccessError::OutcomeConflict {
+            access_id: access.access_id.to_string(),
+        }),
+    }
 }
 
 fn convert_row_error(error: rusqlite::Error) -> MemoryAccessError {
