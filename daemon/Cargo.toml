@@ -33,6 +33,7 @@ petgraph = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
 notify = "7"
+libc = "0.2"
 ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
 ndarray = "0.16"
 tokenizers = "0.20"

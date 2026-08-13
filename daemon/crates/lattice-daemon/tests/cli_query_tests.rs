@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn cli_query_subcommands_call_public_tools_over_daemon_protocol() {
@@ -126,6 +126,122 @@ fn bare_help_and_unknown_invocations_do_not_start_a_daemon() {
     }
 }
 
+#[test]
+fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
+    let workspace = unique_workspace("proxy-eof");
+    std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener
+        .local_addr()
+        .expect("fake daemon address")
+        .to_string();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept proxy");
+        let mut reader = BufReader::new(stream);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("read proxy hello");
+        assert!(
+            hello.contains("workspace_roots"),
+            "expected proxy hello: {hello}"
+        );
+        let mut remainder = String::new();
+        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
+            remainder.clear();
+        }
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
+        .args(["--stdio", "--workspace"])
+        .arg(&workspace)
+        .env("LATTICE_DAEMON_ADDR", addr)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stdio proxy");
+
+    let closed_at = Instant::now();
+    drop(child.stdin.take());
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    assert!(
+        status.success(),
+        "stdio proxy failed after EOF: status={status:?}"
+    );
+    assert!(
+        closed_at.elapsed() <= Duration::from_secs(2),
+        "stdio proxy exceeded the two-second EOF lifecycle bound"
+    );
+    server.join().expect("fake daemon joins");
+}
+
+#[test]
+fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
+    let workspace = unique_workspace("proxy-in-flight");
+    std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener
+        .local_addr()
+        .expect("fake daemon address")
+        .to_string();
+    let (request_received_tx, request_received_rx) = std::sync::mpsc::channel();
+    let (response_sent_tx, response_sent_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept proxy");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone proxy stream"));
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("read proxy hello");
+        let mut request = String::new();
+        reader.read_line(&mut request).expect("read proxy request");
+        request_received_tx.send(()).expect("signal proxy request");
+        thread::sleep(Duration::from_millis(2300));
+        writeln!(stream, "{}", r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+            .expect("write delayed response");
+        response_sent_tx.send(()).expect("signal delayed response");
+        let mut remainder = String::new();
+        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
+            remainder.clear();
+        }
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
+        .args(["--stdio", "--workspace"])
+        .arg(&workspace)
+        .env("LATTICE_DAEMON_ADDR", addr)
+        .env("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stdio proxy");
+    writeln!(
+        child.stdin.as_mut().expect("proxy stdin"),
+        "{}",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#
+    )
+    .expect("write proxy request");
+    child
+        .stdin
+        .as_mut()
+        .expect("proxy stdin")
+        .flush()
+        .expect("flush proxy request");
+    request_received_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("proxy did not forward request to daemon");
+
+    thread::sleep(Duration::from_millis(2100));
+    assert!(
+        child.try_wait().expect("poll proxy").is_none(),
+        "proxy idle timeout terminated the outstanding request"
+    );
+    response_sent_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("proxy did not remain connected for delayed response");
+    drop(child.stdin.take());
+    assert!(wait_for_exit(&mut child, Duration::from_secs(2)).success());
+    server.join().expect("fake daemon joins");
+}
+
 enum FakeMode {
     Immediate,
     Delay,
@@ -214,6 +330,20 @@ fn run_lattice(
             .expect("write stdin");
     }
     child.wait_with_output().expect("wait")
+}
+
+fn wait_for_exit(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not exit within {limit:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn unique_workspace(label: &str) -> PathBuf {
