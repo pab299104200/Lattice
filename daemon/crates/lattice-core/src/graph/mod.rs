@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod digest;
 pub mod model;
 
 #[cfg(test)]
