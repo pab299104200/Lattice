@@ -1,4 +1,4 @@
-use super::schema::CREATE_TABLES;
+use super::schema::{CREATE_NODES_TABLE, CREATE_NODE_INDEX, CREATE_TABLES};
 use crate::error::LatticeError;
 use crate::graph::digest::{
     generate_module_digests, GeneratedModuleDigest, ModuleDigestPayload,
@@ -213,11 +213,26 @@ impl GraphStore {
 
     /// Create tables and indexes if they don't already exist.
     fn initialize(&self) -> Result<(), LatticeError> {
+        self.migrate_legacy_nodes_schema()?;
+        self.conn
+            .execute_batch(CREATE_NODES_TABLE)
+            .map_err(|e| match &self.path {
+                Some(path) => map_sqlite_error(path, "initialize nodes schema", e),
+                None => LatticeError::Storage(format!("Failed to initialize nodes schema: {}", e)),
+            })?;
         self.conn
             .execute_batch(CREATE_TABLES)
             .map_err(|e| match &self.path {
-                Some(path) => map_sqlite_error(path, "initialize schema", e),
-                None => LatticeError::Storage(format!("Failed to initialize schema: {}", e)),
+                Some(path) => map_sqlite_error(path, "initialize supporting schema", e),
+                None => {
+                    LatticeError::Storage(format!("Failed to initialize supporting schema: {}", e))
+                }
+            })?;
+        self.conn
+            .execute_batch(CREATE_NODE_INDEX)
+            .map_err(|e| match &self.path {
+                Some(path) => map_sqlite_error(path, "initialize node index", e),
+                None => LatticeError::Storage(format!("Failed to initialize node index: {}", e)),
             })?;
         self.conn
             .execute_batch(MODULE_DIGEST_TABLES)
@@ -229,6 +244,84 @@ impl GraphStore {
                 )),
             })?;
         Ok(())
+    }
+
+    /// Rebuild pre-removal node tables without disturbing the rest of the graph store.
+    ///
+    /// SQLite table rebuilds are transactional, so either the legacy table remains intact or
+    /// the canonical table (and its index) is fully installed. The column check makes this safe
+    /// to run on every open.
+    fn migrate_legacy_nodes_schema(&self) -> Result<(), LatticeError> {
+        const LEGACY_NODES_TABLE: &str = "nodes__lattice_legacy_edit_count";
+
+        let tx = self.conn.unchecked_transaction().map_err(|e| {
+            LatticeError::Storage(format!("Failed to begin nodes schema migration: {}", e))
+        })?;
+        let has_edit_count = {
+            let mut columns = tx.prepare("PRAGMA table_info(nodes)").map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to inspect nodes schema for migration: {}",
+                    e
+                ))
+            })?;
+            let names = columns
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to query nodes schema for migration: {}",
+                        e
+                    ))
+                })?;
+            let mut found = false;
+            for name in names {
+                if name.map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to read nodes schema for migration: {}",
+                        e
+                    ))
+                })? == "edit_count"
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        if has_edit_count {
+            tx.execute(
+                &format!("ALTER TABLE nodes RENAME TO {LEGACY_NODES_TABLE}"),
+                [],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to rename legacy nodes table: {}", e))
+            })?;
+            tx.execute_batch(CREATE_NODES_TABLE).map_err(|e| {
+                LatticeError::Storage(format!("Failed to create migrated nodes table: {}", e))
+            })?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO nodes (file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified) \
+                     SELECT file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified \
+                     FROM {LEGACY_NODES_TABLE}"
+                ),
+                [],
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to copy legacy nodes during migration: {}", e))
+            })?;
+            tx.execute(&format!("DROP TABLE {LEGACY_NODES_TABLE}"), [])
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to remove legacy nodes table: {}", e))
+                })?;
+            tx.execute_batch(CREATE_NODE_INDEX).map_err(|e| {
+                LatticeError::Storage(format!("Failed to recreate migrated node index: {}", e))
+            })?;
+        }
+
+        tx.commit().map_err(|e| {
+            LatticeError::Storage(format!("Failed to commit nodes schema migration: {}", e))
+        })
     }
 
     pub fn recovery(&self) -> GraphStoreRecovery {
@@ -295,8 +388,8 @@ impl GraphStore {
         {
             let mut insert_node = tx
                 .prepare(
-                    "INSERT INTO nodes (file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, edit_count, last_modified) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO nodes (file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .map_err(|e| LatticeError::Storage(format!("Failed to prepare node insert: {}", e)))?;
 
@@ -313,7 +406,6 @@ impl GraphStore {
                         node.end_line as i64,
                         node.is_exported as i32,
                         format!("{:?}", node.language),
-                        node.edit_count as i64,
                         node.last_modified as i64,
                     ])
                     .map_err(|e| LatticeError::Storage(format!("Failed to insert node: {}", e)))?;
@@ -547,6 +639,20 @@ impl GraphStore {
             )));
         }
         if epoch == 0 {
+            let digest_rows: i64 = tx
+                .query_row("SELECT COUNT(*) FROM module_digests", [], |row| row.get(0))
+                .map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to inspect epoch-zero module digest cache: {}",
+                        e
+                    ))
+                })?;
+            if digest_rows != 0 {
+                return Err(LatticeError::Storage(format!(
+                    "Invalid graph digest cache at epoch 0: found {} module rows",
+                    digest_rows
+                )));
+            }
             tx.commit().map_err(|e| {
                 LatticeError::Storage(format!("Failed to finish graph snapshot read: {}", e))
             })?;
@@ -695,7 +801,7 @@ impl GraphStore {
         // Load all nodes
         let mut stmt = conn
             .prepare(
-                "SELECT file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, edit_count, last_modified FROM nodes",
+                "SELECT file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified FROM nodes",
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare node query: {}", e)))?;
 
@@ -711,8 +817,7 @@ impl GraphStore {
                 let end_line: i64 = row.get(7)?;
                 let is_exported: i32 = row.get(8)?;
                 let language_str: String = row.get(9)?;
-                let edit_count: i64 = row.get(10)?;
-                let last_modified: i64 = row.get(11)?;
+                let last_modified: i64 = row.get(10)?;
 
                 Ok((
                     file,
@@ -725,7 +830,6 @@ impl GraphStore {
                     end_line,
                     is_exported,
                     language_str,
-                    edit_count,
                     last_modified,
                 ))
             })
@@ -743,7 +847,6 @@ impl GraphStore {
                 end_line,
                 is_exported,
                 language_str,
-                edit_count,
                 last_modified,
             ) =
                 row.map_err(|e| LatticeError::Storage(format!("Failed to read node row: {}", e)))?;
@@ -774,9 +877,8 @@ impl GraphStore {
                 language,
             );
 
-            // Update edit_count and last_modified on the node
+            // Restore persisted recency metadata after constructing the node.
             if let Some(node) = graph.get_node_mut_by_index(idx) {
-                node.edit_count = edit_count as u32;
                 node.last_modified = last_modified as u64;
             }
         }
@@ -999,6 +1101,31 @@ fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
 mod module_digest_tests {
     use super::*;
 
+    const LEGACY_SUPPORTING_TABLES: &str = r#"
+CREATE TABLE edges (
+    from_file TEXT NOT NULL,
+    from_name TEXT NOT NULL,
+    from_offset INTEGER NOT NULL,
+    to_file TEXT NOT NULL,
+    to_name TEXT NOT NULL,
+    to_offset INTEGER NOT NULL,
+    kind TEXT NOT NULL
+);
+CREATE TABLE file_index (
+    file TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    parser_version INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    last_indexed_at INTEGER NOT NULL
+);
+CREATE TABLE parsed_files (
+    file TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+"#;
+
     fn id(file: &str, name: &str) -> SymbolId {
         SymbolId {
             file: file.to_string(),
@@ -1032,6 +1159,174 @@ mod module_digest_tests {
             IndexSnapshotLoad::Ready(snapshot) => snapshot,
             IndexSnapshotLoad::DigestCacheMissing { .. } => panic!("expected ready snapshot"),
         }
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn opening_legacy_store_removes_edit_count_and_preserves_persisted_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-graph.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+CREATE TABLE nodes (
+    file TEXT NOT NULL,
+    name TEXT NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    body TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    is_exported INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    edit_count INTEGER NOT NULL DEFAULT 0,
+    last_modified INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file, name, byte_offset)
+);
+CREATE INDEX idx_nodes_file ON nodes(file);
+{LEGACY_SUPPORTING_TABLES}
+INSERT INTO nodes VALUES
+    ('src/a.rs', 'a', 0, 'Function', 'fn a()', '{{}}', 1, 1, 1, 'Rust', 19, 101),
+    ('src/b.rs', 'b', 7, 'Function', 'fn b()', '{{}}', 2, 2, 0, 'Rust', 23, 202);
+INSERT INTO edges VALUES ('src/a.rs', 'a', 0, 'src/b.rs', 'b', 7, 'Calls');
+INSERT INTO file_index VALUES ('src/a.rs', 'hash', 11, 22, 1, 1, 33);
+INSERT INTO parsed_files VALUES ('src/a.rs', '{{"legacy":true}}');
+"#
+        ))
+        .unwrap();
+        drop(conn);
+
+        let store = GraphStore::open(&path).unwrap();
+        let columns = column_names(&store.conn, "nodes");
+        assert!(!columns.iter().any(|column| column == "edit_count"));
+        assert_eq!(
+            columns,
+            [
+                "file",
+                "name",
+                "byte_offset",
+                "kind",
+                "signature",
+                "body",
+                "line",
+                "end_line",
+                "is_exported",
+                "language",
+                "last_modified",
+            ]
+        );
+
+        let graph = store.load_graph().unwrap();
+        assert_eq!(graph.node_count(), 2);
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(
+            graph.get_node(&id("src/a.rs", "a")).unwrap().last_modified,
+            101
+        );
+        assert_eq!(
+            store.load_file_index().unwrap()["src/a.rs"].content_hash,
+            "hash"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT payload FROM parsed_files WHERE file = 'src/a.rs'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"{"legacy":true}"#
+        );
+        drop(store);
+
+        // Reopening exercises the no-op path and must not rebuild or discard any data.
+        let reopened = GraphStore::open(&path).unwrap();
+        assert!(!column_names(&reopened.conn, "nodes")
+            .iter()
+            .any(|column| column == "edit_count"));
+        assert_eq!(reopened.load_graph().unwrap().node_count(), 2);
+        assert_eq!(reopened.load_graph().unwrap().edge_count(), 1);
+    }
+
+    #[test]
+    fn failed_legacy_nodes_rebuild_rolls_back_the_entire_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-legacy-graph.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+CREATE TABLE nodes (
+    file TEXT NOT NULL,
+    name TEXT NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    body TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    is_exported INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    edit_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file, name, byte_offset)
+);
+{LEGACY_SUPPORTING_TABLES}
+INSERT INTO nodes VALUES
+    ('src/a.rs', 'a', 0, 'Function', 'fn a()', '{{}}', 1, 1, 1, 'Rust', 19);
+INSERT INTO edges VALUES ('src/a.rs', 'a', 0, 'src/a.rs', 'a', 0, 'Calls');
+INSERT INTO file_index VALUES ('src/a.rs', 'hash', 11, 22, 1, 1, 33);
+"#
+        ))
+        .unwrap();
+        drop(conn);
+
+        let error = GraphStore::open(&path).err().unwrap().to_string();
+        assert!(
+            error.contains("Failed to copy legacy nodes during migration"),
+            "{error}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        assert!(column_names(&conn, "nodes")
+            .iter()
+            .any(|column| column == "edit_count"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM file_index", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes__lattice_legacy_edit_count'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1108,6 +1403,25 @@ mod module_digest_tests {
         assert_eq!(loaded.epoch, 1);
         assert!(loaded.module_digests.get("src/good.rs").is_some());
         assert!(loaded.module_digests.get("/absolute.rs").is_none());
+    }
+
+    #[test]
+    fn digest_persistence_failure_rolls_back_graph_digests_and_epoch() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.save_index_snapshot(&graph(&["src/old.rs"])).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_new_digest BEFORE INSERT ON module_digests \
+                 WHEN NEW.module_path = 'src/new.rs' BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+            )
+            .unwrap();
+
+        assert!(store.save_index_snapshot(&graph(&["src/new.rs"])).is_err());
+        let loaded = ready(store.load_index_snapshot().unwrap());
+        assert_eq!(loaded.epoch, 1);
+        assert!(loaded.module_digests.get("src/old.rs").is_some());
+        assert!(loaded.module_digests.get("src/new.rs").is_none());
     }
 
     #[test]

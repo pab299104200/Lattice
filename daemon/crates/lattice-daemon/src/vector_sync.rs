@@ -598,7 +598,6 @@ mod tests {
             end_line: 84,
             is_exported: false,
             language: Language::Python,
-            edit_count: 0,
             last_modified: 0,
         }
     }
@@ -627,7 +626,6 @@ def upsert_renewal_policy(org_id, payload):
             end_line: 410,
             is_exported: false,
             language: Language::Python,
-            edit_count: 0,
             last_modified: 0,
         }
     }

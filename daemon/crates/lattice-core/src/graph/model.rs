@@ -49,7 +49,6 @@ pub struct GraphNode {
     pub end_line: usize,
     pub is_exported: bool,
     pub language: Language,
-    pub edit_count: u32,
     pub last_modified: u64,
 }
 
@@ -130,7 +129,6 @@ impl CodeGraph {
                 end_line,
                 is_exported,
                 language,
-                edit_count: 0,
                 last_modified: 0,
             };
             let idx = self.graph.add_node(node);
