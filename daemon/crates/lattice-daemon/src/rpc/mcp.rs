@@ -18,7 +18,7 @@ use lattice_core::events::{
 use lattice_core::git_intelligence::GitIntelligenceSnapshot;
 use lattice_core::git_intelligence_consumers::{
     missing_cochange_partners, order_impact_within_tier, secondary_ranking_evidence,
-    GitIntelligenceView, ImpactCandidate,
+    select_hotspot_warnings, GitIntelligenceView, ImpactCandidate,
 };
 use lattice_core::graph::model::CodeGraph;
 use lattice_core::identity::MemoryId;
@@ -7548,14 +7548,19 @@ fn enrich_impact_tool_result_with_git_intelligence(
 ) {
     let view = git_intelligence_view(snapshot);
     let advisory = missing_cochange_partners(view, changed_paths);
+    let hotspot_warnings = select_hotspot_warnings(view, changed_paths);
     let mut payload = unwrap_tool_text_json(result).unwrap_or_else(|| result.clone());
-    attach_git_intelligence_presentation(
-        &mut payload,
-        json!({
-            "generation": snapshot.map(|published| published.generation),
-            "impact_advisory": advisory,
-        }),
-    );
+    let mut presentation = json!({
+        "generation": snapshot.map(|published| published.generation),
+        "impact_advisory": advisory,
+    });
+    if !hotspot_warnings.is_empty() {
+        presentation
+            .as_object_mut()
+            .expect("Git-intelligence presentation is an object")
+            .insert("hotspot_warnings".to_string(), json!(hotspot_warnings));
+    }
+    attach_git_intelligence_presentation(&mut payload, presentation);
     *result = wrap_tool_result(payload);
 }
 
@@ -13506,6 +13511,90 @@ def detect_agent_version_drift(agent, rollout):
     }
 
     #[test]
+    fn file_impact_presentation_surfaces_bounded_hotspot_warnings_and_stable_summary_marker() {
+        let stored = git_presentation_snapshot();
+        let published = super::McpGitIntelligenceSnapshot {
+            generation: stored.generation,
+            snapshot: Arc::new(stored.snapshot),
+            is_fresh: true,
+        };
+        let mut result = super::wrap_tool_result(json!({ "file": "src/hot.rs" }));
+
+        super::enrich_impact_tool_result_with_git_intelligence(
+            &mut result,
+            Some(&published),
+            &["src/hot.rs".to_string()],
+        );
+
+        let payload = super::unwrap_tool_text_json(&result).expect("file-impact payload");
+        assert_eq!(
+            payload["git_intelligence"]["hotspot_warnings"],
+            json!([{
+                "path": "src/hot.rs",
+                "hotspot_score": 3,
+                "window_commits": 4,
+                "head_commit_id": "head",
+            }])
+        );
+        let summary = super::build_tool_result_summary(&payload).expect("impact summary");
+        assert!(summary.contains(
+            "- Hotspot warning: `src/hot.rs` changed in 3/4 sampled commits; head `head`."
+        ));
+    }
+
+    #[test]
+    fn file_impact_omits_hotspot_warnings_for_unavailable_stale_and_degraded_history() {
+        let cases = [
+            (None, "unavailable"),
+            (
+                Some(super::McpGitIntelligenceSnapshot {
+                    generation: 7,
+                    snapshot: Arc::new(git_presentation_snapshot().snapshot),
+                    is_fresh: false,
+                }),
+                "stale",
+            ),
+            (
+                {
+                    let mut stored = git_presentation_snapshot();
+                    stored.snapshot.report.invalid_path_entries = 1;
+                    Some(super::McpGitIntelligenceSnapshot {
+                        generation: stored.generation,
+                        snapshot: Arc::new(stored.snapshot),
+                        is_fresh: true,
+                    })
+                },
+                "degraded",
+            ),
+        ];
+
+        for (snapshot, availability) in cases {
+            let mut result = super::wrap_tool_result(json!({ "file": "src/hot.rs" }));
+            super::enrich_impact_tool_result_with_git_intelligence(
+                &mut result,
+                snapshot.as_ref(),
+                &["src/hot.rs".to_string()],
+            );
+
+            let payload = super::unwrap_tool_text_json(&result).expect("file-impact payload");
+            let git = &payload["git_intelligence"];
+            assert_eq!(
+                git["impact_advisory"]["metadata"]["availability"],
+                availability
+            );
+            assert!(
+                git.get("hotspot_warnings").is_none(),
+                "{availability} history must not expose hotspot warnings: {git:?}"
+            );
+            let summary = super::build_tool_result_summary(&payload).expect("impact summary");
+            assert!(
+                !summary.contains("Hotspot warning:"),
+                "{availability} history must not expose hotspot summary marker: {summary}"
+            );
+        }
+    }
+
+    #[test]
     fn unavailable_and_stale_history_are_explicit_and_never_affect_results() {
         let mut unavailable = git_presentation_bundle();
         super::enrich_context_bundle_with_git_intelligence(&mut unavailable, None);
@@ -14200,6 +14289,8 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
         lines.push(format!("- Git history: {git_summary}"));
     }
 
+    lines.extend(git_intelligence_hotspot_warning_summary(object));
+
     if let Some(contract) =
         object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
     {
@@ -14223,12 +14314,7 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
 }
 
 fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<String> {
-    let git = object.get("git_intelligence").or_else(|| {
-        object
-            .get("structured_payload")
-            .and_then(Value::as_object)
-            .and_then(|payload| payload.get("git_intelligence"))
-    })?;
+    let git = git_intelligence_presentation(object)?;
     let metadata = git.get("metadata").or_else(|| {
         git.get("impact_advisory")
             .and_then(|advisory| advisory.get("metadata"))
@@ -14257,6 +14343,48 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
         _ => "no applicable presentation evidence".to_string(),
     };
     Some(format!("available across {window} commit(s); {detail}."))
+}
+
+fn git_intelligence_hotspot_warning_summary(
+    object: &serde_json::Map<String, Value>,
+) -> Vec<String> {
+    let Some(warnings) = git_intelligence_presentation(object)
+        .and_then(|git| git.get("hotspot_warnings"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    warnings
+        .iter()
+        .filter_map(|warning| {
+            let path = warning.get("path")?.as_str()?.trim();
+            let hotspot_score = warning.get("hotspot_score")?.as_u64()?;
+            let window_commits = warning.get("window_commits")?.as_u64()?;
+            if path.is_empty() || window_commits == 0 {
+                return None;
+            }
+            let head = warning
+                .get("head_commit_id")
+                .and_then(Value::as_str)
+                .map(|head| format!("; head `{head}`"))
+                .unwrap_or_default();
+            Some(format!(
+                "- Hotspot warning: `{path}` changed in {hotspot_score}/{window_commits} sampled commits{head}."
+            ))
+        })
+        .collect()
+}
+
+fn git_intelligence_presentation<'a>(
+    object: &'a serde_json::Map<String, Value>,
+) -> Option<&'a Value> {
+    object.get("git_intelligence").or_else(|| {
+        object
+            .get("structured_payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("git_intelligence"))
+    })
 }
 
 fn first_result_file(object: &serde_json::Map<String, Value>) -> Option<String> {
