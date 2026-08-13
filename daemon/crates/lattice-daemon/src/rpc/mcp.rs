@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
@@ -51,7 +51,8 @@ use super::workflow_v2::{
 };
 use super::working_memory_tool;
 use crate::adoption_metrics::{
-    source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore, ToolCallRecord,
+    source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore,
+    MemoryRetrievalRecord, ToolCallRecord,
 };
 use crate::index_health::IndexHealth;
 use crate::index_work::IndexWorkCoordinator;
@@ -91,6 +92,9 @@ pub struct McpHandler {
     context_cache: Arc<Mutex<ContextHandleCache>>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
+    /// Monotonic per-handler sequence so every observed retrieval has a
+    /// durable, joinable id without exposing internal ledger details on MCP.
+    memory_retrieval_sequence: AtomicU64,
     client_name: Arc<Mutex<Option<String>>>,
     event_capture: Option<Arc<EventCapture>>,
     workflow_outcome_recorder: Arc<WorkflowOutcomeRecorder>,
@@ -503,6 +507,7 @@ impl McpHandler {
             ))),
             session_metrics: Arc::new(Mutex::new(SessionMetrics::new())),
             adoption_metrics: Arc::new(AdoptionMetricsStore::new(&workspace_root)),
+            memory_retrieval_sequence: AtomicU64::new(0),
             client_name: Arc::new(Mutex::new(None)),
             event_capture,
             workflow_outcome_recorder: Arc::new(WorkflowOutcomeRecorder::new()),
@@ -2528,8 +2533,14 @@ impl McpHandler {
             outcome_memory_reuse_count: 0,
         };
 
-        self.finalize_workflow_value("get_context_capsule", value, &metadata, &response_options)
-            .await
+        self.finalize_workflow_value(
+            "get_context_capsule",
+            args,
+            value,
+            &metadata,
+            &response_options,
+        )
+        .await
     }
 
     async fn tool_prepare_change(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -2702,6 +2713,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "prepare_change",
+            args,
             workflow_bundle,
             &handle.legacy_handle,
             "prepare_change",
@@ -2880,6 +2892,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "plan_edit",
+            args,
             workflow_bundle,
             &handle.legacy_handle,
             "plan_edit",
@@ -2971,6 +2984,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "trace_scenario",
+            args,
             workflow_bundle,
             &handle.legacy_handle,
             "trace_scenario",
@@ -3041,6 +3055,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "find_relevant_tests",
+            args,
             bundle,
             &handle.legacy_handle,
             "find_relevant_tests",
@@ -3135,6 +3150,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "impact_from_diff",
+            args,
             bundle,
             &handle.legacy_handle,
             "impact_from_diff",
@@ -3230,6 +3246,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "get_working_set_context",
+            args,
             report,
             &handle.legacy_handle,
             "get_working_set_context",
@@ -3474,8 +3491,14 @@ impl McpHandler {
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "summarize_subsystem");
         attach_playbook_memory(&mut value, playbook_memory);
-        self.finalize_workflow_value("summarize_subsystem", value, &metadata, &response_options)
-            .await
+        self.finalize_workflow_value(
+            "summarize_subsystem",
+            args,
+            value,
+            &metadata,
+            &response_options,
+        )
+        .await
     }
 
     async fn tool_get_repo_playbook(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -3554,8 +3577,14 @@ impl McpHandler {
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "get_repo_playbook");
         attach_playbook_memory(&mut value, playbook_memory);
-        self.finalize_workflow_value("get_repo_playbook", value, &metadata, &response_options)
-            .await
+        self.finalize_workflow_value(
+            "get_repo_playbook",
+            args,
+            value,
+            &metadata,
+            &response_options,
+        )
+        .await
     }
 
     async fn tool_get_docs_capsule(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -3603,6 +3632,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "get_docs_capsule",
+            args,
             bundle,
             &handle.legacy_handle,
             "get_docs_capsule",
@@ -3759,6 +3789,7 @@ impl McpHandler {
 
         self.serialize_workflow_with_context_handle(
             "diagnose_failure",
+            args,
             workflow_bundle,
             &handle.legacy_handle,
             "diagnose_failure",
@@ -4063,6 +4094,7 @@ impl McpHandler {
     async fn serialize_workflow_with_context_handle<T: serde::Serialize>(
         &self,
         tool_name: &str,
+        arguments: &Value,
         report: T,
         handle: &str,
         origin: &str,
@@ -4072,17 +4104,22 @@ impl McpHandler {
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, handle, origin);
-        self.finalize_workflow_value(tool_name, value, metadata, response_options)
+        self.finalize_workflow_value(tool_name, arguments, value, metadata, response_options)
             .await
     }
 
     async fn finalize_workflow_value(
         &self,
         tool_name: &str,
+        arguments: &Value,
         mut value: Value,
         metadata: &WorkflowRunMetadata,
         response_options: &WorkflowResponseOptions,
     ) -> Result<Value, (i32, String)> {
+        if let Some(retrieved_count) = workflow_memory_result_count(&value) {
+            self.record_memory_retrieval(tool_name, arguments, retrieved_count)
+                .await;
+        }
         let pruning_profile = self.session_pruning_profile().await;
         let mut metadata = metadata.clone();
         let mut budget = select_workflow_budget(
@@ -4505,6 +4542,37 @@ impl McpHandler {
         }
     }
 
+    async fn record_memory_retrieval(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        retrieved_count: usize,
+    ) {
+        let default_client = self
+            .client_name
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "mcp".to_string());
+        let source = source_from_arguments(arguments, &default_client, "mcp");
+        let sequence = self
+            .memory_retrieval_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        let retrieval_id = format!("{}-{tool_name}-{sequence}", self.session_id);
+        if let Err(error) = self
+            .adoption_metrics
+            .record_memory_retrieval(MemoryRetrievalRecord {
+                session_id: self.session_id.clone(),
+                client: source.client,
+                channel: source.channel,
+                retrieval_id,
+                retrieved_count: retrieved_count as u64,
+            })
+        {
+            tracing::warn!(%error, tool = tool_name, "failed to record memory retrieval metrics");
+        }
+    }
+
     async fn tool_get_symbol(&self, args: &Value) -> Result<Value, (i32, String)> {
         let name = args["name"]
             .as_str()
@@ -4804,7 +4872,7 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(10) as usize).min(100);
 
         if self.shared_memory.is_some() {
-            return self.tool_search_memory_merged(query, limit).await;
+            return self.tool_search_memory_merged(query, limit, args).await;
         }
 
         let store = self.memory_store.lock().await;
@@ -4938,6 +5006,10 @@ impl McpHandler {
         let memories: Vec<Memory> = ranked.into_iter().map(|(memory, _, _, _)| memory).collect();
         let mut memory_values = serialize_memory_values(&store, &memories, true)?;
         annotate_memory_freshness_values(&mut memory_values, &memories, &self.workspace_root);
+        let retrieved_count = memory_values.len();
+        drop(store);
+        self.record_memory_retrieval("search_memory", args, retrieved_count)
+            .await;
 
         Ok(wrap_tool_result(json!({
             "query": query,
@@ -4960,6 +5032,7 @@ impl McpHandler {
         &self,
         query: &str,
         limit: usize,
+        args: &Value,
     ) -> Result<Value, (i32, String)> {
         let runtime = self.shared_memory.as_ref().expect("checked above");
         let authority = runtime
@@ -4972,45 +5045,53 @@ impl McpHandler {
             .map_err(|error| (-32602, error))?;
         let repository_store = self.memory_store.lock().await;
         let shared_store = runtime.store.lock().await;
-        let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
-            .map_err(|error| {
-                (
-                    -32603,
-                    format!("Failed to initialize shared memory router: {error}"),
-                )
-            })?;
-        let recalled = router
-            .recall(Some(query), limit)
-            .map_err(|error| (-32603, format!("Failed to recall scoped memory: {error}")))?;
-        let mut values = Vec::with_capacity(recalled.len());
-        for result in recalled {
-            let store = match result.source_tier {
-                MemoryRecallTier::Repository => &*repository_store,
-                MemoryRecallTier::Organization => &*shared_store,
-            };
-            let mut value = serialize_memory_value(store, &result.memory, true)?;
-            annotate_shared_memory_value(
-                &mut value,
-                &result.memory_id.encoded(),
-                match result.source_tier {
-                    MemoryRecallTier::Repository => "repository",
-                    MemoryRecallTier::Organization => "organization",
-                },
-                result.cross_repo,
-                result.origin_repository_id.as_deref(),
-                result.origin_checkout_id.as_deref(),
-                result.effective_verification_status.as_str(),
-                &result.trust_reason,
-            );
-            if let Some(object) = value.as_object_mut() {
-                object.insert("assertion_key".to_string(), json!(result.assertion_key));
-                object.insert(
-                    "origin_verification_status".to_string(),
-                    json!(result.origin_verification_status.as_str()),
+        let values = {
+            let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to initialize shared memory router: {error}"),
+                    )
+                })?;
+            let recalled = router
+                .recall(Some(query), limit)
+                .map_err(|error| (-32603, format!("Failed to recall scoped memory: {error}")))?;
+            let mut values = Vec::with_capacity(recalled.len());
+            for result in recalled {
+                let store = match result.source_tier {
+                    MemoryRecallTier::Repository => &*repository_store,
+                    MemoryRecallTier::Organization => &*shared_store,
+                };
+                let mut value = serialize_memory_value(store, &result.memory, true)?;
+                annotate_shared_memory_value(
+                    &mut value,
+                    &result.memory_id.encoded(),
+                    match result.source_tier {
+                        MemoryRecallTier::Repository => "repository",
+                        MemoryRecallTier::Organization => "organization",
+                    },
+                    result.cross_repo,
+                    result.origin_repository_id.as_deref(),
+                    result.origin_checkout_id.as_deref(),
+                    result.effective_verification_status.as_str(),
+                    &result.trust_reason,
                 );
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("assertion_key".to_string(), json!(result.assertion_key));
+                    object.insert(
+                        "origin_verification_status".to_string(),
+                        json!(result.origin_verification_status.as_str()),
+                    );
+                }
+                values.push(value);
             }
-            values.push(value);
-        }
+            values
+        };
+        let retrieved_count = values.len();
+        drop(shared_store);
+        drop(repository_store);
+        self.record_memory_retrieval("search_memory", args, retrieved_count)
+            .await;
         Ok(wrap_tool_result(json!({
             "query": query,
             "memories": values,
@@ -5452,6 +5533,8 @@ impl McpHandler {
             clipped,
         )
         .map_err(|error| (-32603, error))?;
+        let retrieved_count = bundle.memories.len();
+        drop(store);
         if let Some(capture) = &self.event_capture {
             let ids: Vec<_> = bundle
                 .memories
@@ -5470,6 +5553,8 @@ impl McpHandler {
                 tracing::warn!(tool = "get_task_memory", %error, "failed to capture memory retrieval");
             }
         }
+        self.record_memory_retrieval("get_task_memory", args, retrieved_count)
+            .await;
         serde_json::to_value(&bundle)
             .map(wrap_tool_result)
             .map_err(|error| (-32603, format!("Serialization error: {error}")))
@@ -9803,7 +9888,7 @@ mod tests {
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
         wrap_tool_result, wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler,
-        SharedMemoryRuntime, WorkflowRenderMode, FULL_WORKFLOW_TOKEN_CAP,
+        SharedMemoryRuntime, WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -10448,6 +10533,133 @@ mod tests {
         assert_eq!(payload["context_handle"].as_str(), Some("ctx-json"));
         assert!(!text.contains("### Summary"));
         assert!(!text.contains("lattice-metrics"));
+    }
+
+    #[test]
+    fn workflow_memory_result_count_uses_the_canonical_collection() {
+        assert_eq!(
+            super::workflow_memory_result_count(&json!({
+                "memories": [{"id": "raw"}],
+                "memory_highlights": [{"id": "shown"}, {"id": "shown-2"}]
+            })),
+            Some(2)
+        );
+        assert_eq!(
+            super::workflow_memory_result_count(&json!({"memory_highlights": []})),
+            Some(0)
+        );
+        assert_eq!(
+            super::workflow_memory_result_count(&json!({"files": []})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_memory_results_record_retrieval_metrics_without_changing_payloads() {
+        let (handler, memory_store, workspace_root) = build_memory_test_handler("metrics-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        {
+            let store = memory_store.lock().await;
+            store
+                .store(Memory {
+                    id: String::new(),
+                    session_id: "prior-session".to_string(),
+                    content: "Recall metrics prove memory retrieval wiring".to_string(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 0.9,
+                    linked_symbols: Vec::new(),
+                    linked_files: Vec::new(),
+                    workspace_id: Some(workspace_id),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: Some("retrieval metrics".to_string()),
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Verified,
+                })
+                .expect("seed recall memory");
+        }
+
+        let response = RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "retrieval metrics",
+                    "_lattice_client": "codex",
+                    "_lattice_channel": "mcp"
+                }
+            }),
+        )
+        .await
+        .expect("search memory through MCP");
+        let payload = parse_wrapped_tool_payload(
+            response["content"][0]["text"]
+                .as_str()
+                .expect("wrapped response text"),
+        )
+        .expect("search payload");
+        assert_eq!(payload["count"].as_u64(), Some(1));
+
+        let metric_path = workspace_root.join(".lattice/adoption_metrics.jsonl");
+        let events: Vec<Value> = std::fs::read_to_string(&metric_path)
+            .expect("memory metric ledger")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid metric event"))
+            .collect();
+        let retrieval = events
+            .iter()
+            .find(|event| event["kind"] == "memory_retrieval")
+            .expect("memory retrieval metric");
+        assert_eq!(retrieval["session_id"].as_str(), Some("metrics-session"));
+        assert_eq!(retrieval["client"].as_str(), Some("codex"));
+        assert_eq!(retrieval["channel"].as_str(), Some("mcp"));
+        assert_eq!(retrieval["retrieved_count"].as_u64(), Some(1));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workflow_memory_results_record_empty_recall_misses() {
+        let (handler, _, workspace_root) = build_memory_test_handler("workflow-metrics-session");
+        let response_options = parse_workflow_response_options(&json!({"render": "json"}))
+            .expect("workflow response options");
+        let metadata = WorkflowRunMetadata {
+            delivery_mode: "compact".to_string(),
+            wire_format: "standard".to_string(),
+            single_anchor_used: false,
+            _mode_reason: "test".to_string(),
+            semantic_fallback_used: false,
+            outcome_memory_reuse_count: 0,
+        };
+        handler
+            .finalize_workflow_value(
+                "prepare_change",
+                &json!({"_lattice_client": "codex", "_lattice_channel": "mcp"}),
+                json!({"memory_highlights": []}),
+                &metadata,
+                &response_options,
+            )
+            .await
+            .expect("workflow finalization");
+
+        let metric_path = workspace_root.join(".lattice/adoption_metrics.jsonl");
+        let event: Value = std::fs::read_to_string(&metric_path)
+            .expect("workflow metric ledger")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid metric event"))
+            .next()
+            .expect("workflow retrieval event");
+        assert_eq!(event["kind"].as_str(), Some("memory_retrieval"));
+        assert_eq!(event["retrieved_count"].as_u64(), Some(0));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[test]
@@ -12550,6 +12762,18 @@ fn wrap_text_result(text: String) -> Value {
             "text": text
         }]
     })
+}
+
+/// Workflow bundles expose one canonical memory collection. We record an
+/// empty collection too: a recall miss is operationally distinct from a tool
+/// that did not attempt memory retrieval.
+fn workflow_memory_result_count(value: &Value) -> Option<usize> {
+    let object = value.as_object()?;
+    object
+        .get("memory_highlights")
+        .or_else(|| object.get("memories"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
 }
 
 fn object_get<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
