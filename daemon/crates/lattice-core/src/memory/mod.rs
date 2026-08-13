@@ -1,4 +1,5 @@
 pub mod model;
+pub mod router;
 pub mod store;
 
 #[cfg(test)]
@@ -10,3 +11,7 @@ pub use model::{
     MemoryVerificationStatus,
 };
 pub use store::MemoryStore;
+pub use router::{
+    AuthorityQualifiedMemoryId, MemoryAuthority, MemoryQueryAuthority, MemoryRecallResult,
+    MemoryRecallTier, MemoryStoreRole, MemoryStoreRouter,
+};
