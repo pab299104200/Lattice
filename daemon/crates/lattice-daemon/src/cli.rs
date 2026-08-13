@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,7 +88,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics\n  install <mcp|claude-code|codex>\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  install <mcp|claude-code|codex>\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -840,9 +841,13 @@ fn daemon_connection_message(error: &std::io::Error) -> String {
 }
 
 fn run_metrics_command(args: Vec<String>) -> i32 {
-    match parse_metrics_args(args)
-        .and_then(|(workspace, days, json)| render_metrics_for_workspace(&workspace, days, json))
-    {
+    match parse_metrics_args(args).and_then(|(workspace, days, json, memory)| {
+        if memory {
+            render_memory_metrics_for_workspace(&workspace, days, json)
+        } else {
+            render_metrics_for_workspace(&workspace, days, json)
+        }
+    }) {
         Ok(output) => {
             println!("{}", output.trim_end());
             0
@@ -854,14 +859,16 @@ fn run_metrics_command(args: Vec<String>) -> i32 {
     }
 }
 
-fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool)> {
+fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool, bool)> {
     let mut workspace = None;
     let mut days = 14usize;
     let mut json = false;
+    let mut memory = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json = true,
+            "--memory" => memory = true,
             "--workspace" | "-w" => {
                 let value = args
                     .get(i + 1)
@@ -885,7 +892,106 @@ fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool)> {
         }
         i += 1;
     }
-    Ok((workspace.unwrap_or(detect_workspace_root()?), days, json))
+    Ok((
+        workspace.unwrap_or(detect_workspace_root()?),
+        days,
+        json,
+        memory,
+    ))
+}
+
+/// Project the memory counters from the durable adoption ledger. This keeps
+/// `--memory` read-only and uses the same attribution and retention behavior as
+/// the regular metrics view.
+fn render_memory_metrics_for_workspace(
+    workspace: &Path,
+    days: usize,
+    json: bool,
+) -> Result<String> {
+    let visible_days = render_metrics_for_workspace(workspace, days, false)?
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split('|').next().map(str::trim))
+        .filter(|day| !day.is_empty() && !day.starts_with('_'))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let ledger_text = render_metrics_for_workspace(workspace, days, true)?;
+    let ledger: Value =
+        serde_json::from_str(&ledger_text).context("adoption metrics ledger is not valid JSON")?;
+    let days_value = ledger
+        .get("days")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("adoption metrics ledger has no days object"))?;
+    let mut rows = Vec::new();
+    for (day, clients) in days_value {
+        if !visible_days.contains(day) {
+            continue;
+        }
+        let Some(clients) = clients.as_object() else {
+            continue;
+        };
+        for (client, channels) in clients {
+            let Some(channels) = channels.as_object() else {
+                continue;
+            };
+            for (channel, tools) in channels {
+                let Some(counter) = tools.get("memory") else {
+                    continue;
+                };
+                rows.push(json!({
+                    "day": day,
+                    "client": client,
+                    "channel": channel,
+                    "retrievals": counter.get("memory_retrievals").cloned().unwrap_or_else(|| json!(0)),
+                    "memories_returned": counter.get("memory_retrieved_items").cloned().unwrap_or_else(|| json!(0)),
+                    "memories_used": counter.get("memory_used_items").cloned().unwrap_or_else(|| json!(0)),
+                    "injections": counter.get("memory_injections").cloned().unwrap_or_else(|| json!(0)),
+                    "memories_shown": counter.get("memory_injected_items").cloned().unwrap_or_else(|| json!(0)),
+                    "injection_actions": counter.get("memory_injection_actions").cloned().unwrap_or_else(|| json!(0)),
+                }));
+            }
+        }
+    }
+    if json {
+        return Ok(serde_json::to_string_pretty(&json!({ "days": rows }))?);
+    }
+    let mut out = String::from("day | client | channel | retrievals | memories_returned | memories_used | use_rate | injections | memories_shown | injection_actions | action_rate\n");
+    out.push_str("--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---:\n");
+    if rows.is_empty() {
+        out.push_str("_no memory metrics recorded_\n");
+        return Ok(out);
+    }
+    for row in rows {
+        let returned = row["memories_returned"].as_u64().unwrap_or(0);
+        let used = row["memories_used"].as_u64().unwrap_or(0);
+        let shown = row["memories_shown"].as_u64().unwrap_or(0);
+        let actions = row["injection_actions"].as_u64().unwrap_or(0);
+        let use_rate = if returned == 0 {
+            0.0
+        } else {
+            used as f64 * 100.0 / returned as f64
+        };
+        let action_rate = if shown == 0 {
+            0.0
+        } else {
+            actions as f64 * 100.0 / shown as f64
+        };
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {} | {} | {:.0}% | {} | {} | {} | {:.0}%\n",
+            row["day"].as_str().unwrap_or("unknown"),
+            row["client"].as_str().unwrap_or("unknown"),
+            row["channel"].as_str().unwrap_or("unknown"),
+            row["retrievals"],
+            row["memories_returned"],
+            row["memories_used"],
+            use_rate,
+            row["injections"],
+            row["memories_shown"],
+            row["injection_actions"],
+            action_rate,
+        ));
+    }
+    Ok(out)
 }
 
 fn attach_invocation_metadata(arguments: &mut Value) {
@@ -1461,6 +1567,66 @@ mod tests {
         assert!(message.contains("localhost access was denied"));
         assert!(message.contains("blocked by sandbox"));
         assert!(!message.contains("daemon not running"));
+    }
+
+    #[test]
+    fn parses_memory_metrics_view_flag() {
+        let workspace = std::env::current_dir().unwrap();
+        let (parsed_workspace, days, json, memory) = parse_metrics_args(vec![
+            "lattice".into(),
+            "metrics".into(),
+            "--memory".into(),
+            "--days".into(),
+            "7".into(),
+            "--json".into(),
+            "--workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(parsed_workspace, workspace.canonicalize().unwrap());
+        assert_eq!(days, 7);
+        assert!(json);
+        assert!(memory);
+    }
+
+    #[test]
+    fn memory_metrics_view_projects_retrieval_and_injection_counters() {
+        let root = std::env::temp_dir().join(format!(
+            "lattice-memory-metrics-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".lattice")).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let events = [
+            json!({"kind":"memory_retrieval","timestamp_secs":now,"session_id":"s","client":"codex","channel":"cli","retrieval_id":"r","retrieved_count":3}),
+            json!({"kind":"memory_use","timestamp_secs":now,"retrieval_id":"r","used_count":2}),
+            json!({"kind":"memory_injection","timestamp_secs":now,"session_id":"s","client":"codex","channel":"cli","injection_id":"i","shown_count":2}),
+            json!({"kind":"memory_injection_action","timestamp_secs":now,"injection_id":"i","acted_count":1}),
+        ];
+        let text = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(root.join(".lattice/adoption_metrics.jsonl"), text).unwrap();
+
+        let markdown = render_memory_metrics_for_workspace(&root, 14, false).unwrap();
+        assert!(markdown.contains("retrievals"));
+        assert!(
+            markdown.contains("| 1 | 3 | 2 | 67% | 1 | 2 | 1 | 50%"),
+            "{markdown}"
+        );
+        let json_output = render_memory_metrics_for_workspace(&root, 14, true).unwrap();
+        let value: Value = serde_json::from_str(&json_output).unwrap();
+        assert_eq!(value["days"].as_array().unwrap()[0]["retrievals"], 1);
+        assert_eq!(value["days"].as_array().unwrap()[0]["injection_actions"], 1);
     }
 
     #[test]
