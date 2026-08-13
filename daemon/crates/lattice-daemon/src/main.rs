@@ -528,6 +528,8 @@ pub(crate) struct WorkspaceRuntime {
     pub(crate) handler: Arc<McpHandler>,
     background_tasks: Vec<JoinHandle<()>>,
     compaction_scheduler: Option<SchedulerHandle>,
+    session_capture_retention:
+        Option<session_digest_consolidation_runtime::SessionCaptureRetentionHandle>,
     session_digest_consolidation:
         Option<session_digest_consolidation_runtime::SessionDigestConsolidationHandle>,
 }
@@ -540,6 +542,9 @@ impl WorkspaceRuntime {
         }
         if let Some(scheduler) = self.compaction_scheduler.take() {
             scheduler.shutdown().await;
+        }
+        if let Some(runtime) = self.session_capture_retention.take() {
+            runtime.shutdown().await;
         }
         if let Some(runtime) = self.session_digest_consolidation.take() {
             runtime.shutdown().await;
@@ -872,6 +877,11 @@ pub(crate) async fn build_workspace_runtime(
         memories_path.clone(),
         Arc::clone(&event_writer),
     );
+    let session_capture_retention = session_digest_consolidation_runtime::start_capture_retention(
+        memory_identity.repository_id.clone(),
+        memory_identity.checkout_id.clone(),
+        memories_path.clone(),
+    );
     {
         let handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {
@@ -887,6 +897,7 @@ pub(crate) async fn build_workspace_runtime(
         handler,
         background_tasks,
         compaction_scheduler,
+        session_capture_retention,
         session_digest_consolidation,
     })
 }
