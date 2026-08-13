@@ -26,7 +26,13 @@ with open(sys.argv[1], "a", encoding="utf-8") as log:
     }, separators=(",", ":")), file=log)
 PY
 case "$1" in
-  status) printf '%s\n' 'ready' ;;
+  status)
+    if [[ "${LATTICE_HOOK_TEST_STALE:-0}" == "1" && "$*" == *"--files"* ]]; then
+      printf '%s\n' '{"count":1,"memories":[{"is_stale":true,"verification_status":"stale","linked_files":["src/example.rs"]}]}'
+    else
+      printf '%s\n' 'ready'
+    fi
+    ;;
   recall) printf '%s\n' '{"content":[{"text":"{\"markdown\":\"remembered task\"}"}]}' ;;
   context)
     if [[ "$2" == "repo rules and operator workflow" ]]; then
@@ -121,6 +127,13 @@ exercise_package() {
     assert_claude_envelope "UserPromptSubmit" "$prompt_output"
     assert_claude_envelope "PostToolUse" "$impact_output"
   fi
+
+  stale_output="$(LATTICE_BIN="$fake_lattice" LATTICE_HOOK_COMMAND_LOG="$temp_dir/commands" LATTICE_HOOK_TEST_STALE=1 "$hooks_dir/post-tool-use.sh" <<<'{"file_path":"src/example.rs"}')"
+  [[ "$stale_output" == *'## Lattice Memory Warning'* ]]
+  [[ "$stale_output" == *'verification_status'* ]]
+  if [[ "$client_name" == "claude-code" ]]; then
+    assert_claude_envelope "PostToolUse" "$stale_output"
+  fi
 }
 
 exercise_package codex "$codex_hooks_dir"
@@ -134,6 +147,8 @@ assert_command '{"argv":["status","--timeout","0.5"],"client_name":"claude-code"
 assert_command '{"argv":["context","explain hook delivery","--mode","auto","--min-relevance","0.25","--timeout","3.5"],"client_name":"claude-code","client_channel":"hook","skip_metrics":null}'
 assert_command '{"argv":["context","explain hook delivery","--mode","auto","--min-relevance","0.25","--timeout","3.5"],"client_name":"codex","client_channel":"hook","skip_metrics":null}'
 assert_command '{"argv":["remember","Session edited files: src/example.rs, README.md","--kind","outcome","--timeout","2.5"],"client_name":"claude-code","client_channel":"hook","skip_metrics":null}'
+assert_command '{"argv":["status","--files","src/example.rs","--timeout","1.5"],"client_name":"codex","client_channel":"hook","skip_metrics":null}'
+assert_command '{"argv":["status","--files","src/example.rs","--timeout","1.5"],"client_name":"claude-code","client_channel":"hook","skip_metrics":null}'
 
 unavailable_lattice="$temp_dir/unavailable-lattice"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$unavailable_lattice"

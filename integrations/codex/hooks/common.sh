@@ -94,6 +94,47 @@ lattice_hook_call() {
     return "$primary_status"
   fi
 
+  if [[ "${1:-}" == "impact" && -n "${2:-}" ]]; then
+    local edited_file="$2" impact memory_warning
+    impact="$(lattice_hook_call_raw "$@")"
+    local primary_status=$?
+
+    # `status --files` is deliberately queried with the exact file selected by
+    # PostToolUse. Keep this advisory bounded and silent for unavailable,
+    # empty, or ordinary index/status responses.
+    memory_warning="$(
+      lattice_hook_call_raw status --files "$edited_file" --timeout "${LATTICE_HOOK_MEMORY_TIMEOUT:-1.5}" 2>/dev/null \
+        | python3 -c '
+import sys
+
+raw = sys.stdin.read()
+signals = ("stale", "unverified", "invalidated", "expired", "contradicted", "superseded")
+lines = [line.strip() for line in raw.splitlines() if line.strip()]
+matches = []
+for line in lines:
+    lowered = line.lower()
+    if "is_stale" in lowered and "false" in lowered:
+        continue
+    if "verification_status" in lowered and not any(signal in lowered for signal in signals):
+        continue
+    if any(signal in lowered for signal in signals):
+        matches.append(line)
+if not matches:
+    raise SystemExit
+
+text = "\n".join(matches[:5])[:1200].strip()
+if text:
+    print(text)
+'
+    )"
+
+    [[ -n "${impact//[[:space:]]/}" ]] && printf '%s\n' "$impact"
+    if [[ -n "${memory_warning//[[:space:]]/}" ]]; then
+      printf '## Lattice Memory Warning\n\nThe edited file has file-linked memory that may need verification:\n%s\n' "$memory_warning"
+    fi
+    return "$primary_status"
+  fi
+
   lattice_hook_call_raw "$@"
 }
 
