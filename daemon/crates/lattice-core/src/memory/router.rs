@@ -6,6 +6,7 @@
 //! trusted handler authority, and preserves the owning authority in every
 //! returned identifier.
 
+use super::model::MemoryProvenance;
 use super::{Memory, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryVerificationStatus};
 use crate::error::LatticeError;
 use crate::events::BranchRef;
@@ -16,6 +17,9 @@ use std::cmp::Ordering;
 
 const STORE_ROLE_TABLE: &str = "lattice_memory_store_metadata";
 const STORE_AUDIT_TABLE: &str = "lattice_memory_scope_audit";
+const REPOSITORY_ID_METADATA_KEY: &str = "repository_id";
+const SHARED_STORE_QUERY_WORKSPACE_ID: &str = "__lattice_shared_memory_router__";
+const ORIGIN_CHECKOUT_PROVENANCE_SOURCE: &str = "lattice.memory.origin_checkout.v1";
 
 /// The authority that owns a record. It is part of the public memory identity,
 /// so a shared memory can never be relabeled as belonging to the querying
@@ -102,12 +106,15 @@ impl MemoryQueryAuthority {
     }
 
     fn organization_scope_filter(&self, organization_id: &str) -> ScopeFilter {
+        // ScopeFilter is a union of repository, branch, session, and
+        // organization visibility. A shared store must admit organization rows
+        // only, so keep its non-organization branches impossible and enforce
+        // the exact scope again after querying malformed legacy rows.
         ScopeFilter::new(
-            self.repository_id.clone(),
-            self.branch.clone().map(|name| BranchRef { name }),
+            SHARED_STORE_QUERY_WORKSPACE_ID,
+            None,
             Some(organization_id.to_string()),
         )
-        .for_session(self.session_id.clone())
     }
 }
 
@@ -203,7 +210,10 @@ impl<'a> MemoryStoreRouter<'a> {
                         .as_deref()
                         .is_some_and(|id| id != configured)
                 {
-                    self.audit_denial("remember", "organization authority does not match daemon configuration")?;
+                    self.audit_denial(
+                        "remember",
+                        "organization authority does not match daemon configuration",
+                    )?;
                     return Err(LatticeError::Storage(
                         "organization memory request does not match configured organization authority"
                             .to_string(),
@@ -219,8 +229,11 @@ impl<'a> MemoryStoreRouter<'a> {
                 memory.workspace_id = Some(self.authority.repository_id.clone());
                 memory.branch = None;
                 memory.verification_status = MemoryVerificationStatus::Unverified;
+                let mut shared_fields = fields.clone();
+                shared_fields.verification_status = MemoryVerificationStatus::Unverified;
+                record_origin_checkout(&mut shared_fields, &self.authority.checkout_id);
                 let id = store.store(memory)?;
-                store.update_structured_fields(&id, fields)?;
+                store.update_structured_fields(&id, &shared_fields)?;
                 Ok(AuthorityQualifiedMemoryId {
                     authority: MemoryAuthority::Organization(configured.to_string()),
                     local_id: id,
@@ -228,14 +241,18 @@ impl<'a> MemoryStoreRouter<'a> {
             }
             _ => {
                 if requested_organization_id.is_some() {
-                    self.audit_denial("remember", "non-organization memory supplied organization authority")?;
+                    self.audit_denial(
+                        "remember",
+                        "non-organization memory supplied organization authority",
+                    )?;
                     return Err(LatticeError::Storage(
                         "only organization-scoped memory may name an organization".to_string(),
                     ));
                 }
                 memory.workspace_id = Some(self.authority.repository_id.clone());
                 let id = self.repository_store.store(memory)?;
-                self.repository_store.update_structured_fields(&id, fields)?;
+                self.repository_store
+                    .update_structured_fields(&id, fields)?;
                 Ok(AuthorityQualifiedMemoryId {
                     authority: MemoryAuthority::Repository(self.authority.repository_id.clone()),
                     local_id: id,
@@ -254,13 +271,17 @@ impl<'a> MemoryStoreRouter<'a> {
     ) -> Result<Vec<MemoryRecallResult>, LatticeError> {
         let limit = limit.max(1);
         let oversample = limit.saturating_mul(2).clamp(8, 64);
-        let repository = self
-            .repository_store
-            .query(keyword, oversample, &self.authority.repository_scope_filter())?;
+        let repository = self.repository_store.query(
+            keyword,
+            oversample,
+            &self.authority.repository_scope_filter(),
+        )?;
         let mut ranked = repository
             .into_iter()
             .enumerate()
-            .map(|(query_rank, memory)| self.normalize(memory, MemoryRecallTier::Repository, query_rank))
+            .map(|(query_rank, memory)| {
+                self.normalize(memory, MemoryRecallTier::Repository, query_rank)
+            })
             .collect::<Vec<_>>();
 
         if let (Some(organization_id), Some(shared_store)) =
@@ -271,10 +292,22 @@ impl<'a> MemoryStoreRouter<'a> {
                 oversample,
                 &self.authority.organization_scope_filter(organization_id),
             )?;
-            ranked.extend(shared.into_iter().enumerate().map(|(query_rank, memory)| {
-                self.normalize(memory, MemoryRecallTier::Organization, query_rank)
-            }));
+            ranked.extend(
+                shared
+                    .into_iter()
+                    .filter(|memory| {
+                        memory.scope == MemoryScope::Organization
+                            && memory.scope_organization_id.as_deref() == Some(organization_id)
+                    })
+                    .filter(recall_eligible)
+                    .enumerate()
+                    .map(|(query_rank, memory)| {
+                        self.normalize(memory, MemoryRecallTier::Organization, query_rank)
+                    }),
+            );
         }
+
+        ranked.retain(|ranked| recall_eligible(&ranked.result.memory));
 
         ranked.sort_by(|left, right| recall_order(left, right));
         ranked.dedup_by(|left, right| left.result.memory_id == right.result.memory_id);
@@ -315,12 +348,7 @@ impl<'a> MemoryStoreRouter<'a> {
         Ok(migrated)
     }
 
-    fn normalize(
-        &self,
-        memory: Memory,
-        tier: MemoryRecallTier,
-        query_rank: usize,
-    ) -> RankedRecall {
+    fn normalize(&self, memory: Memory, tier: MemoryRecallTier, query_rank: usize) -> RankedRecall {
         let authority = match tier {
             MemoryRecallTier::Repository => {
                 MemoryAuthority::Repository(self.authority.repository_id.clone())
@@ -399,11 +427,34 @@ struct RankedRecall {
 fn recall_order(left: &RankedRecall, right: &RankedRecall) -> Ordering {
     left.query_rank
         .cmp(&right.query_rank)
-        .then_with(|| verification_rank(right.result.effective_verification_status).cmp(&verification_rank(left.result.effective_verification_status)))
+        .then_with(|| {
+            verification_rank(right.result.effective_verification_status).cmp(&verification_rank(
+                left.result.effective_verification_status,
+            ))
+        })
         .then_with(|| tier_rank(right.result.source_tier).cmp(&tier_rank(left.result.source_tier)))
-        .then_with(|| right.result.memory.confidence.partial_cmp(&left.result.memory.confidence).unwrap_or(Ordering::Equal))
-        .then_with(|| right.result.memory.access_count.cmp(&left.result.memory.access_count))
-        .then_with(|| right.result.memory.created_at.cmp(&left.result.memory.created_at))
+        .then_with(|| {
+            right
+                .result
+                .memory
+                .confidence
+                .partial_cmp(&left.result.memory.confidence)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| {
+            right
+                .result
+                .memory
+                .access_count
+                .cmp(&left.result.memory.access_count)
+        })
+        .then_with(|| {
+            right
+                .result
+                .memory
+                .created_at
+                .cmp(&left.result.memory.created_at)
+        })
         .then_with(|| left.result.memory_id.cmp(&right.result.memory_id))
 }
 
@@ -418,6 +469,35 @@ fn verification_rank(status: MemoryVerificationStatus) -> u8 {
         | MemoryVerificationStatus::Contradicted
         | MemoryVerificationStatus::Invalidated => 0,
     }
+}
+
+fn recall_eligible(memory: &Memory) -> bool {
+    !memory.is_stale
+        && !matches!(
+            memory.verification_status,
+            MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+}
+
+fn record_origin_checkout(fields: &mut MemoryStructuredFields, checkout_id: &str) {
+    if fields.provenance.iter().any(|entry| {
+        entry.source == ORIGIN_CHECKOUT_PROVENANCE_SOURCE
+            && entry.reference.as_deref() == Some(checkout_id)
+    }) {
+        return;
+    }
+    fields.provenance.push(MemoryProvenance {
+        source: ORIGIN_CHECKOUT_PROVENANCE_SOURCE.to_string(),
+        reference: Some(checkout_id.to_string()),
+        captured_at: None,
+        note: Some(
+            "origin checkout identity recorded by the authority-bound memory router".to_string(),
+        ),
+    });
 }
 
 fn tier_rank(tier: MemoryRecallTier) -> u8 {
@@ -468,17 +548,56 @@ fn ensure_store_role(store: &MemoryStore, role: &MemoryStoreRole) -> Result<(), 
                 "memory store role mismatch: database is '{found}', requested '{}'",
                 role.kind()
             ))),
-            Some(_) => Ok(()),
+            Some(_) => ensure_role_identity(conn, role),
             None => {
                 conn.execute(
                     &format!("INSERT INTO {STORE_ROLE_TABLE} (key, value) VALUES ('role', ?1)"),
                     params![role.kind()],
                 )
                 .map_err(|error| LatticeError::Storage(format!("failed to persist memory store role: {error}")))?;
-                Ok(())
+                ensure_role_identity(conn, role)
             }
         }
     })
+}
+
+fn ensure_role_identity(
+    conn: &rusqlite::Connection,
+    role: &MemoryStoreRole,
+) -> Result<(), LatticeError> {
+    let MemoryStoreRole::Repository { repository_id } = role else {
+        return Ok(());
+    };
+    let existing = conn
+        .query_row(
+            &format!("SELECT value FROM {STORE_ROLE_TABLE} WHERE key = ?1"),
+            params![REPOSITORY_ID_METADATA_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "failed to load repository memory-store authority: {error}"
+            ))
+        })?;
+    match existing {
+        Some(found) if found != *repository_id => Err(LatticeError::Storage(format!(
+            "repository memory store authority mismatch: database is '{found}', requested '{repository_id}'"
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            conn.execute(
+                &format!("INSERT INTO {STORE_ROLE_TABLE} (key, value) VALUES (?1, ?2)"),
+                params![REPOSITORY_ID_METADATA_KEY, repository_id],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "failed to persist repository memory-store authority: {error}"
+                ))
+            })?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,17 +618,33 @@ mod tests {
 
     fn memory(scope: MemoryScope, organization: Option<&str>, content: &str) -> Memory {
         Memory {
-            id: String::new(), session_id: "session-1".to_string(), content: content.to_string(),
-            memory_type: MemoryType::Observation, scope, confidence: 0.8,
-            linked_symbols: vec![], linked_files: vec![], workspace_id: None, branch: None,
-            scope_organization_id: organization.map(str::to_string), refresh_key: Some("claim".to_string()),
-            source_query: None, created_at: 0, last_accessed: 0, access_count: 0,
-            is_stale: false, stale_reason: None, verification_status: MemoryVerificationStatus::Verified,
+            id: String::new(),
+            session_id: "session-1".to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Observation,
+            scope,
+            confidence: 0.8,
+            linked_symbols: vec![],
+            linked_files: vec![],
+            workspace_id: None,
+            branch: None,
+            scope_organization_id: organization.map(str::to_string),
+            refresh_key: Some("claim".to_string()),
+            source_query: None,
+            created_at: 0,
+            last_accessed: 0,
+            access_count: 0,
+            is_stale: false,
+            stale_reason: None,
+            verification_status: MemoryVerificationStatus::Verified,
         }
     }
 
     fn fields() -> MemoryStructuredFields {
-        MemoryStructuredFields { memory_class: MemoryClass::Observation, ..Default::default() }
+        MemoryStructuredFields {
+            memory_class: MemoryClass::Observation,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -517,26 +652,100 @@ mod tests {
         let repo_a = MemoryStore::open_in_memory().unwrap();
         let repo_b = MemoryStore::open_in_memory().unwrap();
         let shared = MemoryStore::open_in_memory().unwrap();
-        let router_a = MemoryStoreRouter::new(&repo_a, Some(&shared), authority("repo-a", Some("cadres"))).unwrap();
-        let stored = router_a.remember(memory(MemoryScope::Organization, Some("cadres"), "shared deployment rule"), &fields(), Some("cadres")).unwrap();
-        assert_eq!(stored.authority, MemoryAuthority::Organization("cadres".to_string()));
+        let router_a =
+            MemoryStoreRouter::new(&repo_a, Some(&shared), authority("repo-a", Some("cadres")))
+                .unwrap();
+        let stored = router_a
+            .remember(
+                memory(
+                    MemoryScope::Organization,
+                    Some("cadres"),
+                    "shared deployment rule",
+                ),
+                &fields(),
+                Some("cadres"),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.authority,
+            MemoryAuthority::Organization("cadres".to_string())
+        );
         assert!(repo_a.query_unscoped_admin(None, 10).unwrap().is_empty());
 
-        let router_b = MemoryStoreRouter::new(&repo_b, Some(&shared), authority("repo-b", Some("cadres"))).unwrap();
+        let router_b =
+            MemoryStoreRouter::new(&repo_b, Some(&shared), authority("repo-b", Some("cadres")))
+                .unwrap();
         let result = router_b.recall(Some("deployment"), 10).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].cross_repo);
-        assert_eq!(result[0].effective_verification_status, MemoryVerificationStatus::Unverified);
-        assert_eq!(result[0].memory_id.authority, MemoryAuthority::Organization("cadres".to_string()));
+        assert_eq!(
+            result[0].effective_verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        assert_eq!(
+            result[0].memory_id.authority,
+            MemoryAuthority::Organization("cadres".to_string())
+        );
         assert!(result[0].trust_reason.contains("advisory"));
+    }
+
+    #[test]
+    fn organization_writes_are_unverified_and_record_origin_checkout() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let shared = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            authority("repo-a", Some("cadres")),
+        )
+        .unwrap();
+        let mut structured = fields();
+        structured.verification_status = MemoryVerificationStatus::Verified;
+
+        let stored = router
+            .remember(
+                memory(MemoryScope::Organization, Some("cadres"), "shared rule"),
+                &structured,
+                Some("cadres"),
+            )
+            .unwrap();
+
+        let persisted = shared.get_by_id(&stored.local_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        let persisted_fields = shared
+            .get_structured_fields(&stored.local_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted_fields.verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        assert!(persisted_fields.provenance.iter().any(|entry| {
+            entry.source == ORIGIN_CHECKOUT_PROVENANCE_SOURCE
+                && entry.reference.as_deref() == Some("checkout-repo-a")
+        }));
     }
 
     #[test]
     fn request_cannot_widen_organization_authority() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let shared = MemoryStore::open_in_memory().unwrap();
-        let router = MemoryStoreRouter::new(&repository, Some(&shared), authority("repo-a", Some("cadres"))).unwrap();
-        let error = router.remember(memory(MemoryScope::Organization, Some("other"), "private"), &fields(), Some("other")).unwrap_err();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            authority("repo-a", Some("cadres")),
+        )
+        .unwrap();
+        let error = router
+            .remember(
+                memory(MemoryScope::Organization, Some("other"), "private"),
+                &fields(),
+                Some("other"),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("does not match"));
         assert!(shared.query_unscoped_admin(None, 10).unwrap().is_empty());
     }
@@ -545,7 +754,12 @@ mod tests {
     fn shared_store_role_cannot_be_reopened_as_repository_store() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let shared = MemoryStore::open_in_memory().unwrap();
-        MemoryStoreRouter::new(&repository, Some(&shared), authority("repo-a", Some("cadres"))).unwrap();
+        MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            authority("repo-a", Some("cadres")),
+        )
+        .unwrap();
         let other_shared = MemoryStore::open_in_memory().unwrap();
         let error = match MemoryStoreRouter::new(
             &shared,
@@ -559,11 +773,99 @@ mod tests {
     }
 
     #[test]
+    fn repository_store_cannot_be_reopened_for_a_different_repository() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        MemoryStoreRouter::new(&repository, None, authority("repo-a", None)).unwrap();
+
+        let error = match MemoryStoreRouter::new(&repository, None, authority("repo-b", None)) {
+            Ok(_) => panic!("repository store must retain its configured repository authority"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("authority mismatch"));
+    }
+
+    #[test]
     fn recall_never_queries_shared_store_without_configured_authority() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let shared = MemoryStore::open_in_memory().unwrap();
-        let router = MemoryStoreRouter::new(&repository, Some(&shared), authority("repo-a", None)).unwrap();
-        shared.store(memory(MemoryScope::Organization, Some("cadres"), "must remain hidden")).unwrap();
+        let router =
+            MemoryStoreRouter::new(&repository, Some(&shared), authority("repo-a", None)).unwrap();
+        shared
+            .store(memory(
+                MemoryScope::Organization,
+                Some("cadres"),
+                "must remain hidden",
+            ))
+            .unwrap();
         assert!(router.recall(Some("hidden"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shared_recall_excludes_malformed_non_organization_rows() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let shared = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            authority("repo-a", Some("cadres")),
+        )
+        .unwrap();
+        let mut malformed_session = memory(MemoryScope::Session, None, "shared deployment secret");
+        malformed_session.workspace_id = Some("repo-a".to_string());
+        shared.store(malformed_session).unwrap();
+        let mut malformed_repo = memory(MemoryScope::Repo, None, "shared deployment secret");
+        malformed_repo.workspace_id = Some("repo-a".to_string());
+        shared.store(malformed_repo).unwrap();
+        router
+            .remember(
+                memory(
+                    MemoryScope::Organization,
+                    Some("cadres"),
+                    "shared deployment rule",
+                ),
+                &fields(),
+                Some("cadres"),
+            )
+            .unwrap();
+
+        let recalled = router.recall(Some("deployment"), 10).unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].source_tier, MemoryRecallTier::Organization);
+        assert_eq!(recalled[0].memory.content, "shared deployment rule");
+    }
+
+    #[test]
+    fn ineligible_shared_lifecycle_states_do_not_surface_in_normal_recall() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let shared = MemoryStore::open_in_memory().unwrap();
+        let router = MemoryStoreRouter::new(
+            &repository,
+            Some(&shared),
+            authority("repo-a", Some("cadres")),
+        )
+        .unwrap();
+        let stored = router
+            .remember(
+                memory(
+                    MemoryScope::Organization,
+                    Some("cadres"),
+                    "obsolete deployment rule",
+                ),
+                &fields(),
+                Some("cadres"),
+            )
+            .unwrap();
+        shared
+            .set_verification_state(
+                &stored.local_id,
+                MemoryVerificationStatus::Contradicted,
+                false,
+                None,
+                0,
+                None,
+            )
+            .unwrap();
+
+        assert!(router.recall(Some("deployment"), 10).unwrap().is_empty());
     }
 }

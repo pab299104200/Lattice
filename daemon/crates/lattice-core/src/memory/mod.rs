@@ -10,8 +10,8 @@ pub use model::{
     MemoryScope, MemoryScoreKind, MemoryScoreRecord, MemoryStructuredFields, MemoryType,
     MemoryVerificationStatus,
 };
-pub use store::MemoryStore;
 pub use router::{
     AuthorityQualifiedMemoryId, MemoryAuthority, MemoryQueryAuthority, MemoryRecallResult,
     MemoryRecallTier, MemoryStoreRole, MemoryStoreRouter,
 };
+pub use store::MemoryStore;
