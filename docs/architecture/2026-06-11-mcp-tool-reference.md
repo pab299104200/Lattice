@@ -17,7 +17,7 @@ Implementation source of truth:
 | `prepare_change` | Builds an implementation map with likely edit files, symbols, tests, risks, and memory. | `mode=prepare` routes to change prep, `mode=plan_edit` to patch planning, and `mode=trace` to scenario tracing. |
 | `impact` | Computes dependency blast radius and relevant tests that literal search cannot infer. | Routes to impact graph, dependents, dependencies, diff impact, or relevant-test selection from `target`, `direction`, and `include_tests`. |
 | `diagnose` | Maps compiler, test, or runtime failure text to likely culprit code and tests. | Routes to failure diagnosis using `failure_text`, optional `kind`, and optional context files. |
-| `search` | Uses graph identity for symbol lookup, symbol details, call paths, backlinks, and outgoing links. | Routes by `kind=symbol`, `symbol_detail`, `flow`, or `links`. |
+| `search` | Uses graph identity for symbol and document-section lookup, symbol details, call paths, backlinks, and outgoing links. | Default symbol search ranks exact names/files, phrase matches, and normalized all-term matches across names and paths; `symbol_detail`, `flow`, and `links` select the other routes. |
 | `remember` | Writes reusable cross-session memory or workflow outcomes. | Routes by `kind=quick`, `durable`, or `outcome`. |
 | `recall` | Retrieves task memory, searches durable memory, or verifies/explains memory with trust diagnostics. | Routes by `mode=search`, `task`, or `verify`. |
 | `status` | Reports operational health that grep cannot observe. | Routes by `scope=index`, `docs`, `memory`, or `conflicts`. |
@@ -47,7 +47,7 @@ This split is intentional: MCP agents get a compact 8-verb surface, while first-
 
 ## Response And Handle Contract
 
-The 8 public verbs reuse the existing compact workflow renderers and structured payloads. First-pass responses should remain bounded and should prefer handles over large payloads. When a result includes `context_handle` or `suggested_expand`, callers should use `context` with `mode=expand`, `handle`, and `focus` for the next delta.
+The 8 public verbs reuse the existing compact workflow renderers and structured payloads. Workflow responses accept only `render=markdown` (the default) or `render=json`; there is no hybrid or HTML rendering mode. First-pass responses should remain bounded and should prefer handles over large payloads. When a result includes `context_handle` or `suggested_expand`, callers should use `context` with `mode=expand`, `handle`, and `focus` for the next delta. Rendered workflow contracts may include a bounded `next_action` string, but must not smuggle telemetry or machine-only diagnostics into markdown.
 
 Memory returned through `recall` is recall, not proof. Callers must use the trust diagnostics, checkout state, evidence links, and verification modes before relying on durable memory in high-risk work.
 
@@ -66,6 +66,8 @@ lattice status [--scope index|docs|memory]
 ```
 
 The CLI speaks the same daemon protocol as the stdio proxy but does not auto-start the daemon. Markdown is the default stdout format; `--json` returns the raw MCP result. `lattice context` defaults to `--mode subsystem` to keep shell calls query-relevant and under the latency budget; pass `--mode auto` or a more specific mode for broader routing. Exit code `2` means the daemon is unreachable, and exit code `3` means the CLI timeout expired.
+
+Root-level files such as `AGENTS.md` are path anchors even without a directory separator. `prepare_change` also resolves existing workspace-file tokens directly into entry files, so an explicit filename outranks generic same-heading matches in archived or unrelated documents.
 
 ## Validation
 

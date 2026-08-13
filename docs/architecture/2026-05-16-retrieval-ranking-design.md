@@ -35,6 +35,8 @@ Candidate sources are:
 
 Source retrieval must be bounded before ranking. Broad textual search remains appropriate for exact strings, but workflow tools should return summary-first bundles rather than forcing clients to dump source files.
 
+Known-extension root files are first-class path anchors. Change-preparation routes resolve existing file tokens against the canonical workspace root, reject references outside that root, cap the inferred entry set, and promote those files ahead of generic lexical matches. Structural `search` normalizes punctuation and can require all query terms across a node name and file path, allowing document headings and root instruction files to be found without weakening exact-name ordering.
+
 ## Ranking signals
 
 The required ranking signals from [## Retrieval Engine](../plans/2026-05-16-cognitive-workspace-fork-plan.md#retrieval-engine) are:
@@ -54,6 +56,8 @@ The required ranking signals from [## Retrieval Engine](../plans/2026-05-16-cogn
 | recent successful reuse | Recent workflow reuse improves confidence when scope still matches. |
 | user preference compatibility | Candidate must not conflict with durable user preferences. |
 | token cost | Lower-cost candidates can outrank equivalent high-cost candidates. |
+
+Large-repository ranking computes graph-wide normalization values such as maximum modification time and caller count once per query, outside the candidate loop. Recomputing those values for every candidate is prohibited because it changes ranking from bounded graph work into repeated whole-graph traversal and causes hook/CLI latency to scale with candidate count.
 
 ## Diagnostic mode
 

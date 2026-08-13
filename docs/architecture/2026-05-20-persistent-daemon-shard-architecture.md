@@ -124,6 +124,7 @@ The registry is responsible for:
 - single-flight shard load
 - eviction coordination
 - backpressure when memory budget is exceeded
+- process-wide admission control for graph rebuilds
 
 ### Shard Runtime
 
@@ -173,6 +174,12 @@ the daemon should:
 
 The merge layer is the place where combined workspaces become visible. It should not require a giant unified graph object.
 
+### Query isolation and backpressure
+
+Graph publication and graph querying have different concurrency requirements. Indexers publish a new immutable `Arc<CodeGraph>` snapshot under the short-lived engine lock. Context, preparation, plan, and subsystem workflows clone that query-engine snapshot, release the lock, and perform traversal and bundle construction on the blocking CPU pool. Query history is shared across snapshots so adaptive ranking behavior remains consistent without making the live graph lock a query-lifetime lock.
+
+The daemon admits at most two concurrent CPU query jobs per handler. If both slots are occupied, another graph workflow returns a bounded partial response with `reason: query_capacity` instead of queueing unbounded work. A client-side or server-side timeout may stop waiting for a blocking task, but the task retains its permit until it actually exits. This prevents timed-out work from multiplying in the background. Status and other latency-sensitive administrative paths do not acquire a query permit and remain available while a query runs.
+
 ### Exact and administrative tools
 
 Tools that do not require a cross-shard structural graph can operate shard-locally or directly against durable stores:
@@ -207,6 +214,7 @@ Required budgets:
 - per-shard resident target
 - per-shard snippet/vector cache target
 - max concurrently warm shards
+- max concurrent full-graph index jobs
 
 Eviction priority should prefer:
 
@@ -230,11 +238,14 @@ Status: implemented for persistent-daemon runtime ownership.
 Implemented behavior:
 
 - the global daemon registry is keyed by canonical root shard, not by the full requested workspace set
-- overlapping requests such as `rmm` followed by `rmm + portal` reuse the `rmm` shard and prewarm `portal` as a separate bounded shard instead of creating a combined graph-owning runtime
+- overlapping requests such as `rmm` followed by `rmm + portal` reuse the `rmm` shard and load `portal` as a separate bounded shard when a request needs it instead of creating a combined graph-owning runtime
 - shard load is single-flight per root
-- idle eviction operates on shards
+- idle eviction operates on shards, and capacity pressure evicts the least-recently-used inactive non-indexing shard before another shard loads
 - `LATTICE_MAX_LOADED_SHARDS` caps warm shards and falls back to the legacy `LATTICE_MAX_LOADED_WORKSPACES` value for compatibility
-- `LATTICE_PREWARM_VIEW_SHARDS` controls best-effort background prewarm of non-primary logical-view roots and defaults on
+- `LATTICE_PREWARM_VIEW_SHARDS` controls best-effort background prewarm of non-primary logical-view roots and defaults off
+- startup, watcher, refresh, and explicit reindex work share `LATTICE_MAX_CONCURRENT_INDEX_JOBS` admission control, which defaults to one full-graph job per daemon
+- file-watcher batches apply all upserts and removals with one graph rebuild instead of rebuilding once per changed file
+- secondary shards use request-scoped leases and remain eligible for capacity eviction between fan-out requests
 - current MCP methods and tool schemas are unchanged
 
 Deliberate Phase 1 limitation:
@@ -252,7 +263,9 @@ Phase 2 implemented behavior:
 
 - logical multi-root sessions use a view request handler instead of binding every tool call directly to the primary shard
 - `index_status` fans out across the selected shard set and returns aggregate node, edge, and file counts plus per-shard status entries; logical-view responses label primary-shard metadata separately from query scope and report per-call request workspace as unavailable when the stdio client does not provide caller CWD
-- each shard-local `index_status` entry reports warm-load diagnostics: whether persisted graph warm-load was skipped, skip reason, persisted file count, persisted DB/WAL/SHM bytes, active file and byte limits, controlling env vars, and the current effective post-ignore file count
+- each shard-local `index_status` entry reports warm-load diagnostics: graph storage state (`healthy`, `rebuilt_corrupt`, `busy`, or `unhealthy`), whether persisted graph warm-load was skipped, skip reason, persisted file count, persisted DB/WAL/SHM bytes, active file and byte limits, controlling env vars, and the current effective indexed file count
+- status uses lock-free graph snapshots and a non-blocking graph-store probe, so snapshot publication produces a typed `busy` diagnostic instead of delaying status
+- index status includes process-wide active, queued, completed, capacity, and state fields for the bounded index-work scheduler
 - tool calls with explicit absolute file/path arguments are routed to the matching shard, so warmed non-primary shards can answer targeted file and symbol requests without changing MCP schemas
 - relative file/path arguments route to a non-primary shard only when that path exists under exactly one configured root; ambiguous relative paths fall back to primary handling and include routing diagnostics instead of silently inferring ownership
 - explicit absolute file/path arguments outside every configured shard are not routed by guesswork; the logical view falls back to primary-shard handling and the primary tool enforces its normal workspace-boundary behavior
@@ -268,6 +281,12 @@ Remaining work:
 
 - add semantic score normalization across heterogeneous shard result sets instead of relying only on existing per-shard scores
 - add view-level result budgeting so merged responses remain compact under large shard sets
+
+### Derived graph integrity and daemon startup
+
+Each shard treats `graph.db` as reconstructable cache state. File-backed open validates SQLite integrity before enabling WAL or loading graph rows. Confirmed corruption removes only the graph database and its WAL/SHM sidecars, recreates the schema, records `rebuilt_corrupt` in shard status, and lets normal workspace indexing repopulate it. Non-corruption storage failures fail shard construction; they do not create a misleading ready, memory-only graph.
+
+Stdio proxies coordinate auto-start with a cross-process advisory lock keyed by loopback daemon address. A waiting proxy rechecks the listener after acquiring the lock and spawns only if no daemon is available, preventing simultaneous hook/MCP processes from creating competing daemon children. The lock is held through listener readiness and released when the connected stream is returned.
 - remove giant unified multi-root graph as the default query surface
 
 Required design details before implementation:
