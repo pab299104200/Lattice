@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,9 +12,10 @@ use lattice_core::indexer::{BatchIndexReport, IndexFailure, IndexFailureKind, In
 use lattice_core::parser;
 use lattice_core::security::SecurityFilter;
 use lattice_core::storage::{
-    FileIndexEntry, GraphStore, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+    content_sha256, FileIndexEntry, GraphStore, ParsedCacheLookup, ParsedFileCache,
+    FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
 };
-use lattice_core::symbols::ParsedFile;
+use lattice_core::symbols::{Language, ParsedFile};
 
 pub(crate) const WARM_GRAPH_FILE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_FILES";
 pub(crate) const WARM_GRAPH_BYTE_LIMIT_ENV: &str = "LATTICE_MAX_WARM_GRAPH_BYTES";
@@ -28,6 +30,76 @@ pub(crate) struct IncrementalIndexResult {
     pub(crate) changed_count: usize,
     pub(crate) removed_count: usize,
     pub(crate) index_report: BatchIndexReport,
+    pub(crate) parsed_cache: ParsedCacheOperationStats,
+}
+
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub(crate) struct ParsedCacheOperationStats {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) invalid: u64,
+    pub(crate) writes: u64,
+    pub(crate) errors: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct ParsedCacheMetrics {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    invalid: AtomicU64,
+    writes: AtomicU64,
+    errors: AtomicU64,
+}
+
+impl ParsedCacheMetrics {
+    pub(crate) fn snapshot(&self) -> ParsedCacheOperationStats {
+        ParsedCacheOperationStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            invalid: self.invalid.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, stats: ParsedCacheOperationStats) {
+        self.hits.fetch_add(stats.hits, Ordering::Relaxed);
+        self.misses.fetch_add(stats.misses, Ordering::Relaxed);
+        self.invalid.fetch_add(stats.invalid, Ordering::Relaxed);
+        self.writes.fetch_add(stats.writes, Ordering::Relaxed);
+        self.errors.fetch_add(stats.errors, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ParsedCacheRuntime {
+    pub(crate) store: Arc<ParsedFileCache>,
+    pub(crate) metrics: Arc<ParsedCacheMetrics>,
+}
+
+impl ParsedCacheRuntime {
+    pub(crate) fn open(path: &Path) -> Result<Self, lattice_core::LatticeError> {
+        let store = ParsedFileCache::open(path)?;
+        let metrics = ParsedCacheMetrics::default();
+        if store.recovered_corrupt() {
+            metrics.invalid.store(1, Ordering::Relaxed);
+            tracing::warn!(
+                path = %path.display(),
+                "Rebuilt corrupt repository parsed-file cache"
+            );
+        }
+        Ok(Self {
+            store: Arc::new(store),
+            metrics: Arc::new(metrics),
+        })
+    }
+
+    pub(crate) fn in_memory() -> Self {
+        Self {
+            store: Arc::new(ParsedFileCache::open_in_memory().unwrap()),
+            metrics: Arc::new(ParsedCacheMetrics::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,9 +121,9 @@ pub(crate) fn background_vector_sync_enabled() -> bool {
     )
 }
 
-pub(crate) async fn load_incremental_cache(
+pub(crate) async fn load_incremental_manifest(
     graph_store: &Arc<Mutex<GraphStore>>,
-) -> (HashMap<String, FileIndexEntry>, HashMap<String, ParsedFile>) {
+) -> HashMap<String, FileIndexEntry> {
     let graph_store = Arc::clone(graph_store);
     tokio::task::spawn_blocking(move || {
         let store = graph_store.blocking_lock();
@@ -66,18 +138,14 @@ pub(crate) async fn load_incremental_cache(
                 max_cached_files,
                 "Skipping persisted parsed-file cache because it exceeds the safety limit"
             );
-            return (HashMap::new(), HashMap::new());
+            return HashMap::new();
         }
-        let parsed_files = store.load_parsed_files().unwrap_or_else(|err| {
-            tracing::warn!("Failed to load cached parsed files: {}", err);
-            HashMap::new()
-        });
-        (manifest, parsed_files)
+        manifest
     })
     .await
     .unwrap_or_else(|error| {
         tracing::warn!(%error, "Incremental cache load worker failed");
-        (HashMap::new(), HashMap::new())
+        HashMap::new()
     })
 }
 
@@ -110,9 +178,6 @@ pub(crate) async fn persist_incremental_cache(
         if let Err(err) = store.save_file_index(&incremental.file_index) {
             tracing::warn!("Failed to save file index manifest: {}", err);
         }
-        if let Err(err) = store.save_parsed_files(&incremental.parsed_files) {
-            tracing::warn!("Failed to save cached parsed files: {}", err);
-        }
         incremental
     })
     .await
@@ -126,7 +191,21 @@ pub(crate) async fn persist_incremental_cache(
 pub(crate) fn build_incremental_index_for_roots(
     roots: &[PathBuf],
     manifest: Option<&HashMap<String, FileIndexEntry>>,
+    parsed_files: HashMap<String, ParsedFile>,
+) -> IncrementalIndexResult {
+    build_incremental_index_for_roots_with_cache(
+        roots,
+        manifest,
+        parsed_files,
+        &ParsedCacheRuntime::in_memory(),
+    )
+}
+
+pub(crate) fn build_incremental_index_for_roots_with_cache(
+    roots: &[PathBuf],
+    manifest: Option<&HashMap<String, FileIndexEntry>>,
     mut parsed_files: HashMap<String, ParsedFile>,
+    parsed_cache: &ParsedCacheRuntime,
 ) -> IncrementalIndexResult {
     let manifest = manifest.cloned().unwrap_or_default();
     let records = collect_indexable_file_records(roots);
@@ -143,6 +222,7 @@ pub(crate) fn build_incremental_index_for_roots(
     parsed_files.retain(|file, _| current_files.contains(file));
 
     let mut changed_count = 0usize;
+    let mut cache_stats = ParsedCacheOperationStats::default();
     let mut failures = Vec::new();
     let mut file_index = Vec::with_capacity(records.len());
     let now = unix_timestamp_secs();
@@ -163,28 +243,66 @@ pub(crate) fn build_incremental_index_for_roots(
 
         if !unchanged {
             let abs_path = record.root.join(&record.rel_path);
+            let known_hash = metadata_unchanged
+                .then(|| previous.map(|entry| entry.content_hash.clone()))
+                .flatten();
+            let language = language_for_path(&record.indexed_path);
+            let cached = known_hash.as_deref().and_then(|content_hash| {
+                lookup_parsed_cache(
+                    parsed_cache,
+                    content_hash,
+                    language,
+                    &record.indexed_path,
+                    &mut cache_stats,
+                )
+            });
+            if let Some(parsed) = cached {
+                parsed_files.insert(record.indexed_path.clone(), parsed);
+                file_index.push(FileIndexEntry {
+                    file: record.indexed_path,
+                    content_hash: known_hash.unwrap_or_default(),
+                    mtime_ns: record.mtime_ns,
+                    size_bytes: record.size_bytes,
+                    parser_version: FILE_INDEX_PARSER_VERSION,
+                    schema_version: FILE_INDEX_SCHEMA_VERSION,
+                    last_indexed_at: now,
+                });
+                continue;
+            }
             match fs::read_to_string(&abs_path) {
                 Ok(content) => {
                     let content_hash = stable_content_hash(content.as_bytes());
-                    if previous
-                        .map(|entry| entry.content_hash == content_hash && parser_unchanged)
-                        .unwrap_or(false)
-                        && parsed_files.contains_key(&record.indexed_path)
-                    {
-                        file_index.push(FileIndexEntry {
-                            file: record.indexed_path,
-                            content_hash,
-                            mtime_ns: record.mtime_ns,
-                            size_bytes: record.size_bytes,
-                            parser_version: FILE_INDEX_PARSER_VERSION,
-                            schema_version: FILE_INDEX_SCHEMA_VERSION,
-                            last_indexed_at: now,
-                        });
-                        continue;
+                    if known_hash.as_deref() != Some(content_hash.as_str()) {
+                        if let Some(parsed) = lookup_parsed_cache(
+                            parsed_cache,
+                            &content_hash,
+                            language,
+                            &record.indexed_path,
+                            &mut cache_stats,
+                        ) {
+                            parsed_files.insert(record.indexed_path.clone(), parsed);
+                            file_index.push(FileIndexEntry {
+                                file: record.indexed_path,
+                                content_hash,
+                                mtime_ns: record.mtime_ns,
+                                size_bytes: record.size_bytes,
+                                parser_version: FILE_INDEX_PARSER_VERSION,
+                                schema_version: FILE_INDEX_SCHEMA_VERSION,
+                                last_indexed_at: now,
+                            });
+                            continue;
+                        }
                     }
 
                     match parser::parse_file(&record.indexed_path, &content) {
                         Ok(parsed) => {
+                            match parsed_cache.store.put(&content_hash, &parsed) {
+                                Ok(()) => cache_stats.writes += 1,
+                                Err(error) => {
+                                    cache_stats.errors += 1;
+                                    tracing::warn!(file = record.indexed_path, %error, "Failed to publish parsed-file cache row");
+                                }
+                            }
                             parsed_files.insert(record.indexed_path.clone(), parsed);
                             changed_count += 1;
                         }
@@ -234,6 +352,7 @@ pub(crate) fn build_incremental_index_for_roots(
     indexer.replace_parsed_files(parsed_files);
     let (graph, parsed_files) = indexer.into_parts();
     let indexed_count = parsed_files.len();
+    parsed_cache.metrics.record(cache_stats);
     IncrementalIndexResult {
         graph: Arc::new(graph),
         parsed_files,
@@ -248,7 +367,66 @@ pub(crate) fn build_incremental_index_for_roots(
             removed_files: Vec::new(),
             failures,
         },
+        parsed_cache: cache_stats,
     }
+}
+
+fn lookup_parsed_cache(
+    runtime: &ParsedCacheRuntime,
+    content_hash: &str,
+    language: Language,
+    indexed_path: &str,
+    stats: &mut ParsedCacheOperationStats,
+) -> Option<ParsedFile> {
+    match runtime.store.get(content_hash, language, indexed_path) {
+        Ok((ParsedCacheLookup::Hit, parsed)) => {
+            stats.hits += 1;
+            parsed
+        }
+        Ok((ParsedCacheLookup::Miss, _)) => {
+            stats.misses += 1;
+            None
+        }
+        Ok((ParsedCacheLookup::Invalid, _)) => {
+            stats.invalid += 1;
+            None
+        }
+        Err(error) => {
+            stats.errors += 1;
+            tracing::warn!(file = indexed_path, %error, "Parsed-file cache lookup failed");
+            None
+        }
+    }
+}
+
+pub(crate) fn parse_with_repository_cache(
+    runtime: &ParsedCacheRuntime,
+    indexed_path: &str,
+    content: &str,
+) -> Result<ParsedFile, lattice_core::LatticeError> {
+    let hash = stable_content_hash(content.as_bytes());
+    let language = language_for_path(indexed_path);
+    let mut stats = ParsedCacheOperationStats::default();
+    if let Some(parsed) = lookup_parsed_cache(runtime, &hash, language, indexed_path, &mut stats) {
+        runtime.metrics.record(stats);
+        return Ok(parsed);
+    }
+    let parsed = match parser::parse_file(indexed_path, content) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            runtime.metrics.record(stats);
+            return Err(error);
+        }
+    };
+    match runtime.store.put(&hash, &parsed) {
+        Ok(()) => stats.writes += 1,
+        Err(error) => {
+            stats.errors += 1;
+            tracing::warn!(file = indexed_path, %error, "Failed to publish watcher parsed-file cache row");
+        }
+    }
+    runtime.metrics.record(stats);
+    Ok(parsed)
 }
 
 fn warn_if_indexable_file_count_exceeds_warm_limit(roots: &[PathBuf], candidate_files: usize) {
@@ -329,12 +507,16 @@ pub(crate) fn max_cached_parsed_files() -> usize {
 }
 
 fn stable_content_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    content_sha256(bytes)
+}
+
+fn language_for_path(path: &str) -> Language {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Language::from_extension(&extension)
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> i64 {
@@ -440,6 +622,18 @@ fn indexing_priority(rel_path: &str) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_cache_counts_a_miss_even_when_parsing_fails() {
+        let cache = ParsedCacheRuntime::in_memory();
+        let error = parse_with_repository_cache(&cache, "unsupported.txt", "plain text")
+            .expect_err("unknown languages are not parseable");
+
+        assert!(error.to_string().contains("Unsupported language"));
+        let metrics = cache.metrics.snapshot();
+        assert_eq!(metrics.misses, 1);
+        assert_eq!(metrics.writes, 0);
+    }
 
     #[test]
     fn cold_start_skips_unparsed_c_family_files() {

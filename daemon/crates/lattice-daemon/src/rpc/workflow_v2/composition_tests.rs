@@ -613,14 +613,10 @@ async fn seed_indexed_file(
         .index_file_content(rel_path, content)
         .expect("index content");
     let graph = indexer.graph().clone();
-    let parsed_files = indexer.parsed_files().clone();
     drop(indexer);
 
     let graph_store = graph_store.lock().await;
     graph_store.save_graph(&graph).expect("save graph");
-    graph_store
-        .save_parsed_files(&parsed_files)
-        .expect("save parsed files");
     graph_store
         .save_file_index(&[FileIndexEntry {
             file: rel_path.to_string(),

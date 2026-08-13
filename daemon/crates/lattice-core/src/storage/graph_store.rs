@@ -6,7 +6,7 @@ use crate::graph::digest::{
 };
 use crate::graph::model::CodeGraph;
 use crate::graph::model::EdgeKind;
-use crate::symbols::{Language, ParsedFile, SymbolId, SymbolKind};
+use crate::symbols::{Language, SymbolId, SymbolKind};
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -543,66 +543,6 @@ impl GraphStore {
         }
         tx.commit()
             .map_err(|e| LatticeError::Storage(format!("Failed to commit file index: {}", e)))?;
-        Ok(())
-    }
-
-    pub fn load_parsed_files(&self) -> Result<HashMap<String, ParsedFile>, LatticeError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT file, payload FROM parsed_files")
-            .map_err(|e| {
-                LatticeError::Storage(format!("Failed to prepare parsed files query: {}", e))
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                let file: String = row.get(0)?;
-                let payload: String = row.get(1)?;
-                Ok((file, payload))
-            })
-            .map_err(|e| LatticeError::Storage(format!("Failed to query parsed files: {}", e)))?;
-
-        let mut files = HashMap::new();
-        for row in rows {
-            let (file, payload) = row.map_err(|e| {
-                LatticeError::Storage(format!("Failed to read parsed file row: {}", e))
-            })?;
-            let parsed: ParsedFile = serde_json::from_str(&payload).map_err(|e| {
-                LatticeError::Storage(format!("Failed to deserialize parsed file {}: {}", file, e))
-            })?;
-            files.insert(file, parsed);
-        }
-        Ok(files)
-    }
-
-    pub fn save_parsed_files(
-        &self,
-        parsed_files: &HashMap<String, ParsedFile>,
-    ) -> Result<(), LatticeError> {
-        let tx = self.conn.unchecked_transaction().map_err(|e| {
-            LatticeError::Storage(format!("Failed to begin parsed files transaction: {}", e))
-        })?;
-        tx.execute("DELETE FROM parsed_files", [])
-            .map_err(|e| LatticeError::Storage(format!("Failed to clear parsed files: {}", e)))?;
-        {
-            let mut insert = tx
-                .prepare("INSERT INTO parsed_files (file, payload) VALUES (?1, ?2)")
-                .map_err(|e| {
-                    LatticeError::Storage(format!("Failed to prepare parsed file insert: {}", e))
-                })?;
-            for (file, parsed) in parsed_files {
-                let payload = serde_json::to_string(parsed).map_err(|e| {
-                    LatticeError::Storage(format!(
-                        "Failed to serialize parsed file {}: {}",
-                        file, e
-                    ))
-                })?;
-                insert.execute(params![file, payload]).map_err(|e| {
-                    LatticeError::Storage(format!("Failed to insert parsed file {}: {}", file, e))
-                })?;
-            }
-        }
-        tx.commit()
-            .map_err(|e| LatticeError::Storage(format!("Failed to commit parsed files: {}", e)))?;
         Ok(())
     }
 

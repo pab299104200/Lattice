@@ -50,14 +50,14 @@ use lattice_core::storage::{
     GraphStore, IndexSnapshot, IndexSnapshotLoad, SharedVectorIndex, UsearchVectorIndex,
     VectorIndex, VectorStore,
 };
-use lattice_core::symbols::ParsedFile;
 use lattice_core::workspace::WorkspaceManager;
 use rpc::mcp::GitIntelligenceSnapshotHandle;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
 use runtime_support::{
-    background_vector_sync_enabled, build_incremental_index_for_roots, load_incremental_cache,
-    max_warm_graph_bytes, max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
+    background_vector_sync_enabled, build_incremental_index_for_roots,
+    build_incremental_index_for_roots_with_cache, load_incremental_manifest, max_warm_graph_bytes,
+    max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult, ParsedCacheRuntime,
     WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
 };
 use watcher_health::WatcherHealth;
@@ -181,18 +181,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create .lattice dir for persistent storage
-    let lattice_dir = workspace_root.join(".lattice");
-    let _ = std::fs::create_dir_all(&lattice_dir);
+    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
+    let lattice_dir = memory_identity.checkout_lattice_dir();
+    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
+    std::fs::create_dir_all(&lattice_dir)?;
     // The watcher and the MCP handler must share a runtime identity: watcher
     // events are the authoritative source for adoption follow-through.
     let session_id = generate_session_id();
 
     // Repository memory is shared by Git worktrees; checkout-local graph and
     // watcher state continue to use `lattice_dir` below.
-    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
-    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
     let memories_path = memory_identity.memories_path();
+    let parsed_cache_runtime = ParsedCacheRuntime::open(&memory_identity.parsed_cache_path())?;
     let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
     let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
@@ -256,11 +256,12 @@ async fn main() -> Result<()> {
         let indexing_bg = Arc::clone(&indexing);
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
-        let lattice_dir_bg = ws_root.join(".lattice");
+        let lattice_dir_bg = lattice_dir.clone();
         let vector_index_bg = vector_index.clone();
         let index_work_bg = Arc::clone(&index_work);
         let index_readiness_bg = Arc::clone(&index_readiness);
         let index_health_bg = Arc::clone(&index_health);
+        let parsed_cache_bg = parsed_cache_runtime.clone();
 
         tokio::spawn(async move {
             tracing::info!("Background indexing starting...");
@@ -270,21 +271,19 @@ async fn main() -> Result<()> {
                 .expect("index work coordinator remains open for the process lifetime");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
-            let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
-            publish_cached_parsed_graph_snapshot(
-                &parsed_cache,
-                Some(&indexer_bg),
-                &engine_bg,
-                &compaction_graph_bg,
-            )
-            .await;
+            let manifest = load_incremental_manifest(&graph_store_bg).await;
             let roots = if is_multi_repo {
                 ws_roots_bg.clone()
             } else {
                 vec![ws_root.clone()]
             };
             let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                build_incremental_index_for_roots_with_cache(
+                    &roots,
+                    Some(&manifest),
+                    HashMap::new(),
+                    &parsed_cache_bg,
+                )
             })
             .await
             {
@@ -310,6 +309,7 @@ async fn main() -> Result<()> {
                 changed_count,
                 removed_count,
                 index_report,
+                ..
             } = incremental;
             index_health_bg.replace_from_report(&index_report);
             {
@@ -434,6 +434,7 @@ async fn main() -> Result<()> {
         let watcher_health = Arc::clone(&watcher_health);
         let index_health = Arc::clone(&index_health);
         let watcher_session_id = session_id.clone();
+        let parsed_cache_for_watchers = parsed_cache_runtime.clone();
 
         tokio::spawn(async move {
             for root in workspace_roots {
@@ -454,7 +455,8 @@ async fn main() -> Result<()> {
                     Arc::clone(&index_health),
                     None,
                     watcher_session_id.clone(),
-                );
+                )
+                .with_parsed_cache(parsed_cache_for_watchers.clone());
 
                 tokio::spawn(async move {
                     if let Err(e) = watcher.run().await {
@@ -485,29 +487,32 @@ async fn main() -> Result<()> {
     // ── Create McpHandler and start StdioServer ──────────────────────
     let context_cache_path = lattice_dir.join("context_handles.json");
     tracing::info!("Creating MCP handler (session: {})", session_id);
-    let handler = Arc::new(McpHandler::new_with_shared_repo_state(
-        engine,
-        indexer,
-        memory_store,
-        graph_store,
-        embedding_engine,
-        vector_index,
-        workspace_root,
-        memory_identity.repository_id,
-        memories_path.clone(),
-        context_cache_path,
-        session_id,
-        workspace_manager,
-        workspace_roots,
-        indexing,
-        Some(event_writer),
-        default_focus.files,
-        default_focus.dirs,
-        repo_state,
-        index_work,
-        watcher_health,
-        index_health,
-    ));
+    let handler = Arc::new(
+        McpHandler::new_with_shared_repo_state(
+            engine,
+            indexer,
+            memory_store,
+            graph_store,
+            embedding_engine,
+            vector_index,
+            workspace_root,
+            memory_identity.repository_id,
+            memories_path.clone(),
+            context_cache_path,
+            session_id,
+            workspace_manager,
+            workspace_roots,
+            indexing,
+            Some(event_writer),
+            default_focus.files,
+            default_focus.dirs,
+            repo_state,
+            index_work,
+            watcher_health,
+            index_health,
+        )
+        .with_checkout_storage(memory_identity.checkout_id, parsed_cache_runtime),
+    );
     tracing::info!("Starting stdio server");
     let server = StdioServer::new(handler);
     server.run().await?;
@@ -560,14 +565,15 @@ pub(crate) async fn build_workspace_runtime(
         }
     }
 
-    let lattice_dir = workspace_root.join(".lattice");
-    let _ = std::fs::create_dir_all(&lattice_dir);
+    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
+    let lattice_dir = memory_identity.checkout_lattice_dir();
+    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
+    std::fs::create_dir_all(&lattice_dir)?;
     // Keep watcher attribution scoped to the handler session for this runtime.
     let session_id = generate_session_id();
 
-    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
-    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
     let memories_path = memory_identity.memories_path();
+    let parsed_cache_runtime = ParsedCacheRuntime::open(&memory_identity.parsed_cache_path())?;
     let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
     let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
@@ -643,11 +649,12 @@ pub(crate) async fn build_workspace_runtime(
         let indexing_bg = Arc::clone(&indexing);
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
-        let lattice_dir_bg = ws_root.join(".lattice");
+        let lattice_dir_bg = lattice_dir.clone();
         let vector_index_bg = vector_index.clone();
         let index_work_bg = Arc::clone(&index_work);
         let index_readiness_bg = Arc::clone(&index_readiness);
         let index_health_bg = Arc::clone(&index_health);
+        let parsed_cache_bg = parsed_cache_runtime.clone();
 
         let task = tokio::spawn(async move {
             tracing::info!("Background indexing starting for {}...", ws_root.display());
@@ -657,21 +664,19 @@ pub(crate) async fn build_workspace_runtime(
                 .expect("index work coordinator remains open for the process lifetime");
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
-            let (manifest, parsed_cache) = load_incremental_cache(&graph_store_bg).await;
-            publish_cached_parsed_graph_snapshot(
-                &parsed_cache,
-                Some(&indexer_bg),
-                &engine_bg,
-                &compaction_graph_bg,
-            )
-            .await;
+            let manifest = load_incremental_manifest(&graph_store_bg).await;
             let roots = if is_multi_repo {
                 ws_roots_bg.clone()
             } else {
                 vec![ws_root.clone()]
             };
             let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                build_incremental_index_for_roots_with_cache(
+                    &roots,
+                    Some(&manifest),
+                    HashMap::new(),
+                    &parsed_cache_bg,
+                )
             })
             .await
             {
@@ -801,7 +806,8 @@ pub(crate) async fn build_workspace_runtime(
                 Arc::clone(&index_health),
                 git_refresh_handles.get(&root).cloned(),
                 watcher_session_id.clone(),
-            );
+            )
+            .with_parsed_cache(parsed_cache_runtime.clone());
             let task = tokio::spawn(async move {
                 if let Err(e) = watcher.run().await {
                     tracing::error!("File watcher failed for {:?}: {}", root, e);
@@ -858,6 +864,7 @@ pub(crate) async fn build_workspace_runtime(
             watcher_health,
             index_health,
         )
+        .with_checkout_storage(memory_identity.checkout_id.clone(), parsed_cache_runtime)
         .with_git_intelligence_snapshot_handle(git_intelligence_snapshots),
     );
     let session_digest_consolidation = session_digest_consolidation_runtime::start(
@@ -1635,58 +1642,6 @@ fn generate_session_id() -> String {
     let h = hasher.finish();
 
     format!("s-{:08x}{:08x}", (h >> 32) as u32, now.subsec_nanos())
-}
-
-async fn publish_cached_parsed_graph_snapshot(
-    parsed_files: &HashMap<String, ParsedFile>,
-    indexer: Option<&Arc<Mutex<Indexer>>>,
-    engine: &Arc<Mutex<QueryEngine>>,
-    compaction_graph: &Arc<std::sync::Mutex<Arc<CodeGraph>>>,
-) -> bool {
-    if parsed_files.is_empty() {
-        return false;
-    }
-
-    {
-        let engine = engine.lock().await;
-        if engine.graph().stats().node_count > 0 {
-            return false;
-        }
-    }
-
-    let mut cached_indexer = Indexer::new(PathBuf::new());
-    cached_indexer.replace_parsed_files(parsed_files.clone());
-    let (cached_graph, cached_parsed_files) = cached_indexer.into_parts();
-    let cached_graph = Arc::new(cached_graph);
-    let stats = cached_graph.stats();
-    if stats.node_count == 0 {
-        return false;
-    }
-
-    if let Some(indexer) = indexer {
-        let mut indexer = indexer.lock().await;
-        indexer.replace_shared_index(Arc::clone(&cached_graph), cached_parsed_files);
-    }
-
-    if let Ok(mut graph) = compaction_graph.lock() {
-        *graph = Arc::clone(&cached_graph);
-    } else {
-        tracing::warn!("Failed to publish cached graph to compaction graph snapshot");
-    }
-
-    let mut engine = engine.lock().await;
-    if engine.graph().stats().node_count == 0 {
-        engine.update_graph_arc(cached_graph);
-        tracing::info!(
-            "Warm-published cached graph snapshot: {} nodes, {} edges, {} files",
-            stats.node_count,
-            stats.edge_count,
-            stats.file_count
-        );
-        true
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]

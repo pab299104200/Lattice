@@ -1,6 +1,30 @@
 # Worktree Storage Architecture
 
-**Status:** binding design for recovery workplan C1
+**Status:** implemented C1 contract (2026-08-13)
+
+## Implemented layout
+
+The runtime resolver emits SHA-256 encoded `repo_*`/`standalone_*` repository
+IDs and a separate `checkout_*` ID derived from the repository identity and
+canonical checkout root. Runtime bootstrap consumes that one object and opens:
+
+```text
+<primary>/.lattice/
+  memories.db
+  parsed-cache.db
+  checkouts/<checkout-id>/
+    graph.db
+    vectors.db
+    vectors.usearch
+    events.db
+    context_handles.json
+```
+
+The explicit reindex, checkout refresh, startup index, and watcher parse paths
+all use `parsed-cache.db`. `status(scope=index)` includes repository and checkout
+IDs and cumulative `hits`, `misses`, `invalid`, `writes`, and `errors` counters.
+Invalid checksum, malformed JSON, language mismatch, and non-path-free rows are
+misses; none are allowed to reach graph construction.
 
 ## Decision
 

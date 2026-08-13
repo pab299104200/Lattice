@@ -36,11 +36,6 @@ CREATE TABLE IF NOT EXISTS file_index (
     last_indexed_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS parsed_files (
-    file TEXT PRIMARY KEY,
-    payload TEXT NOT NULL
-);
-
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file, from_name, from_offset);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file, to_name, to_offset);
 "#;

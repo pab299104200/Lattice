@@ -74,8 +74,9 @@ use crate::memory_attribution::{
 use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
 use crate::rpc::request_control;
 use crate::runtime_support::{
-    background_vector_sync_enabled, build_incremental_index_for_roots, load_incremental_cache,
-    max_warm_graph_bytes, max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
+    background_vector_sync_enabled, build_incremental_index_for_roots_with_cache,
+    load_incremental_manifest, max_warm_graph_bytes, max_warm_graph_files,
+    persist_incremental_cache, IncrementalIndexResult, ParsedCacheRuntime,
     WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
 };
 use crate::watcher_health::WatcherHealth;
@@ -99,6 +100,8 @@ pub struct McpHandler {
     /// Canonical repository identity used only for durable memory scope. The
     /// checkout root remains the source/graph boundary.
     memory_workspace_id: String,
+    checkout_id: String,
+    parsed_cache: ParsedCacheRuntime,
     session_id: String,
     #[allow(dead_code)]
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
@@ -832,6 +835,8 @@ impl McpHandler {
             vector_index,
             workspace_root: workspace_root.clone(),
             memory_workspace_id,
+            checkout_id: workspace_root.to_string_lossy().to_string(),
+            parsed_cache: ParsedCacheRuntime::in_memory(),
             session_id,
             workspace_manager,
             workspace_roots,
@@ -872,6 +877,16 @@ impl McpHandler {
         handle: GitIntelligenceSnapshotHandle,
     ) -> Self {
         self.git_intelligence = Some(handle);
+        self
+    }
+
+    pub(crate) fn with_checkout_storage(
+        mut self,
+        checkout_id: String,
+        parsed_cache: ParsedCacheRuntime,
+    ) -> Self {
+        self.checkout_id = checkout_id;
+        self.parsed_cache = parsed_cache;
         self
     }
 
@@ -932,6 +947,7 @@ impl McpHandler {
         let refresh_running = Arc::clone(&self.refresh_running);
         let index_work = Arc::clone(&self.index_work);
         let index_health = Arc::clone(&self.index_health);
+        let parsed_cache_runtime = self.parsed_cache.clone();
         let workspace_key = self.workspace_root.to_string_lossy().to_string();
 
         tokio::spawn(async move {
@@ -945,10 +961,16 @@ impl McpHandler {
                     repo_state.current_epoch()
                 };
 
-                let (manifest, parsed_cache) = load_incremental_cache(&graph_store).await;
+                let manifest = load_incremental_manifest(&graph_store).await;
                 let roots = workspace_roots.clone();
+                let parsed_cache_runtime = parsed_cache_runtime.clone();
                 let incremental = match tokio::task::spawn_blocking(move || {
-                    build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                    build_incremental_index_for_roots_with_cache(
+                        &roots,
+                        Some(&manifest),
+                        HashMap::new(),
+                        &parsed_cache_runtime,
+                    )
                 })
                 .await
                 {
@@ -5897,6 +5919,9 @@ impl McpHandler {
             "status": if is_indexing { "indexing" } else { "ready" },
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.workspace_root.to_string_lossy(),
+            "repository_id": self.memory_workspace_id,
+            "checkout_id": self.checkout_id,
+            "parsed_file_cache": self.parsed_cache.metrics.snapshot(),
             "workspace_role": "shard",
             "workspace_field_meaning": "shard_workspace",
             "request_workspace": self.workspace_root.to_string_lossy(),
@@ -7244,6 +7269,7 @@ impl McpHandler {
         let index_work = Arc::clone(&self.index_work);
         let refresh_running = Arc::clone(&self.refresh_running);
         let index_health = Arc::clone(&self.index_health);
+        let parsed_cache_runtime = self.parsed_cache.clone();
         let workspace_key = self.workspace_root.to_string_lossy().to_string();
 
         indexing.store(true, Ordering::Relaxed);
@@ -7252,10 +7278,15 @@ impl McpHandler {
                 .acquire(workspace_key, "explicit_reindex")
                 .await
                 .expect("index work coordinator remains open for the process lifetime");
-            let (manifest, parsed_cache) = load_incremental_cache(&graph_store).await;
+            let manifest = load_incremental_manifest(&graph_store).await;
             let roots = workspace_roots.clone();
             let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots(&roots, Some(&manifest), parsed_cache)
+                build_incremental_index_for_roots_with_cache(
+                    &roots,
+                    Some(&manifest),
+                    HashMap::new(),
+                    &parsed_cache_runtime,
+                )
             })
             .await
             {
@@ -12343,6 +12374,10 @@ export function greet(name: string): string {
         );
         assert_eq!(payload["watch_poll_interval_secs"].as_u64(), Some(30));
         assert!(payload["watch_last_poll_epoch_secs"].as_u64().is_some());
+        assert!(payload["repository_id"].as_str().is_some());
+        assert!(payload["checkout_id"].as_str().is_some());
+        assert_eq!(payload["parsed_file_cache"]["hits"].as_u64(), Some(0));
+        assert_eq!(payload["parsed_file_cache"]["invalid"].as_u64(), Some(0));
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }

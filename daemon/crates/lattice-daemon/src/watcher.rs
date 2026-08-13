@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
 use lattice_core::embeddings::EmbeddingEngine;
-use lattice_core::indexer::Indexer;
+use lattice_core::indexer::{IndexFailure, IndexFailureKind, Indexer};
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
@@ -20,6 +20,7 @@ use crate::git_intelligence_runtime::GitIntelligenceRefreshHandle;
 use crate::index_health::IndexHealth;
 use crate::index_work::{IndexReadiness, IndexWorkCoordinator};
 use crate::repo_state::RepoStateTracker;
+use crate::runtime_support::{parse_with_repository_cache, ParsedCacheRuntime};
 use crate::watcher_health::WatcherHealth;
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
@@ -78,6 +79,7 @@ pub struct FileWatcher {
     index_readiness: Arc<IndexReadiness>,
     watcher_health: Arc<WatcherHealth>,
     index_health: Arc<IndexHealth>,
+    parsed_cache: Option<ParsedCacheRuntime>,
     git_intelligence: Option<GitIntelligenceRefreshHandle>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
     session_id: String,
@@ -126,6 +128,7 @@ impl FileWatcher {
             index_readiness,
             watcher_health,
             index_health,
+            parsed_cache: None,
             git_intelligence,
             adoption_metrics,
             session_id,
@@ -135,6 +138,11 @@ impl FileWatcher {
             #[cfg(test)]
             head_read_count: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn with_parsed_cache(mut self, parsed_cache: ParsedCacheRuntime) -> Self {
+        self.parsed_cache = Some(parsed_cache);
+        self
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -386,6 +394,7 @@ impl FileWatcher {
         let repo_name = self.repo_name.clone();
         let workspace_manager = self.workspace_manager.clone();
         let indexer = self.indexer.clone();
+        let parsed_cache = self.parsed_cache.clone();
         let batch_result = tokio::task::spawn_blocking(move || {
             let batch =
                 prepare_change_batch(&workspace_root, repo_name.as_deref(), changes.source_paths);
@@ -431,7 +440,29 @@ impl FileWatcher {
             };
             let mut indexer = indexer.blocking_lock();
             let before_snapshot = indexer.graph_snapshot_id();
-            let report = indexer.apply_file_batch_contents(upserts, removals);
+            let report = if let Some(cache) = parsed_cache.as_ref() {
+                let requested_count = upserts.len();
+                let mut parsed = Vec::with_capacity(requested_count);
+                let mut failures = Vec::new();
+                for (path, content) in upserts {
+                    match parse_with_repository_cache(cache, &path, &content) {
+                        Ok(file) => parsed.push(file),
+                        Err(error) => failures.push(IndexFailure {
+                            file: path,
+                            kind: IndexFailureKind::ParseError,
+                            message: error.to_string(),
+                        }),
+                    }
+                }
+                let mut report = indexer.apply_file_batch_parsed(parsed, removals);
+                report.requested_count = requested_count;
+                report.failures = failures;
+                report.is_partial =
+                    report.indexed_count != requested_count || !report.failures.is_empty();
+                report
+            } else {
+                indexer.apply_file_batch_contents(upserts, removals)
+            };
             if indexer.graph_snapshot_id() == before_snapshot && !report.is_partial {
                 return None;
             }

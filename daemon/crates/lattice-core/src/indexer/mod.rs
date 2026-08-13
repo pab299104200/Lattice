@@ -300,6 +300,49 @@ impl Indexer {
         }
     }
 
+    /// Apply already parsed, path-bound files from a validated external cache.
+    /// Cache validation and path rebinding happen before this API boundary;
+    /// graph maintenance is identical to a locally parsed watcher batch.
+    pub fn apply_file_batch_parsed(
+        &mut self,
+        upserts: Vec<ParsedFile>,
+        removals: Vec<String>,
+    ) -> BatchIndexReport {
+        let requested_count = upserts.len();
+        let requested_paths = upserts
+            .iter()
+            .map(|parsed| parsed.file.as_str())
+            .chain(removals.iter().map(String::as_str));
+        let previous_names = self.symbol_names_for_files(requested_paths);
+        let indexed_files = upserts
+            .iter()
+            .map(|parsed| parsed.file.clone())
+            .collect::<Vec<_>>();
+        for parsed in upserts {
+            self.parsed_files.insert(parsed.file.clone(), parsed);
+        }
+        let removed_files = removals;
+        let removed_count = removed_files
+            .iter()
+            .filter(|path| self.parsed_files.remove(*path).is_some())
+            .count();
+        if !indexed_files.is_empty() || removed_count > 0 {
+            let changed_files = indexed_files
+                .iter()
+                .map(String::as_str)
+                .chain(removed_files.iter().map(String::as_str));
+            self.rebuild_changed_files(changed_files, previous_names);
+        }
+        BatchIndexReport {
+            requested_count,
+            indexed_count: indexed_files.len(),
+            is_partial: false,
+            indexed_files,
+            removed_files,
+            failures: Vec::new(),
+        }
+    }
+
     /// Number of files currently indexed.
     pub fn file_count(&self) -> usize {
         self.parsed_files.len()

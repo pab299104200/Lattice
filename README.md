@@ -134,12 +134,16 @@ Process lifecycle events for the proxy and the long-lived daemon are appended to
 
 At runtime Lattice keeps assistant state under the workspace-local `.lattice/` directory:
 
-- `graph.db` stores the persisted graph snapshot, file fingerprint manifest, and cached parsed files used for incremental startup indexing
-- `memories.db` stores memory rows, plus an FTS5 keyword index that is rebuilt automatically on open
+- `.lattice/checkouts/<checkout-id>/graph.db` stores the graph snapshot and file fingerprint manifest for exactly one canonical checkout
+- `.lattice/checkouts/<checkout-id>/vectors.db`, `vectors.usearch`, `events.db`, and `context_handles.json` keep vector, event, and context-handle state isolated to that checkout
+- `.lattice/parsed-cache.db` is the repository-shared, content-addressed parsed-file cache; its keys include content, language/parser, parsed-schema, and parse-configuration versions and its stored payloads contain no checkout path
+- `.lattice/memories.db` stores repository memory shared by the primary checkout and every linked Git worktree, plus an FTS5 keyword index that is rebuilt automatically on open
 - `vectors.db` stores semantic vectors as the durable source of truth and exact-search fallback
 - `vectors.usearch` stores the persisted ANN index used on the semantic-search hot path
 
-On startup, Lattice warm-loads the persisted graph immediately, computes current file fingerprints in the background, and reparses only new, changed, deleted, or parser/schema-version-stale files. The first run after this cache format is introduced populates cached parsed files; later restarts reuse unchanged parsed files and update the loaded graph from deltas.
+On startup, Lattice warm-loads the current checkout's persisted graph immediately, computes current file fingerprints in the background, and resolves files through the repository parsed cache before parsing locally. A linked worktree therefore gets a distinct graph and vector namespace while reusing parse work for byte-identical files. `status` reports the stable repository and checkout identities plus cumulative parsed-cache hit, miss, invalid-row, write, and error counters.
+
+Git linked worktrees do not create their own `<worktree>/.lattice` authority. Lattice resolves Git's common directory, uses the primary repository's `.lattice` directory for shared memory and parsing, and stores checkout-derived state below a stable opaque checkout ID. Non-Git workspaces use the same layout beneath their own `.lattice` directory. If a `.git` pointer exists but is malformed or inaccessible, startup fails with an actionable identity error instead of silently treating the worktree as an unrelated repository.
 
 Subsystem retrieval also uses deterministic, persisted module digests. The indexer
 generates one digest per indexed source file from sorted
