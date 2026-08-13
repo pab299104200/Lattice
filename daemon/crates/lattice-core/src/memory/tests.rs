@@ -201,6 +201,29 @@ fn test_open_backfills_fts_for_legacy_memory_rows() {
     }
 
     let store = MemoryStore::open(&path).expect("Failed to open migrated memory store");
+    let migration_count: i64 = store
+        .with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM memory_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| crate::error::LatticeError::Storage(error.to_string()))
+        })
+        .expect("Failed to inspect recorded memory schema migrations");
+    assert_eq!(
+        migration_count, 27,
+        "every legacy column migration is recorded"
+    );
+    let fts_is_dirty: i64 = store
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT is_dirty FROM memory_fts_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| crate::error::LatticeError::Storage(error.to_string()))
+        })
+        .expect("Failed to inspect FTS state");
+    assert_eq!(fts_is_dirty, 0, "legacy backfill leaves FTS clean");
     let jwt_results = store
         .search_by_keyword("JWT refresh")
         .expect("Failed to search migrated content");
@@ -213,6 +236,116 @@ fn test_open_backfills_fts_for_legacy_memory_rows() {
     assert_eq!(symbol_results.len(), 1);
     assert_eq!(symbol_results[0].id, "legacy-1");
 
+    cleanup_db_files(&path);
+}
+
+#[test]
+fn test_fts_search_orders_by_relevance_not_creation_time() {
+    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
+
+    let mut concise = make_memory("durable migration safety", MemoryType::Decision, vec![]);
+    concise.created_at = 1;
+    concise.last_accessed = 1;
+    store.store(concise).expect("Failed to store concise match");
+
+    let mut recent_but_noisy = make_memory(
+        "durable migration safety filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler",
+        MemoryType::Decision,
+        vec![],
+    );
+    recent_but_noisy.created_at = 10_000;
+    recent_but_noisy.last_accessed = 10_000;
+    store
+        .store(recent_but_noisy)
+        .expect("Failed to store noisy match");
+
+    let results = store
+        .search_by_keyword("durable migration safety")
+        .expect("Failed to run FTS search");
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].created_at, 1,
+        "best BM25 match must win over recency"
+    );
+}
+
+#[test]
+fn test_dirty_fts_state_rebuilds_only_when_recovery_is_required() {
+    let path = temp_db_path("fts-dirty-recovery");
+    cleanup_db_files(&path);
+    {
+        let store = MemoryStore::open(&path).expect("Failed to open memory store");
+        let id = store
+            .store(make_memory(
+                "rebuildable derived FTS index",
+                MemoryType::Observation,
+                vec![],
+            ))
+            .expect("Failed to store memory");
+        store
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM memories_fts WHERE memory_id = ?1", [&id])
+                    .and_then(|_| {
+                        conn.execute(
+                            "UPDATE memory_fts_state SET is_dirty = 1 WHERE singleton = 1",
+                            [],
+                        )
+                    })
+                    .map(|_| ())
+                    .map_err(|error| crate::error::LatticeError::Storage(error.to_string()))
+            })
+            .expect("Failed to simulate interrupted FTS update");
+    }
+
+    let recovered = MemoryStore::open(&path).expect("Dirty FTS state must recover on open");
+    let results = recovered
+        .search_by_keyword("rebuildable derived")
+        .expect("Failed to query recovered FTS index");
+    assert_eq!(results.len(), 1);
+    let is_dirty: i64 = recovered
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT is_dirty FROM memory_fts_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| crate::error::LatticeError::Storage(error.to_string()))
+        })
+        .expect("Failed to inspect recovered FTS state");
+    assert_eq!(is_dirty, 0);
+    cleanup_db_files(&path);
+}
+
+#[test]
+fn test_recorded_migration_missing_column_fails_loudly() {
+    let path = temp_db_path("inconsistent-migration");
+    cleanup_db_files(&path);
+    {
+        let conn = Connection::open(&path).expect("Failed to create fixture database");
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY, content TEXT NOT NULL, memory_type TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0, linked_symbols TEXT NOT NULL DEFAULT '[]',
+                source_query TEXT, created_at INTEGER NOT NULL, last_accessed INTEGER NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 0, is_stale INTEGER NOT NULL DEFAULT 0,
+                stale_reason TEXT, is_invalidated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE memory_schema_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, applied_at INTEGER NOT NULL
+            );
+            INSERT INTO memory_schema_migrations (version, name, applied_at)
+            VALUES (1, 'add_session_id', 1);",
+        )
+        .expect("Failed to seed inconsistent migration fixture");
+    }
+
+    let error = match MemoryStore::open(&path) {
+        Ok(_) => panic!("inconsistent migration must not be ignored"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("recorded but column 'session_id' is missing"));
     cleanup_db_files(&path);
 }
 

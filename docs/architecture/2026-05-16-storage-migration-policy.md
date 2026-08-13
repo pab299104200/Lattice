@@ -51,6 +51,10 @@ The order below is chronological and binding. A later phase may add indexes for 
 
 Phase 4 retrieval introduces no source-of-truth tables in this policy. It may add derived indexes, FTS tables, vector indexes, or ranking metadata only as rebuildable accelerators. Those accelerators must never become the only source of truth for graph, event, memory, or working-memory state.
 
+### Memory store migration and FTS recovery
+
+`memories.db` records its additive column upgrades in `memory_schema_migrations`. An upgrade records a migration only after its schema operation succeeds; a recorded migration whose expected column is absent is an explicit open failure, not a silently ignored error. The derived `memories_fts` index has a persisted dirty bit in `memory_fts_state`: normal writes update the affected row incrementally, while an interrupted write leaves the bit set and causes one source-of-truth rebuild on the next open. FTS matches are ordered by SQLite `bm25` relevance, with creation time used only as a deterministic tie-breaker.
+
 ## Rollback
 
 Rollback classes:

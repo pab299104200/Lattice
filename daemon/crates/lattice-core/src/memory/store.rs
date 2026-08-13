@@ -24,6 +24,47 @@ const MEMORY_DB_BUSY_TIMEOUT_SECS: u64 = 5;
 const MEMORY_DB_AUTO_CHECKPOINT_PAGES: u32 = 100;
 const MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES: u32 = 1_048_576;
 const MEMORIES_FTS_TABLE: &str = "memories_fts";
+const MEMORY_FTS_STATE_TABLE: &str = "memory_fts_state";
+
+/// A schema migration is recorded only after its DDL succeeds.  Individual
+/// column migrations make interrupted upgrades resumable: a later open skips
+/// columns that already exist and retries only the unapplied migration.
+struct MemorySchemaMigration {
+    version: i64,
+    name: &'static str,
+    column: &'static str,
+    sql: &'static str,
+}
+
+const MEMORY_SCHEMA_MIGRATIONS: &[MemorySchemaMigration] = &[
+    MemorySchemaMigration { version: 1, name: "add_session_id", column: "session_id", sql: "ALTER TABLE memories ADD COLUMN session_id TEXT NOT NULL DEFAULT ''" },
+    MemorySchemaMigration { version: 2, name: "add_scope", column: "scope", sql: "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'session'" },
+    MemorySchemaMigration { version: 3, name: "add_linked_files", column: "linked_files", sql: "ALTER TABLE memories ADD COLUMN linked_files TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 4, name: "add_workspace_id", column: "workspace_id", sql: "ALTER TABLE memories ADD COLUMN workspace_id TEXT" },
+    MemorySchemaMigration { version: 5, name: "add_branch", column: "branch", sql: "ALTER TABLE memories ADD COLUMN branch TEXT" },
+    MemorySchemaMigration { version: 6, name: "add_scope_organization_id", column: "scope_organization_id", sql: "ALTER TABLE memories ADD COLUMN scope_organization_id TEXT" },
+    MemorySchemaMigration { version: 7, name: "add_refresh_key", column: "refresh_key", sql: "ALTER TABLE memories ADD COLUMN refresh_key TEXT" },
+    MemorySchemaMigration { version: 8, name: "add_memory_class", column: "memory_class", sql: "ALTER TABLE memories ADD COLUMN memory_class TEXT NOT NULL DEFAULT 'observation'" },
+    MemorySchemaMigration { version: 9, name: "add_assertion_type", column: "assertion_type", sql: "ALTER TABLE memories ADD COLUMN assertion_type TEXT NOT NULL DEFAULT 'observation'" },
+    MemorySchemaMigration { version: 10, name: "add_verification_status", column: "verification_status", sql: "ALTER TABLE memories ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'" },
+    MemorySchemaMigration { version: 11, name: "add_confidence_reason", column: "confidence_reason", sql: "ALTER TABLE memories ADD COLUMN confidence_reason TEXT" },
+    MemorySchemaMigration { version: 12, name: "add_supersedes_memory_id", column: "supersedes_memory_id", sql: "ALTER TABLE memories ADD COLUMN supersedes_memory_id TEXT" },
+    MemorySchemaMigration { version: 13, name: "add_superseded_by_memory_id", column: "superseded_by_memory_id", sql: "ALTER TABLE memories ADD COLUMN superseded_by_memory_id TEXT" },
+    MemorySchemaMigration { version: 14, name: "add_contradicts_memory_ids", column: "contradicts_memory_ids", sql: "ALTER TABLE memories ADD COLUMN contradicts_memory_ids TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 15, name: "add_contradicted_by_memory_ids", column: "contradicted_by_memory_ids", sql: "ALTER TABLE memories ADD COLUMN contradicted_by_memory_ids TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 16, name: "add_freshness_policy", column: "freshness_policy", sql: "ALTER TABLE memories ADD COLUMN freshness_policy TEXT NOT NULL DEFAULT 'session_scoped'" },
+    MemorySchemaMigration { version: 17, name: "add_freshness_policy_detail", column: "freshness_policy_detail", sql: "ALTER TABLE memories ADD COLUMN freshness_policy_detail TEXT" },
+    MemorySchemaMigration { version: 18, name: "add_validity_conditions_json", column: "validity_conditions_json", sql: "ALTER TABLE memories ADD COLUMN validity_conditions_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 19, name: "add_invalidation_triggers_json", column: "invalidation_triggers_json", sql: "ALTER TABLE memories ADD COLUMN invalidation_triggers_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 20, name: "add_provenance_json", column: "provenance_json", sql: "ALTER TABLE memories ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 21, name: "add_evidence_json", column: "evidence_json", sql: "ALTER TABLE memories ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 22, name: "add_linked_docs_json", column: "linked_docs_json", sql: "ALTER TABLE memories ADD COLUMN linked_docs_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 23, name: "add_linked_tests_json", column: "linked_tests_json", sql: "ALTER TABLE memories ADD COLUMN linked_tests_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 24, name: "add_linked_memories_json", column: "linked_memories_json", sql: "ALTER TABLE memories ADD COLUMN linked_memories_json TEXT NOT NULL DEFAULT '[]'" },
+    MemorySchemaMigration { version: 25, name: "add_expires_at", column: "expires_at", sql: "ALTER TABLE memories ADD COLUMN expires_at INTEGER" },
+    MemorySchemaMigration { version: 26, name: "add_last_verified_at", column: "last_verified_at", sql: "ALTER TABLE memories ADD COLUMN last_verified_at INTEGER" },
+    MemorySchemaMigration { version: 27, name: "add_last_verified_graph_snapshot_id", column: "last_verified_graph_snapshot_id", sql: "ALTER TABLE memories ADD COLUMN last_verified_graph_snapshot_id INTEGER" },
+];
 
 fn now_unix_micros() -> i64 {
     SystemTime::now()
@@ -225,110 +266,8 @@ impl MemoryStore {
                 LatticeError::Storage(format!("Failed to initialize memory schema: {}", e))
             })?;
 
-        // Migration: add session_id column if upgrading from older schema
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'session'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN linked_files TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self
-            .conn
-            .execute("ALTER TABLE memories ADD COLUMN workspace_id TEXT", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE memories ADD COLUMN branch TEXT", []);
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN scope_organization_id TEXT",
-            [],
-        );
-        let _ = self
-            .conn
-            .execute("ALTER TABLE memories ADD COLUMN refresh_key TEXT", []);
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN memory_class TEXT NOT NULL DEFAULT 'observation'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN assertion_type TEXT NOT NULL DEFAULT 'observation'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'",
-            [],
-        );
-        let _ = self
-            .conn
-            .execute("ALTER TABLE memories ADD COLUMN confidence_reason TEXT", []);
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN supersedes_memory_id TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN superseded_by_memory_id TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN contradicts_memory_ids TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN contradicted_by_memory_ids TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN freshness_policy TEXT NOT NULL DEFAULT 'session_scoped'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN freshness_policy_detail TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN validity_conditions_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN invalidation_triggers_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN linked_docs_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN linked_tests_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN linked_memories_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self
-            .conn
-            .execute("ALTER TABLE memories ADD COLUMN expires_at INTEGER", []);
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN last_verified_at INTEGER",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE memories ADD COLUMN last_verified_graph_snapshot_id INTEGER",
-            [],
-        );
+        self.initialize_migration_table()?;
+        self.apply_schema_migrations()?;
 
         self.conn
             .execute_batch(
@@ -377,7 +316,8 @@ impl MemoryStore {
                 LatticeError::Storage(format!("Failed to initialize memory FTS5 schema: {}", e))
             })?;
 
-        self.rebuild_fts()?;
+        self.initialize_fts_state()?;
+        self.rebuild_fts_if_dirty()?;
         crate::working_memory::initialize_schema(&self.conn).map_err(|e| {
             LatticeError::Storage(format!("Failed to initialize working memory schema: {}", e))
         })?;
@@ -457,6 +397,10 @@ impl MemoryStore {
             })?;
         let metadata = self.load_existing_verification_metadata(&memory.id)?;
 
+        // Set recovery state before mutating the source of truth. If this
+        // process stops between the memory write and its FTS update, the next
+        // open rebuilds rather than serving a stale derived index.
+        self.set_fts_dirty(true)?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO memories
@@ -559,7 +503,7 @@ impl MemoryStore {
                  WHERE memories.is_invalidated = 0
                    AND {scope_predicate}
                    AND {table} MATCH ?
-                 ORDER BY memories.created_at DESC
+                 ORDER BY bm25({table}), memories.created_at DESC
                  LIMIT ?",
                 table = MEMORIES_FTS_TABLE,
                 scope_predicate = predicate.where_clause,
@@ -638,7 +582,7 @@ impl MemoryStore {
                     ON {table}.memory_id = memories.id
                  WHERE memories.is_invalidated = 0
                    AND {table} MATCH ?1
-                 ORDER BY memories.created_at DESC
+                 ORDER BY bm25({table}), memories.created_at DESC
                  LIMIT ?2",
                 table = MEMORIES_FTS_TABLE,
             );
@@ -1522,7 +1466,7 @@ impl MemoryStore {
                     ON {table}.memory_id = memories.id
                  WHERE memories.is_invalidated = 0
                    AND {table} MATCH ?1
-                 ORDER BY memories.created_at DESC",
+                 ORDER BY bm25({table}), memories.created_at DESC",
                 table = MEMORIES_FTS_TABLE,
             );
             self.query_memories(&sql, params![fts_query], "search memories")?
@@ -1622,6 +1566,7 @@ impl MemoryStore {
 
     /// Delete all memories and return the number deleted.
     pub fn clear_all(&self) -> Result<usize, LatticeError> {
+        self.set_fts_dirty(true)?;
         let count = self
             .conn
             .execute("DELETE FROM memories", [])
@@ -1631,11 +1576,13 @@ impl MemoryStore {
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to clear memory FTS index: {}", e))
             })?;
+        self.set_fts_dirty(false)?;
         Ok(count)
     }
 
     /// Soft-delete a memory by setting is_invalidated = 1.
     pub fn invalidate(&self, id: &str) -> Result<(), LatticeError> {
+        self.set_fts_dirty(true)?;
         self.conn
             .execute(
                 "UPDATE memories SET is_invalidated = 1 WHERE id = ?1",
@@ -1649,6 +1596,7 @@ impl MemoryStore {
     /// Update the content of a memory in-place. Clears stale flags since the content is now fresh.
     pub fn update_content(&self, id: &str, new_content: &str) -> Result<(), LatticeError> {
         self.record_direct_write();
+        self.set_fts_dirty(true)?;
         let updated = self
             .conn
             .execute(
@@ -1745,6 +1693,7 @@ impl MemoryStore {
         refresh_key: Option<&str>,
     ) -> Result<(), LatticeError> {
         self.record_direct_write();
+        self.set_fts_dirty(true)?;
         let freshness_policy = MemoryFreshnessPolicy::from_scope(&scope);
         let updated = if let Some(linked_files) = linked_files {
             let linked_files_json = serde_json::to_string(linked_files).map_err(|e| {
@@ -1848,6 +1797,7 @@ impl MemoryStore {
         stale_days: u64,
     ) -> Result<usize, LatticeError> {
         let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
+        self.set_fts_dirty(true)?;
         self.conn
             .execute(
                 &format!(
@@ -1871,6 +1821,7 @@ impl MemoryStore {
                 params![min_confidence, cutoff as i64],
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to prune memories: {}", e)))?;
+        self.set_fts_dirty(false)?;
         Ok(count)
     }
 
@@ -1967,7 +1918,7 @@ impl MemoryStore {
                      WHERE memories.is_invalidated = 0
                        AND memories.session_id != ?1
                        AND {table} MATCH ?2
-                     ORDER BY memories.created_at DESC
+                     ORDER BY bm25({table}), memories.created_at DESC
                      LIMIT ?3",
                     table = MEMORIES_FTS_TABLE,
                 );
@@ -1990,7 +1941,7 @@ impl MemoryStore {
                         ON {table}.memory_id = memories.id
                      WHERE memories.is_invalidated = 0
                        AND {table} MATCH ?1
-                     ORDER BY memories.created_at DESC
+                     ORDER BY bm25({table}), memories.created_at DESC
                      LIMIT ?2",
                     table = MEMORIES_FTS_TABLE,
                 );
@@ -2053,7 +2004,7 @@ impl MemoryStore {
                  WHERE memories.is_invalidated = 0
                    AND memories.is_stale = 1
                    AND {table} MATCH ?1
-                 ORDER BY memories.created_at DESC
+                 ORDER BY bm25({table}), memories.created_at DESC
                  LIMIT ?2",
                 table = MEMORIES_FTS_TABLE,
             );
@@ -2286,7 +2237,130 @@ impl MemoryStore {
         Ok(())
     }
 
+    fn initialize_migration_table(&self) -> Result<(), LatticeError> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS memory_schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    applied_at INTEGER NOT NULL
+                );",
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to initialize memory schema migration table: {error}"
+                ))
+            })
+    }
+
+    fn apply_schema_migrations(&self) -> Result<(), LatticeError> {
+        for migration in MEMORY_SCHEMA_MIGRATIONS {
+            let applied = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM memory_schema_migrations WHERE version = ?1",
+                    params![migration.version],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to read memory schema migrations: {error}"
+                    ))
+                })?
+                .is_some();
+            if applied {
+                if !self.memory_column_exists(migration.column)? {
+                    return Err(LatticeError::Storage(format!(
+                        "Memory schema migration {} ({}) is recorded but column '{}' is missing",
+                        migration.version, migration.name, migration.column
+                    )));
+                }
+                continue;
+            }
+
+            if !self.memory_column_exists(migration.column)? {
+                self.conn.execute(migration.sql, []).map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to apply memory schema migration {} ({}): {error}",
+                        migration.version, migration.name
+                    ))
+                })?;
+            }
+
+            self.conn
+                .execute(
+                    "INSERT INTO memory_schema_migrations (version, name, applied_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, now_unix_micros()],
+                )
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to record memory schema migration {} ({}): {error}",
+                        migration.version, migration.name
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn memory_column_exists(&self, column: &str) -> Result<bool, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare("PRAGMA table_info(memories)")
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to inspect memory schema: {error}"))
+            })?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to inspect memory schema columns: {error}"))
+            })?;
+        for name in columns {
+            if name.map_err(|error| {
+                LatticeError::Storage(format!("Failed to read memory schema column: {error}"))
+            })? == column
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn initialize_fts_state(&self) -> Result<(), LatticeError> {
+        self.conn
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {MEMORY_FTS_STATE_TABLE} (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    is_dirty INTEGER NOT NULL DEFAULT 1
+                );
+                 INSERT OR IGNORE INTO {MEMORY_FTS_STATE_TABLE} (singleton, is_dirty)
+                 VALUES (1, 1);"
+            ))
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to initialize memory FTS state: {error}"))
+            })
+    }
+
+    fn rebuild_fts_if_dirty(&self) -> Result<(), LatticeError> {
+        let dirty: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT is_dirty FROM {MEMORY_FTS_STATE_TABLE} WHERE singleton = 1"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to read memory FTS state: {error}"))
+            })?;
+        if dirty != 0 {
+            self.rebuild_fts()?;
+        }
+        Ok(())
+    }
+
     fn rebuild_fts(&self) -> Result<(), LatticeError> {
+        self.set_fts_dirty(true)?;
         self.conn
             .execute(&format!("DELETE FROM {}", MEMORIES_FTS_TABLE), [])
             .map_err(|e| {
@@ -2294,15 +2368,23 @@ impl MemoryStore {
             })?;
 
         for memory in self.list_all()? {
-            self.upsert_fts_row(&memory)?;
+            self.upsert_fts_row_raw(&memory)?;
         }
+
+        self.set_fts_dirty(false)?;
 
         Ok(())
     }
 
     fn upsert_fts_row(&self, memory: &Memory) -> Result<(), LatticeError> {
+        self.set_fts_dirty(true)?;
+        self.upsert_fts_row_raw(memory)?;
+        self.set_fts_dirty(false)
+    }
+
+    fn upsert_fts_row_raw(&self, memory: &Memory) -> Result<(), LatticeError> {
         let document = build_memory_search_document(memory);
-        self.delete_fts_row(&memory.id)?;
+        self.delete_fts_row_raw(&memory.id)?;
         self.conn
             .execute(
                 &format!(
@@ -2327,6 +2409,12 @@ impl MemoryStore {
     }
 
     fn delete_fts_row(&self, id: &str) -> Result<(), LatticeError> {
+        self.set_fts_dirty(true)?;
+        self.delete_fts_row_raw(id)?;
+        self.set_fts_dirty(false)
+    }
+
+    fn delete_fts_row_raw(&self, id: &str) -> Result<(), LatticeError> {
         self.conn
             .execute(
                 &format!("DELETE FROM {} WHERE memory_id = ?1", MEMORIES_FTS_TABLE),
@@ -2337,6 +2425,18 @@ impl MemoryStore {
                     "Failed to delete memory FTS row for '{}': {}",
                     id, e
                 ))
+            })?;
+        Ok(())
+    }
+
+    fn set_fts_dirty(&self, is_dirty: bool) -> Result<(), LatticeError> {
+        self.conn
+            .execute(
+                &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = ?1 WHERE singleton = 1"),
+                params![i64::from(is_dirty)],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to update memory FTS state: {error}"))
             })?;
         Ok(())
     }
