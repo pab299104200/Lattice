@@ -22,6 +22,16 @@ impl GraphBuilder {
 
     /// Consume the builder and produce a CodeGraph.
     pub fn build(self) -> CodeGraph {
+        Self::build_from_files(self.files.iter())
+    }
+
+    /// Build directly from borrowed parsed files.
+    ///
+    /// Index rebuilds already retain parsed files in the indexer cache. Borrowing
+    /// them avoids materializing a second full parsed-file collection while a
+    /// replacement graph is under construction.
+    pub fn build_from_files<'a>(files: impl IntoIterator<Item = &'a ParsedFile>) -> CodeGraph {
+        let files = files.into_iter().collect::<Vec<_>>();
         let mut graph = CodeGraph::new();
 
         // name_lookup: symbol name → list of SymbolIds with that name
@@ -32,7 +42,7 @@ impl GraphBuilder {
         let mut kind_lookup: HashMap<SymbolId, SymbolKind> = HashMap::new();
 
         // ---- Pass 1: Add all symbols as nodes ----
-        for file in &self.files {
+        for file in &files {
             for symbol in &file.symbols {
                 graph.add_node(
                     symbol.id.clone(),
@@ -71,7 +81,7 @@ impl GraphBuilder {
         }
 
         // ---- Pass 2: Resolve edges ----
-        for file in &self.files {
+        for file in &files {
             // 2a: Resolve import edges
             for import in &file.imports {
                 // Resolve the import source to a target file path
@@ -453,4 +463,64 @@ fn find_symbol_in_file(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GraphBuilder;
+    use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
+    use crate::parser::parse_file;
+    use crate::symbols::SymbolId;
+
+    fn graph_snapshot(graph: &CodeGraph) -> (Vec<GraphNode>, Vec<(SymbolId, SymbolId, EdgeKind)>) {
+        let nodes = graph.all_nodes().into_iter().cloned().collect();
+        let edges = graph
+            .all_edges()
+            .into_iter()
+            .map(|(from, to, kind)| (from.id.clone(), to.id.clone(), kind))
+            .collect();
+        (nodes, edges)
+    }
+
+    #[test]
+    fn borrowed_files_build_the_same_graph_without_consuming_the_cache() {
+        let caller = parse_file(
+            "src/caller.ts",
+            r#"
+import { helper } from './helper';
+
+export function caller(): string {
+    return helper();
+}
+"#,
+        )
+        .expect("caller fixture should parse");
+        let helper = parse_file(
+            "src/helper.ts",
+            r#"
+export function helper(): string {
+    return "ready";
+}
+"#,
+        )
+        .expect("helper fixture should parse");
+        let cached_files = vec![caller, helper];
+
+        let borrowed_graph = GraphBuilder::build_from_files(cached_files.iter());
+
+        assert_eq!(cached_files.len(), 2);
+        assert_eq!(cached_files[0].file, "src/caller.ts");
+        assert!(!cached_files[0].symbols.is_empty());
+
+        let mut owned_builder = GraphBuilder::new();
+        for file in cached_files.clone() {
+            owned_builder.add_file(file);
+        }
+        let owned_graph = owned_builder.build();
+
+        assert_eq!(
+            graph_snapshot(&borrowed_graph),
+            graph_snapshot(&owned_graph)
+        );
+    }
 }
