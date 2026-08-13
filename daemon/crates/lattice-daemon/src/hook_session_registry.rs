@@ -12,9 +12,15 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
-pub const HOOK_REGISTRY_SCHEMA_VERSION: u32 = 1;
+use crate::hook_session_binding::{
+    HookBindingId, HookCapabilityVerifier, HookCheckoutIdentity, HookIntegrationId,
+    HookInternalSessionId, HookRepositoryState, HookSessionCapability, HookSessionCryptography,
+    HostSessionId,
+};
+
+pub const HOOK_REGISTRY_SCHEMA_VERSION: u32 = 2;
 const APPLICATION_ID: i64 = 0x4c_48_53_52; // "LHSR"
-const MAX_OPAQUE_ID_BYTES: usize = 256;
+const MAX_OPAQUE_ID_BYTES: usize = 4096;
 const SHA256_BYTES: usize = 32;
 
 /// Finite limits enforced independently of adapter behavior.
@@ -166,18 +172,86 @@ impl RegistryReceiptStatus {
     }
 }
 
-/// Persisted authority material. Both hashes must be one-way derivations; the
-/// registry does not accept repository, checkout, host-session, or event text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NewRegistryBinding {
-    pub binding_id: RegistryId,
-    pub authority_fingerprint: RegistryHash,
-    pub capability_verifier: RegistryHash,
+#[derive(Debug)]
+pub struct RegistrySessionResume {
+    pub binding_id: HookBindingId,
+    pub capability: HookSessionCapability,
+}
+
+/// Complete input to the registry's atomic session service. Identity and Git
+/// state must already have been independently resolved by the daemon. The host
+/// session value is used only by keyed fingerprinting and is never persisted.
+#[derive(Debug)]
+pub struct RegistryOpenRequest {
+    pub integration: HookIntegrationId,
+    pub host_session_id: HostSessionId,
+    pub checkout: HookCheckoutIdentity,
+    pub repository_state: HookRepositoryState,
+    pub resume: Option<RegistrySessionResume>,
+    pub now_ms: i64,
+    pub idle_ttl_ms: i64,
+    pub absolute_ttl_ms: i64,
+    pub retention_ms: i64,
+}
+
+#[derive(Clone)]
+pub struct RegistryOpenOutcome {
+    pub binding_id: HookBindingId,
+    pub capability: HookSessionCapability,
+    pub internal_session_id: HookInternalSessionId,
     pub generation: u64,
-    pub created_at_ms: i64,
+    pub resumed: bool,
     pub idle_deadline_ms: i64,
     pub absolute_deadline_ms: i64,
-    pub prune_after_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct RegistryVerifyRequest {
+    pub binding_id: HookBindingId,
+    pub capability: HookSessionCapability,
+    pub integration: HookIntegrationId,
+    pub current_checkout: HookCheckoutIdentity,
+    pub now_ms: i64,
+    pub idle_ttl_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryVerification {
+    pub binding_id: HookBindingId,
+    pub internal_session_id: HookInternalSessionId,
+    pub integration: HookIntegrationId,
+    pub checkout: HookCheckoutIdentity,
+    pub repository_state: HookRepositoryState,
+    pub generation: u64,
+    pub idle_deadline_ms: i64,
+    pub absolute_deadline_ms: i64,
+}
+
+#[cfg(test)]
+struct TestRegistryBinding {
+    binding_id: RegistryId,
+    authority_fingerprint: RegistryHash,
+    capability_verifier: RegistryHash,
+    generation: u64,
+    created_at_ms: i64,
+    idle_deadline_ms: i64,
+    absolute_deadline_ms: i64,
+    prune_after_ms: i64,
+}
+
+impl fmt::Debug for RegistryOpenOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistryOpenOutcome")
+            .field("binding_id", &"<redacted>")
+            .field("capability", &"<redacted>")
+            .field("internal_session_id", &"<redacted>")
+            .field("generation", &self.generation)
+            .field("resumed", &self.resumed)
+            .field("idle_deadline_ms", &self.idle_deadline_ms)
+            .field("absolute_deadline_ms", &self.absolute_deadline_ms)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +261,12 @@ pub struct RegistryBinding {
     pub binding_id: RegistryId,
     pub authority_fingerprint: RegistryHash,
     pub capability_verifier: RegistryHash,
+    pub internal_session_id: RegistryId,
+    pub integration_id: RegistryId,
+    pub repository_id: RegistryId,
+    pub checkout_id: RegistryId,
+    pub start_branch: Option<String>,
+    pub start_revision: String,
     pub generation: u64,
     pub state: RegistryBindingState,
     pub created_at_ms: i64,
@@ -280,6 +360,12 @@ pub enum HookRegistryError {
     BindingNotFound,
     #[error("hook-session binding already exists with different authority")]
     BindingConflict,
+    #[error("hook-session binding is already open and requires its capability to resume")]
+    BindingAlreadyOpen,
+    #[error("hook-session capability is invalid")]
+    InvalidCapability,
+    #[error("hook-session resume authority does not match the persisted binding tuple")]
+    AuthorityMismatch,
     #[error("hook-session binding has expired")]
     Expired,
     #[error("hook-session binding is sealed")]
@@ -340,43 +426,30 @@ impl HookSessionRegistry {
         HOOK_REGISTRY_SCHEMA_VERSION
     }
 
-    /// Inserts an authority row. A byte-identical retry is idempotent; a retry
-    /// that changes authority or lifetime is rejected.
-    pub fn insert_binding(
+    #[cfg(test)]
+    fn insert_test_binding(
         &mut self,
-        binding: NewRegistryBinding,
+        binding: TestRegistryBinding,
     ) -> Result<bool, HookRegistryError> {
-        validate_new_binding(&binding)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = load_binding_from(&transaction, &binding.binding_id)? {
-            let matches = existing.authority_fingerprint == binding.authority_fingerprint
-                && existing.capability_verifier == binding.capability_verifier
-                && existing.generation == binding.generation
-                && existing.created_at_ms == binding.created_at_ms
-                && existing.idle_deadline_ms == binding.idle_deadline_ms
-                && existing.absolute_deadline_ms == binding.absolute_deadline_ms
-                && existing.prune_after_ms == binding.prune_after_ms;
-            transaction.commit()?;
-            return if matches {
-                Ok(false)
-            } else {
-                Err(HookRegistryError::BindingConflict)
-            };
-        }
-        transaction.execute(
-            "INSERT INTO hook_bindings
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO hook_bindings
              (schema_version, row_version, binding_id, authority_fingerprint,
-              capability_verifier, generation, state, created_at_ms,
-              last_seen_at_ms, idle_deadline_ms, absolute_deadline_ms,
-              prune_after_ms, next_sequence)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5, 'open', ?6, ?6, ?7, ?8, ?9, 1)",
+              capability_verifier, internal_session_id, integration_id,
+              repository_id, checkout_id, start_branch, start_revision,
+              generation, state, created_at_ms, last_seen_at_ms,
+              idle_deadline_ms, absolute_deadline_ms, prune_after_ms,
+              next_sequence)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'main', 'abc123',
+                     ?9, 'open', ?10, ?10, ?11, ?12, ?13, 1)",
             params![
                 i64::from(HOOK_REGISTRY_SCHEMA_VERSION),
                 binding.binding_id.as_bytes(),
                 binding.authority_fingerprint.as_bytes(),
                 binding.capability_verifier.as_bytes(),
+                [3_u8; 16],
+                b"test-adapter",
+                b"test-repository",
+                b"test-checkout",
                 to_i64(binding.generation)?,
                 binding.created_at_ms,
                 binding.idle_deadline_ms,
@@ -384,8 +457,218 @@ impl HookSessionRegistry {
                 binding.prune_after_ms,
             ],
         )?;
+        Ok(changed == 1)
+    }
+
+    /// Atomically opens a new durable binding or verifies and resumes the one
+    /// open binding for the exact integration/host-session/checkout tuple.
+    ///
+    /// This is the sole binding-creation seam: callers cannot supply verifier
+    /// hashes, tuple fingerprints, internal session IDs, or generations.
+    pub fn open_or_resume(
+        &mut self,
+        cryptography: &HookSessionCryptography,
+        request: RegistryOpenRequest,
+    ) -> Result<RegistryOpenOutcome, HookRegistryError> {
+        validate_open_request(&request)?;
+        let authority_fingerprint = cryptography.authority_fingerprint(
+            &request.integration,
+            &request.host_session_id,
+            &request.checkout,
+        );
+        let authority_hash = RegistryHash::from_bytes(*authority_fingerprint.as_bytes());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        expire_open_tuple_if_needed(&transaction, &authority_hash, request.now_ms)?;
+        if let Some(existing) = load_open_binding_by_authority(&transaction, &authority_hash)? {
+            let resume = request
+                .resume
+                .as_ref()
+                .ok_or(HookRegistryError::BindingAlreadyOpen)?;
+            if existing.binding_id.as_bytes() != resume.binding_id.as_bytes() {
+                return Err(HookRegistryError::AuthorityMismatch);
+            }
+            verify_persisted_identity(&existing, &request)?;
+            let expected =
+                HookCapabilityVerifier::from_bytes(*existing.capability_verifier.as_bytes());
+            if !cryptography.verify_capability(&resume.binding_id, &resume.capability, &expected) {
+                return Err(HookRegistryError::InvalidCapability);
+            }
+            let requested_idle = request
+                .now_ms
+                .checked_add(request.idle_ttl_ms)
+                .ok_or(HookRegistryError::InvalidValue)?;
+            let idle_deadline_ms = requested_idle.min(existing.absolute_deadline_ms);
+            transaction.execute(
+                "UPDATE hook_bindings
+                 SET row_version = row_version + 1, last_seen_at_ms = ?2,
+                     idle_deadline_ms = ?3
+                 WHERE binding_id = ?1 AND state = 'open'",
+                params![
+                    existing.binding_id.as_bytes(),
+                    request.now_ms,
+                    idle_deadline_ms
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(RegistryOpenOutcome {
+                binding_id: resume.binding_id,
+                capability: resume.capability,
+                internal_session_id: hook_internal_session_id(&existing.internal_session_id)?,
+                generation: existing.generation,
+                resumed: true,
+                idle_deadline_ms,
+                absolute_deadline_ms: existing.absolute_deadline_ms,
+            });
+        }
+
+        if let Some(resume) = &request.resume {
+            let binding_id = registry_id(resume.binding_id.as_bytes())?;
+            let existing = load_binding_from(&transaction, &binding_id)?
+                .ok_or(HookRegistryError::BindingNotFound)?;
+            let error = match existing.state {
+                RegistryBindingState::Open => HookRegistryError::AuthorityMismatch,
+                RegistryBindingState::Sealed => HookRegistryError::Sealed,
+                RegistryBindingState::Expired => HookRegistryError::Expired,
+                RegistryBindingState::Revoked => HookRegistryError::Revoked,
+            };
+            if existing.state == RegistryBindingState::Expired {
+                transaction.commit()?;
+            }
+            return Err(error);
+        }
+
+        let prepared = cryptography
+            .prepare_binding(
+                &request.integration,
+                &request.host_session_id,
+                &request.checkout,
+            )
+            .map_err(|_| HookRegistryError::InvalidValue)?;
+        let generation = next_generation(&transaction, &authority_hash)?;
+        let idle_deadline_ms = request
+            .now_ms
+            .checked_add(request.idle_ttl_ms)
+            .ok_or(HookRegistryError::InvalidValue)?;
+        let absolute_deadline_ms = request
+            .now_ms
+            .checked_add(request.absolute_ttl_ms)
+            .ok_or(HookRegistryError::InvalidValue)?;
+        let prune_after_ms = absolute_deadline_ms
+            .checked_add(request.retention_ms)
+            .ok_or(HookRegistryError::InvalidValue)?;
+        transaction.execute(
+            "INSERT INTO hook_bindings
+             (schema_version, row_version, binding_id, authority_fingerprint,
+              capability_verifier, internal_session_id, integration_id,
+              repository_id, checkout_id, start_branch, start_revision,
+              generation, state, created_at_ms,
+              last_seen_at_ms, idle_deadline_ms, absolute_deadline_ms,
+              prune_after_ms, next_sequence)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, 'open', ?12, ?12, ?13, ?14, ?15, 1)",
+            params![
+                i64::from(HOOK_REGISTRY_SCHEMA_VERSION),
+                prepared.binding_id.as_bytes(),
+                prepared.authority_fingerprint.as_bytes(),
+                prepared.capability_verifier.as_bytes(),
+                prepared.internal_session_id.as_bytes(),
+                request.integration.as_str().as_bytes(),
+                request.checkout.repository_id().as_bytes(),
+                request.checkout.checkout_id().as_bytes(),
+                request.repository_state.branch(),
+                request.repository_state.revision(),
+                to_i64(generation)?,
+                request.now_ms,
+                idle_deadline_ms,
+                absolute_deadline_ms,
+                prune_after_ms,
+            ],
+        )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(RegistryOpenOutcome {
+            binding_id: prepared.binding_id,
+            capability: prepared.capability,
+            internal_session_id: prepared.internal_session_id,
+            generation,
+            resumed: false,
+            idle_deadline_ms,
+            absolute_deadline_ms,
+        })
+    }
+
+    /// Verifies durable session authority and renews its idle lease in the same
+    /// transaction. Event/close services call this before accepting content;
+    /// they receive only daemon-owned persisted authority in return.
+    pub fn verify_and_renew(
+        &mut self,
+        cryptography: &HookSessionCryptography,
+        request: RegistryVerifyRequest,
+    ) -> Result<RegistryVerification, HookRegistryError> {
+        if request.now_ms < 0 || request.idle_ttl_ms <= 0 {
+            return Err(HookRegistryError::InvalidValue);
+        }
+        let binding_id = registry_id(request.binding_id.as_bytes())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut binding = load_binding_from(&transaction, &binding_id)?
+            .ok_or(HookRegistryError::BindingNotFound)?;
+        let expected = HookCapabilityVerifier::from_bytes(*binding.capability_verifier.as_bytes());
+        if !cryptography.verify_capability(&request.binding_id, &request.capability, &expected) {
+            return Err(HookRegistryError::InvalidCapability);
+        }
+        if binding.integration_id.as_bytes() != request.integration.as_str().as_bytes()
+            || binding.repository_id.as_bytes()
+                != request.current_checkout.repository_id().as_bytes()
+            || binding.checkout_id.as_bytes() != request.current_checkout.checkout_id().as_bytes()
+        {
+            return Err(HookRegistryError::AuthorityMismatch);
+        }
+        expire_binding_if_needed(&transaction, &mut binding, request.now_ms)?;
+        let state_error = match binding.state {
+            RegistryBindingState::Open => None,
+            RegistryBindingState::Sealed => Some(HookRegistryError::Sealed),
+            RegistryBindingState::Expired => Some(HookRegistryError::Expired),
+            RegistryBindingState::Revoked => Some(HookRegistryError::Revoked),
+        };
+        if let Some(error) = state_error {
+            transaction.commit()?;
+            return Err(error);
+        }
+        let idle_deadline_ms = request
+            .now_ms
+            .checked_add(request.idle_ttl_ms)
+            .ok_or(HookRegistryError::InvalidValue)?
+            .min(binding.absolute_deadline_ms);
+        transaction.execute(
+            "UPDATE hook_bindings
+             SET row_version = row_version + 1, last_seen_at_ms = ?2,
+                 idle_deadline_ms = ?3
+             WHERE binding_id = ?1 AND state = 'open'",
+            params![
+                binding.binding_id.as_bytes(),
+                request.now_ms,
+                idle_deadline_ms
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(RegistryVerification {
+            binding_id: request.binding_id,
+            internal_session_id: hook_internal_session_id(&binding.internal_session_id)?,
+            integration: request.integration,
+            checkout: request.current_checkout,
+            repository_state: HookRepositoryState::new(
+                binding.start_branch,
+                binding.start_revision,
+            )
+            .map_err(|_| HookRegistryError::InvalidIdentifier)?,
+            generation: binding.generation,
+            idle_deadline_ms,
+            absolute_deadline_ms: binding.absolute_deadline_ms,
+        })
     }
 
     pub fn binding(
@@ -761,23 +1044,52 @@ fn configure_connection(connection: &Connection) -> Result<(), rusqlite::Error> 
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
-    let found = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+    let mut found = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
     if found > HOOK_REGISTRY_SCHEMA_VERSION {
         return Err(HookRegistryError::UnsupportedSchema {
             found,
             expected: HOOK_REGISTRY_SCHEMA_VERSION,
         });
     }
+    if found == 1 {
+        let application_id =
+            connection.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?;
+        if application_id != APPLICATION_ID {
+            return Err(HookRegistryError::UnsupportedSchema {
+                found,
+                expected: HOOK_REGISTRY_SCHEMA_VERSION,
+            });
+        }
+        // D3 was not wired while schema v1 existed, and v1 did not retain the
+        // identity needed to authenticate or migrate a binding. Preserving
+        // unverifiable rows would create authority, so the v2 transition
+        // deliberately invalidates that prerelease state.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS hook_outbox;
+             DROP TABLE IF EXISTS hook_receipts;
+             DROP TABLE IF EXISTS hook_bindings;
+             PRAGMA user_version = 0;
+             COMMIT;",
+        )?;
+        found = 0;
+    }
     if found == 0 {
         connection.execute_batch(&format!(
             "BEGIN IMMEDIATE;
              PRAGMA application_id = {APPLICATION_ID};
              CREATE TABLE hook_bindings (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB PRIMARY KEY NOT NULL CHECK (length(binding_id) BETWEEN 1 AND 256),
                  authority_fingerprint BLOB NOT NULL CHECK (length(authority_fingerprint) = 32),
                  capability_verifier BLOB NOT NULL CHECK (length(capability_verifier) = 32),
+                 internal_session_id BLOB NOT NULL CHECK (length(internal_session_id) = 16),
+                 integration_id BLOB NOT NULL CHECK (length(integration_id) BETWEEN 1 AND 128),
+                 repository_id BLOB NOT NULL CHECK (length(repository_id) BETWEEN 1 AND 4096),
+                 checkout_id BLOB NOT NULL CHECK (length(checkout_id) BETWEEN 1 AND 4096),
+                 start_branch TEXT,
+                 start_revision TEXT NOT NULL CHECK (length(start_revision) BETWEEN 1 AND 256),
                  generation INTEGER NOT NULL CHECK (generation > 0),
                  state TEXT NOT NULL CHECK (state IN ('open', 'sealed', 'expired', 'revoked')),
                  created_at_ms INTEGER NOT NULL,
@@ -793,8 +1105,10 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
                  CHECK (created_at_ms < absolute_deadline_ms),
                  CHECK (absolute_deadline_ms <= prune_after_ms)
              );
+             CREATE UNIQUE INDEX hook_bindings_one_open_tuple_idx
+                 ON hook_bindings(authority_fingerprint) WHERE state = 'open';
              CREATE TABLE hook_receipts (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB NOT NULL REFERENCES hook_bindings(binding_id) ON DELETE CASCADE,
                  delivery_id BLOB NOT NULL CHECK (length(delivery_id) BETWEEN 1 AND 256),
@@ -813,7 +1127,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
                  CHECK (admitted_at_ms <= prune_after_ms)
              );
              CREATE TABLE hook_outbox (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB NOT NULL,
                  delivery_id BLOB NOT NULL,
@@ -848,14 +1162,16 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
     Ok(())
 }
 
-fn validate_new_binding(binding: &NewRegistryBinding) -> Result<(), HookRegistryError> {
-    if binding.generation == 0
-        || binding.created_at_ms < 0
-        || binding.created_at_ms >= binding.idle_deadline_ms
-        || binding.created_at_ms >= binding.absolute_deadline_ms
-        || binding.idle_deadline_ms > binding.absolute_deadline_ms
-        || binding.absolute_deadline_ms > binding.prune_after_ms
-        || binding.generation > i64::MAX as u64
+fn validate_open_request(request: &RegistryOpenRequest) -> Result<(), HookRegistryError> {
+    if request.now_ms < 0
+        || request.idle_ttl_ms <= 0
+        || request.absolute_ttl_ms < request.idle_ttl_ms
+        || request.retention_ms < 0
+        || request
+            .now_ms
+            .checked_add(request.absolute_ttl_ms)
+            .and_then(|deadline| deadline.checked_add(request.retention_ms))
+            .is_none()
     {
         return Err(HookRegistryError::InvalidValue);
     }
@@ -905,7 +1221,9 @@ fn load_binding_from(
     connection
         .query_row(
             "SELECT schema_version, row_version, binding_id,
-                    authority_fingerprint, capability_verifier, generation,
+                    authority_fingerprint, capability_verifier,
+                    internal_session_id, integration_id, repository_id,
+                    checkout_id, start_branch, start_revision, generation,
                     state, created_at_ms, last_seen_at_ms, idle_deadline_ms,
                     absolute_deadline_ms, prune_after_ms, next_sequence,
                     closing_sequence
@@ -918,19 +1236,110 @@ fn load_binding_from(
                     binding_id: blob_id(row.get(2)?)?,
                     authority_fingerprint: blob_hash(row.get(3)?)?,
                     capability_verifier: blob_hash(row.get(4)?)?,
-                    generation: u64_column(row.get(5)?)?,
-                    state: RegistryBindingState::parse(&row.get::<_, String>(6)?)?,
-                    created_at_ms: row.get(7)?,
-                    last_seen_at_ms: row.get(8)?,
-                    idle_deadline_ms: row.get(9)?,
-                    absolute_deadline_ms: row.get(10)?,
-                    prune_after_ms: row.get(11)?,
-                    next_sequence: u64_column(row.get(12)?)?,
-                    closing_sequence: row.get::<_, Option<i64>>(13)?.map(u64_column).transpose()?,
+                    internal_session_id: blob_id(row.get(5)?)?,
+                    integration_id: blob_id(row.get(6)?)?,
+                    repository_id: blob_id(row.get(7)?)?,
+                    checkout_id: blob_id(row.get(8)?)?,
+                    start_branch: row.get(9)?,
+                    start_revision: row.get(10)?,
+                    generation: u64_column(row.get(11)?)?,
+                    state: RegistryBindingState::parse(&row.get::<_, String>(12)?)?,
+                    created_at_ms: row.get(13)?,
+                    last_seen_at_ms: row.get(14)?,
+                    idle_deadline_ms: row.get(15)?,
+                    absolute_deadline_ms: row.get(16)?,
+                    prune_after_ms: row.get(17)?,
+                    next_sequence: u64_column(row.get(18)?)?,
+                    closing_sequence: row.get::<_, Option<i64>>(19)?.map(u64_column).transpose()?,
                 })
             },
         )
         .optional()
+}
+
+fn load_open_binding_by_authority(
+    connection: &Connection,
+    authority_fingerprint: &RegistryHash,
+) -> rusqlite::Result<Option<RegistryBinding>> {
+    let binding_id = connection
+        .query_row(
+            "SELECT binding_id FROM hook_bindings
+             WHERE authority_fingerprint = ?1 AND state = 'open'",
+            params![authority_fingerprint.as_bytes()],
+            |row| blob_id(row.get(0)?),
+        )
+        .optional()?;
+    binding_id
+        .as_ref()
+        .map(|binding_id| load_binding_from(connection, binding_id))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn expire_open_tuple_if_needed(
+    connection: &Connection,
+    authority_fingerprint: &RegistryHash,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE hook_bindings
+         SET state = 'expired', row_version = row_version + 1
+         WHERE authority_fingerprint = ?1 AND state = 'open'
+           AND (idle_deadline_ms <= ?2 OR absolute_deadline_ms <= ?2)",
+        params![authority_fingerprint.as_bytes(), now_ms],
+    )?;
+    connection.execute(
+        "DELETE FROM hook_outbox
+         WHERE binding_id IN (
+             SELECT binding_id FROM hook_bindings
+             WHERE authority_fingerprint = ?1 AND state = 'expired'
+         )",
+        params![authority_fingerprint.as_bytes()],
+    )?;
+    Ok(())
+}
+
+fn next_generation(
+    connection: &Connection,
+    authority_fingerprint: &RegistryHash,
+) -> Result<u64, HookRegistryError> {
+    let previous: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(generation), 0) FROM hook_bindings
+         WHERE authority_fingerprint = ?1",
+        params![authority_fingerprint.as_bytes()],
+        |row| row.get(0),
+    )?;
+    u64_column(previous)?
+        .checked_add(1)
+        .ok_or(HookRegistryError::InvalidValue)
+}
+
+fn verify_persisted_identity(
+    existing: &RegistryBinding,
+    request: &RegistryOpenRequest,
+) -> Result<(), HookRegistryError> {
+    let matches = existing.integration_id.as_bytes() == request.integration.as_str().as_bytes()
+        && existing.repository_id.as_bytes() == request.checkout.repository_id().as_bytes()
+        && existing.checkout_id.as_bytes() == request.checkout.checkout_id().as_bytes();
+    if matches {
+        Ok(())
+    } else {
+        Err(HookRegistryError::BindingConflict)
+    }
+}
+
+fn registry_id(bytes: &[u8]) -> Result<RegistryId, HookRegistryError> {
+    RegistryId::from_bytes(bytes.to_vec())
+}
+
+fn hook_internal_session_id(
+    identifier: &RegistryId,
+) -> Result<HookInternalSessionId, HookRegistryError> {
+    let bytes: [u8; 16] = identifier
+        .as_bytes()
+        .try_into()
+        .map_err(|_| HookRegistryError::InvalidIdentifier)?;
+    Ok(HookInternalSessionId::from_bytes(bytes))
 }
 
 fn load_receipt_from(
@@ -1052,8 +1461,8 @@ mod tests {
         RegistryHash::from_bytes([value; SHA256_BYTES])
     }
 
-    fn binding() -> NewRegistryBinding {
-        NewRegistryBinding {
+    fn binding() -> TestRegistryBinding {
+        TestRegistryBinding {
             binding_id: id("binding-1"),
             authority_fingerprint: hash(1),
             capability_verifier: hash(2),
@@ -1079,6 +1488,24 @@ mod tests {
         }
     }
 
+    fn cryptography() -> HookSessionCryptography {
+        HookSessionCryptography::from_secret([0x51; 32])
+    }
+
+    fn open_request(now_ms: i64, resume: Option<RegistrySessionResume>) -> RegistryOpenRequest {
+        RegistryOpenRequest {
+            integration: HookIntegrationId::new("codex/v1").unwrap(),
+            host_session_id: HostSessionId::new("opaque-host-session").unwrap(),
+            checkout: HookCheckoutIdentity::new("repository-A", "checkout-A").unwrap(),
+            repository_state: HookRepositoryState::new(Some("feature/d3"), "abc123").unwrap(),
+            resume,
+            now_ms,
+            idle_ttl_ms: 100,
+            absolute_ttl_ms: 1_000,
+            retention_ms: 1_000,
+        }
+    }
+
     fn temp_db(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1098,14 +1525,156 @@ mod tests {
     }
 
     #[test]
+    fn open_or_resume_is_atomic_persistent_and_renews_only_idle() {
+        let path = temp_db("open-resume");
+        let crypto = cryptography();
+        let opened = {
+            let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+            let opened = registry
+                .open_or_resume(&crypto, open_request(10, None))
+                .unwrap();
+            assert!(!opened.resumed);
+            assert_eq!(opened.generation, 1);
+            assert_eq!(opened.idle_deadline_ms, 110);
+            assert_eq!(opened.absolute_deadline_ms, 1_010);
+            let row = registry
+                .binding(&registry_id(opened.binding_id.as_bytes()).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.internal_session_id.as_bytes(),
+                opened.internal_session_id.as_bytes()
+            );
+            assert_eq!(row.integration_id.as_bytes(), b"codex/v1");
+            assert_eq!(row.repository_id.as_bytes(), b"repository-A");
+            assert_eq!(row.checkout_id.as_bytes(), b"checkout-A");
+            assert_eq!(row.start_branch.as_deref(), Some("feature/d3"));
+            assert_eq!(row.start_revision, "abc123");
+            opened
+        };
+
+        let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+        assert!(matches!(
+            registry.open_or_resume(&crypto, open_request(20, None)),
+            Err(HookRegistryError::BindingAlreadyOpen)
+        ));
+        let wrong = RegistrySessionResume {
+            binding_id: opened.binding_id,
+            capability: HookSessionCapability::from_bytes([0xff; 32]),
+        };
+        assert!(matches!(
+            registry.open_or_resume(&crypto, open_request(20, Some(wrong))),
+            Err(HookRegistryError::InvalidCapability)
+        ));
+        let before = registry
+            .binding(&registry_id(opened.binding_id.as_bytes()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.last_seen_at_ms, 10);
+        assert_eq!(before.idle_deadline_ms, 110);
+
+        let resumed = registry
+            .open_or_resume(
+                &crypto,
+                open_request(
+                    50,
+                    Some(RegistrySessionResume {
+                        binding_id: opened.binding_id,
+                        capability: opened.capability,
+                    }),
+                ),
+            )
+            .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.internal_session_id, opened.internal_session_id);
+        assert_eq!(resumed.generation, 1);
+        assert_eq!(resumed.idle_deadline_ms, 150);
+        assert_eq!(resumed.absolute_deadline_ms, 1_010);
+        clean_db(&path);
+    }
+
+    #[test]
+    fn durable_verification_returns_persisted_authority_and_renews_lease() {
+        let path = temp_db("verify-renew");
+        let crypto = cryptography();
+        let opened = {
+            let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+            registry
+                .open_or_resume(&crypto, open_request(10, None))
+                .unwrap()
+        };
+        let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+        let verified = registry
+            .verify_and_renew(
+                &crypto,
+                RegistryVerifyRequest {
+                    binding_id: opened.binding_id,
+                    capability: opened.capability,
+                    integration: HookIntegrationId::new("codex/v1").unwrap(),
+                    current_checkout: HookCheckoutIdentity::new("repository-A", "checkout-A")
+                        .unwrap(),
+                    now_ms: 90,
+                    idle_ttl_ms: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(verified.internal_session_id, opened.internal_session_id);
+        assert_eq!(verified.repository_state.branch(), Some("feature/d3"));
+        assert_eq!(verified.repository_state.revision(), "abc123");
+        assert_eq!(verified.idle_deadline_ms, 190);
+        assert_eq!(verified.absolute_deadline_ms, 1_010);
+
+        let error = registry
+            .verify_and_renew(
+                &crypto,
+                RegistryVerifyRequest {
+                    binding_id: opened.binding_id,
+                    capability: opened.capability,
+                    integration: HookIntegrationId::new("codex/v1").unwrap(),
+                    current_checkout: HookCheckoutIdentity::new("repository-A", "sibling-checkout")
+                        .unwrap(),
+                    now_ms: 100,
+                    idle_ttl_ms: 100,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, HookRegistryError::AuthorityMismatch));
+        clean_db(&path);
+    }
+
+    #[test]
+    fn expired_tuple_opens_new_generation_without_reusing_internal_session() {
+        let crypto = cryptography();
+        let mut registry = HookSessionRegistry::open_in_memory(Default::default()).unwrap();
+        let first = registry
+            .open_or_resume(&crypto, open_request(10, None))
+            .unwrap();
+        let second = registry
+            .open_or_resume(&crypto, open_request(110, None))
+            .unwrap();
+        assert_eq!(second.generation, 2);
+        assert_ne!(second.binding_id, first.binding_id);
+        assert_ne!(second.internal_session_id, first.internal_session_id);
+        assert_ne!(second.capability, first.capability);
+        assert_eq!(
+            registry
+                .binding(&registry_id(first.binding_id.as_bytes()).unwrap())
+                .unwrap()
+                .unwrap()
+                .state,
+            RegistryBindingState::Expired
+        );
+    }
+
+    #[test]
     fn admission_and_completion_are_atomic_and_versioned() {
         let mut registry = HookSessionRegistry::open_in_memory(Default::default()).unwrap();
-        assert!(registry.insert_binding(binding()).unwrap());
-        assert!(!registry.insert_binding(binding()).unwrap());
+        assert!(registry.insert_test_binding(binding()).unwrap());
+        assert!(!registry.insert_test_binding(binding()).unwrap());
 
         let outcome = registry.admit(admission("delivery-1", 1, 7)).unwrap();
         assert!(!outcome.idempotent_replay);
-        assert_eq!(outcome.receipt.schema_version, 1);
+        assert_eq!(outcome.receipt.schema_version, 2);
         assert_eq!(outcome.receipt.row_version, 1);
         assert_eq!(registry.pending(20, 10).unwrap().len(), 1);
 
@@ -1136,7 +1705,7 @@ mod tests {
         let path = temp_db("restart");
         {
             let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
-            registry.insert_binding(binding()).unwrap();
+            registry.insert_test_binding(binding()).unwrap();
             registry.admit(admission("delivery-1", 1, 7)).unwrap();
         }
         {
@@ -1159,7 +1728,7 @@ mod tests {
     #[test]
     fn exact_replay_is_idempotent_and_changed_hash_revokes() {
         let mut registry = HookSessionRegistry::open_in_memory(Default::default()).unwrap();
-        registry.insert_binding(binding()).unwrap();
+        registry.insert_test_binding(binding()).unwrap();
         registry.admit(admission("delivery-1", 1, 7)).unwrap();
         let replay = registry.admit(admission("delivery-1", 1, 7)).unwrap();
         assert!(replay.idempotent_replay);
@@ -1177,7 +1746,7 @@ mod tests {
     #[test]
     fn failed_out_of_order_completion_leaves_receipt_and_outbox_pending() {
         let mut registry = HookSessionRegistry::open_in_memory(Default::default()).unwrap();
-        registry.insert_binding(binding()).unwrap();
+        registry.insert_test_binding(binding()).unwrap();
         registry.admit(admission("delivery-2", 2, 8)).unwrap();
 
         let error = registry
@@ -1216,7 +1785,7 @@ mod tests {
             let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
             let mut row = binding();
             row.idle_deadline_ms = 30;
-            registry.insert_binding(row).unwrap();
+            registry.insert_test_binding(row).unwrap();
             let mut late = admission("late", 1, 7);
             late.admitted_at_ms = 30;
             late.idle_deadline_ms = 40;
@@ -1244,7 +1813,7 @@ mod tests {
             let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
             let mut row = binding();
             row.idle_deadline_ms = 30;
-            registry.insert_binding(row).unwrap();
+            registry.insert_test_binding(row).unwrap();
             registry.admit(admission("delivery-1", 1, 7)).unwrap();
         }
         {
@@ -1268,7 +1837,7 @@ mod tests {
         let path = temp_db("close");
         {
             let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
-            registry.insert_binding(binding()).unwrap();
+            registry.insert_test_binding(binding()).unwrap();
             let mut close = admission("close-1", 1, 9);
             close.kind = RegistryDeliveryKind::Close;
             registry.admit(close).unwrap();

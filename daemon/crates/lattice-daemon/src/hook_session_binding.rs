@@ -21,6 +21,8 @@ const HASH_BYTES: usize = 32;
 const MAX_IDENTITY_BYTES: usize = 4096;
 const MAX_HOST_SESSION_BYTES: usize = 1024;
 const MAX_INTEGRATION_BYTES: usize = 128;
+const MAX_BRANCH_BYTES: usize = 1024;
+const MAX_REVISION_BYTES: usize = 256;
 const MAX_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ABSOLUTE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_CLOSE_RETRY_GRACE: Duration = Duration::from_secs(60 * 60);
@@ -136,6 +138,10 @@ impl HostSessionId {
         validate_bounded_identity(&value, MAX_HOST_SESSION_BYTES)?;
         Ok(Self(value))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for HostSessionId {
@@ -172,6 +178,158 @@ redacted_id!(HookInternalSessionId, ID_BYTES, "HookInternalSessionId");
 redacted_id!(HookDeliveryId, ID_BYTES, "HookDeliveryId");
 redacted_id!(HookSessionCapability, TOKEN_BYTES, "HookSessionCapability");
 redacted_id!(HookDaemonEpoch, ID_BYTES, "HookDaemonEpoch");
+redacted_id!(
+    HookAuthorityFingerprint,
+    HASH_BYTES,
+    "HookAuthorityFingerprint"
+);
+redacted_id!(HookCapabilityVerifier, HASH_BYTES, "HookCapabilityVerifier");
+
+/// Daemon-observed Git state recorded at binding creation. `branch` is absent
+/// for detached HEAD; `revision` is always required so persisted authority can
+/// be attributed to an exact starting point without trusting hook input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HookRepositoryState {
+    branch: Option<String>,
+    revision: String,
+}
+
+impl fmt::Debug for HookRepositoryState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HookRepositoryState(<redacted>)")
+    }
+}
+
+impl HookRepositoryState {
+    pub fn new(
+        branch: Option<impl Into<String>>,
+        revision: impl Into<String>,
+    ) -> Result<Self, HookSessionError> {
+        let branch = branch.map(Into::into);
+        if let Some(branch) = &branch {
+            validate_bounded_identity(branch, MAX_BRANCH_BYTES)?;
+        }
+        let revision = revision.into();
+        validate_bounded_identity(&revision, MAX_REVISION_BYTES)?;
+        Ok(Self { branch, revision })
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+}
+
+/// The one cryptographic implementation shared by volatile authority and the
+/// durable registry. The caller must retain this secret across daemon boots
+/// when using it with persisted registry rows.
+pub struct HookSessionCryptography {
+    secret: [u8; TOKEN_BYTES],
+}
+
+impl fmt::Debug for HookSessionCryptography {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HookSessionCryptography(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+pub struct PreparedHookBinding {
+    pub binding_id: HookBindingId,
+    pub capability: HookSessionCapability,
+    pub internal_session_id: HookInternalSessionId,
+    pub authority_fingerprint: HookAuthorityFingerprint,
+    pub capability_verifier: HookCapabilityVerifier,
+}
+
+impl fmt::Debug for PreparedHookBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedHookBinding")
+            .field("binding_id", &"<redacted>")
+            .field("capability", &"<redacted>")
+            .field("internal_session_id", &"<redacted>")
+            .field("authority_fingerprint", &"<redacted>")
+            .field("capability_verifier", &"<redacted>")
+            .finish()
+    }
+}
+
+impl HookSessionCryptography {
+    pub fn new() -> Result<Self, HookSessionError> {
+        let mut secret = [0_u8; TOKEN_BYTES];
+        secure_random(&mut secret)?;
+        Ok(Self { secret })
+    }
+
+    /// Constructs the authority from daemon-owned persistent key material.
+    /// The raw key is intentionally neither returned nor rendered.
+    pub fn from_secret(secret: [u8; TOKEN_BYTES]) -> Self {
+        Self { secret }
+    }
+
+    pub fn authority_fingerprint(
+        &self,
+        integration: &HookIntegrationId,
+        host_session_id: &HostSessionId,
+        checkout: &HookCheckoutIdentity,
+    ) -> HookAuthorityFingerprint {
+        HookAuthorityFingerprint(derive_session_key(
+            &self.secret,
+            integration,
+            host_session_id,
+            checkout,
+        ))
+    }
+
+    pub fn prepare_binding(
+        &self,
+        integration: &HookIntegrationId,
+        host_session_id: &HostSessionId,
+        checkout: &HookCheckoutIdentity,
+    ) -> Result<PreparedHookBinding, HookSessionError> {
+        let mut binding_id = [0_u8; ID_BYTES];
+        let mut capability = [0_u8; TOKEN_BYTES];
+        let mut internal_session_id = [0_u8; ID_BYTES];
+        secure_random(&mut binding_id)?;
+        secure_random(&mut capability)?;
+        secure_random(&mut internal_session_id)?;
+        let binding_id = HookBindingId(binding_id);
+        let capability = HookSessionCapability(capability);
+        Ok(PreparedHookBinding {
+            binding_id,
+            capability,
+            internal_session_id: HookInternalSessionId(internal_session_id),
+            authority_fingerprint: self.authority_fingerprint(
+                integration,
+                host_session_id,
+                checkout,
+            ),
+            capability_verifier: self.capability_verifier(&binding_id, &capability),
+        })
+    }
+
+    pub fn capability_verifier(
+        &self,
+        binding_id: &HookBindingId,
+        capability: &HookSessionCapability,
+    ) -> HookCapabilityVerifier {
+        HookCapabilityVerifier(capability_verifier(&self.secret, binding_id, capability))
+    }
+
+    pub fn verify_capability(
+        &self,
+        binding_id: &HookBindingId,
+        capability: &HookSessionCapability,
+        expected: &HookCapabilityVerifier,
+    ) -> bool {
+        let presented = self.capability_verifier(binding_id, capability);
+        constant_time_eq(expected.as_bytes(), presented.as_bytes())
+    }
+}
 
 /// Hash of a fully normalized, already-sanitized event.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -361,7 +519,7 @@ pub enum HookSessionError {
 /// In-memory, daemon-boot authority. Capabilities from another instance fail.
 pub struct HookSessionAuthority {
     config: HookSessionConfig,
-    secret: [u8; TOKEN_BYTES],
+    cryptography: HookSessionCryptography,
     epoch: HookDaemonEpoch,
     bindings: HashMap<HookBindingId, BindingRecord>,
     session_keys: HashMap<SessionKey, HookBindingId>,
@@ -373,7 +531,7 @@ impl fmt::Debug for HookSessionAuthority {
         formatter
             .debug_struct("HookSessionAuthority")
             .field("config", &self.config)
-            .field("secret", &"<redacted>")
+            .field("cryptography", &"<redacted>")
             .field("epoch", &"<redacted>")
             .field("binding_count", &self.bindings.len())
             .finish()
@@ -434,7 +592,7 @@ impl HookSessionAuthority {
     ) -> Self {
         Self {
             config,
-            secret,
+            cryptography: HookSessionCryptography::from_secret(secret),
             epoch: HookDaemonEpoch(epoch),
             bindings: HashMap::new(),
             session_keys: HashMap::new(),
@@ -543,12 +701,12 @@ impl HookSessionAuthority {
         request: HookSessionOpenRequest,
         now: Instant,
     ) -> Result<MintedHookSession, HookSessionError> {
-        let session_key = derive_session_key(
-            &self.secret,
+        let session_key = SessionKey(derive_session_key(
+            &self.cryptography.secret,
             &request.integration,
             &request.host_session_id,
             &request.checkout,
-        );
+        ));
         if let Some(existing_id) = self.session_keys.get(&session_key).copied() {
             if let Some(existing) = self.bindings.get_mut(&existing_id) {
                 expire_if_needed(existing, now);
@@ -565,16 +723,15 @@ impl HookSessionAuthority {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(HookSessionError::InvalidConfiguration)?;
-        let mut binding_id = [0_u8; ID_BYTES];
-        let mut capability = [0_u8; TOKEN_BYTES];
-        let mut internal_session_id = [0_u8; ID_BYTES];
-        secure_random(&mut binding_id)?;
-        secure_random(&mut capability)?;
-        secure_random(&mut internal_session_id)?;
-        let binding_id = HookBindingId(binding_id);
-        let capability = HookSessionCapability(capability);
-        let internal_session_id = HookInternalSessionId(internal_session_id);
-        let verifier = capability_verifier(&self.secret, &self.epoch, &binding_id, &capability);
+        let prepared = self.cryptography.prepare_binding(
+            &request.integration,
+            &request.host_session_id,
+            &request.checkout,
+        )?;
+        let binding_id = prepared.binding_id;
+        let capability = prepared.capability;
+        let internal_session_id = prepared.internal_session_id;
+        let verifier = *prepared.capability_verifier.as_bytes();
         let idle_deadline = now + self.config.idle_ttl;
         let absolute_deadline = now + self.config.absolute_ttl;
 
@@ -619,12 +776,12 @@ impl HookSessionAuthority {
         request: HookSessionResumeRequest,
         now: Instant,
     ) -> Result<ResumedHookSession, HookSessionError> {
-        let expected_key = derive_session_key(
-            &self.secret,
+        let expected_key = SessionKey(derive_session_key(
+            &self.cryptography.secret,
             &request.integration,
             &request.host_session_id,
             &request.current_checkout,
-        );
+        ));
         let verify_request = HookSessionVerifyRequest {
             binding_id: request.binding_id,
             capability: request.capability,
@@ -658,13 +815,10 @@ impl HookSessionAuthority {
             .get_mut(&request.binding_id)
             .ok_or(HookSessionError::BindingNotFound)?;
 
-        let presented = capability_verifier(
-            &self.secret,
-            &self.epoch,
-            &request.binding_id,
-            &request.capability,
-        );
-        if !constant_time_eq(&binding.verifier, &presented) {
+        let presented = self
+            .cryptography
+            .capability_verifier(&request.binding_id, &request.capability);
+        if !constant_time_eq(&binding.verifier, presented.as_bytes()) {
             return Err(HookSessionError::InvalidCapability);
         }
         if binding.integration != request.integration {
@@ -870,26 +1024,28 @@ fn derive_session_key(
     integration: &HookIntegrationId,
     host_session_id: &HostSessionId,
     checkout: &HookCheckoutIdentity,
-) -> SessionKey {
+) -> [u8; HASH_BYTES] {
     let mut message = Vec::with_capacity(
-        64 + integration.0.len() + host_session_id.0.len() + checkout.checkout_id.len(),
+        64 + integration.0.len()
+            + host_session_id.0.len()
+            + checkout.repository_id.len()
+            + checkout.checkout_id.len(),
     );
     append_field(&mut message, b"lattice-hook-session-key-v1");
     append_field(&mut message, integration.0.as_bytes());
     append_field(&mut message, host_session_id.0.as_bytes());
+    append_field(&mut message, checkout.repository_id.as_bytes());
     append_field(&mut message, checkout.checkout_id.as_bytes());
-    SessionKey(hmac_sha256(secret, &message))
+    hmac_sha256(secret, &message)
 }
 
 fn capability_verifier(
     secret: &[u8; TOKEN_BYTES],
-    epoch: &HookDaemonEpoch,
     binding_id: &HookBindingId,
     capability: &HookSessionCapability,
 ) -> [u8; HASH_BYTES] {
     let mut message = Vec::with_capacity(96);
     append_field(&mut message, b"lattice-hook-capability-v1");
-    append_field(&mut message, epoch.as_bytes());
     append_field(&mut message, binding_id.as_bytes());
     append_field(&mut message, capability.as_bytes());
     hmac_sha256(secret, &message)
@@ -1092,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_is_boot_scoped_and_only_verifier_is_retained() {
+    fn in_memory_authority_retains_only_verifier_and_not_cross_instance_state() {
         let mut first = authority();
         let minted = open(&mut first);
         first.verify(&verify_request(&minted)).unwrap();
@@ -1109,6 +1265,50 @@ mod tests {
         assert_ne!(
             first.bindings[&minted.binding_id].verifier,
             *minted.capability.as_bytes()
+        );
+    }
+
+    #[test]
+    fn durable_cryptography_prepares_and_verifies_one_tuple_without_epoch_state() {
+        let first = HookSessionCryptography::from_secret([0x61; TOKEN_BYTES]);
+        let integration = HookIntegrationId::new("codex/v1").unwrap();
+        let host = HostSessionId::new("host-session").unwrap();
+        let checkout = checkout("repo-A", "checkout-A");
+        let prepared = first
+            .prepare_binding(&integration, &host, &checkout)
+            .unwrap();
+        assert!(first.verify_capability(
+            &prepared.binding_id,
+            &prepared.capability,
+            &prepared.capability_verifier
+        ));
+
+        // A daemon restart reconstructs the same verifier authority from its
+        // protected persistent secret; no boot epoch participates.
+        let restarted = HookSessionCryptography::from_secret([0x61; TOKEN_BYTES]);
+        assert!(restarted.verify_capability(
+            &prepared.binding_id,
+            &prepared.capability,
+            &prepared.capability_verifier
+        ));
+        assert_eq!(
+            restarted.authority_fingerprint(&integration, &host, &checkout),
+            prepared.authority_fingerprint
+        );
+
+        let wrong_secret = HookSessionCryptography::from_secret([0x62; TOKEN_BYTES]);
+        assert!(!wrong_secret.verify_capability(
+            &prepared.binding_id,
+            &prepared.capability,
+            &prepared.capability_verifier
+        ));
+        assert_ne!(
+            restarted.authority_fingerprint(
+                &integration,
+                &HostSessionId::new("other-host-session").unwrap(),
+                &checkout,
+            ),
+            prepared.authority_fingerprint
         );
     }
 
