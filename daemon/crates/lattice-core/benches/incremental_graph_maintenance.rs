@@ -182,32 +182,21 @@ fn apply_scoped_update(graph: &mut CodeGraph, update: &ScopedUpdatePlan) {
 }
 
 fn assert_graph_equivalent(actual: &CodeGraph, expected: &CodeGraph) {
-    let actual_nodes = actual
+    let mut actual_nodes = actual.all_nodes().into_iter().cloned().collect::<Vec<_>>();
+    let mut expected_nodes = expected
         .all_nodes()
         .into_iter()
-        .map(|node| {
-            (
-                node.id.file.clone(),
-                node.id.name.clone(),
-                node.id.byte_offset,
-                node.signature.to_string(),
-                node.body.to_string(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let expected_nodes = expected
-        .all_nodes()
-        .into_iter()
-        .map(|node| {
-            (
-                node.id.file.clone(),
-                node.id.name.clone(),
-                node.id.byte_offset,
-                node.signature.to_string(),
-                node.body.to_string(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
+        .cloned()
+        .collect::<Vec<_>>();
+    let by_id = |left: &lattice_core::graph::GraphNode, right: &lattice_core::graph::GraphNode| {
+        (&left.id.file, &left.id.name, left.id.byte_offset).cmp(&(
+            &right.id.file,
+            &right.id.name,
+            right.id.byte_offset,
+        ))
+    };
+    actual_nodes.sort_by(by_id);
+    expected_nodes.sort_by(by_id);
     assert_eq!(actual_nodes, expected_nodes, "scoped candidate node drift");
 
     let canonical_edges = |graph: &CodeGraph| {
