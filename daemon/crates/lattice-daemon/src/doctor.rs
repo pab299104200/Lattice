@@ -45,10 +45,26 @@ pub(crate) struct HookRegistration {
 
 const DOCTOR_HOOK_FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HOOK_FIXTURE_OUTPUT_BYTES: usize = 8 * 1024;
+const SESSION_START_RECOVERY_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HookFixtureResult {
     elapsed_ms: u128,
+}
+
+/// The doctor fixture deliberately cannot reach the daemon.  SessionStart is
+/// therefore the sole hook allowed to render the adapter's bounded recovery
+/// notice; all other fixture output is a wiring failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookFixtureStdout {
+    Silent,
+    SessionStartRecovery(HookFixtureHost),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookFixtureHost {
+    Codex,
+    ClaudeCode,
 }
 
 /// A snapshot of the process table.  Keeping this boundary explicit makes the
@@ -809,6 +825,7 @@ fn run_hook_fixture(
     if !command.is_file() {
         anyhow::bail!("configured hook path is missing: {}", command.display());
     }
+    let expected_stdout = hook_fixture_stdout_contract(registration)?;
     let state_root = doctor_hook_fixture_state_root()?;
     let result = run_hook_fixture_at(
         &command,
@@ -817,6 +834,7 @@ fn run_hook_fixture(
         executable,
         &state_root,
         Duration::from_secs(timeout_secs).min(DOCTOR_HOOK_FIXTURE_TIMEOUT),
+        expected_stdout,
     );
     let cleanup = fs::remove_dir_all(&state_root);
     match result {
@@ -852,6 +870,37 @@ fn hook_fixture_is_eligible(registration: &HookRegistration, workspace: &Path) -
         && hook_command_path(registration, workspace).is_file()
 }
 
+fn hook_fixture_stdout_contract(registration: &HookRegistration) -> Result<HookFixtureStdout> {
+    if registration.event != "SessionStart" {
+        return Ok(HookFixtureStdout::Silent);
+    }
+
+    let command = Path::new(&registration.command);
+    match (
+        path_has_component(&registration.source, ".codex"),
+        path_has_component(command, "codex"),
+        path_has_component(&registration.source, ".claude"),
+        path_has_component(command, "claude-code"),
+    ) {
+        (true, true, false, false) => Ok(HookFixtureStdout::SessionStartRecovery(
+            HookFixtureHost::Codex,
+        )),
+        (false, false, true, true) => Ok(HookFixtureStdout::SessionStartRecovery(
+            HookFixtureHost::ClaudeCode,
+        )),
+        _ => anyhow::bail!(
+            "SessionStart fixture is not a recognized Codex or Claude Code hook: {} at {}",
+            registration.source.display(),
+            registration.json_path
+        ),
+    }
+}
+
+fn path_has_component(path: &Path, component: &str) -> bool {
+    path.components()
+        .any(|part| part.as_os_str() == std::ffi::OsStr::new(component))
+}
+
 fn doctor_hook_fixture_state_root() -> Result<PathBuf> {
     let nonce = format!(
         "{}-{}",
@@ -881,6 +930,7 @@ fn run_hook_fixture_at(
     executable: &Path,
     state_root: &Path,
     timeout: Duration,
+    expected_stdout: HookFixtureStdout,
 ) -> Result<HookFixtureResult> {
     let started = Instant::now();
     let mut child = Command::new(command)
@@ -938,12 +988,56 @@ fn run_hook_fixture_at(
     if !status.success() {
         anyhow::bail!("exited with {status}: {}", fixture_output_summary(&stderr));
     }
-    if !stdout.bytes.is_empty() || stdout.truncated {
-        anyhow::bail!("wrote stdout: {}", fixture_output_summary(&stdout));
-    }
+    validate_hook_fixture_stdout(expected_stdout, &stdout)?;
     Ok(HookFixtureResult {
         elapsed_ms: started.elapsed().as_millis(),
     })
+}
+
+fn validate_hook_fixture_stdout(
+    expected: HookFixtureStdout,
+    stdout: &LimitedFixtureOutput,
+) -> Result<()> {
+    if stdout.truncated {
+        anyhow::bail!("wrote stdout: {}", fixture_output_summary(stdout));
+    }
+    match expected {
+        HookFixtureStdout::Silent if stdout.bytes.is_empty() => Ok(()),
+        HookFixtureStdout::Silent => {
+            anyhow::bail!("wrote stdout: {}", fixture_output_summary(stdout))
+        }
+        HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex)
+            if stdout.bytes == format!("{SESSION_START_RECOVERY_NOTICE}\n").as_bytes() =>
+        {
+            Ok(())
+        }
+        HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex) => anyhow::bail!(
+            "wrote unexpected Codex SessionStart recovery output: {}",
+            fixture_output_summary(stdout)
+        ),
+        HookFixtureStdout::SessionStartRecovery(HookFixtureHost::ClaudeCode) => {
+            let envelope: Value = serde_json::from_slice(&stdout.bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "wrote invalid Claude Code SessionStart recovery output: {}",
+                    fixture_output_summary(stdout)
+                )
+            })?;
+            let expected = json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": SESSION_START_RECOVERY_NOTICE,
+                }
+            });
+            if envelope == expected {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "wrote unexpected Claude Code SessionStart recovery output: {}",
+                    fixture_output_summary(stdout)
+                );
+            }
+        }
+    }
 }
 
 struct LimitedFixtureOutput {
@@ -1262,7 +1356,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::write(
             &hook,
-            "#!/bin/sh\ninput=$(cat)\nprintf '%s' \"$input\" | grep -q '\"session_id\":\"doctor-hook-fixture\"'\ntest -n \"$LATTICE_BIN\"\ntest \"$LATTICE_DAEMON_ADDR\" = '127.0.0.1:0'\n",
+            "#!/bin/sh\ninput=$(cat)\nprintf '%s' \"$input\" | grep -q '\"session_id\":\"doctor-hook-fixture\"'\ntest -n \"$LATTICE_BIN\"\ntest \"$LATTICE_DAEMON_ADDR\" = '127.0.0.1:0'\nprintf '%s\\n' \"lattice: daemon unreachable — run 'lattice doctor'\"\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&hook).unwrap().permissions();
@@ -1285,11 +1379,105 @@ mod tests {
             Path::new("/fixture/lattice"),
             &state,
             Duration::from_secs(2),
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex),
         );
 
         assert!(result.is_ok(), "{result:?}");
         assert!(hook_fixture_is_eligible(&registration, &workspace));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_start_fixture_accepts_only_expected_host_recovery_envelopes() {
+        let codex = LimitedFixtureOutput {
+            bytes: format!("{SESSION_START_RECOVERY_NOTICE}\n").into_bytes(),
+            truncated: false,
+        };
+        assert!(validate_hook_fixture_stdout(
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex),
+            &codex,
+        )
+        .is_ok());
+
+        let claude = LimitedFixtureOutput {
+            bytes: json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": SESSION_START_RECOVERY_NOTICE,
+                }
+            })
+            .to_string()
+            .into_bytes(),
+            truncated: false,
+        };
+        assert!(validate_hook_fixture_stdout(
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::ClaudeCode),
+            &claude,
+        )
+        .is_ok());
+
+        let unexpected = LimitedFixtureOutput {
+            bytes: format!("{SESSION_START_RECOVERY_NOTICE}\nunexpected").into_bytes(),
+            truncated: false,
+        };
+        let error = validate_hook_fixture_stdout(
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex),
+            &unexpected,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected Codex"));
+
+        let wrong_claude_event = LimitedFixtureOutput {
+            bytes: json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": SESSION_START_RECOVERY_NOTICE,
+                }
+            })
+            .to_string()
+            .into_bytes(),
+            truncated: false,
+        };
+        let error = validate_hook_fixture_stdout(
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::ClaudeCode),
+            &wrong_claude_event,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unexpected Claude Code"));
+    }
+
+    #[test]
+    fn session_start_fixture_contract_requires_matching_host_configuration() {
+        let codex = HookRegistration {
+            source: PathBuf::from("/workspace/.codex/hooks.json"),
+            json_path: "$.hooks.SessionStart[0].hooks[0]".to_string(),
+            event: "SessionStart".to_string(),
+            command: "/workspace/integrations/codex/hooks/session-start.sh".to_string(),
+            timeout_secs: Some(5),
+        };
+        assert_eq!(
+            hook_fixture_stdout_contract(&codex).unwrap(),
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex)
+        );
+
+        let claude = HookRegistration {
+            source: PathBuf::from("/workspace/.claude/settings.json"),
+            command: "/workspace/integrations/claude-code/hooks/session-start.sh".to_string(),
+            ..codex.clone()
+        };
+        assert_eq!(
+            hook_fixture_stdout_contract(&claude).unwrap(),
+            HookFixtureStdout::SessionStartRecovery(HookFixtureHost::ClaudeCode)
+        );
+
+        let error = hook_fixture_stdout_contract(&HookRegistration {
+            command: "/workspace/integrations/claude-code/hooks/session-start.sh".to_string(),
+            ..codex
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("recognized Codex or Claude Code"));
     }
 
     #[cfg(unix)]
@@ -1316,6 +1504,7 @@ mod tests {
             Path::new("/fixture/lattice"),
             &state,
             Duration::from_millis(25),
+            HookFixtureStdout::Silent,
         )
         .unwrap_err();
 
