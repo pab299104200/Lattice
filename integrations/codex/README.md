@@ -27,11 +27,11 @@ Codex requires project `.codex/` layers to be trusted before project-local hooks
 - `SessionStart`: calls `lattice recall "session start" --mode task --json` and `lattice context "repo rules and operator workflow" --mode rules`, then prints compact markdown for Codex to consume when hook stdout is supported.
 - `UserPromptSubmit`: extracts the prompt from the hook payload, calls `lattice context "<prompt>" --mode auto --min-relevance 0.25`, and emits nothing when the result is too small or not relevant.
 - `PostToolUse`: for `apply_patch|Edit|Write`, extracts the edited file, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
-- `Stop`: extracts edited files from the hook payload and calls `lattice remember --kind outcome` so later sessions can recall the work.
+- `Stop`: sends an authenticated, content-free close marker for the host session. The daemon reduces a verified close into repository-local session memory; unavailable capture is not reported as successful.
 
-Every script first checks whether the Lattice binary exists and whether the daemon answers `lattice status` within `LATTICE_HOOK_PROBE_TIMEOUT` seconds. If either check fails, the script exits `0` without output so hooks never break a Codex session. This is deliberately a no-injection result, not evidence that the hook configuration is absent: diagnose it with `lattice status --timeout 2` after the session is responsive. Session recall and rule lookup run concurrently. The installer records a five-second outer timeout for every hook; this exceeds the shipped session/prompt query deadline (3.5 seconds) and edit/stop deadline (2.5 seconds), leaving process overhead for extraction and output.
+Every script locates the configured or installed Lattice binary and invokes the bounded adapter. If the binary is missing, the daemon is unavailable, or the adapter cannot finish within its two-second invocation deadline, the script exits `0` without output so hooks never break a Codex session. This is deliberately a no-injection result, not evidence that the hook configuration is absent: diagnose it with `lattice status --timeout 2` after the session is responsive. Session recall and rule lookup run concurrently. The installer records a five-second outer timeout for every hook, leaving process and serialization overhead around the adapter call.
 
-Actual hook calls set `LATTICE_CLIENT_NAME=codex` and `LATTICE_CLIENT_CHANNEL=hook` before invoking the CLI. Readiness probes set `LATTICE_SKIP_METRICS=1`, so `lattice metrics` measures delivered hook value instead of probe noise.
+Hook delivery is attributed by the daemon as `codex` / `hook`; installer fixture runs use a protected state root and skip metrics so verification does not pollute adoption reports.
 
 ## MCP
 
@@ -57,7 +57,6 @@ The CLI twins from Phase 3 also work directly from Codex shell commands without 
 ## Controls
 
 - Set `LATTICE_BIN=/absolute/path/to/lattice` to force a binary path.
-- Set `LATTICE_HOOK_PROBE_TIMEOUT` to tune the readiness probe timeout; the default is `0.5` seconds.
 - Set `LATTICE_HOOK_MIN_RELEVANCE` to tune prompt context filtering.
 - Set `LATTICE_HOOK_MIN_DEPENDENTS` to tune PostToolUse noise filtering.
 - Disable a hook by removing its entry from `.codex/hooks.json`.

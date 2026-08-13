@@ -11,7 +11,7 @@ Add exactly one registration named `lattice` in each client scope:
   "mcpServers": {
     "lattice": {
       "type": "stdio",
-      "command": "/home/pete/cadres/lattice/daemon/target/release/lattice",
+      "command": "/absolute/path/to/lattice",
       "args": ["--stdio", "--workspace", "/path/to/workspace"]
     }
   }
@@ -73,7 +73,7 @@ The installed hooks are:
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
 
-All hooks exit `0` without output if the binary is missing, the daemon is down, or its bounded readiness probe does not answer in time. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for session/prompt context and four seconds for post-edit/stop work; internal calls have smaller budgets so shell and serialization overhead cannot consume the entire outer deadline.
+All hooks exit `0` without output if the binary is missing, the daemon is down, or the bounded adapter call cannot complete. The adapter has a two-second invocation deadline and performs no separate health check. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for all four hooks, leaving process and serialization overhead around the bounded adapter call.
 
 ### D3a session boundary
 
@@ -102,7 +102,7 @@ Codex can use the same MCP registration shape in `config.toml`:
 
 ```toml
 [mcp_servers.lattice]
-command = "/home/pete/cadres/lattice/daemon/target/release/lattice"
+command = "/absolute/path/to/lattice"
 args = ["--stdio", "--workspace", "/path/to/workspace"]
 cwd = "/path/to/workspace"
 ```
