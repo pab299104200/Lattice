@@ -39,7 +39,8 @@ use lattice_core::memory::MemoryStore;
 use lattice_core::memory_graph::MemoryMigrator;
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::{
-    GraphStore, SharedVectorIndex, UsearchVectorIndex, VectorIndex, VectorStore,
+    GraphStore, IndexSnapshot, IndexSnapshotLoad, SharedVectorIndex, UsearchVectorIndex,
+    VectorIndex, VectorStore,
 };
 use lattice_core::symbols::ParsedFile;
 use lattice_core::workspace::WorkspaceManager;
@@ -192,19 +193,18 @@ async fn main() -> Result<()> {
 
     let index_work = IndexWorkCoordinator::from_env();
     let graph_path = lattice_dir.join("graph.db");
-    let (graph_store, graph) = open_graph_store_with_warm_graph(
+    let (graph_store, warm_graph) = open_graph_store_with_warm_graph(
         graph_path,
         workspace_root.clone(),
         Arc::clone(&index_work),
     )
     .await?;
-    let graph = Arc::new(graph);
-    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
-    let engine = QueryEngine::new_shared(
-        Arc::clone(&graph),
+    let (graph, engine) = build_warm_query_engine(
+        warm_graph,
         vector_index.clone(),
         Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
     );
+    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(graph_store));
@@ -559,19 +559,18 @@ pub(crate) async fn build_workspace_runtime(
     );
 
     let graph_path = lattice_dir.join("graph.db");
-    let (graph_store, graph) = open_graph_store_with_warm_graph(
+    let (graph_store, warm_graph) = open_graph_store_with_warm_graph(
         graph_path.clone(),
         workspace_root.clone(),
         Arc::clone(&index_work),
     )
     .await?;
-    let graph = Arc::new(graph);
-    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
-    let engine = QueryEngine::new_shared(
-        Arc::clone(&graph),
+    let (graph, engine) = build_warm_query_engine(
+        warm_graph,
         vector_index.clone(),
         Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
     );
+    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(graph_store));
@@ -923,11 +922,38 @@ fn env_usize(name: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+enum WarmGraphLoad {
+    Snapshot(IndexSnapshot),
+    Graph(Arc<CodeGraph>),
+}
+
+fn build_warm_query_engine(
+    warm_graph: WarmGraphLoad,
+    vector_index: Option<SharedVectorIndex>,
+    memory_store: Option<Arc<std::sync::Mutex<MemoryStore>>>,
+) -> (Arc<CodeGraph>, QueryEngine) {
+    match warm_graph {
+        WarmGraphLoad::Snapshot(snapshot) => {
+            let graph = Arc::clone(&snapshot.graph);
+            (
+                graph,
+                QueryEngine::from_index_snapshot(snapshot, vector_index, memory_store),
+            )
+        }
+        // A graph saved before digest snapshots is still structurally valid. It
+        // remains available while startup indexing publishes a fresh generation.
+        WarmGraphLoad::Graph(graph) => {
+            let engine = QueryEngine::new_shared(Arc::clone(&graph), vector_index, memory_store);
+            (graph, engine)
+        }
+    }
+}
+
 async fn open_graph_store_with_warm_graph(
     graph_path: PathBuf,
     workspace_root: PathBuf,
     index_work: Arc<IndexWorkCoordinator>,
-) -> Result<(GraphStore, CodeGraph)> {
+) -> Result<(GraphStore, WarmGraphLoad)> {
     let _permit = index_work
         .acquire(workspace_root.to_string_lossy().to_string(), "warm_load")
         .await
@@ -941,17 +967,31 @@ async fn open_graph_store_with_warm_graph(
                 "Replaced corrupt derived graph database; workspace indexing will rebuild it"
             );
         }
-        let graph = if should_warm_load_graph(&graph_store, &workspace_root) {
-            graph_store.load_graph().unwrap_or_else(|error| {
-                tracing::warn!(
-                    workspace = %workspace_root.display(),
-                    %error,
-                    "Failed to load persisted graph"
-                );
-                CodeGraph::new()
-            })
+        let warm_graph = if should_warm_load_graph(&graph_store, &workspace_root) {
+            match graph_store.load_index_snapshot() {
+                Ok(IndexSnapshotLoad::Ready(snapshot)) => WarmGraphLoad::Snapshot(snapshot),
+                Ok(IndexSnapshotLoad::DigestCacheMissing { graph }) => {
+                    tracing::info!(
+                        workspace = %workspace_root.display(),
+                        "Persisted graph has no digest snapshot; using graph-only warm fallback"
+                    );
+                    WarmGraphLoad::Graph(graph)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        workspace = %workspace_root.display(),
+                        %error,
+                        "Failed to load persisted graph snapshot"
+                    );
+                    WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
+                }
+            }
         } else {
-            CodeGraph::new()
+            WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
+        };
+        let graph = match &warm_graph {
+            WarmGraphLoad::Snapshot(snapshot) => Arc::clone(&snapshot.graph),
+            WarmGraphLoad::Graph(graph) => Arc::clone(graph),
         };
         let stats = graph.stats();
         if stats.node_count > 0 {
@@ -963,7 +1003,7 @@ async fn open_graph_store_with_warm_graph(
                 "Warm-loaded persisted graph"
             );
         }
-        Ok((graph_store, graph))
+        Ok((graph_store, warm_graph))
     })
     .await
     .map_err(|error| anyhow::anyhow!("graph warm-load worker failed: {error}"))?
@@ -1616,10 +1656,13 @@ async fn publish_cached_parsed_graph_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_incremental_index_for_roots, memory_store_artifact_paths, open_memory_stores,
-        MemoryStoreMode,
+        build_incremental_index_for_roots, build_warm_query_engine, memory_store_artifact_paths,
+        open_memory_stores, MemoryStoreMode, WarmGraphLoad,
     };
+    use lattice_core::graph::CodeGraph;
     use lattice_core::memory::{Memory, MemoryScope, MemoryType, MemoryVerificationStatus};
+    use lattice_core::storage::{GraphStore, IndexSnapshotLoad};
+    use lattice_core::symbols::{Language, SymbolId, SymbolKind};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1659,6 +1702,68 @@ mod tests {
             stale_reason: None,
             verification_status: MemoryVerificationStatus::Unverified,
         }
+    }
+
+    fn graph_with_payment_symbol() -> CodeGraph {
+        let mut graph = CodeGraph::new();
+        graph.add_node(
+            SymbolId {
+                file: "src/payments.rs".to_string(),
+                name: "charge_card".to_string(),
+                byte_offset: 0,
+            },
+            SymbolKind::Function,
+            "charge_card".to_string(),
+            "fn charge_card(card: Card) -> Receipt".to_string(),
+            "fn charge_card(card: Card) -> Receipt { todo!() }".to_string(),
+            "src/payments.rs".to_string(),
+            1,
+            3,
+            true,
+            Language::Rust,
+        );
+        graph
+    }
+
+    #[test]
+    fn warm_snapshot_hydrates_cached_module_digests_into_query_engine() {
+        let store = GraphStore::open_in_memory().expect("in-memory graph store");
+        let snapshot = store
+            .save_index_snapshot(&graph_with_payment_symbol())
+            .expect("save graph and digest snapshot");
+        let (_, mut engine) =
+            build_warm_query_engine(WarmGraphLoad::Snapshot(snapshot), None, None);
+
+        let capsule = engine.query("charge card payments", None, false);
+        assert!(
+            capsule
+                .context
+                .iter()
+                .any(|node| node.kind == "module_digest"),
+            "hydrated snapshots should render their precomputed module digests"
+        );
+    }
+
+    #[test]
+    fn digest_cache_missing_uses_graph_only_warm_fallback() {
+        let store = GraphStore::open_in_memory().expect("in-memory graph store");
+        let warm_graph = match store.load_index_snapshot().expect("load fresh graph store") {
+            IndexSnapshotLoad::DigestCacheMissing { graph } => WarmGraphLoad::Graph(graph),
+            IndexSnapshotLoad::Ready(_) => {
+                panic!("fresh graph store must not report a digest snapshot")
+            }
+        };
+        let (loaded_graph, mut engine) = build_warm_query_engine(warm_graph, None, None);
+
+        assert_eq!(loaded_graph.stats().node_count, 0);
+        let capsule = engine.query("charge card payments", None, false);
+        assert!(
+            capsule
+                .context
+                .iter()
+                .all(|node| node.kind != "module_digest"),
+            "graph-only fallback must not synthesize digests while serving a query"
+        );
     }
 
     #[test]
