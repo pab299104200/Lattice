@@ -27,7 +27,8 @@ use lattice_core::intelligence::{
 };
 use lattice_core::memory::model::MemoryStructuredFields;
 use lattice_core::memory::{
-    Memory, MemoryClass, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus,
+    Memory, MemoryClass, MemoryQueryAuthority, MemoryRecallTier, MemoryScope, MemoryStore,
+    MemoryStoreRouter, MemoryType, MemoryVerificationStatus,
 };
 use lattice_core::query::{ContextCapsule, QueryEngine};
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
@@ -49,7 +50,7 @@ use super::workflow_v2::{
 };
 use super::working_memory_tool;
 use crate::adoption_metrics::{
-    follow_through_from_arguments, source_from_arguments, AdoptionMetricsStore, ToolCallRecord,
+    source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore, ToolCallRecord,
 };
 use crate::index_health::IndexHealth;
 use crate::index_work::IndexWorkCoordinator;
@@ -68,10 +69,15 @@ pub struct McpHandler {
     query_jobs: Arc<Semaphore>,
     indexer: Arc<Mutex<Indexer>>,
     memory_store: Arc<Mutex<MemoryStore>>,
+    shared_memory: Option<SharedMemoryRuntime>,
+    shared_memory_error: Option<String>,
     graph_store: Arc<Mutex<GraphStore>>,
     embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
     vector_index: Option<SharedVectorIndex>,
     workspace_root: PathBuf,
+    /// Canonical repository identity used only for durable memory scope. The
+    /// checkout root remains the source/graph boundary.
+    memory_workspace_id: String,
     session_id: String,
     #[allow(dead_code)]
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
@@ -96,6 +102,171 @@ pub struct McpHandler {
     refresh_running: Arc<AtomicBool>,
     watcher_health: Arc<WatcherHealth>,
     index_health: Arc<IndexHealth>,
+}
+
+#[derive(Clone)]
+struct SharedMemoryRuntime {
+    store: Arc<Mutex<MemoryStore>>,
+    organization_id: String,
+}
+
+#[derive(Debug, Default)]
+struct SharedMemoryConfig {
+    organization_id: Option<String>,
+    shared_store_path: Option<PathBuf>,
+}
+
+impl SharedMemoryRuntime {
+    /// Shared-memory authority is process configuration only. In particular,
+    /// repository files and MCP request arguments never grant organization
+    /// access. C1 supplies the canonical repository identity to the handler.
+    fn from_environment() -> Result<Option<Self>, String> {
+        let config = load_shared_memory_config()?;
+        let organization_id = match std::env::var("LATTICE_ORGANIZATION_ID") {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            Ok(_) => return Err("LATTICE_ORGANIZATION_ID must not be empty".to_string()),
+            Err(std::env::VarError::NotPresent) => config.organization_id,
+            Err(error) => return Err(format!("failed to read LATTICE_ORGANIZATION_ID: {error}")),
+        };
+        let Some(organization_id) = organization_id else {
+            return Ok(None);
+        };
+        let path = match std::env::var_os("LATTICE_SHARED_MEMORY_PATH") {
+            Some(value) => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err("LATTICE_SHARED_MEMORY_PATH must be absolute".to_string());
+                }
+                path
+            }
+            None => config.shared_store_path.unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".lattice/shared/memories.db"))
+                    .unwrap_or_default()
+            }),
+        };
+        if !path.is_absolute() {
+            return Err("shared memory path must be absolute".to_string());
+        }
+        let parent = path.parent().ok_or_else(|| {
+            format!(
+                "shared memory path {} has no parent directory",
+                path.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create shared memory directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    format!(
+                        "failed to protect shared memory directory {}: {error}",
+                        parent.display()
+                    )
+                },
+            )?;
+        }
+        let store = MemoryStore::open(&path).map_err(|error| {
+            format!(
+                "failed to open shared memory store {}: {error}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |error| {
+                    format!(
+                        "failed to protect shared memory database {}: {error}",
+                        path.display()
+                    )
+                },
+            )?;
+        }
+        Ok(Some(Self {
+            store: Arc::new(Mutex::new(store)),
+            organization_id,
+        }))
+    }
+
+    fn query_authority(
+        &self,
+        repository_id: &str,
+        checkout_id: &str,
+        branch: Option<String>,
+        session_id: &str,
+    ) -> Result<MemoryQueryAuthority, String> {
+        MemoryQueryAuthority::new(
+            repository_id.to_string(),
+            checkout_id.to_string(),
+            branch,
+            session_id.to_string(),
+            Some(self.organization_id.clone()),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn load_shared_memory_config() -> Result<SharedMemoryConfig, String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(SharedMemoryConfig::default());
+    };
+    let path = PathBuf::from(home).join(".lattice/config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedMemoryConfig::default())
+        }
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    parse_shared_memory_config(&text)
+}
+
+fn parse_shared_memory_config(text: &str) -> Result<SharedMemoryConfig, String> {
+    let mut config = SharedMemoryConfig::default();
+    let mut in_memory_section = false;
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_memory_section = line == "[memory]";
+            continue;
+        }
+        if !in_memory_section {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            return Err("invalid [memory] configuration line; expected key = value".to_string());
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            return Err(format!("[memory].{key} must not be empty"));
+        }
+        match key {
+            "organization_id" => config.organization_id = Some(value.to_string()),
+            "shared_store_path" => config.shared_store_path = Some(PathBuf::from(value)),
+            _ => {}
+        }
+    }
+    if config
+        .shared_store_path
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("[memory].shared_store_path must be absolute".to_string());
+    }
+    Ok(config)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +378,8 @@ impl McpHandler {
         default_focus_dirs: Vec<String>,
     ) -> Self {
         let repo_state = Arc::new(Mutex::new(RepoStateTracker::new(&workspace_root)));
+        let memory_workspace_id = workspace_root.to_string_lossy().to_string();
+        let memory_db_path = workspace_root.join(".lattice").join("memories.db");
         Self::new_with_shared_repo_state(
             engine,
             indexer,
@@ -215,6 +388,8 @@ impl McpHandler {
             embedding_engine,
             vector_index,
             workspace_root,
+            memory_workspace_id,
+            memory_db_path,
             context_cache_path,
             session_id,
             workspace_manager,
@@ -238,6 +413,8 @@ impl McpHandler {
         embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
         vector_index: Option<SharedVectorIndex>,
         workspace_root: PathBuf,
+        memory_workspace_id: String,
+        memory_db_path: PathBuf,
         context_cache_path: PathBuf,
         session_id: String,
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
@@ -251,7 +428,14 @@ impl McpHandler {
         watcher_health: Arc<WatcherHealth>,
         index_health: Arc<IndexHealth>,
     ) -> Self {
-        let workspace_id = workspace_root.to_string_lossy().to_string();
+        let workspace_id = memory_workspace_id.clone();
+        let (shared_memory, shared_memory_error) = match SharedMemoryRuntime::from_environment() {
+            Ok(shared_memory) => (shared_memory, None),
+            Err(error) => {
+                tracing::error!(%error, "organization memory disabled due to invalid daemon configuration");
+                (None, Some(error))
+            }
+        };
         let refresh_running = Arc::new(AtomicBool::new(false));
         let branch = resolve_repo_state(&workspace_root)
             .and_then(|snapshot| snapshot.head_ref)
@@ -278,7 +462,6 @@ impl McpHandler {
             }
         });
         let session_consolidator = event_writer.as_ref().and_then(|writer| {
-            let memory_db_path = workspace_root.join(".lattice").join("memories.db");
             if !memory_db_path.exists() {
                 return None;
             }
@@ -299,10 +482,13 @@ impl McpHandler {
             query_jobs: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERY_JOBS)),
             indexer,
             memory_store,
+            shared_memory,
+            shared_memory_error,
             graph_store,
             embedding_engine,
             vector_index,
             workspace_root: workspace_root.clone(),
+            memory_workspace_id,
             session_id,
             workspace_manager,
             workspace_roots,
@@ -534,12 +720,8 @@ impl McpHandler {
 
     fn current_memory_scope_filter(&self) -> ScopeFilter {
         let branch = current_git_branch(&self.workspace_root).map(|name| BranchRef { name });
-        ScopeFilter::new(
-            self.workspace_root.to_string_lossy().to_string(),
-            branch,
-            None,
-        )
-        .for_session(self.session_id.clone())
+        ScopeFilter::new(self.memory_workspace_id.clone(), branch, None)
+            .for_session(self.session_id.clone())
     }
 
     async fn lock_query_engine_for_workflow(&self) -> Result<MutexGuard<'_, QueryEngine>, ()> {
@@ -3620,7 +3802,7 @@ impl McpHandler {
         if !identifiers.is_empty() {
             content.push_str(&format!(" Identifiers: {}.", identifiers.join(", ")));
         }
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let branch = current_git_branch(&self.workspace_root);
         let scope = if branch.is_some() {
             MemoryScope::Branch
@@ -3736,7 +3918,7 @@ impl McpHandler {
         let Some(consolidator) = self.session_consolidator.as_ref().cloned() else {
             return;
         };
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let task_id = task.to_string();
         let outcome = match status {
             "failure" | "failed" => EpisodeOutcome::Failure,
@@ -4002,7 +4184,7 @@ impl McpHandler {
     }
 
     async fn load_durable_memory_values(&self, limit: usize) -> Result<Vec<Value>, (i32, String)> {
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let store = self.memory_store.lock().await;
         let branch = current_git_branch(&self.workspace_root);
         let scope_filter = self.current_memory_scope_filter();
@@ -4060,7 +4242,7 @@ impl McpHandler {
         files: &[String],
         symbols: &[String],
     ) -> Result<Vec<Value>, (i32, String)> {
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let branch = current_git_branch(&self.workspace_root);
         let subsystem_key = format!(
             "subsystem_playbook::{}",
@@ -4104,7 +4286,7 @@ impl McpHandler {
         files: &[String],
         symbols: &[String],
     ) -> Result<Vec<Value>, (i32, String)> {
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let branch = current_git_branch(&self.workspace_root);
         let refresh_key = format!(
             "workflow_outcome::{}",
@@ -4172,7 +4354,7 @@ impl McpHandler {
         source_query: Option<String>,
         prefer_branch_scope: bool,
     ) -> Result<Value, (i32, String)> {
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let branch = current_git_branch(&self.workspace_root);
         let scope = if prefer_branch_scope && branch.is_some() {
             MemoryScope::Branch
@@ -4287,12 +4469,17 @@ impl McpHandler {
             .unwrap_or_else(|| "mcp".to_string());
         let source = source_from_arguments(arguments, &default_client, "mcp");
         let latency_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let suggested_files = result
+            .as_ref()
+            .map(|value| suggested_files_from_tool_result(tool_name, value))
+            .unwrap_or_default();
         if let Err(error) = self.adoption_metrics.record(ToolCallRecord {
+            session_id: self.session_id.clone(),
             client: source.client,
             channel: source.channel,
             tool: tool_name.to_string(),
             latency_ms,
-            follow_through_edit: follow_through_from_arguments(tool_name, arguments),
+            suggested_files,
         }) {
             tracing::warn!(%error, tool = tool_name, "failed to record adoption metrics");
         }
@@ -4596,9 +4783,13 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let limit = (args["limit"].as_u64().unwrap_or(10) as usize).min(100);
 
+        if self.shared_memory.is_some() {
+            return self.tool_search_memory_merged(query, limit).await;
+        }
+
         let store = self.memory_store.lock().await;
         let scope_filter = self.current_memory_scope_filter();
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let fts_memories = store
             .query(Some(query), limit.saturating_mul(4).max(20), &scope_filter)
             .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
@@ -4741,6 +4932,74 @@ impl McpHandler {
                 "durable_exact_term_counts": durable_exact_term_counts,
                 "exact_term_status": exact_term_status,
                 "matches": diagnostics
+            }
+        })))
+    }
+
+    async fn tool_search_memory_merged(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Value, (i32, String)> {
+        let runtime = self.shared_memory.as_ref().expect("checked above");
+        let authority = runtime
+            .query_authority(
+                &self.memory_workspace_id,
+                &self.workspace_root.to_string_lossy(),
+                current_git_branch(&self.workspace_root),
+                &self.session_id,
+            )
+            .map_err(|error| (-32602, error))?;
+        let repository_store = self.memory_store.lock().await;
+        let shared_store = runtime.store.lock().await;
+        let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to initialize shared memory router: {error}"),
+                )
+            })?;
+        let recalled = router
+            .recall(Some(query), limit)
+            .map_err(|error| (-32603, format!("Failed to recall scoped memory: {error}")))?;
+        let mut values = Vec::with_capacity(recalled.len());
+        for result in recalled {
+            let store = match result.source_tier {
+                MemoryRecallTier::Repository => &*repository_store,
+                MemoryRecallTier::Organization => &*shared_store,
+            };
+            let mut value = serialize_memory_value(store, &result.memory, true)?;
+            annotate_shared_memory_value(
+                &mut value,
+                &result.memory_id.encoded(),
+                match result.source_tier {
+                    MemoryRecallTier::Repository => "repository",
+                    MemoryRecallTier::Organization => "organization",
+                },
+                result.cross_repo,
+                result.origin_repository_id.as_deref(),
+                result.origin_checkout_id.as_deref(),
+                result.effective_verification_status.as_str(),
+                &result.trust_reason,
+            );
+            if let Some(object) = value.as_object_mut() {
+                object.insert("assertion_key".to_string(), json!(result.assertion_key));
+                object.insert(
+                    "origin_verification_status".to_string(),
+                    json!(result.origin_verification_status.as_str()),
+                );
+            }
+            values.push(value);
+        }
+        Ok(wrap_tool_result(json!({
+            "query": query,
+            "memories": values,
+            "count": values.len(),
+            "diagnostics": {
+                "repository_id": self.memory_workspace_id,
+                "organization_id": runtime.organization_id,
+                "search_tiers": ["repository", "organization"],
+                "partial": false
             }
         })))
     }
@@ -5178,7 +5437,7 @@ impl McpHandler {
                 .memories
                 .iter()
                 .map(|memory| MemoryId {
-                    workspace_id: self.workspace_root.to_string_lossy().to_string(),
+                    workspace_id: self.memory_workspace_id.clone(),
                     ulid: memory.id.clone(),
                 })
                 .collect();
@@ -5201,7 +5460,7 @@ impl McpHandler {
             memory_v2::save_quick_memory::parse_args(args).map_err(|message| (-32602, message))?;
         memory_v2::save_quick_memory::validate_args(&parsed)
             .map_err(|message| (-32602, message))?;
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let task_state = if let Some(task_id) = parsed.task_id.as_deref() {
             self.load_working_memory_state(task_id)
                 .await?
@@ -5264,9 +5523,75 @@ impl McpHandler {
         let parsed =
             memory_v2::save_memory::parse_args(args).map_err(|message| (-32602, message))?;
         memory_v2::save_memory::validate_args(&parsed).map_err(|message| (-32602, message))?;
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let (memory, structured) =
             memory_v2::save_memory::build_memory(&self.session_id, &workspace_id, &parsed);
+        if matches!(
+            parsed.scope,
+            memory_v2::save_memory::MemoryScopeArg::Organization
+        ) {
+            let runtime = self.shared_memory.as_ref().ok_or_else(|| {
+                (
+                    -32602,
+                    self.shared_memory_error.clone().unwrap_or_else(|| {
+                        "organization memory requires trusted daemon configuration: set LATTICE_ORGANIZATION_ID and optional LATTICE_SHARED_MEMORY_PATH".to_string()
+                    }),
+                )
+            })?;
+            let authority = runtime
+                .query_authority(
+                    &self.memory_workspace_id,
+                    &self.workspace_root.to_string_lossy(),
+                    current_git_branch(&self.workspace_root),
+                    &self.session_id,
+                )
+                .map_err(|error| (-32602, error))?;
+            let repository_store = self.memory_store.lock().await;
+            let shared_store = runtime.store.lock().await;
+            let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to initialize shared memory router: {error}"),
+                    )
+                })?;
+            let qualified_id = router
+                .remember(memory, &structured, parsed.organization_id.as_deref())
+                .map_err(|error| {
+                    (
+                        -32602,
+                        format!("Failed to store organization memory: {error}"),
+                    )
+                })?;
+            let verification_job_id = shared_store
+                .enqueue_verification_job(&self.memory_workspace_id, &qualified_id.local_id)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to enqueue organization memory verification: {error}"),
+                    )
+                })?;
+            let response = memory_v2::save_memory::build_response(
+                &shared_store,
+                &self.memory_workspace_id,
+                &qualified_id.local_id,
+                verification_job_id,
+            )
+            .map_err(|error| (-32603, error))?;
+            let mut value = serde_json::to_value(response)
+                .map_err(|error| (-32603, format!("Serialization error: {error}")))?;
+            annotate_shared_memory_value(
+                &mut value,
+                &qualified_id.encoded(),
+                "organization",
+                false,
+                Some(self.memory_workspace_id.as_str()),
+                Some(self.workspace_root.to_string_lossy().as_ref()),
+                "unverified",
+                "organization memory is unverified until evidence is verified for this repository",
+            );
+            return Ok(wrap_tool_result(value));
+        }
         let store = self.memory_store.lock().await;
         let memory_id = store
             .store(memory)
@@ -5313,7 +5638,7 @@ impl McpHandler {
             .map_err(|message| (-32602, message))?;
         memory_v2::propose_memory_evolution::validate_args(&parsed)
             .map_err(|message| (-32602, message))?;
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let store = self.memory_store.lock().await;
         match parsed.action {
             memory_v2::EvolutionAction::Propose => {
@@ -5437,7 +5762,7 @@ impl McpHandler {
             .map_err(|message| (-32602, message))?;
         let render_mode = parsed.render_mode.unwrap_or_default();
         let mode = parsed.mode.unwrap_or_default();
-        let workspace_id = self.workspace_root.to_string_lossy().to_string();
+        let workspace_id = self.memory_workspace_id.clone();
         let capture = self.event_capture.as_ref().ok_or((
             -32603,
             "Event capture is not configured for this session".to_string(),
@@ -8382,6 +8707,50 @@ fn serialize_memory_values(
         .collect()
 }
 
+/// Attach the fields that identify a record's owning memory authority. This is
+/// deliberately done at the RPC boundary so a shared record is never rendered
+/// as if its local SQLite id belonged to the querying repository.
+fn annotate_shared_memory_value(
+    value: &mut Value,
+    qualified_id: &str,
+    source_tier: &str,
+    cross_repo: bool,
+    origin_repository_id: Option<&str>,
+    origin_checkout_id: Option<&str>,
+    effective_verification_status: &str,
+    trust_reason: &str,
+) {
+    let annotate = |object: &mut serde_json::Map<String, Value>| {
+        object.insert("id".to_string(), json!(qualified_id));
+        object.insert("memory_id".to_string(), json!(qualified_id));
+        object.insert("source_tier".to_string(), json!(source_tier));
+        object.insert("cross_repo".to_string(), json!(cross_repo));
+        object.insert(
+            "origin_repository_id".to_string(),
+            json!(origin_repository_id),
+        );
+        object.insert("origin_checkout_id".to_string(), json!(origin_checkout_id));
+        object.insert(
+            "effective_verification_status".to_string(),
+            json!(effective_verification_status),
+        );
+        object.insert("trust_reason".to_string(), json!(trust_reason));
+        if cross_repo {
+            object.insert("verification_status".to_string(), json!("unverified"));
+            object.insert("trust_status".to_string(), json!("advisory"));
+        }
+    };
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("memory_id") {
+            object.insert("memory_id".to_string(), json!(qualified_id));
+        }
+        annotate(object);
+        if let Some(memory) = object.get_mut("memory").and_then(Value::as_object_mut) {
+            annotate(memory);
+        }
+    }
+}
+
 fn annotate_memory_freshness_values(
     values: &mut [Value],
     memories: &[Memory],
@@ -9440,10 +9809,11 @@ mod tests {
     use super::{
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
         memory_seed_values, parse_wrapped_tool_payload, report_memory_highlights,
+        parse_shared_memory_config,
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
         wrap_tool_result, wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler,
-        WorkflowRenderMode, FULL_WORKFLOW_TOKEN_CAP,
+        SharedMemoryRuntime, WorkflowRenderMode, FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::graph::CodeGraph;
     use lattice_core::indexer::Indexer;
@@ -10225,6 +10595,87 @@ mod tests {
         );
 
         (handler, memory_store, workspace_root)
+    }
+
+    #[test]
+    fn shared_memory_config_accepts_only_absolute_store_paths() {
+        let config = parse_shared_memory_config(
+            "[memory]\norganization_id = \"cadres\"\nshared_store_path = \"/var/tmp/cadres-memories.db\"\n",
+        )
+        .expect("valid shared memory config");
+        assert_eq!(config.organization_id.as_deref(), Some("cadres"));
+        assert_eq!(
+            config.shared_store_path.as_deref(),
+            Some(std::path::Path::new("/var/tmp/cadres-memories.db"))
+        );
+        assert!(parse_shared_memory_config("[memory]\nshared_store_path = \"relative.db\"\n")
+            .unwrap_err()
+            .contains("absolute"));
+    }
+
+    #[tokio::test]
+    async fn organization_memory_routes_to_shared_store_and_is_advisory_cross_repo() {
+        let shared_store = Arc::new(Mutex::new(
+            MemoryStore::open_in_memory().expect("shared memory store"),
+        ));
+        let (mut handler_a, repository_a, workspace_a) = build_memory_test_handler("shared-a");
+        handler_a.shared_memory = Some(SharedMemoryRuntime {
+            store: shared_store.clone(),
+            organization_id: "cadres".to_string(),
+        });
+        handler_a.memory_workspace_id = "repo-a".to_string();
+        let save = handler_a
+            .tool_save_memory_v2(&json!({
+                "content": "All Cadres services use a shared deployment policy.",
+                "memory_class": "constraint",
+                "scope": "organization",
+                "confidence": 0.9,
+                "confidence_reason": "operator policy",
+                "freshness_policy": "manual_review"
+            }))
+            .await
+            .expect("organization memory saves");
+        let save_payload: Value = serde_json::from_str(
+            save["content"][0]["text"]
+                .as_str()
+                .expect("wrapped save response"),
+        )
+        .expect("save JSON");
+        assert!(save_payload["memory_id"]
+            .as_str()
+            .expect("qualified id")
+            .starts_with("organization:cadres:"));
+        assert!(repository_a
+            .lock()
+            .await
+            .query_unscoped_admin(None, 10)
+            .expect("repository query")
+            .is_empty());
+
+        let (mut handler_b, _, workspace_b) = build_memory_test_handler("shared-b");
+        handler_b.shared_memory = Some(SharedMemoryRuntime {
+            store: shared_store,
+            organization_id: "cadres".to_string(),
+        });
+        handler_b.memory_workspace_id = "repo-b".to_string();
+        let search = handler_b
+            .tool_search_memory(&json!({"query": "shared deployment", "limit": 10}))
+            .await
+            .expect("merged organization recall");
+        let search_payload: Value = serde_json::from_str(
+            search["content"][0]["text"]
+                .as_str()
+                .expect("wrapped search response"),
+        )
+        .expect("search JSON");
+        let memory = &search_payload["memories"][0];
+        assert_eq!(memory["source_tier"], "organization");
+        assert_eq!(memory["cross_repo"], true);
+        assert_eq!(memory["effective_verification_status"], "unverified");
+        assert_eq!(memory["trust_status"], "advisory");
+
+        let _ = std::fs::remove_dir_all(workspace_a);
+        let _ = std::fs::remove_dir_all(workspace_b);
     }
 
     #[tokio::test]

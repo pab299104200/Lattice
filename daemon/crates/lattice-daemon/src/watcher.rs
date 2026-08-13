@@ -13,6 +13,7 @@ use lattice_core::query::QueryEngine;
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
+use crate::adoption_metrics::AdoptionMetricsStore;
 use crate::index_health::IndexHealth;
 use crate::index_work::{IndexReadiness, IndexWorkCoordinator};
 use crate::repo_state::RepoStateTracker;
@@ -38,6 +39,8 @@ pub struct FileWatcher {
     index_readiness: Arc<IndexReadiness>,
     watcher_health: Arc<WatcherHealth>,
     index_health: Arc<IndexHealth>,
+    adoption_metrics: Arc<AdoptionMetricsStore>,
+    session_id: String,
     #[cfg(test)]
     forced_watch_failure: Option<String>,
 }
@@ -58,7 +61,9 @@ impl FileWatcher {
         index_readiness: Arc<IndexReadiness>,
         watcher_health: Arc<WatcherHealth>,
         index_health: Arc<IndexHealth>,
+        session_id: String,
     ) -> Self {
+        let adoption_metrics = Arc::new(AdoptionMetricsStore::new(&workspace_root));
         Self {
             workspace_root,
             repo_name,
@@ -74,6 +79,8 @@ impl FileWatcher {
             index_readiness,
             watcher_health,
             index_health,
+            adoption_metrics,
+            session_id,
             #[cfg(test)]
             forced_watch_failure: None,
         }
@@ -246,6 +253,7 @@ impl FileWatcher {
 
     async fn process_changes(&self, paths: Vec<PathBuf>) {
         self.index_readiness.wait().await;
+        self.record_observed_edits(&paths);
         let requires_workspace_invalidation =
             should_invalidate_workspace(&self.workspace_root, &paths);
         let target_epoch = if requires_workspace_invalidation {
@@ -360,6 +368,30 @@ impl FileWatcher {
                     "Watcher batch worker failed"
                 );
                 self.indexing.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_observed_edits(&self, paths: &[PathBuf]) {
+        for path in paths {
+            let Ok(relative) = path.strip_prefix(&self.workspace_root) else {
+                continue;
+            };
+            let rel_path = relative.to_string_lossy().replace('\\', "/");
+            if is_git_state_path(&rel_path) || !lattice_core::watcher::should_index_file(&rel_path)
+            {
+                continue;
+            }
+            let file = self
+                .repo_name
+                .as_deref()
+                .map(|repo| repo_rel_path(repo, &rel_path))
+                .unwrap_or(rel_path);
+            if let Err(error) = self
+                .adoption_metrics
+                .record_observed_edit(&self.session_id, &file)
+            {
+                tracing::warn!(%error, file = file.as_str(), "failed to record watcher-observed edit for adoption metrics");
             }
         }
     }
@@ -634,6 +666,36 @@ mod tests {
     }
 
     #[test]
+    fn watcher_records_real_edit_for_its_runtime_session_only() {
+        let root = unique_test_root("watch-adoption");
+        let path = root.join("src/auth.rs");
+        std::fs::create_dir_all(path.parent().expect("source parent"))
+            .expect("create source directory");
+        std::fs::write(&path, "pub fn auth() {}\n").expect("write source");
+        let (watcher, _, _, _, _) = test_watcher(root.clone());
+        watcher
+            .adoption_metrics
+            .record(crate::adoption_metrics::ToolCallRecord {
+                session_id: watcher.session_id.clone(),
+                client: "codex".to_string(),
+                channel: "mcp".to_string(),
+                tool: "context".to_string(),
+                latency_ms: 1,
+                suggested_files: vec!["src/auth.rs".to_string()],
+            })
+            .expect("record assistance");
+
+        watcher.record_observed_edits(&[path]);
+
+        assert!(watcher
+            .adoption_metrics
+            .render_table(1)
+            .expect("render metrics")
+            .contains("codex | mcp | context | 1 | 1 | 1 | 100%"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn watcher_batch_uses_cold_scan_index_eligibility() {
         let root = unique_test_root("watch-eligibility");
         std::fs::create_dir_all(root.join("src")).expect("create source directory");
@@ -712,6 +774,7 @@ mod tests {
             readiness,
             Arc::clone(&health),
             Arc::new(IndexHealth::default()),
+            "test-session".to_string(),
         );
         (watcher, indexer, indexing, health, index_work)
     }

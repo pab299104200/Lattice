@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const LEDGER_VERSION: u32 = 1;
+const LEDGER_VERSION: u32 = 2;
+const RETENTION_DAYS: u64 = 90;
+const FOLLOW_THROUGH_WINDOW_SECS: u64 = 60 * 60;
+const MAX_SUGGESTED_FILES: usize = 32;
 const SECS_PER_DAY: u64 = 86_400;
 
 #[derive(Debug, Clone)]
@@ -17,17 +21,25 @@ pub(crate) struct ToolCallSource {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRecord {
+    pub(crate) session_id: String,
     pub(crate) client: String,
     pub(crate) channel: String,
     pub(crate) tool: String,
     pub(crate) latency_ms: u64,
-    pub(crate) follow_through_edit: bool,
+    /// Files the tool actually returned as relevant. Follow-through is only
+    /// credited after the watcher subsequently observes one of these files.
+    pub(crate) suggested_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct AdoptionMetricsStore {
     path: PathBuf,
-    lock: Mutex<()>,
+    lock: Mutex<StoreState>,
+}
+
+#[derive(Debug, Default)]
+struct StoreState {
+    last_compaction_day: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,80 +65,177 @@ impl Default for AdoptionLedger {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AdoptionEvent {
+    ToolCall {
+        timestamp_secs: u64,
+        session_id: String,
+        client: String,
+        channel: String,
+        tool: String,
+        latency_ms: u64,
+        suggested_files: Vec<String>,
+    },
+    ObservedEdit {
+        timestamp_secs: u64,
+        session_id: String,
+        file: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingAssistance {
+    timestamp_secs: u64,
+    session_id: String,
+    suggested_files: BTreeSet<String>,
+    counter_key: CounterKey,
+    credited: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CounterKey {
+    day: String,
+    client: String,
+    channel: String,
+    tool: String,
+}
+
 impl AdoptionMetricsStore {
     pub(crate) fn new(workspace_root: &Path) -> Self {
         Self {
             path: workspace_root
                 .join(".lattice")
-                .join("adoption_metrics.json"),
-            lock: Mutex::new(()),
+                .join("adoption_metrics.jsonl"),
+            lock: Mutex::new(StoreState::default()),
         }
     }
 
     pub(crate) fn record(&self, record: ToolCallRecord) -> Result<()> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let mut ledger = self.read_ledger_unlocked()?;
-        let day = today_key();
-        let client = clean_key(&record.client, "unknown-client");
-        let channel = clean_key(&record.channel, "unknown-channel");
-        let tool = clean_key(&record.tool, "unknown-tool");
-        let day_entry = ledger.days.entry(day).or_default();
-        let counter = day_entry
-            .entry(client.clone())
-            .or_default()
-            .entry(channel.clone())
-            .or_default()
-            .entry(tool.clone())
-            .or_default();
-        counter.calls += 1;
-        counter.total_latency_ms += record.latency_ms;
-        counter.max_latency_ms = counter.max_latency_ms.max(record.latency_ms);
-        if record.follow_through_edit {
-            counter.follow_through_edits += 1;
-            credit_prior_assistance_follow_through(day_entry, &client, &channel);
-        }
-        let text = serde_json::to_string_pretty(&ledger)?;
-        fs::write(&self.path, text)
-            .with_context(|| format!("failed to write {}", self.path.display()))
+        self.append_event(AdoptionEvent::ToolCall {
+            timestamp_secs: now_secs(),
+            session_id: clean_key(&record.session_id, "unknown-session"),
+            client: clean_key(&record.client, "unknown-client"),
+            channel: clean_key(&record.channel, "unknown-channel"),
+            tool: clean_key(&record.tool, "unknown-tool"),
+            latency_ms: record.latency_ms,
+            suggested_files: normalize_suggested_files(record.suggested_files),
+        })
+    }
+
+    /// Records an actual filesystem change emitted by the watcher. Attribution
+    /// is resolved by replaying events, never by caller-supplied prose.
+    pub(crate) fn record_observed_edit(&self, session_id: &str, file: &str) -> Result<()> {
+        self.append_event(AdoptionEvent::ObservedEdit {
+            timestamp_secs: now_secs(),
+            session_id: clean_key(session_id, "unknown-session"),
+            file: clean_file(file).unwrap_or_default(),
+        })
     }
 
     pub(crate) fn render_table(&self, days: usize) -> Result<String> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
-        let ledger = self.read_ledger_unlocked()?;
+        let ledger = self.read_ledger()?;
         Ok(render_table_from_ledger(&ledger, days))
     }
 
     pub(crate) fn read_json(&self) -> Result<serde_json::Value> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
-        let ledger = self.read_ledger_unlocked()?;
+        let ledger = self.read_ledger()?;
         serde_json::to_value(ledger).map_err(Into::into)
     }
 
-    fn read_ledger_unlocked(&self) -> Result<AdoptionLedger> {
+    fn append_event(&self, event: AdoptionEvent) -> Result<()> {
+        let mut state = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
+        self.ensure_parent_dir()?;
+        self.compact_if_due(&mut state)?;
+        let mut line = serde_json::to_string(&event)?;
+        line.push('\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        // Keep an event and its delimiter in one append operation. O_APPEND
+        // then prevents separate daemon processes from interleaving records.
+        file.write_all(line.as_bytes())?;
+        file.flush()
+            .with_context(|| format!("failed to append {}", self.path.display()))
+    }
+
+    fn read_ledger(&self) -> Result<AdoptionLedger> {
+        let mut state = self
+            .lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
+        self.ensure_parent_dir()?;
+        self.compact_if_due(&mut state)?;
+        let events = self.read_events_unlocked()?;
+        Ok(ledger_from_events(&events))
+    }
+
+    fn ensure_parent_dir(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        Ok(())
+    }
+
+    fn compact_if_due(&self, state: &mut StoreState) -> Result<()> {
+        let today = current_epoch_day();
+        if state.last_compaction_day == Some(today) {
+            return Ok(());
+        }
+        state.last_compaction_day = Some(today);
         if !self.path.exists() {
-            return Ok(AdoptionLedger::default());
+            return Ok(());
+        }
+
+        let cutoff = now_secs().saturating_sub(RETENTION_DAYS * SECS_PER_DAY);
+        let retained = self
+            .read_events_unlocked()?
+            .into_iter()
+            .filter(|event| event_timestamp(event) >= cutoff)
+            .collect::<Vec<_>>();
+        let temp = self.path.with_extension("jsonl.compacting");
+        let mut file = fs::File::create(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        for event in retained {
+            serde_json::to_writer(&mut file, &event)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        fs::rename(&temp, &self.path).with_context(|| {
+            format!(
+                "failed to replace adoption metrics {} with compacted ledger",
+                self.path.display()
+            )
+        })
+    }
+
+    fn read_events_unlocked(&self) -> Result<Vec<AdoptionEvent>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
         }
         let text = fs::read_to_string(&self.path)
             .with_context(|| format!("failed to read {}", self.path.display()))?;
-        let mut ledger: AdoptionLedger = serde_json::from_str(&text)
-            .with_context(|| format!("failed to parse {}", self.path.display()))?;
-        if ledger.version != LEDGER_VERSION {
-            ledger.version = LEDGER_VERSION;
+        let mut events = Vec::new();
+        for (line_number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "failed to parse adoption metrics {} line {}",
+                    self.path.display(),
+                    line_number + 1
+                )
+            })?;
+            events.push(event);
         }
-        Ok(ledger)
+        Ok(events)
     }
 }
 
@@ -151,17 +260,23 @@ pub(crate) fn source_from_arguments(
     }
 }
 
-pub(crate) fn follow_through_from_arguments(tool: &str, args: &serde_json::Value) -> bool {
-    if tool != "remember" && tool != "record_workflow_outcome" {
-        return false;
+/// Extracts only file references explicitly present in a successful tool
+/// result. Free-form query text is deliberately ignored: follow-through must
+/// be tied to files Lattice returned, not to strings the caller happened to
+/// send us.
+pub(crate) fn suggested_files_from_tool_result(
+    tool: &str,
+    result: &serde_json::Value,
+) -> Vec<String> {
+    if !matches!(
+        tool,
+        "context" | "impact" | "get_context_capsule" | "impact_from_diff"
+    ) {
+        return Vec::new();
     }
-    let content = args
-        .get("content")
-        .or_else(|| args.get("summary"))
-        .or_else(|| args.get("task"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    content.contains("Session edited files:")
+    let mut files = BTreeSet::new();
+    collect_response_files(result, &mut files);
+    files.into_iter().take(MAX_SUGGESTED_FILES).collect()
 }
 
 pub(crate) fn render_metrics_for_workspace(
@@ -174,6 +289,145 @@ pub(crate) fn render_metrics_for_workspace(
         return Ok(serde_json::to_string_pretty(&store.read_json()?)?);
     }
     store.render_table(days)
+}
+
+fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
+    let mut ledger = AdoptionLedger::default();
+    let mut pending = Vec::new();
+    for event in events {
+        match event {
+            AdoptionEvent::ToolCall {
+                timestamp_secs,
+                session_id,
+                client,
+                channel,
+                tool,
+                latency_ms,
+                suggested_files,
+            } => {
+                let day = date_key_from_epoch_day(*timestamp_secs / SECS_PER_DAY);
+                let counter = ledger
+                    .days
+                    .entry(day.clone())
+                    .or_default()
+                    .entry(client.clone())
+                    .or_default()
+                    .entry(channel.clone())
+                    .or_default()
+                    .entry(tool.clone())
+                    .or_default();
+                counter.calls += 1;
+                counter.total_latency_ms += latency_ms;
+                counter.max_latency_ms = counter.max_latency_ms.max(*latency_ms);
+                if matches!(tool.as_str(), "context" | "impact") && !suggested_files.is_empty() {
+                    pending.push(PendingAssistance {
+                        timestamp_secs: *timestamp_secs,
+                        session_id: session_id.clone(),
+                        suggested_files: suggested_files.iter().cloned().collect(),
+                        counter_key: CounterKey {
+                            day,
+                            client: client.clone(),
+                            channel: channel.clone(),
+                            tool: tool.clone(),
+                        },
+                        credited: false,
+                    });
+                }
+            }
+            AdoptionEvent::ObservedEdit {
+                timestamp_secs,
+                session_id,
+                file,
+            } => {
+                let Some(candidate) = pending.iter_mut().rev().find(|candidate| {
+                    !candidate.credited
+                        && candidate.session_id == *session_id
+                        && *timestamp_secs >= candidate.timestamp_secs
+                        && timestamp_secs.saturating_sub(candidate.timestamp_secs)
+                            <= FOLLOW_THROUGH_WINDOW_SECS
+                        && candidate.suggested_files.contains(file)
+                }) else {
+                    continue;
+                };
+                candidate.credited = true;
+                if let Some(counter) = ledger
+                    .days
+                    .get_mut(&candidate.counter_key.day)
+                    .and_then(|clients| clients.get_mut(&candidate.counter_key.client))
+                    .and_then(|channels| channels.get_mut(&candidate.counter_key.channel))
+                    .and_then(|tools| tools.get_mut(&candidate.counter_key.tool))
+                {
+                    counter.follow_through_edits += 1;
+                }
+            }
+        }
+    }
+    ledger
+}
+
+fn event_timestamp(event: &AdoptionEvent) -> u64 {
+    match event {
+        AdoptionEvent::ToolCall { timestamp_secs, .. }
+        | AdoptionEvent::ObservedEdit { timestamp_secs, .. } => *timestamp_secs,
+    }
+}
+
+fn normalize_suggested_files(files: Vec<String>) -> Vec<String> {
+    files
+        .into_iter()
+        .filter_map(|file| clean_file(&file))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_SUGGESTED_FILES)
+        .collect()
+}
+
+fn collect_response_files(value: &serde_json::Value, files: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                match (key.as_str(), child) {
+                    (
+                        "file" | "from_file" | "to_file" | "path" | "f",
+                        serde_json::Value::String(file),
+                    ) => {
+                        if let Some(file) = clean_file(file) {
+                            files.insert(file);
+                        }
+                    }
+                    ("files", serde_json::Value::Array(values)) => {
+                        for value in values {
+                            if let Some(file) = value.as_str().and_then(clean_file) {
+                                files.insert(file);
+                            }
+                        }
+                    }
+                    ("text", serde_json::Value::String(text)) => {
+                        if let Ok(payload) = serde_json::from_str(text) {
+                            collect_response_files(&payload, files);
+                        }
+                    }
+                    _ => collect_response_files(child, files),
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_response_files(value, files);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clean_file(file: &str) -> Option<String> {
+    let file = file.trim().replace('\\', "/");
+    (!file.is_empty()
+        && !file.starts_with('/')
+        && !file
+            .split('/')
+            .any(|segment| segment == ".." || segment.is_empty()))
+    .then_some(file)
 }
 
 fn render_table_from_ledger(ledger: &AdoptionLedger, days: usize) -> String {
@@ -233,36 +487,15 @@ fn clean_key(value: &str, fallback: &str) -> String {
     }
 }
 
-fn credit_prior_assistance_follow_through(
-    day_entry: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, AdoptionCounter>>>,
-    client: &str,
-    channel: &str,
-) {
-    let Some(channel_entry) = day_entry
-        .get_mut(client)
-        .and_then(|channels| channels.get_mut(channel))
-    else {
-        return;
-    };
-    for tool in ["context", "impact"] {
-        if let Some(counter) = channel_entry.get_mut(tool) {
-            if counter.follow_through_edits < counter.calls {
-                counter.follow_through_edits += 1;
-            }
-        }
-    }
-}
-
-fn today_key() -> String {
-    date_key_from_epoch_day(current_epoch_day())
-}
-
-fn current_epoch_day() -> u64 {
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        / SECS_PER_DAY
+}
+
+fn current_epoch_day() -> u64 {
+    now_secs() / SECS_PER_DAY
 }
 
 fn day_number_from_key(day: &str) -> Option<u64> {
@@ -318,56 +551,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ledger_records_client_channel_tool_counts() {
-        let root = std::env::temp_dir().join(format!("lattice-adoption-{}", std::process::id()));
-        let store = AdoptionMetricsStore::new(&root);
-        store
-            .record(ToolCallRecord {
-                client: "claude-code".to_string(),
-                channel: "hook".to_string(),
-                tool: "context".to_string(),
-                latency_ms: 42,
-                follow_through_edit: true,
-            })
-            .expect("record");
-        let table = store.render_table(14).expect("render");
-        assert!(table.contains("claude-code | hook | context | 1 | 42 | 42 | 100%"));
-        let _ = std::fs::remove_dir_all(root);
+    fn watcher_edit_credits_only_same_session_and_suggested_file() {
+        let events = vec![
+            call(10, "session-a", "context", &["src/auth.rs"]),
+            call(11, "session-b", "impact", &["src/auth.rs"]),
+            edit(12, "session-b", "src/auth.rs"),
+            edit(13, "session-a", "src/other.rs"),
+            edit(14, "session-a", "src/auth.rs"),
+        ];
+        let ledger = ledger_from_events(&events);
+        let tools = today_tools(&ledger);
+
+        assert_eq!(tools["context"].follow_through_edits, 1);
+        assert_eq!(tools["impact"].follow_through_edits, 1);
     }
 
     #[test]
-    fn edited_file_reports_credit_prior_context_and_impact_calls() {
-        let root = std::env::temp_dir().join(format!(
-            "lattice-adoption-follow-through-{}",
-            std::process::id()
-        ));
-        let store = AdoptionMetricsStore::new(&root);
-        for tool in ["context", "impact"] {
-            store
-                .record(ToolCallRecord {
-                    client: "claude-code".to_string(),
-                    channel: "hook".to_string(),
-                    tool: tool.to_string(),
-                    latency_ms: 10,
-                    follow_through_edit: false,
-                })
-                .expect("record assistance");
-        }
-        store
-            .record(ToolCallRecord {
-                client: "claude-code".to_string(),
-                channel: "hook".to_string(),
-                tool: "remember".to_string(),
-                latency_ms: 5,
-                follow_through_edit: true,
-            })
-            .expect("record edited files");
+    fn observed_edit_does_not_credit_outside_bounded_session_window() {
+        let events = vec![
+            call(10, "session-a", "context", &["src/auth.rs"]),
+            edit(
+                10 + FOLLOW_THROUGH_WINDOW_SECS + 1,
+                "session-a",
+                "src/auth.rs",
+            ),
+        ];
+        let ledger = ledger_from_events(&events);
+        assert_eq!(today_tools(&ledger)["context"].follow_through_edits, 0);
+    }
 
-        let table = store.render_table(14).expect("render");
-        assert!(table.contains("claude-code | hook | context | 1 | 10 | 10 | 100%"));
-        assert!(table.contains("claude-code | hook | impact | 1 | 10 | 10 | 100%"));
-        assert!(table.contains("claude-code | hook | remember | 1 | 5 | 5 | 100%"));
-        let _ = std::fs::remove_dir_all(root);
+    #[test]
+    fn append_only_records_and_compacts_entries_past_retention() {
+        let root = unique_root("retention");
+        let store = AdoptionMetricsStore::new(&root);
+        let old = AdoptionEvent::ObservedEdit {
+            timestamp_secs: now_secs().saturating_sub((RETENTION_DAYS + 1) * SECS_PER_DAY),
+            session_id: "old".to_string(),
+            file: "src/old.rs".to_string(),
+        };
+        store.ensure_parent_dir().expect("metrics parent");
+        fs::write(
+            &store.path,
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .expect("seed old event");
+        store
+            .record(call_record("session-a", "context", &["src/auth.rs"]))
+            .expect("append event");
+
+        let contents = fs::read_to_string(&store.path).expect("read log");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "old record should be compacted"
+        );
+        assert!(contents.contains("tool_call"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -385,9 +624,68 @@ mod tests {
     }
 
     #[test]
-    fn date_keys_round_trip_to_epoch_days() {
-        let today = current_epoch_day();
-        let key = date_key_from_epoch_day(today);
-        assert_eq!(day_number_from_key(&key), Some(today));
+    fn result_file_extraction_ignores_caller_text_and_keeps_returned_files() {
+        let files = suggested_files_from_tool_result(
+            "context",
+            &serde_json::json!({
+                "content": [{
+                    "text": "{\"pivots\":[{\"file\":\"src/auth.rs\"}],\"query\":\"do not credit src/untrusted.rs\"}"
+                }]
+            }),
+        );
+
+        assert_eq!(files, vec!["src/auth.rs".to_string()]);
+    }
+
+    fn call(timestamp: u64, session: &str, tool: &str, files: &[&str]) -> AdoptionEvent {
+        AdoptionEvent::ToolCall {
+            timestamp_secs: timestamp,
+            session_id: session.to_string(),
+            client: "codex".to_string(),
+            channel: "mcp".to_string(),
+            tool: tool.to_string(),
+            latency_ms: 10,
+            suggested_files: files.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn edit(timestamp: u64, session: &str, file: &str) -> AdoptionEvent {
+        AdoptionEvent::ObservedEdit {
+            timestamp_secs: timestamp,
+            session_id: session.to_string(),
+            file: file.to_string(),
+        }
+    }
+
+    fn call_record(session: &str, tool: &str, files: &[&str]) -> ToolCallRecord {
+        ToolCallRecord {
+            session_id: session.to_string(),
+            client: "codex".to_string(),
+            channel: "mcp".to_string(),
+            tool: tool.to_string(),
+            latency_ms: 10,
+            suggested_files: files.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn today_tools(ledger: &AdoptionLedger) -> &BTreeMap<String, AdoptionCounter> {
+        ledger
+            .days
+            .get(&date_key_from_epoch_day(0))
+            .expect("event day")
+            .get("codex")
+            .expect("client")
+            .get("mcp")
+            .expect("channel")
+    }
+
+    fn unique_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lattice-adoption-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }

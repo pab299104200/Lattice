@@ -171,16 +171,6 @@ pub fn validate_args(args: &SaveMemoryArgs) -> Result<(), String> {
         MemoryScopeArg::Branch if args.branch.as_deref().unwrap_or("").trim().is_empty() => {
             Err("branch-scoped memory requires a branch".to_string())
         }
-        MemoryScopeArg::Organization
-            if args
-                .organization_id
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty() =>
-        {
-            Err("organization-scoped memory requires organization_id".to_string())
-        }
         _ => Ok(()),
     }
 }

@@ -14,6 +14,7 @@ mod socket_server;
 mod vector_sync;
 mod watcher;
 mod watcher_health;
+mod workspace_identity;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -165,9 +166,15 @@ async fn main() -> Result<()> {
     // Create .lattice dir for persistent storage
     let lattice_dir = workspace_root.join(".lattice");
     let _ = std::fs::create_dir_all(&lattice_dir);
+    // The watcher and the MCP handler must share a runtime identity: watcher
+    // events are the authoritative source for adoption follow-through.
+    let session_id = generate_session_id();
 
-    // File-backed memory store — observations persist across daemon restarts when available.
-    let memories_path = lattice_dir.join("memories.db");
+    // Repository memory is shared by Git worktrees; checkout-local graph and
+    // watcher state continue to use `lattice_dir` below.
+    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
+    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
+    let memories_path = memory_identity.memories_path();
     let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
     let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
@@ -406,6 +413,7 @@ async fn main() -> Result<()> {
         let index_readiness_for_watchers = Arc::clone(&index_readiness);
         let watcher_health = Arc::clone(&watcher_health);
         let index_health = Arc::clone(&index_health);
+        let watcher_session_id = session_id.clone();
 
         tokio::spawn(async move {
             for root in workspace_roots {
@@ -424,6 +432,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&index_readiness_for_watchers),
                     Arc::clone(&watcher_health),
                     Arc::clone(&index_health),
+                    watcher_session_id.clone(),
                 );
 
                 tokio::spawn(async move {
@@ -453,7 +462,6 @@ async fn main() -> Result<()> {
     }
 
     // ── Create McpHandler and start StdioServer ──────────────────────
-    let session_id = generate_session_id();
     let context_cache_path = lattice_dir.join("context_handles.json");
     tracing::info!("Creating MCP handler (session: {})", session_id);
     let handler = Arc::new(McpHandler::new_with_shared_repo_state(
@@ -464,6 +472,8 @@ async fn main() -> Result<()> {
         embedding_engine,
         vector_index,
         workspace_root,
+        memory_identity.repository_id,
+        memories_path.clone(),
         context_cache_path,
         session_id,
         workspace_manager,
@@ -526,8 +536,12 @@ pub(crate) async fn build_workspace_runtime(
 
     let lattice_dir = workspace_root.join(".lattice");
     let _ = std::fs::create_dir_all(&lattice_dir);
+    // Keep watcher attribution scoped to the handler session for this runtime.
+    let session_id = generate_session_id();
 
-    let memories_path = lattice_dir.join("memories.db");
+    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
+    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
+    let memories_path = memory_identity.memories_path();
     let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
     let vector_index = open_vector_index(&lattice_dir);
     let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
@@ -721,6 +735,7 @@ pub(crate) async fn build_workspace_runtime(
         let vector_index = vector_index.clone();
         let watcher_health = Arc::clone(&watcher_health);
         let index_health = Arc::clone(&index_health);
+        let watcher_session_id = session_id.clone();
 
         for root in workspace_roots {
             let watcher = crate::watcher::FileWatcher::new(
@@ -738,6 +753,7 @@ pub(crate) async fn build_workspace_runtime(
                 Arc::clone(&index_readiness),
                 Arc::clone(&watcher_health),
                 Arc::clone(&index_health),
+                watcher_session_id.clone(),
             );
             let task = tokio::spawn(async move {
                 if let Err(e) = watcher.run().await {
@@ -765,7 +781,6 @@ pub(crate) async fn build_workspace_runtime(
         background_tasks.push(task);
     }
 
-    let session_id = generate_session_id();
     let context_cache_path = lattice_dir.join("context_handles.json");
     tracing::info!(
         "Creating MCP handler for {} (session: {})",
@@ -780,6 +795,8 @@ pub(crate) async fn build_workspace_runtime(
         embedding_engine,
         vector_index,
         workspace_root,
+        memory_identity.repository_id,
+        memories_path.clone(),
         context_cache_path,
         session_id,
         workspace_manager,
@@ -1419,7 +1436,8 @@ fn parse_memory_migrate_options() -> Result<MemoryMigrateOptions> {
         anyhow::bail!("memory-migrate requires exactly one of --dry-run or --apply");
     }
     let workspace = parse_workspace_roots()?.remove(0);
-    let lattice_dir = workspace.join(".lattice");
+    let lattice_dir =
+        crate::workspace_identity::WorkspaceIdentity::resolve(&workspace)?.repository_lattice_dir;
     Ok(MemoryMigrateOptions {
         source_path: source_path.unwrap_or_else(|| lattice_dir.join("memories.db")),
         dest_path: dest_path.unwrap_or_else(|| lattice_dir.join("memory_graph.db")),
