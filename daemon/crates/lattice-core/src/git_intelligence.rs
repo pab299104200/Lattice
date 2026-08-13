@@ -11,6 +11,94 @@ use serde::{Deserialize, Serialize};
 
 /// The maximum history window read during one refresh.
 pub const DEFAULT_HISTORY_LIMIT: usize = 500;
+/// Hard ceiling for an operator-configured history window.
+pub const MAX_HISTORY_LIMIT: usize = 500;
+/// A wider commit is excluded rather than partially contributing file signals.
+pub const MAX_PATHS_PER_COMMIT: usize = 20_000;
+/// A commit exceeding this bound contributes files but no symbol signals.
+pub const MAX_SYMBOLS_PER_COMMIT: usize = 4_096;
+/// Wider commits contribute file signals but no co-change pairs.
+pub const MAX_CO_CHANGE_WIDTH: usize = 256;
+/// A generation exceeding this bound publishes no partial co-change view.
+pub const MAX_CO_CHANGE_PAIRS: usize = 250_000;
+/// Increment when persisted aggregation semantics change.
+pub const AGGREGATION_VERSION: u32 = 1;
+
+/// Effective aggregation bounds persisted alongside a snapshot generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitMiningLimits {
+    pub history_limit: usize,
+    pub paths_per_commit: usize,
+    pub symbols_per_commit: usize,
+    pub co_change_width: usize,
+    pub co_change_pairs: usize,
+}
+
+impl Default for GitMiningLimits {
+    fn default() -> Self {
+        Self {
+            history_limit: DEFAULT_HISTORY_LIMIT,
+            paths_per_commit: MAX_PATHS_PER_COMMIT,
+            symbols_per_commit: MAX_SYMBOLS_PER_COMMIT,
+            co_change_width: MAX_CO_CHANGE_WIDTH,
+            co_change_pairs: MAX_CO_CHANGE_PAIRS,
+        }
+    }
+}
+
+impl GitMiningLimits {
+    fn bounded(self) -> Self {
+        Self {
+            history_limit: self.history_limit.min(MAX_HISTORY_LIMIT),
+            paths_per_commit: self.paths_per_commit.min(MAX_PATHS_PER_COMMIT),
+            symbols_per_commit: self.symbols_per_commit.min(MAX_SYMBOLS_PER_COMMIT),
+            co_change_width: self.co_change_width.min(MAX_CO_CHANGE_WIDTH),
+            co_change_pairs: self.co_change_pairs.min(MAX_CO_CHANGE_PAIRS),
+        }
+    }
+}
+
+/// Completeness evidence for one pure aggregation run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitMiningReport {
+    pub aggregation_version: u32,
+    pub limits: GitMiningLimits,
+    /// Adapter samples examined, including invalid and replayed samples.
+    pub samples_seen: u64,
+    /// Distinct valid commit ids admitted to the history window.
+    pub sampled_commits: u32,
+    /// Sampled commits with complete file observations.
+    pub included_commits: u32,
+    pub duplicate_commits: u64,
+    pub invalid_commit_ids: u64,
+    pub invalid_path_entries: u64,
+    pub path_overflow_commits: u32,
+    pub symbol_overflow_commits: u32,
+    pub co_change_width_exclusions: u32,
+    /// False means all co-change rows were discarded to avoid a biased view.
+    pub co_changes_complete: bool,
+}
+
+impl GitMiningReport {
+    /// Complete snapshots are the only snapshots eligible to affect consumers.
+    /// Degraded aggregates remain useful for diagnostics and a later rebuild.
+    pub fn is_complete(&self) -> bool {
+        !self.is_degraded()
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.sampled_commits
+            != self
+                .included_commits
+                .saturating_add(self.path_overflow_commits)
+            || self.invalid_commit_ids > 0
+            || self.invalid_path_entries > 0
+            || self.path_overflow_commits > 0
+            || self.symbol_overflow_commits > 0
+            || self.co_change_width_exclusions > 0
+            || !self.co_changes_complete
+    }
+}
 
 /// A bounded observation of one commit, ordered newest-first by the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +130,7 @@ pub struct GitIntelligenceSnapshot {
     pub files: Vec<FileHistorySignal>,
     pub symbols: Vec<SymbolHistorySignal>,
     pub co_changes: Vec<CoChangeSignal>,
+    pub report: GitMiningReport,
 }
 
 impl GitIntelligenceSnapshot {
@@ -52,7 +141,117 @@ impl GitIntelligenceSnapshot {
             files: Vec::new(),
             symbols: Vec::new(),
             co_changes: Vec::new(),
+            report: GitMiningReport {
+                aggregation_version: AGGREGATION_VERSION,
+                limits: GitMiningLimits::default(),
+                samples_seen: 0,
+                sampled_commits: 0,
+                included_commits: 0,
+                duplicate_commits: 0,
+                invalid_commit_ids: 0,
+                invalid_path_entries: 0,
+                path_overflow_commits: 0,
+                symbol_overflow_commits: 0,
+                co_change_width_exclusions: 0,
+                co_changes_complete: true,
+            },
         }
+    }
+
+    /// The newest commit represented by this snapshot.
+    pub fn head_commit_id(&self) -> Option<&str> {
+        self.processed_commits.first().map(String::as_str)
+    }
+
+    /// Looks up a file signal without requiring consumers to rebuild an index.
+    pub fn file(&self, path: &str) -> Option<&FileHistorySignal> {
+        let path = canonical_repository_path(path)?;
+        self.files
+            .binary_search_by(|candidate| candidate.path.cmp(&path))
+            .ok()
+            .map(|index| &self.files[index])
+    }
+
+    /// Looks up an exact stable symbol key.
+    pub fn symbol(&self, symbol: &str) -> Option<&SymbolHistorySignal> {
+        let symbol = symbol.trim();
+        if symbol.is_empty() {
+            return None;
+        }
+        self.symbols
+            .binary_search_by(|candidate| candidate.symbol.as_str().cmp(symbol))
+            .ok()
+            .map(|index| &self.symbols[index])
+    }
+
+    /// Looks up an unordered co-change pair when that signal is complete.
+    pub fn co_change(&self, left_path: &str, right_path: &str) -> Option<&CoChangeSignal> {
+        if self.report.is_degraded() {
+            return None;
+        }
+        let left = canonical_repository_path(left_path)?;
+        let right = canonical_repository_path(right_path)?;
+        if left == right {
+            return None;
+        }
+        let pair = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        self.co_changes
+            .binary_search_by(|candidate| {
+                (&candidate.left_path, &candidate.right_path).cmp(&(&pair.0, &pair.1))
+            })
+            .ok()
+            .map(|index| &self.co_changes[index])
+    }
+
+    /// Returns bounded co-change partners absent from the supplied current diff.
+    pub fn missing_co_change_partners<I, S>(
+        &self,
+        changed_paths: I,
+        minimum_commits: u32,
+        limit: usize,
+    ) -> Vec<MissingCoChangePartner>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if self.report.is_degraded() || limit == 0 {
+            return Vec::new();
+        }
+        let changed: BTreeSet<String> = changed_paths
+            .into_iter()
+            .filter_map(|path| canonical_repository_path(path.as_ref()))
+            .collect();
+        let mut partners = Vec::new();
+        for signal in &self.co_changes {
+            let (source_path, partner_path) = match (
+                changed.contains(&signal.left_path),
+                changed.contains(&signal.right_path),
+            ) {
+                (true, false) => (&signal.left_path, &signal.right_path),
+                (false, true) => (&signal.right_path, &signal.left_path),
+                _ => continue,
+            };
+            if signal.commit_count >= minimum_commits {
+                partners.push(MissingCoChangePartner {
+                    source_path: source_path.clone(),
+                    partner_path: partner_path.clone(),
+                    commit_count: signal.commit_count,
+                });
+            }
+        }
+        partners.sort_unstable_by(|left, right| {
+            right
+                .commit_count
+                .cmp(&left.commit_count)
+                .then_with(|| left.source_path.cmp(&right.source_path))
+                .then_with(|| left.partner_path.cmp(&right.partner_path))
+        });
+        partners.truncate(limit);
+        partners
     }
 
     /// Returns the decile cutoff for nonzero file hotness, if one exists.
@@ -61,18 +260,36 @@ impl GitIntelligenceSnapshot {
     /// value is derived from files, never commits, and intentionally excludes
     /// zeroes because no unobserved path belongs in a history-derived warning.
     pub fn top_decile_hotspot_cutoff(&self) -> Option<u32> {
-        let mut scores: Vec<u32> = self
-            .files
-            .iter()
-            .map(|file| file.hotspot_score)
-            .filter(|score| *score > 0)
-            .collect();
-        if scores.is_empty() {
+        if self.report.is_degraded() {
             return None;
         }
-        scores.sort_unstable_by(|left, right| right.cmp(left));
-        let index = ((scores.len() - 1) / 10).min(scores.len() - 1);
-        scores.get(index).copied()
+        let mut histogram = vec![0_usize; self.processed_commits.len().saturating_add(1)];
+        let mut nonzero_files = 0_usize;
+        for file in &self.files {
+            let score = usize::try_from(file.hotspot_score).ok()?;
+            if score == 0 {
+                continue;
+            }
+            // Reject corrupt persisted aggregates instead of allocating from or
+            // issuing warnings based on an impossible score.
+            if score >= histogram.len() {
+                return None;
+            }
+            histogram[score] = histogram[score].saturating_add(1);
+            nonzero_files = nonzero_files.saturating_add(1);
+        }
+        if nonzero_files == 0 {
+            return None;
+        }
+        let target_index = (nonzero_files - 1) / 10;
+        let mut seen = 0_usize;
+        for score in (1..histogram.len()).rev() {
+            seen = seen.saturating_add(histogram[score]);
+            if seen > target_index {
+                return u32::try_from(score).ok();
+            }
+        }
+        None
     }
 }
 
@@ -110,10 +327,18 @@ pub struct CoChangeSignal {
     pub commit_count: u32,
 }
 
+/// An impact advisory linking a changed path to an unchanged history partner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingCoChangePartner {
+    pub source_path: String,
+    pub partner_path: String,
+    pub commit_count: u32,
+}
+
 /// Pure miner with a deliberately bounded history window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GitHistoryMiner {
-    history_limit: usize,
+    limits: GitMiningLimits,
 }
 
 impl Default for GitHistoryMiner {
@@ -124,10 +349,21 @@ impl Default for GitHistoryMiner {
 
 impl GitHistoryMiner {
     pub fn new(history_limit: usize) -> Self {
-        Self {
-            // Zero is a useful explicit way for an operator to disable mining.
+        Self::with_limits(GitMiningLimits {
             history_limit,
+            ..GitMiningLimits::default()
+        })
+    }
+
+    /// Accepts lower test/operator bounds while enforcing every hard ceiling.
+    pub fn with_limits(limits: GitMiningLimits) -> Self {
+        Self {
+            limits: limits.bounded(),
         }
+    }
+
+    pub fn limits(&self) -> GitMiningLimits {
+        self.limits
     }
 
     /// Aggregates at most `history_limit` samples in caller-provided order.
@@ -144,28 +380,73 @@ impl GitHistoryMiner {
         let mut files: BTreeMap<String, FileAccumulator> = BTreeMap::new();
         let mut symbols: BTreeMap<String, SymbolAccumulator> = BTreeMap::new();
         let mut co_changes: BTreeMap<(String, String), u32> = BTreeMap::new();
+        let mut report = GitMiningReport {
+            aggregation_version: AGGREGATION_VERSION,
+            limits: self.limits,
+            samples_seen: 0,
+            sampled_commits: 0,
+            included_commits: 0,
+            duplicate_commits: 0,
+            invalid_commit_ids: 0,
+            invalid_path_entries: 0,
+            path_overflow_commits: 0,
+            symbol_overflow_commits: 0,
+            co_change_width_exclusions: 0,
+            co_changes_complete: true,
+        };
 
-        for commit in commits.into_iter().take(self.history_limit) {
-            if commit.id.trim().is_empty() || !seen_commits.insert(commit.id.clone()) {
+        for commit in commits {
+            if processed_commits.len() >= self.limits.history_limit {
+                break;
+            }
+            report.samples_seen = report.samples_seen.saturating_add(1);
+            let commit_id = commit.id.trim();
+            if commit_id.is_empty() {
+                report.invalid_commit_ids = report.invalid_commit_ids.saturating_add(1);
                 continue;
             }
-            processed_commits.push(commit.id);
+            if !seen_commits.insert(commit_id.to_owned()) {
+                report.duplicate_commits = report.duplicate_commits.saturating_add(1);
+                continue;
+            }
+            processed_commits.push(commit_id.to_owned());
+            report.sampled_commits = report.sampled_commits.saturating_add(1);
             let is_bug_fix = looks_like_bug_fix(&commit.subject);
             let mut commit_paths = BTreeSet::new();
             let mut commit_symbols = BTreeSet::new();
+            let mut path_overflow = false;
+            let mut symbol_overflow = false;
 
             for change in commit.changes {
                 let Some(path) = canonical_repository_path(&change.path) else {
+                    report.invalid_path_entries = report.invalid_path_entries.saturating_add(1);
                     continue;
                 };
-                commit_paths.insert(path.clone());
+                commit_paths.insert(path);
+                if commit_paths.len() > self.limits.paths_per_commit {
+                    path_overflow = true;
+                    break;
+                }
                 for symbol in change.symbols {
                     let symbol = symbol.trim();
-                    if !symbol.is_empty() {
+                    if !symbol.is_empty() && !symbol_overflow {
                         commit_symbols.insert(symbol.to_owned());
+                        if commit_symbols.len() > self.limits.symbols_per_commit {
+                            commit_symbols.clear();
+                            symbol_overflow = true;
+                        }
                     }
                 }
             }
+
+            if path_overflow {
+                report.path_overflow_commits = report.path_overflow_commits.saturating_add(1);
+                continue;
+            }
+            if symbol_overflow {
+                report.symbol_overflow_commits = report.symbol_overflow_commits.saturating_add(1);
+            }
+            report.included_commits = report.included_commits.saturating_add(1);
 
             for path in &commit_paths {
                 files
@@ -180,11 +461,29 @@ impl GitHistoryMiner {
                     .record(commit.author.as_deref(), is_bug_fix);
             }
             let paths: Vec<_> = commit_paths.into_iter().collect();
+            if paths.len() > self.limits.co_change_width {
+                report.co_change_width_exclusions =
+                    report.co_change_width_exclusions.saturating_add(1);
+                continue;
+            }
+            if !report.co_changes_complete {
+                continue;
+            }
             for left_index in 0..paths.len() {
                 for right_index in (left_index + 1)..paths.len() {
-                    *co_changes
-                        .entry((paths[left_index].clone(), paths[right_index].clone()))
-                        .or_default() += 1;
+                    let pair = (paths[left_index].clone(), paths[right_index].clone());
+                    if !co_changes.contains_key(&pair)
+                        && co_changes.len() >= self.limits.co_change_pairs
+                    {
+                        co_changes.clear();
+                        report.co_changes_complete = false;
+                        break;
+                    }
+                    let count = co_changes.entry(pair).or_default();
+                    *count = count.saturating_add(1);
+                }
+                if !report.co_changes_complete {
+                    break;
                 }
             }
         }
@@ -207,6 +506,7 @@ impl GitHistoryMiner {
                     commit_count,
                 })
                 .collect(),
+            report,
         }
     }
 }
@@ -221,14 +521,15 @@ struct FileAccumulator {
 
 impl FileAccumulator {
     fn record(&mut self, author: Option<&str>, is_bug_fix: bool) {
-        self.commits += 1;
+        self.commits = self.commits.saturating_add(1);
         if is_bug_fix {
-            self.bug_fix_commits += 1;
+            self.bug_fix_commits = self.bug_fix_commits.saturating_add(1);
         }
         if let Some(author) = author.map(str::trim).filter(|author| !author.is_empty()) {
-            *self.known_authors.entry(author.to_owned()).or_default() += 1;
+            let count = self.known_authors.entry(author.to_owned()).or_default();
+            *count = count.saturating_add(1);
         } else {
-            self.unknown_author_commits += 1;
+            self.unknown_author_commits = self.unknown_author_commits.saturating_add(1);
         }
     }
 
@@ -278,9 +579,9 @@ struct SymbolAccumulator {
 
 impl SymbolAccumulator {
     fn record(&mut self, author: Option<&str>, is_bug_fix: bool) {
-        self.commits += 1;
+        self.commits = self.commits.saturating_add(1);
         if is_bug_fix {
-            self.bug_fix_commits += 1;
+            self.bug_fix_commits = self.bug_fix_commits.saturating_add(1);
         }
         if let Some(author) = author.map(str::trim).filter(|author| !author.is_empty()) {
             self.known_authors.insert(author.to_owned());
@@ -322,7 +623,11 @@ pub fn looks_like_bug_fix(subject: &str) -> bool {
 /// Canonicalizes a repository-relative path or rejects unsafe/ambiguous input.
 pub fn canonical_repository_path(path: &str) -> Option<String> {
     let path = path.trim().replace('\\', "/");
-    if path.is_empty() || path.starts_with('/') || path.contains('\0') {
+    let has_windows_drive_prefix = path
+        .as_bytes()
+        .get(..2)
+        .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':');
+    if path.is_empty() || path.starts_with('/') || has_windows_drive_prefix || path.contains('\0') {
         return None;
     }
     let mut parts = Vec::new();
@@ -417,28 +722,205 @@ mod tests {
             commit("first", Some("B"), "fix", vec![change("src/b.rs", &[])]),
             commit("third", Some("C"), "fix", vec![change("src/c.rs", &[])]),
         ]);
-        assert_eq!(snapshot.processed_commits, vec!["first"]);
+        assert_eq!(snapshot.processed_commits, vec!["first", "third"]);
+        assert_eq!(snapshot.report.samples_seen, 3);
+        assert_eq!(snapshot.report.sampled_commits, 2);
+        assert_eq!(snapshot.report.included_commits, 2);
+        assert_eq!(snapshot.report.duplicate_commits, 1);
+        assert_eq!(snapshot.files.len(), 2);
         assert_eq!(snapshot.files[0].hotspot_score, 1);
         assert_eq!(snapshot.symbols[0].hotspot_score, 1);
     }
 
     #[test]
-    fn rejects_unsafe_paths_and_keeps_unknown_authorship_honest() {
-        let snapshot = GitHistoryMiner::default().mine(vec![commit(
-            "one",
-            None,
-            "patch",
-            vec![
-                change("/private", &[]),
-                change("src/../secret", &[]),
-                change("src\\safe.rs", &[]),
-            ],
+    fn clamps_all_configurable_limits_to_hard_ceilings() {
+        let miner = GitHistoryMiner::with_limits(GitMiningLimits {
+            history_limit: usize::MAX,
+            paths_per_commit: usize::MAX,
+            symbols_per_commit: usize::MAX,
+            co_change_width: usize::MAX,
+            co_change_pairs: usize::MAX,
+        });
+
+        assert_eq!(
+            miner.limits(),
+            GitMiningLimits {
+                history_limit: MAX_HISTORY_LIMIT,
+                paths_per_commit: MAX_PATHS_PER_COMMIT,
+                symbols_per_commit: MAX_SYMBOLS_PER_COMMIT,
+                co_change_width: MAX_CO_CHANGE_WIDTH,
+                co_change_pairs: MAX_CO_CHANGE_PAIRS,
+            }
+        );
+    }
+
+    #[test]
+    fn excludes_an_overwide_commit_without_partial_file_signals() {
+        let miner = GitHistoryMiner::with_limits(GitMiningLimits {
+            paths_per_commit: 1,
+            ..GitMiningLimits::default()
+        });
+        let snapshot = miner.mine(vec![commit(
+            "wide",
+            Some("A"),
+            "fix",
+            vec![change("src/a.rs", &["a"]), change("src/b.rs", &["b"])],
         )]);
+
+        assert_eq!(snapshot.processed_commits, vec!["wide"]);
+        assert!(snapshot.files.is_empty());
+        assert!(snapshot.symbols.is_empty());
+        assert_eq!(snapshot.report.path_overflow_commits, 1);
+        assert_eq!(snapshot.report.sampled_commits, 1);
+        assert_eq!(snapshot.report.included_commits, 0);
+        assert!(snapshot.report.is_degraded());
+    }
+
+    #[test]
+    fn symbol_overflow_preserves_complete_file_observations() {
+        let miner = GitHistoryMiner::with_limits(GitMiningLimits {
+            symbols_per_commit: 1,
+            ..GitMiningLimits::default()
+        });
+        let snapshot = miner.mine(vec![commit(
+            "symbols",
+            Some("A"),
+            "feature",
+            vec![change("src/a.rs", &["a", "b"])],
+        )]);
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(snapshot.symbols.is_empty());
+        assert_eq!(snapshot.report.symbol_overflow_commits, 1);
+        assert!(snapshot.report.is_degraded());
+    }
+
+    #[test]
+    fn co_change_bounds_never_publish_a_biased_partial_set() {
+        let width_limited = GitHistoryMiner::with_limits(GitMiningLimits {
+            co_change_width: 1,
+            ..GitMiningLimits::default()
+        })
+        .mine(vec![commit(
+            "wide-pair",
+            Some("A"),
+            "feature",
+            vec![change("a", &[]), change("b", &[])],
+        )]);
+        assert_eq!(width_limited.files.len(), 2);
+        assert!(width_limited.co_changes.is_empty());
+        assert_eq!(width_limited.report.co_change_width_exclusions, 1);
+        assert!(width_limited.report.is_degraded());
+
+        let pair_limited = GitHistoryMiner::with_limits(GitMiningLimits {
+            co_change_pairs: 1,
+            ..GitMiningLimits::default()
+        })
+        .mine(vec![commit(
+            "too-many-pairs",
+            Some("A"),
+            "feature",
+            vec![change("a", &[]), change("b", &[]), change("c", &[])],
+        )]);
+        assert!(pair_limited.co_changes.is_empty());
+        assert!(!pair_limited.report.co_changes_complete);
+        assert!(pair_limited.report.is_degraded());
+    }
+
+    #[test]
+    fn snapshot_lookups_and_missing_partners_are_bounded_and_stable() {
+        let snapshot = GitHistoryMiner::default().mine(vec![
+            commit(
+                "c3",
+                Some("A"),
+                "feature",
+                vec![change("src/a.rs", &["a"]), change("src/c.rs", &[])],
+            ),
+            commit(
+                "c2",
+                Some("B"),
+                "feature",
+                vec![change("src/a.rs", &["a"]), change("src/b.rs", &[])],
+            ),
+            commit(
+                "c1",
+                Some("A"),
+                "feature",
+                vec![change("src/a.rs", &["a"]), change("src/b.rs", &[])],
+            ),
+        ]);
+
+        assert_eq!(snapshot.head_commit_id(), Some("c3"));
+        assert_eq!(snapshot.file("./src\\a.rs").unwrap().hotspot_score, 3);
+        assert_eq!(snapshot.symbol(" a ").unwrap().hotspot_score, 3);
+        assert_eq!(
+            snapshot
+                .co_change("src/b.rs", "src/a.rs")
+                .unwrap()
+                .commit_count,
+            2
+        );
+        assert_eq!(
+            snapshot.missing_co_change_partners(["src/a.rs"], 1, 1),
+            vec![MissingCoChangePartner {
+                source_path: "src/a.rs".to_owned(),
+                partner_path: "src/b.rs".to_owned(),
+                commit_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn replayed_input_produces_identical_snapshots() {
+        let history = vec![
+            commit("c2", Some("A"), "fix: x", vec![change("b", &["b"])]),
+            commit("c1", Some("B"), "feature", vec![change("a", &["a"])]),
+        ];
+        let miner = GitHistoryMiner::default();
+
+        assert_eq!(miner.mine(history.clone()), miner.mine(history));
+    }
+
+    #[test]
+    fn hotspot_cutoff_uses_a_bounded_histogram_and_rejects_corrupt_scores() {
+        let changes: Vec<PathChange> = (0..11)
+            .map(|index| change(&format!("src/{index}.rs"), &[]))
+            .collect();
+        let mut snapshot = GitHistoryMiner::default().mine(vec![
+            commit("c2", Some("A"), "feature", changes),
+            commit("c1", Some("A"), "feature", vec![change("src/0.rs", &[])]),
+        ]);
+
+        // Two files form the top decile of an eleven-file population.
+        assert_eq!(snapshot.top_decile_hotspot_cutoff(), Some(1));
+        snapshot.files[0].hotspot_score = 3;
+        assert_eq!(snapshot.top_decile_hotspot_cutoff(), None);
+    }
+
+    #[test]
+    fn rejects_unsafe_paths_and_keeps_unknown_authorship_honest() {
+        let snapshot = GitHistoryMiner::default().mine(vec![
+            commit(" ", None, "patch", vec![change("ignored", &[])]),
+            commit(
+                "one",
+                None,
+                "patch",
+                vec![
+                    change("/private", &[]),
+                    change("C:\\private", &[]),
+                    change("src/../secret", &[]),
+                    change("src\\safe.rs", &[]),
+                ],
+            ),
+        ]);
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].path, "src/safe.rs");
         assert_eq!(snapshot.files[0].author_count, 0);
         assert_eq!(snapshot.files[0].bus_factor, None);
         assert_eq!(snapshot.files[0].top_author_share_per_mille, None);
+        assert_eq!(snapshot.report.invalid_commit_ids, 1);
+        assert_eq!(snapshot.report.invalid_path_entries, 3);
+        assert!(snapshot.top_decile_hotspot_cutoff().is_none());
     }
 
     #[test]
