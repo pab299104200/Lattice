@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::adoption_metrics::{AdoptionMetricsStore, CaptureMetricRecord, CaptureOutcome};
 use crate::hook_session_binding::{
     HookBindingId, HookCheckoutIdentity, HookIntegrationId, HookRepositoryState,
     HookSessionCapability, HookSessionCryptography, HostSessionId,
@@ -39,6 +40,10 @@ const RECOVERY_BATCH: usize = 64;
 const MAX_JOURNAL_ROWS_PER_BINDING: i64 = 16_385;
 const RETRY_BASE_MS: i64 = 250;
 const RETRY_MAX_MS: i64 = 30_000;
+// The route itself is the first and only extractor for the bounded hook facts.
+// Keep this numeric metric dimension independent of the user-controlled
+// integration identifier and of the string stored with session digests.
+const CAPTURE_EXTRACTOR_VERSION: u32 = 1;
 
 pub(crate) const HOOK_SESSION_OPEN_METHOD: &str = "hook/session_open";
 pub(crate) const HOOK_EVENT_METHOD: &str = "hook/event";
@@ -207,143 +212,238 @@ impl HookSessionRoute {
         }
         let params: HookDeliveryParams =
             serde_json::from_value(params).map_err(|_| HookSessionRouteError::InvalidRequest)?;
+        let identity = resolve_authority(hello)?;
         if params.sequence == 0 {
+            record_capture_metric(
+                &identity,
+                CaptureMetricContext {
+                    integration: capture_metric_integration(&params.integration),
+                    schema_version: capture_schema_version(&params.event),
+                },
+                CaptureOutcome::Rejected,
+                false,
+            );
             return Err(HookSessionRouteError::InvalidRequest);
         }
-        let identity = resolve_authority(hello)?;
-        let binding_id = HookBindingId::from_bytes(decode_hex::<16>(&params.binding_id)?);
-        let capability = HookSessionCapability::from_bytes(decode_hex::<32>(&params.capability)?);
-        let integration = HookIntegrationId::new(params.integration)
-            .map_err(|_| HookSessionRouteError::InvalidRequest)?;
-        let delivery_id = RegistryId::from_bytes(decode_hex::<16>(&params.delivery_id)?.to_vec())
-            .map_err(map_registry_error)?;
-        let checkout = HookCheckoutIdentity::new(
-            identity.repository_id.clone(),
-            identity.checkout_root.to_string_lossy().to_string(),
-        )
-        .map_err(|_| HookSessionRouteError::Unavailable)?;
-        let admitted_at_ms = now_ms()?;
-
-        // Capability, integration and exact checkout are authenticated before
-        // the event body is interpreted or any repository content is touched.
-        let mut registry = self
-            .registry
-            .lock()
-            .map_err(|_| HookSessionRouteError::Unavailable)?;
-        let verification = registry
-            .verify_and_renew(
-                &self.cryptography,
-                RegistryVerifyRequest {
-                    binding_id,
-                    capability,
-                    integration,
-                    current_checkout: checkout,
-                    now_ms: admitted_at_ms,
-                    idle_ttl_ms: IDLE_TTL_MS,
-                    renew_idle: false,
-                    replay_delivery_id: (kind == RegistryDeliveryKind::Close)
-                        .then_some(delivery_id.clone()),
-                },
-            )
-            .map_err(map_registry_error)?;
-        let current_state = resolve_repository_state(&identity.checkout_root)?;
-        let payload_json = serde_json::to_string(&params.event)
-            .map_err(|_| HookSessionRouteError::InvalidRequest)?;
-        let (normalized_json, hash_json) = match kind {
-            RegistryDeliveryKind::Event => {
-                let event = parse_session_capture_event(&payload_json)
-                    .map_err(|_| HookSessionRouteError::InvalidRequest)?;
-                validate_event_path(&identity.checkout_root, &event.fact)?;
-                let mut normalized_value = serde_json::to_value(&event.fact)
-                    .map_err(|_| HookSessionRouteError::Unavailable)?;
-                normalized_value
-                    .as_object_mut()
-                    .ok_or(HookSessionRouteError::Unavailable)?
-                    .insert(
-                        "schema_version".to_string(),
-                        serde_json::json!(event.schema_version),
-                    );
-                let normalized = serde_json::to_string(&normalized_value)
-                    .map_err(|_| HookSessionRouteError::Unavailable)?;
-                (normalized.clone(), normalized)
-            }
-            RegistryDeliveryKind::Close => {
-                let close = parse_session_capture_close(
-                    &payload_json,
-                    DateTime::<Utc>::from_unix_seconds(admitted_at_ms / 1_000),
-                )
-                .map_err(|_| HookSessionRouteError::InvalidRequest)?;
-                let stable_value = match close.final_summary {
-                    Some(summary) => serde_json::json!({
-                        "schema_version": close.schema_version,
-                        "final_summary": summary,
-                    }),
-                    None => serde_json::json!({"schema_version": close.schema_version}),
-                };
-                let stable = serde_json::to_string(&stable_value)
-                    .map_err(|_| HookSessionRouteError::Unavailable)?;
-                (stable.clone(), stable)
-            }
+        let metric = CaptureMetricContext {
+            integration: capture_metric_integration(&params.integration),
+            schema_version: capture_schema_version(&params.event),
         };
-        let normalized_hash = RegistryHash::from_bytes(sha256(hash_json.as_bytes()));
-        let binding_registry_id =
-            RegistryId::from_bytes(binding_id.as_bytes().to_vec()).map_err(map_registry_error)?;
-        let journal = CaptureJournal::open(&identity)?;
-        if let Err(error) = journal.stage(JournalDelivery {
-            binding_id: &binding_registry_id,
-            delivery_id: &delivery_id,
-            sequence: params.sequence,
-            kind,
-            normalized_hash,
-            normalized_json: &normalized_json,
-            branch: current_state.branch(),
-            revision: current_state.revision(),
-            received_at_ms: admitted_at_ms,
-        }) {
-            if matches!(error, HookSessionRouteError::AuthorityRejected) {
-                let _ = registry.revoke(&binding_registry_id);
-            }
-            return Err(error);
-        }
-        let outcome = registry
-            .admit(RegistryAdmission {
-                binding_id: binding_registry_id.clone(),
-                delivery_id: delivery_id.clone(),
+        let result = (|| {
+            let binding_id = HookBindingId::from_bytes(decode_hex::<16>(&params.binding_id)?);
+            let capability =
+                HookSessionCapability::from_bytes(decode_hex::<32>(&params.capability)?);
+            let integration = HookIntegrationId::new(params.integration)
+                .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+            let delivery_id =
+                RegistryId::from_bytes(decode_hex::<16>(&params.delivery_id)?.to_vec())
+                    .map_err(map_registry_error)?;
+            let checkout = HookCheckoutIdentity::new(
+                identity.repository_id.clone(),
+                identity.checkout_root.to_string_lossy().to_string(),
+            )
+            .map_err(|_| HookSessionRouteError::Unavailable)?;
+            let admitted_at_ms = now_ms()?;
+
+            // Capability, integration and exact checkout are authenticated before
+            // the event body is interpreted or any repository content is touched.
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| HookSessionRouteError::Unavailable)?;
+            let verification = registry
+                .verify_and_renew(
+                    &self.cryptography,
+                    RegistryVerifyRequest {
+                        binding_id,
+                        capability,
+                        integration,
+                        current_checkout: checkout,
+                        now_ms: admitted_at_ms,
+                        idle_ttl_ms: IDLE_TTL_MS,
+                        renew_idle: false,
+                        replay_delivery_id: (kind == RegistryDeliveryKind::Close)
+                            .then_some(delivery_id.clone()),
+                    },
+                )
+                .map_err(map_registry_error)?;
+            let current_state = resolve_repository_state(&identity.checkout_root)?;
+            let payload_json = serde_json::to_string(&params.event)
+                .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+            let (normalized_json, hash_json) = match kind {
+                RegistryDeliveryKind::Event => {
+                    let event = parse_session_capture_event(&payload_json)
+                        .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+                    validate_event_path(&identity.checkout_root, &event.fact)?;
+                    let mut normalized_value = serde_json::to_value(&event.fact)
+                        .map_err(|_| HookSessionRouteError::Unavailable)?;
+                    normalized_value
+                        .as_object_mut()
+                        .ok_or(HookSessionRouteError::Unavailable)?
+                        .insert(
+                            "schema_version".to_string(),
+                            serde_json::json!(event.schema_version),
+                        );
+                    let normalized = serde_json::to_string(&normalized_value)
+                        .map_err(|_| HookSessionRouteError::Unavailable)?;
+                    (normalized.clone(), normalized)
+                }
+                RegistryDeliveryKind::Close => {
+                    let close = parse_session_capture_close(
+                        &payload_json,
+                        DateTime::<Utc>::from_unix_seconds(admitted_at_ms / 1_000),
+                    )
+                    .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+                    let stable_value = match close.final_summary {
+                        Some(summary) => serde_json::json!({
+                            "schema_version": close.schema_version,
+                            "final_summary": summary,
+                        }),
+                        None => serde_json::json!({"schema_version": close.schema_version}),
+                    };
+                    let stable = serde_json::to_string(&stable_value)
+                        .map_err(|_| HookSessionRouteError::Unavailable)?;
+                    (stable.clone(), stable)
+                }
+            };
+            let normalized_hash = RegistryHash::from_bytes(sha256(hash_json.as_bytes()));
+            let binding_registry_id = RegistryId::from_bytes(binding_id.as_bytes().to_vec())
+                .map_err(map_registry_error)?;
+            let journal = CaptureJournal::open(&identity)?;
+            if let Err(error) = journal.stage(JournalDelivery {
+                binding_id: &binding_registry_id,
+                delivery_id: &delivery_id,
                 sequence: params.sequence,
                 kind,
-                event_schema_version: SESSION_CAPTURE_SCHEMA_VERSION,
                 normalized_hash,
+                normalized_json: &normalized_json,
+                branch: current_state.branch(),
+                revision: current_state.revision(),
+                received_at_ms: admitted_at_ms,
+            }) {
+                if matches!(error, HookSessionRouteError::AuthorityRejected) {
+                    let _ = registry.revoke(&binding_registry_id);
+                }
+                return Err(error);
+            }
+            let outcome = registry
+                .admit(RegistryAdmission {
+                    binding_id: binding_registry_id.clone(),
+                    delivery_id: delivery_id.clone(),
+                    sequence: params.sequence,
+                    kind,
+                    event_schema_version: SESSION_CAPTURE_SCHEMA_VERSION,
+                    normalized_hash,
+                    admitted_at_ms,
+                    idle_deadline_ms: admitted_at_ms
+                        .checked_add(IDLE_TTL_MS)
+                        .ok_or(HookSessionRouteError::Unavailable)?,
+                    receipt_prune_after_ms: admitted_at_ms
+                        .checked_add(RETENTION_MS)
+                        .ok_or(HookSessionRouteError::Unavailable)?,
+                })
+                .map_err(map_registry_error)?;
+            drain_binding(
+                &mut registry,
+                &identity,
+                &verification,
+                &binding_registry_id,
                 admitted_at_ms,
-                idle_deadline_ms: admitted_at_ms
-                    .checked_add(IDLE_TTL_MS)
-                    .ok_or(HookSessionRouteError::Unavailable)?,
-                receipt_prune_after_ms: admitted_at_ms
-                    .checked_add(RETENTION_MS)
-                    .ok_or(HookSessionRouteError::Unavailable)?,
-            })
-            .map_err(map_registry_error)?;
-        drain_binding(
-            &mut registry,
-            &identity,
-            &verification,
-            &binding_registry_id,
-            admitted_at_ms,
-        )?;
-        let receipt = registry
-            .receipt(&binding_registry_id, &delivery_id)
-            .map_err(map_registry_error)?
-            .ok_or(HookSessionRouteError::Unavailable)?;
-        Ok(serde_json::json!({
-            "delivery_id": params.delivery_id,
-            "sequence": params.sequence,
-            "status": match receipt.status {
-                RegistryReceiptStatus::Pending => "pending",
-                RegistryReceiptStatus::Reduced => "reduced",
-                RegistryReceiptStatus::Sealed => "sealed",
-            },
-            "replayed": outcome.idempotent_replay,
-        }))
+            )?;
+            let receipt = registry
+                .receipt(&binding_registry_id, &delivery_id)
+                .map_err(map_registry_error)?
+                .ok_or(HookSessionRouteError::Unavailable)?;
+            Ok(serde_json::json!({
+                "delivery_id": params.delivery_id,
+                "sequence": params.sequence,
+                "status": match receipt.status {
+                    RegistryReceiptStatus::Pending => "pending",
+                    RegistryReceiptStatus::Reduced => "reduced",
+                    RegistryReceiptStatus::Sealed => "sealed",
+                },
+                "replayed": outcome.idempotent_replay,
+            }))
+        })();
+        record_delivery_metric(&identity, metric, &result);
+        result
     }
+}
+
+#[derive(Clone, Copy)]
+struct CaptureMetricContext {
+    integration: &'static str,
+    schema_version: u32,
+}
+
+/// Capture metrics are intentionally only admitted after the adapter's
+/// checkout authority has been resolved. This prevents a rejected, untrusted
+/// request from creating a ledger at an attacker-selected location.
+fn record_delivery_metric(
+    identity: &WorkspaceIdentity,
+    context: CaptureMetricContext,
+    result: &Result<Value, HookSessionRouteError>,
+) {
+    let (outcome, idempotent_replay) = match result {
+        Ok(receipt) => (
+            match receipt.get("status").and_then(Value::as_str) {
+                Some("pending") => CaptureOutcome::Queued,
+                Some("reduced" | "sealed") => CaptureOutcome::Captured,
+                // The route creates only these receipt states. Do not turn a
+                // future, malformed response into a successful capture.
+                _ => CaptureOutcome::StoreUnavailable,
+            },
+            receipt
+                .get("replayed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        Err(HookSessionRouteError::InvalidRequest | HookSessionRouteError::AuthorityRejected) => {
+            (CaptureOutcome::Rejected, false)
+        }
+        // After authority and bounded delivery parameters are admitted, an
+        // unavailable route dependency means the delivery was not committed.
+        Err(HookSessionRouteError::Unavailable) => (CaptureOutcome::StoreUnavailable, false),
+    };
+    record_capture_metric(identity, context, outcome, idempotent_replay);
+}
+
+fn record_capture_metric(
+    identity: &WorkspaceIdentity,
+    context: CaptureMetricContext,
+    outcome: CaptureOutcome,
+    idempotent_replay: bool,
+) {
+    // The ledger deliberately receives no binding, delivery, session,
+    // capability, path, hash, payload, or error value. Metrics are
+    // best-effort: a ledger outage must not change capture acknowledgement.
+    let _ = AdoptionMetricsStore::new(&identity.repository_root).record_capture_outcome(
+        CaptureMetricRecord {
+            integration: context.integration.to_string(),
+            schema_version: context.schema_version,
+            extractor_version: CAPTURE_EXTRACTOR_VERSION,
+            outcome,
+        },
+        idempotent_replay,
+    );
+}
+
+fn capture_metric_integration(integration: &str) -> &'static str {
+    match integration {
+        "codex/v1" | "codex-hooks/v1" => "codex",
+        "claude-code/v1" | "claude-code-hooks/v1" => "claude-code",
+        "cursor/v1" | "cursor-hooks/v1" => "cursor",
+        "generic/v1" | "generic-hooks/v1" => "generic",
+        _ => "other",
+    }
+}
+
+fn capture_schema_version(event: &Value) -> u32 {
+    event
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or_default()
 }
 
 struct JournalDelivery<'a> {
@@ -1389,6 +1489,105 @@ mod tests {
             rejected,
             Err(HookSessionRouteError::AuthorityRejected)
         ));
+
+        let capture_health =
+            crate::adoption_metrics::capture_health_for_workspace(&identity.repository_root)
+                .expect("read capture counters");
+        assert_eq!(capture_health.total_attempts, 4);
+        assert_eq!(capture_health.outcomes.get("queued"), Some(&1));
+        assert_eq!(capture_health.outcomes.get("captured"), Some(&2));
+        assert_eq!(capture_health.outcomes.get("rejected"), Some(&1));
+        // The close replay is a transport retry of the same admitted delivery;
+        // it must not create a second capture metric.
+        assert_eq!(capture_health.outcomes.values().sum::<u64>(), 4);
+
+        let metrics = std::fs::read_to_string(
+            identity
+                .repository_lattice_dir
+                .join("adoption_metrics.jsonl"),
+        )
+        .expect("read content-free capture metrics");
+        for forbidden in [
+            "capture-host-session",
+            opened["binding_id"].as_str().unwrap(),
+            opened["capability"].as_str().unwrap(),
+            "11111111111111111111111111111111",
+            "33333333333333333333333333333333",
+            "fixture.txt",
+            "Completed capture routing.",
+        ] {
+            assert!(
+                !metrics.contains(forbidden),
+                "capture metrics retained forbidden value {forbidden:?}"
+            );
+        }
+
+        drop(route);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    #[test]
+    fn unavailable_capture_store_records_content_free_failure() {
+        let directory = test_directory("capture-store-unavailable-state");
+        let checkout = committed_repository("capture-store-unavailable-checkout");
+        let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+        let hello = ProxyRequest {
+            workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        let route = HookSessionRoute::open_at(&directory).unwrap();
+        let opened = route
+            .handle_open(
+                &hello,
+                serde_json::json!({
+                    "integration": "codex/v1",
+                    "host_session_id": "store-unavailable-host-session",
+                }),
+            )
+            .unwrap();
+        let delivery = |sequence: u64, delivery_id: &str, event: Value| {
+            serde_json::json!({
+                "binding_id": opened["binding_id"],
+                "capability": opened["capability"],
+                "integration": "codex/v1",
+                "delivery_id": delivery_id,
+                "sequence": sequence,
+                "event": event,
+            })
+        };
+        route
+            .handle_event(
+                &hello,
+                delivery(
+                    1,
+                    "11111111111111111111111111111111",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "edited_path",
+                        "path": "fixture.txt",
+                    }),
+                ),
+            )
+            .unwrap();
+        std::fs::create_dir(identity.memories_path()).unwrap();
+        let close = route.handle_close(
+            &hello,
+            delivery(
+                2,
+                "22222222222222222222222222222222",
+                serde_json::json!({"schema_version": 1}),
+            ),
+        );
+        assert!(matches!(close, Err(HookSessionRouteError::Unavailable)));
+
+        let capture_health =
+            crate::adoption_metrics::capture_health_for_workspace(&identity.repository_root)
+                .expect("read capture counters");
+        assert_eq!(capture_health.total_attempts, 2);
+        assert_eq!(capture_health.outcomes.get("captured"), Some(&1));
+        assert_eq!(capture_health.outcomes.get("store_unavailable"), Some(&1));
 
         drop(route);
         std::fs::remove_dir_all(directory).unwrap();
