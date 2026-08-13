@@ -23,6 +23,37 @@ const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 const WORKSPACE_INVALIDATION_BATCH_THRESHOLD: usize = 20;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The part of a checkout state that makes source contents potentially differ.
+///
+/// A symbolic ref name deliberately participates in equality even when both
+/// refs resolve to the same object: changing branches changes the checkout
+/// contract and must not be treated as a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedCheckoutHead {
+    ref_name: Option<String>,
+    target: HeadTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadTarget {
+    Unborn,
+    Resolved(String),
+}
+
+#[derive(Debug, Default)]
+struct ClassifiedChanges {
+    source_paths: Vec<PathBuf>,
+    has_owned_git_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathClassification {
+    Source,
+    OwnedGitState,
+    IgnoredGitState,
+    OutsideWorkspace,
+}
+
 /// File system watcher that triggers incremental indexing on changes.
 pub struct FileWatcher {
     workspace_root: PathBuf,
@@ -41,6 +72,10 @@ pub struct FileWatcher {
     index_health: Arc<IndexHealth>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
     session_id: String,
+    /// This baseline is intentionally owned by the watcher rather than the
+    /// shared repo-state tracker.  It is updated only after a successful Git
+    /// read, so transient rebase/checkout writes cannot manufacture an epoch.
+    observed_head: Arc<Mutex<Option<ObservedCheckoutHead>>>,
     #[cfg(test)]
     forced_watch_failure: Option<String>,
 }
@@ -81,6 +116,7 @@ impl FileWatcher {
             index_health,
             adoption_metrics,
             session_id,
+            observed_head: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             forced_watch_failure: None,
         }
@@ -124,6 +160,24 @@ impl FileWatcher {
         })?;
 
         watcher.watch(&self.workspace_root, RecursiveMode::Recursive)?;
+        for control_path in checkout_git_control_paths(&self.workspace_root) {
+            if !control_path.exists() {
+                continue;
+            }
+            if let Err(error) = watcher.watch(&control_path, RecursiveMode::NonRecursive) {
+                tracing::warn!(
+                    workspace = %self.workspace_root.display(),
+                    path = %control_path.display(),
+                    %error,
+                    "Watcher could not register an exact checkout Git control path"
+                );
+            }
+        }
+        // The baseline is captured only after the source watch is active. A
+        // checkout that changes between construction and watch installation is
+        // therefore represented by the first observed state, not by a
+        // synthetic startup invalidation.
+        self.capture_head_baseline().await;
         self.watcher_health.mark_healthy();
         info!("File watcher started for: {:?}", self.workspace_root);
 
@@ -237,25 +291,27 @@ impl FileWatcher {
     }
 
     fn should_process(&self, path: &Path) -> bool {
-        if path.is_dir() {
-            return false;
-        }
-        let rel = path
-            .strip_prefix(&self.workspace_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if is_git_state_path(&rel) {
-            return true;
-        }
-        lattice_core::watcher::should_index_file(&rel)
+        !path.is_dir()
+            && (path_is_checkout_git_metadata(&self.workspace_root, path)
+                || path
+                    .strip_prefix(&self.workspace_root)
+                    .ok()
+                    .is_some_and(|relative| {
+                        lattice_core::watcher::should_index_file(&relative.to_string_lossy())
+                    }))
     }
 
     async fn process_changes(&self, paths: Vec<PathBuf>) {
         self.index_readiness.wait().await;
-        self.record_observed_edits(&paths);
+        let changes = self.classify_changes(paths).await;
+        self.record_observed_edits(&changes.source_paths);
+        let head_changed = if changes.has_owned_git_state {
+            self.observe_head_transition().await
+        } else {
+            false
+        };
         let requires_workspace_invalidation =
-            should_invalidate_workspace(&self.workspace_root, &paths);
+            changes.source_paths.len() >= WORKSPACE_INVALIDATION_BATCH_THRESHOLD || head_changed;
         let target_epoch = if requires_workspace_invalidation {
             self.indexing.store(true, Ordering::Relaxed);
             let mut repo_state = self.repo_state.lock().await;
@@ -263,6 +319,12 @@ impl FileWatcher {
         } else {
             None
         };
+
+        // Git-only batches whose checkout state has not changed must be a true
+        // no-op: no index-work permit, graph write, or indexing flag change.
+        if changes.source_paths.is_empty() && !head_changed {
+            return;
+        }
 
         if self.workspace_manager.is_none() && self.indexer.is_none() {
             return;
@@ -289,7 +351,8 @@ impl FileWatcher {
         let workspace_manager = self.workspace_manager.clone();
         let indexer = self.indexer.clone();
         let batch_result = tokio::task::spawn_blocking(move || {
-            let batch = prepare_change_batch(&workspace_root, repo_name.as_deref(), paths);
+            let batch =
+                prepare_change_batch(&workspace_root, repo_name.as_deref(), changes.source_paths);
             if batch.upserts.is_empty() && batch.removals.is_empty() {
                 return None;
             }
@@ -372,14 +435,58 @@ impl FileWatcher {
         }
     }
 
+    async fn capture_head_baseline(&self) {
+        let snapshot = read_checkout_head(&self.workspace_root);
+        if let Some(snapshot) = snapshot {
+            *self.observed_head.lock().await = Some(snapshot);
+        }
+    }
+
+    async fn observe_head_transition(&self) -> bool {
+        let Some(current) = read_checkout_head(&self.workspace_root) else {
+            // Git rewrites HEAD and its ref files in several steps. Retaining
+            // the last good baseline is safer than invalidating on uncertainty;
+            // a later owned event will perform the comparison again.
+            tracing::warn!(
+                workspace = %self.workspace_root.display(),
+                "Watcher could not read a coherent checkout HEAD; retaining last baseline"
+            );
+            return false;
+        };
+
+        let mut observed = self.observed_head.lock().await;
+        let changed = observed
+            .as_ref()
+            .is_some_and(|previous| previous != &current);
+        *observed = Some(current);
+        changed
+    }
+
+    async fn classify_changes(&self, paths: Vec<PathBuf>) -> ClassifiedChanges {
+        let observed = self.observed_head.lock().await.clone();
+        let mut classified = ClassifiedChanges::default();
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            let key = normalized_path_key(&path);
+            if !seen.insert(key) {
+                continue;
+            }
+            match classify_path(&self.workspace_root, observed.as_ref(), &path) {
+                PathClassification::Source => classified.source_paths.push(path),
+                PathClassification::OwnedGitState => classified.has_owned_git_state = true,
+                PathClassification::IgnoredGitState | PathClassification::OutsideWorkspace => {}
+            }
+        }
+        classified
+    }
+
     fn record_observed_edits(&self, paths: &[PathBuf]) {
         for path in paths {
             let Ok(relative) = path.strip_prefix(&self.workspace_root) else {
                 continue;
             };
             let rel_path = relative.to_string_lossy().replace('\\', "/");
-            if is_git_state_path(&rel_path) || !lattice_core::watcher::should_index_file(&rel_path)
-            {
+            if !lattice_core::watcher::should_index_file(&rel_path) {
                 continue;
             }
             let file = self
@@ -524,7 +631,10 @@ fn prepare_change_batch(
             continue;
         };
         let rel_path = relative.to_string_lossy().replace('\\', "/");
-        if is_git_state_path(&rel_path) || !lattice_core::watcher::should_index_file(&rel_path) {
+        // Callers pass only paths classified as Source. Keep this guard as a
+        // boundary check so a future caller cannot accidentally parse Git
+        // metadata into the graph.
+        if !lattice_core::watcher::should_index_file(&rel_path) {
             continue;
         }
         let graph_path = repo_name
@@ -566,31 +676,174 @@ fn poll_interval() -> Duration {
         .unwrap_or(DEFAULT_POLL_INTERVAL)
 }
 
-fn should_invalidate_workspace(workspace_root: &Path, paths: &[PathBuf]) -> bool {
-    paths.len() >= WORKSPACE_INVALIDATION_BATCH_THRESHOLD
-        || paths.iter().any(|path| {
-            let rel = path
-                .strip_prefix(workspace_root)
-                .unwrap_or(path.as_path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            is_git_state_path(&rel)
+fn classify_path(
+    workspace_root: &Path,
+    observed_head: Option<&ObservedCheckoutHead>,
+    path: &Path,
+) -> PathClassification {
+    if let Ok(relative) = path.strip_prefix(workspace_root) {
+        let rel = relative.to_string_lossy().replace('\\', "/");
+        if lattice_core::watcher::should_index_file(&rel) {
+            return PathClassification::Source;
+        }
+    }
+    let Some(git_rel) = checkout_git_relative_path(workspace_root, path) else {
+        return PathClassification::OutsideWorkspace;
+    };
+
+    // A primary checkout sees linked worktree administrative files under its
+    // own `.git`. They are never evidence about this checkout's HEAD.
+    if git_rel.starts_with("worktrees/") {
+        return PathClassification::IgnoredGitState;
+    }
+    if matches!(
+        git_rel.as_str(),
+        "HEAD" | "ORIG_HEAD" | "MERGE_HEAD" | "REBASE_HEAD" | "packed-refs"
+    ) || git_rel.starts_with("rebase-apply/")
+        || git_rel.starts_with("rebase-merge/")
+    {
+        return PathClassification::OwnedGitState;
+    }
+
+    let active_ref = observed_head.and_then(|head| head.ref_name.as_deref());
+    if let Some(active_ref) = active_ref {
+        if git_rel == active_ref {
+            return PathClassification::OwnedGitState;
+        }
+    }
+    PathClassification::IgnoredGitState
+}
+
+fn path_is_checkout_git_metadata(workspace_root: &Path, path: &Path) -> bool {
+    checkout_git_relative_path(workspace_root, path).is_some()
+}
+
+fn checkout_git_relative_path(workspace_root: &Path, path: &Path) -> Option<String> {
+    if let Ok(relative) = path.strip_prefix(workspace_root) {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative == ".git" {
+            return Some(String::new());
+        }
+        if let Some(git_relative) = relative.strip_prefix(".git/") {
+            return Some(git_relative.to_string());
+        }
+    }
+    let git_dir = checkout_git_dir(workspace_root)?;
+    git_ref_directories(&git_dir)
+        .into_iter()
+        .find_map(|directory| {
+            path.strip_prefix(directory)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         })
 }
 
-fn is_git_state_path(rel_path: &str) -> bool {
-    let normalized = rel_path.replace('\\', "/");
-    matches!(
-        normalized.as_str(),
-        ".git/HEAD"
-            | ".git/index"
-            | ".git/ORIG_HEAD"
-            | ".git/MERGE_HEAD"
-            | ".git/REBASE_HEAD"
-            | ".git/packed-refs"
-    ) || normalized.starts_with(".git/rebase-apply/")
-        || normalized.starts_with(".git/rebase-merge/")
-        || normalized.starts_with(".git/refs/heads/")
+fn normalized_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn read_checkout_head(workspace_root: &Path) -> Option<ObservedCheckoutHead> {
+    let git_dir = checkout_git_dir(workspace_root)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let trimmed = head.trim();
+    if let Some(ref_name) = trimmed.strip_prefix("ref:").map(str::trim) {
+        let target = resolve_ref_target(&git_dir, ref_name)
+            .map(HeadTarget::Resolved)
+            .unwrap_or(HeadTarget::Unborn);
+        return Some(ObservedCheckoutHead {
+            ref_name: Some(ref_name.to_string()),
+            target,
+        });
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(ObservedCheckoutHead {
+        ref_name: None,
+        target: HeadTarget::Resolved(trimmed.to_string()),
+    })
+}
+
+fn checkout_git_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let git_path = workspace_root.join(".git");
+    if git_path.is_dir() {
+        return git_path.canonicalize().ok();
+    }
+    let gitdir = std::fs::read_to_string(git_path).ok()?;
+    let location = gitdir.trim().strip_prefix("gitdir:")?.trim();
+    workspace_root.join(location).canonicalize().ok()
+}
+
+fn checkout_git_control_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(git_dir) = checkout_git_dir(workspace_root) else {
+        return Vec::new();
+    };
+    let mut paths = vec![
+        git_dir.join("HEAD"),
+        git_dir.join("ORIG_HEAD"),
+        git_dir.join("MERGE_HEAD"),
+        git_dir.join("REBASE_HEAD"),
+        git_dir.join("rebase-apply"),
+        git_dir.join("rebase-merge"),
+    ];
+    for ref_dir in git_ref_directories(&git_dir) {
+        paths.push(ref_dir.join("packed-refs"));
+        if let Some(head) = read_checkout_head(workspace_root) {
+            if let Some(ref_name) = head.ref_name {
+                paths.push(ref_dir.join(ref_name));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn resolve_ref_target(git_dir: &Path, ref_name: &str) -> Option<String> {
+    for dir in git_ref_directories(git_dir) {
+        if let Ok(contents) = std::fs::read_to_string(dir.join(ref_name)) {
+            let oid = contents.trim();
+            if !oid.is_empty() {
+                return Some(oid.to_string());
+            }
+        }
+        if let Some(oid) = resolve_packed_ref(&dir, ref_name) {
+            return Some(oid);
+        }
+    }
+    None
+}
+
+fn git_ref_directories(git_dir: &Path) -> Vec<PathBuf> {
+    let mut directories = vec![git_dir.to_path_buf()];
+    let Ok(common_dir) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return directories;
+    };
+    let common_dir = common_dir.trim();
+    if common_dir.is_empty() {
+        return directories;
+    }
+    let common = git_dir
+        .join(common_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| git_dir.join(common_dir));
+    if common != git_dir {
+        directories.push(common);
+    }
+    directories
+}
+
+fn resolve_packed_ref(git_dir: &Path, ref_name: &str) -> Option<String> {
+    let packed_refs = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    packed_refs.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let mut parts = line.split_whitespace();
+        let oid = parts.next()?;
+        (parts.next()? == ref_name).then(|| oid.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -724,6 +977,158 @@ mod tests {
             .changed_graph_files
             .iter()
             .any(|path| path.ends_with("native.cpp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn classifier_ignores_sibling_worktree_churn_even_in_large_batches() {
+        let root = unique_test_root("watch-sibling-git");
+        let sibling_events = (0..32)
+            .map(|index| root.join(format!(".git/worktrees/sibling-{index}/HEAD")))
+            .collect::<Vec<_>>();
+        let classified = sibling_events
+            .iter()
+            .map(|path| classify_path(&root, None, path))
+            .collect::<Vec<_>>();
+
+        assert!(classified
+            .iter()
+            .all(|classification| *classification == PathClassification::IgnoredGitState));
+        assert!(
+            classified
+                .iter()
+                .filter(|classification| **classification == PathClassification::Source)
+                .count()
+                < WORKSPACE_INVALIDATION_BATCH_THRESHOLD
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn classifier_observes_only_the_current_symbolic_ref() {
+        let root = unique_test_root("watch-ref-classification");
+        let observed = ObservedCheckoutHead {
+            ref_name: Some("refs/heads/main".to_string()),
+            target: HeadTarget::Resolved("abc".to_string()),
+        };
+
+        assert_eq!(
+            classify_path(&root, Some(&observed), &root.join(".git/refs/heads/main")),
+            PathClassification::OwnedGitState
+        );
+        assert_eq!(
+            classify_path(
+                &root,
+                Some(&observed),
+                &root.join(".git/refs/heads/sibling")
+            ),
+            PathClassification::IgnoredGitState
+        );
+        assert_eq!(
+            classify_path(&root, Some(&observed), &root.join(".git/index")),
+            PathClassification::IgnoredGitState
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn own_branch_switch_at_same_target_invalidates_once() {
+        let root = unique_test_root("watch-own-branch-switch");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("create git refs");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write head");
+        std::fs::write(root.join(".git/refs/heads/main"), "same\n").expect("write main");
+        std::fs::write(root.join(".git/refs/heads/feature"), "same\n").expect("write feature");
+        let (watcher, _, _, _, index_work) = test_watcher(root.clone());
+        watcher.capture_head_baseline().await;
+
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature\n").expect("switch branch");
+        watcher.process_changes(vec![root.join(".git/HEAD")]).await;
+        watcher.process_changes(vec![root.join(".git/HEAD")]).await;
+
+        assert_eq!(index_work.snapshot().completed_jobs, 1);
+        assert_eq!(watcher.repo_state.lock().await.current_epoch(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sibling_worktree_events_and_unchanged_packed_refs_do_no_index_work() {
+        let root = unique_test_root("watch-sibling-noop");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("create git refs");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write head");
+        std::fs::write(root.join(".git/refs/heads/main"), "main\n").expect("write main");
+        std::fs::write(root.join(".git/packed-refs"), "").expect("write packed refs");
+        let (watcher, _, _, _, index_work) = test_watcher(root.clone());
+        watcher.capture_head_baseline().await;
+        let initial_epoch = watcher.repo_state.lock().await.current_epoch();
+
+        let sibling_events = (0..32)
+            .map(|index| root.join(format!(".git/worktrees/sibling-{index}/HEAD")))
+            .collect();
+        watcher.process_changes(sibling_events).await;
+        watcher
+            .process_changes(vec![root.join(".git/packed-refs")])
+            .await;
+
+        assert_eq!(index_work.snapshot().completed_jobs, 0);
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkout_head_resolves_a_linked_worktrees_common_ref() {
+        let root = unique_test_root("watch-linked-head");
+        let private_git_dir = root.join("private-git");
+        let common_git_dir = root.join("common-git");
+        std::fs::create_dir_all(common_git_dir.join("refs/heads")).expect("create common refs");
+        std::fs::create_dir_all(&private_git_dir).expect("create private git dir");
+        std::fs::write(root.join(".git"), "gitdir: private-git\n").expect("write pointer");
+        std::fs::write(private_git_dir.join("HEAD"), "ref: refs/heads/linked\n")
+            .expect("write head");
+        std::fs::write(private_git_dir.join("commondir"), "../common-git\n")
+            .expect("write common dir");
+        std::fs::write(common_git_dir.join("refs/heads/linked"), "linked-oid\n")
+            .expect("write linked ref");
+
+        assert_eq!(
+            read_checkout_head(&root),
+            Some(ObservedCheckoutHead {
+                ref_name: Some("refs/heads/linked".to_string()),
+                target: HeadTarget::Resolved("linked-oid".to_string()),
+            })
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn linked_checkout_registers_only_exact_owned_git_control_paths() {
+        let root = unique_test_root("watch-linked-controls");
+        let private_git_dir = root.join("private-git");
+        let common_git_dir = root.join("common-git");
+        std::fs::create_dir_all(common_git_dir.join("refs/heads")).expect("create common refs");
+        std::fs::create_dir_all(&private_git_dir).expect("create private git dir");
+        std::fs::write(root.join(".git"), "gitdir: private-git\n").expect("write pointer");
+        std::fs::write(private_git_dir.join("HEAD"), "ref: refs/heads/linked\n")
+            .expect("write head");
+        std::fs::write(private_git_dir.join("commondir"), "../common-git\n")
+            .expect("write common dir");
+        std::fs::write(common_git_dir.join("refs/heads/linked"), "linked-oid\n")
+            .expect("write linked ref");
+        std::fs::write(common_git_dir.join("packed-refs"), "").expect("write packed refs");
+
+        let paths = checkout_git_control_paths(&root);
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new("private-git/HEAD"))));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new("common-git/refs/heads/linked"))));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new("common-git/packed-refs"))));
+        assert!(paths.iter().all(|path| !path.ends_with("worktrees")));
         let _ = std::fs::remove_dir_all(root);
     }
 
