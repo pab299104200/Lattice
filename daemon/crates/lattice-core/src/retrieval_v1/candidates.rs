@@ -15,6 +15,7 @@ use crate::identity::{DocId, FileId, Identity, MemoryId, SectionId, SymbolId};
 use crate::memory::MemoryStore;
 use crate::storage::vector_index::{VectorIndex, VectorScope};
 use crate::symbols::{SymbolId as LegacySymbolId, SymbolKind};
+use crate::verification::ScopeFilter;
 
 use super::{AnchorResolution, IntentClassification, IntentLabel, ResolvedAnchor};
 
@@ -231,8 +232,8 @@ async fn retrieve_fts(
     let Some(store) = ctx.memory_store else {
         return Vec::new();
     };
-    let Ok(memories) =
-        store.query_unscoped_admin(Some(&intent.inspected_text), budget.max_fts_rows)
+    let scope = workspace_scope(ctx);
+    let Ok(memories) = store.query(Some(&intent.inspected_text), budget.max_fts_rows, &scope)
     else {
         return Vec::new();
     };
@@ -306,7 +307,8 @@ async fn retrieve_memory_links(
     let Some(store) = ctx.memory_store else {
         return Vec::new();
     };
-    let Ok(memories) = store.query_unscoped_admin(None, budget.max_candidates_per_source) else {
+    let scope = workspace_scope(ctx);
+    let Ok(memories) = store.query(None, budget.max_candidates_per_source, &scope) else {
         return Vec::new();
     };
     let anchor_terms = anchor_link_terms(anchors);
@@ -444,6 +446,13 @@ fn memory_candidate(ctx: &RetrievalContext<'_>, id: String, source: CandidateSou
         traversal_path: Vec::new(),
         budget_exhausted: false,
     }
+}
+
+/// Retrieval V1 has no branch, session, or organization authority in its context.
+/// Restrict memory sources to the active workspace's repository scope rather than
+/// using an administrative query and reconstructing a workspace identity from it.
+fn workspace_scope(ctx: &RetrievalContext<'_>) -> ScopeFilter {
+    ScopeFilter::new(ctx.workspace_id, None, None)
 }
 
 fn event_candidate(event: &EventEnvelope, source: CandidateSource) -> Candidate {

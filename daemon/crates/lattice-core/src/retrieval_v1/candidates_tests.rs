@@ -149,6 +149,54 @@ async fn fts_embeddings_and_event_similarity_participate_when_present() {
 }
 
 #[tokio::test]
+async fn memory_candidates_are_scoped_to_the_active_workspace() {
+    let store = MemoryStore::open_in_memory().expect("memory store");
+    store
+        .store(memory(
+            "memory-local",
+            "debug auth failure login",
+            &["login"],
+            &["src/auth.rs"],
+        ))
+        .expect("store local memory");
+    let mut foreign = memory(
+        "memory-foreign",
+        "debug auth failure login",
+        &["login"],
+        &["src/auth.rs"],
+    );
+    foreign.workspace_id = Some("workspace-foreign".to_string());
+    store.store(foreign).expect("store foreign memory");
+
+    let intent = classify_intent("debug auth failure login");
+    let anchors = vec![resolved_symbol_anchor("src/auth.rs", "login")];
+    let candidates = retrieve_candidates(
+        &intent,
+        &anchors,
+        &RetrievalBudget::default(),
+        &empty_context().with_memory_store(&store),
+    )
+    .await;
+
+    let memory_candidates = candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.source,
+                CandidateSource::Fts | CandidateSource::MemoryLinks
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(memory_candidates
+        .iter()
+        .any(|candidate| { candidate.identity.to_string().contains("memory-local") }));
+    assert!(memory_candidates
+        .iter()
+        .all(|candidate| { !candidate.identity.to_string().contains("memory-foreign") }));
+}
+
+#[tokio::test]
 async fn working_memory_window_returns_most_recent_items() {
     let working = vec![
         Identity::File(file_id("src/old.rs")),
