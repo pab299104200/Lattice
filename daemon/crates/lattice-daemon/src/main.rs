@@ -18,6 +18,7 @@ mod proxy;
 mod repo_state;
 mod rpc;
 mod runtime_support;
+mod session_digest_consolidation_runtime;
 mod socket_server;
 mod transport;
 mod transport_credentials;
@@ -522,6 +523,8 @@ pub(crate) struct WorkspaceRuntime {
     pub(crate) handler: Arc<McpHandler>,
     background_tasks: Vec<JoinHandle<()>>,
     compaction_scheduler: Option<SchedulerHandle>,
+    session_digest_consolidation:
+        Option<session_digest_consolidation_runtime::SessionDigestConsolidationHandle>,
 }
 
 impl WorkspaceRuntime {
@@ -532,6 +535,9 @@ impl WorkspaceRuntime {
         }
         if let Some(scheduler) = self.compaction_scheduler.take() {
             scheduler.shutdown().await;
+        }
+        if let Some(runtime) = self.session_digest_consolidation.take() {
+            runtime.shutdown().await;
         }
     }
 }
@@ -837,14 +843,14 @@ pub(crate) async fn build_workspace_runtime(
             embedding_engine,
             vector_index,
             workspace_root,
-            memory_identity.repository_id,
+            memory_identity.repository_id.clone(),
             memories_path.clone(),
             context_cache_path,
             session_id,
             workspace_manager,
             workspace_roots,
             indexing,
-            Some(event_writer),
+            Some(Arc::clone(&event_writer)),
             default_focus_files,
             default_focus_dirs,
             repo_state,
@@ -853,6 +859,11 @@ pub(crate) async fn build_workspace_runtime(
             index_health,
         )
         .with_git_intelligence_snapshot_handle(git_intelligence_snapshots),
+    );
+    let session_digest_consolidation = session_digest_consolidation_runtime::start(
+        memory_identity.repository_id.clone(),
+        memories_path.clone(),
+        Arc::clone(&event_writer),
     );
     {
         let handler = Arc::clone(&handler);
@@ -869,6 +880,7 @@ pub(crate) async fn build_workspace_runtime(
         handler,
         background_tasks,
         compaction_scheduler,
+        session_digest_consolidation,
     })
 }
 
