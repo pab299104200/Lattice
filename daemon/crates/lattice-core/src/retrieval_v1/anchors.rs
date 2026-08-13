@@ -415,6 +415,9 @@ impl PathAnchorExt for RawAnchor {
     fn with_heading(mut self, heading: Option<String>) -> RawAnchor {
         if let RawAnchorData::Path(path) = &mut self.data {
             path.heading = heading;
+            if let Some(heading) = &path.heading {
+                self.anchor_text = format!("{}#{heading}", path.path);
+            }
         }
         self
     }

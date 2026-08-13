@@ -149,7 +149,10 @@ fn structural_targets_emit_normalized_file_and_qualified_symbol_anchors() {
     assert_eq!(path.anchor_text, "src/auth.rs");
     let symbol = anchors
         .iter()
-        .find(|anchor| anchor.kind == AnchorKind::Symbol)
+        .find(|anchor| {
+            anchor.kind == AnchorKind::Symbol
+                && anchor.anchor_text == "src/auth.rs::login_user"
+        })
         .expect("qualified symbol anchor");
     assert_eq!(symbol.anchor_text, "src/auth.rs::login_user");
 
