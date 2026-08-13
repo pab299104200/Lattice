@@ -149,6 +149,8 @@ enum AdoptionEvent {
     },
     MemoryInjection {
         timestamp_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_id: Option<String>,
         session_id: String,
         client: String,
         channel: String,
@@ -157,6 +159,8 @@ enum AdoptionEvent {
     },
     MemoryInjectionAction {
         timestamp_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_id: Option<String>,
         injection_id: String,
         acted_count: u64,
     },
@@ -302,6 +306,7 @@ impl AdoptionMetricsStore {
     pub(crate) fn record_memory_injection(&self, record: MemoryInjectionRecord) -> Result<()> {
         self.append_event(AdoptionEvent::MemoryInjection {
             timestamp_secs: now_secs(),
+            metric_id: None,
             session_id: clean_key(&record.session_id, "unknown-session"),
             client: clean_key(&record.client, "unknown-client"),
             channel: clean_key(&record.channel, "unknown-channel"),
@@ -316,9 +321,53 @@ impl AdoptionMetricsStore {
     ) -> Result<()> {
         self.append_event(AdoptionEvent::MemoryInjectionAction {
             timestamp_secs: now_secs(),
+            metric_id: None,
             injection_id: clean_identifier(&record.injection_id, "unknown-injection"),
             acted_count: record.acted_count,
         })
+    }
+
+    /// Appends an injection metric exactly once for a caller-supplied stable
+    /// metric id. A retry of the same payload returns false; reusing the id
+    /// for a different payload fails without appending anything.
+    pub(crate) fn record_memory_injection_once(
+        &self,
+        metric_id: &str,
+        record: MemoryInjectionRecord,
+    ) -> Result<bool> {
+        let metric_id = stable_metric_id(metric_id)?;
+        self.append_event_once(
+            metric_id.clone(),
+            AdoptionEvent::MemoryInjection {
+                timestamp_secs: now_secs(),
+                metric_id: Some(metric_id),
+                session_id: clean_key(&record.session_id, "unknown-session"),
+                client: clean_key(&record.client, "unknown-client"),
+                channel: clean_key(&record.channel, "unknown-channel"),
+                injection_id: clean_identifier(&record.injection_id, "unknown-injection"),
+                shown_count: record.shown_count,
+            },
+        )
+    }
+
+    /// Appends an injection-action metric exactly once for a caller-supplied
+    /// stable metric id, with the same retry and conflict contract as
+    /// record_memory_injection_once.
+    pub(crate) fn record_memory_injection_action_once(
+        &self,
+        metric_id: &str,
+        record: MemoryInjectionActionRecord,
+    ) -> Result<bool> {
+        let metric_id = stable_metric_id(metric_id)?;
+        self.append_event_once(
+            metric_id.clone(),
+            AdoptionEvent::MemoryInjectionAction {
+                timestamp_secs: now_secs(),
+                metric_id: Some(metric_id),
+                injection_id: clean_identifier(&record.injection_id, "unknown-injection"),
+                acted_count: record.acted_count,
+            },
+        )
     }
 
     pub(crate) fn render_table(&self, days: usize) -> Result<String> {
@@ -345,11 +394,16 @@ impl AdoptionMetricsStore {
         let _file_lock = self.acquire_file_lock()?;
         self.compact_if_due(&mut state)?;
         let events = self.read_events_unlocked()?;
-        if events
+        if let Some(existing) = events
             .iter()
-            .any(|existing| event_metric_id(existing) == Some(metric_id.as_str()))
+            .find(|existing| event_metric_id(existing) == Some(metric_id.as_str()))
         {
-            return Ok(false);
+            if metric_event_matches(existing, &event) {
+                return Ok(false);
+            }
+            return Err(anyhow::anyhow!(
+                "adoption metric id already exists with different payload"
+            ));
         }
         self.append_event_unlocked(&event)?;
         Ok(true)
@@ -531,8 +585,98 @@ fn stable_metric_id(metric_id: &str) -> Result<String> {
 fn event_metric_id(event: &AdoptionEvent) -> Option<&str> {
     match event {
         AdoptionEvent::MemoryRetrieval { metric_id, .. }
-        | AdoptionEvent::MemoryUse { metric_id, .. } => metric_id.as_deref(),
+        | AdoptionEvent::MemoryUse { metric_id, .. }
+        | AdoptionEvent::MemoryInjection { metric_id, .. }
+        | AdoptionEvent::MemoryInjectionAction { metric_id, .. } => metric_id.as_deref(),
         _ => None,
+    }
+}
+
+fn metric_event_matches(existing: &AdoptionEvent, candidate: &AdoptionEvent) -> bool {
+    match (existing, candidate) {
+        (
+            AdoptionEvent::MemoryRetrieval {
+                metric_id: Some(a),
+                session_id: asession,
+                client: aclient,
+                channel: achannel,
+                retrieval_id: arid,
+                retrieved_count: acount,
+                ..
+            },
+            AdoptionEvent::MemoryRetrieval {
+                metric_id: Some(b),
+                session_id: bsession,
+                client: bclient,
+                channel: bchannel,
+                retrieval_id: brid,
+                retrieved_count: bcount,
+                ..
+            },
+        ) => {
+            a == b
+                && asession == bsession
+                && aclient == bclient
+                && achannel == bchannel
+                && arid == brid
+                && acount == bcount
+        }
+        (
+            AdoptionEvent::MemoryUse {
+                metric_id: Some(a),
+                retrieval_id: arid,
+                used_count: acount,
+                ..
+            },
+            AdoptionEvent::MemoryUse {
+                metric_id: Some(b),
+                retrieval_id: brid,
+                used_count: bcount,
+                ..
+            },
+        ) => a == b && arid == brid && acount == bcount,
+        (
+            AdoptionEvent::MemoryInjection {
+                metric_id: Some(a),
+                session_id: asession,
+                client: aclient,
+                channel: achannel,
+                injection_id: aiid,
+                shown_count: acount,
+                ..
+            },
+            AdoptionEvent::MemoryInjection {
+                metric_id: Some(b),
+                session_id: bsession,
+                client: bclient,
+                channel: bchannel,
+                injection_id: biid,
+                shown_count: bcount,
+                ..
+            },
+        ) => {
+            a == b
+                && asession == bsession
+                && aclient == bclient
+                && achannel == bchannel
+                && aiid == biid
+                && acount == bcount
+        }
+        (
+            AdoptionEvent::MemoryInjectionAction {
+                metric_id: Some(a),
+                injection_id: aiid,
+                acted_count: acount,
+                ..
+            },
+            AdoptionEvent::MemoryInjectionAction {
+                metric_id: Some(b),
+                injection_id: biid,
+                acted_count: bcount,
+                ..
+            },
+        ) => a == b && aiid == biid && acount == bcount,
+        _ => false,
     }
 }
 
@@ -1167,16 +1311,19 @@ mod tests {
         assert!(!store
             .record_memory_retrieval_once("retrieval:retrieval-a", record.clone())
             .expect("recovered retry"));
-        assert!(!store
-            .record_memory_retrieval_once(
-                "retrieval:retrieval-a",
-                MemoryRetrievalRecord {
-                    session_id: "session-after-restart".to_string(),
-                    retrieved_count: 3,
-                    ..record
-                },
-            )
-            .expect("recovery retry with a new request session"));
+        assert!(
+            store
+                .record_memory_retrieval_once(
+                    "retrieval:retrieval-a",
+                    MemoryRetrievalRecord {
+                        session_id: "session-after-restart".to_string(),
+                        retrieved_count: 3,
+                        ..record
+                    },
+                )
+                .is_err(),
+            "same id with a different payload must fail"
+        );
 
         let contents = fs::read_to_string(&store.path).expect("read log");
         assert_eq!(contents.lines().count(), 1);
@@ -1220,6 +1367,66 @@ mod tests {
         let store = AdoptionMetricsStore::new(&root);
         let contents = fs::read_to_string(&store.path).expect("read log");
         assert_eq!(contents.lines().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn injection_metric_id_is_idempotent_and_rejects_conflicts() {
+        let root = unique_root("injection-metric-id");
+        let store = AdoptionMetricsStore::new(&root);
+        let record = MemoryInjectionRecord {
+            session_id: "session-a".to_string(),
+            client: "codex".to_string(),
+            channel: "hook".to_string(),
+            injection_id: "injection-a".to_string(),
+            shown_count: 2,
+        };
+        assert!(store
+            .record_memory_injection_once("injection:injection-a", record.clone())
+            .expect("first injection append"));
+        assert!(!store
+            .record_memory_injection_once("injection:injection-a", record.clone())
+            .expect("replayed injection"));
+        assert!(store
+            .record_memory_injection_once(
+                "injection:injection-a",
+                MemoryInjectionRecord {
+                    shown_count: 3,
+                    ..record
+                },
+            )
+            .is_err());
+        assert_eq!(fs::read_to_string(&store.path).unwrap().lines().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn injection_action_metric_id_survives_compaction_and_replay() {
+        let root = unique_root("injection-action-metric-id");
+        let store = AdoptionMetricsStore::new(&root);
+        let record = MemoryInjectionActionRecord {
+            injection_id: "injection-a".to_string(),
+            acted_count: 1,
+        };
+        store
+            .record_memory_injection(MemoryInjectionRecord {
+                session_id: "session-a".to_string(),
+                client: "codex".to_string(),
+                channel: "hook".to_string(),
+                injection_id: "injection-a".to_string(),
+                shown_count: 1,
+            })
+            .expect("injection for action join");
+        assert!(store
+            .record_memory_injection_action_once("action:injection-a", record.clone())
+            .expect("first action append"));
+        store.lock.lock().unwrap().last_compaction_day = None;
+        assert!(!store
+            .record_memory_injection_action_once("action:injection-a", record)
+            .expect("replayed action after compaction"));
+        assert_eq!(fs::read_to_string(&store.path).unwrap().lines().count(), 2);
+        let ledger = store.read_json().expect("replay compacted ledger");
+        assert_eq!(ledger["days"].as_object().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1307,6 +1514,7 @@ mod tests {
     fn memory_injection(timestamp: u64, injection_id: &str, shown_count: u64) -> AdoptionEvent {
         AdoptionEvent::MemoryInjection {
             timestamp_secs: timestamp,
+            metric_id: None,
             session_id: "session-a".to_string(),
             client: "codex".to_string(),
             channel: "hook".to_string(),
@@ -1322,6 +1530,7 @@ mod tests {
     ) -> AdoptionEvent {
         AdoptionEvent::MemoryInjectionAction {
             timestamp_secs: timestamp,
+            metric_id: None,
             injection_id: injection_id.to_string(),
             acted_count,
         }
