@@ -8,28 +8,35 @@
       {
         "hooks": [
           {
-            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/post-tool-use.sh",
+            "command": "/Users/pete/Cadres/lattice/integrations/claude-code/hooks/post-tool-use.sh",
+            "statusMessage": "Checking Lattice edit impact",
+            "timeout": 5,
             "type": "command"
           }
         ],
-        "matcher": "Edit|Write"
+        "matcher": "apply_patch|Edit|Write"
       }
     ],
     "SessionStart": [
       {
         "hooks": [
           {
-            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/session-start.sh",
+            "command": "/Users/pete/Cadres/lattice/integrations/claude-code/hooks/session-start.sh",
+            "statusMessage": "Loading Lattice session context",
+            "timeout": 5,
             "type": "command"
           }
-        ]
+        ],
+        "matcher": "startup|resume|clear|compact"
       }
     ],
     "Stop": [
       {
         "hooks": [
           {
-            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/stop.sh",
+            "command": "/Users/pete/Cadres/lattice/integrations/claude-code/hooks/stop.sh",
+            "statusMessage": "Recording Lattice session outcome",
+            "timeout": 5,
             "type": "command"
           }
         ]
@@ -39,7 +46,9 @@
       {
         "hooks": [
           {
-            "command": "/home/pete/cadres/lattice/integrations/claude-code/hooks/user-prompt-submit.sh",
+            "command": "/Users/pete/Cadres/lattice/integrations/claude-code/hooks/user-prompt-submit.sh",
+            "statusMessage": "Loading Lattice prompt context",
+            "timeout": 5,
             "type": "command"
           }
         ]
