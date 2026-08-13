@@ -4,6 +4,9 @@ mod adoption_metrics;
 mod cli;
 mod doctor;
 mod git_intelligence_runtime;
+mod hook_session_binding;
+mod hook_session_registry;
+mod hook_session_route;
 mod index_health;
 mod index_work;
 mod install;
@@ -393,11 +396,11 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         tracing::info!("No ONNX model: {}", e);
                     }
+                }
             } else {
                 tracing::info!(
                     "No valid shared embedding model installed; semantic search disabled and lexical recall remains available"
                 );
-                }
             }
 
             indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);

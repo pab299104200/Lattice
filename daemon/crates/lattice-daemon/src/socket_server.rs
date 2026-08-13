@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::hook_session_route::{HookSessionRoute, HOOK_SESSION_OPEN_METHOD};
 use crate::lifecycle_log;
 use crate::proxy::daemon_addr;
 use crate::rpc::protocol::{format_response, parse_request, JsonRpcResponse};
@@ -539,17 +540,26 @@ pub(crate) struct GlobalDaemon {
     has_loaded_runtime: AtomicBool,
     exit_when_idle: bool,
     index_work: Arc<crate::index_work::IndexWorkCoordinator>,
+    hook_session_route: Option<Arc<HookSessionRoute>>,
 }
 
 impl GlobalDaemon {
     pub(crate) fn new() -> Self {
-        Self::new_with_config(
+        let mut daemon = Self::new_with_config(
             env_usize(
                 "LATTICE_MAX_LOADED_SHARDS",
                 env_usize("LATTICE_MAX_LOADED_WORKSPACES", 3),
             ),
             env_bool("LATTICE_PREWARM_VIEW_SHARDS", false),
-        )
+        );
+        match HookSessionRoute::open_default() {
+            Ok(route) => daemon.hook_session_route = Some(Arc::new(route)),
+            Err(_) => {
+                tracing::error!("hook-session service is unavailable");
+                lifecycle_log::log_event("daemon", "hook_session_registry_unavailable", &[]);
+            }
+        }
+        daemon
     }
 
     fn new_with_config(max_loaded_shards: usize, prewarm_view_shards: bool) -> Self {
@@ -565,7 +575,14 @@ impl GlobalDaemon {
             has_loaded_runtime: AtomicBool::new(false),
             exit_when_idle: env_bool("LATTICE_DAEMON_EXIT_WHEN_IDLE", false),
             index_work: crate::index_work::IndexWorkCoordinator::from_env(),
+            hook_session_route: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_hook_session_route(mut self, route: HookSessionRoute) -> Self {
+        self.hook_session_route = Some(Arc::new(route));
+        self
     }
 
     async fn handler_for(self: &Arc<Self>, request: &ProxyRequest) -> Result<RuntimeLease> {
@@ -969,9 +986,8 @@ async fn handle_proxy_connection(
             ("client_kind", serde_json::json!(metadata.client_kind)),
         ],
     );
-    let lease = daemon.handler_for(&request).await?;
-    let workspace_key = workspace_key(&canonical_roots(&request.workspace_roots)?);
-    let result = run_json_rpc_connection(lease, metadata, lines, write_half).await;
+    let workspace_key = request.workspace_roots.join("\n");
+    let result = run_json_rpc_connection(daemon, request, metadata, lines, write_half).await;
     match &result {
         Ok(()) => lifecycle_log::log_event(
             "daemon",
@@ -997,12 +1013,13 @@ async fn handle_proxy_connection(
 }
 
 async fn run_json_rpc_connection(
-    lease: RuntimeLease,
+    daemon: Arc<GlobalDaemon>,
+    proxy_request: ProxyRequest,
     _connection: ConnectionMetadata,
     mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
-    let handler = Arc::clone(&lease.handler);
+    let mut lease: Option<RuntimeLease> = None;
     let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<PendingResponse>();
     let mut active_requests: HashMap<String, ActiveRequest> = HashMap::new();
     let mut cancelled_requests = HashSet::new();
@@ -1029,6 +1046,39 @@ async fn run_json_rpc_connection(
                 };
                 let is_notification = request.id.is_null();
                 let request_id = request_id_key(&request.id);
+
+                if request.method == HOOK_SESSION_OPEN_METHOD {
+                    if is_notification {
+                        continue;
+                    }
+                    let response = match daemon.hook_session_route.as_ref() {
+                        Some(route) => {
+                            let route = Arc::clone(route);
+                            let hook_request = proxy_request.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                route.handle(&hook_request, request.params)
+                            }).await {
+                                Ok(Ok(result)) => JsonRpcResponse::success(request.id, result),
+                                Ok(Err(error)) => {
+                                    let (code, message) = error.json_rpc_error();
+                                    JsonRpcResponse::error(request.id, code, message)
+                                }
+                                Err(_) => JsonRpcResponse::error(
+                                    request.id,
+                                    -32603,
+                                    "hook session service is unavailable".to_string(),
+                                ),
+                            }
+                        }
+                        None => JsonRpcResponse::error(
+                            request.id,
+                            -32603,
+                            "hook session service is unavailable".to_string(),
+                        ),
+                    };
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
 
                 match request.method.as_str() {
                     "notifications/cancelled" => {
@@ -1066,6 +1116,28 @@ async fn run_json_rpc_connection(
                     }
                     continue;
                 }
+
+                if lease.is_none() {
+                    match daemon.handler_for(&proxy_request).await {
+                        Ok(loaded) => lease = Some(loaded),
+                        Err(_) => {
+                            if !is_notification {
+                                write_response(&mut writer, &JsonRpcResponse::error(
+                                    request.id,
+                                    -32603,
+                                    "workspace runtime is unavailable".to_string(),
+                                )).await?;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let handler = Arc::clone(
+                    &lease
+                        .as_ref()
+                        .expect("runtime lease was loaded for ordinary RPC")
+                        .handler,
+                );
 
                 if let Some(key) = request_id {
                     cancelled_requests.remove(&key);
@@ -1178,7 +1250,180 @@ fn request_id_key(id: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{client_handshake, ClientKind};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn authenticated_hook_open_does_not_load_a_workspace_shard() {
+        let root = committed_test_repository("hook-open-no-shard");
+        let state = unique_test_root("hook-open-state");
+        let route = HookSessionRoute::open_at(&state).expect("open test hook route");
+        let daemon =
+            Arc::new(GlobalDaemon::new_with_config(8, false).with_hook_session_route(route));
+        let proxy_request = ProxyRequest {
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        let (mut reader, mut writer, server) =
+            authenticated_test_connection(Arc::clone(&daemon), &proxy_request).await;
+
+        assert!(daemon.shards.lock().await.is_empty());
+        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&root).unwrap();
+        let params = serde_json::json!({
+            "integration": "codex/v1",
+            "host_session_id": "host-session-1",
+            "checkout_root": identity.checkout_root.to_string_lossy(),
+            "repository_id": identity.repository_id,
+            "checkout_id": identity.checkout_root.to_string_lossy(),
+        });
+        let mut unknown = params.clone();
+        unknown["client_name"] = serde_json::json!("trusted-hook");
+        write_json_rpc_request(&mut writer, 0, HOOK_SESSION_OPEN_METHOD, unknown).await;
+        let rejected_label = read_json_line(&mut reader).await;
+        assert_eq!(rejected_label["error"]["code"], -32602);
+        assert_eq!(
+            rejected_label["error"]["message"],
+            "hook session open request is invalid"
+        );
+
+        let mut mismatch = params.clone();
+        mismatch["repository_id"] = serde_json::json!("claimed-repository");
+        write_json_rpc_request(&mut writer, 0, HOOK_SESSION_OPEN_METHOD, mismatch).await;
+        let rejected_identity = read_json_line(&mut reader).await;
+        assert_eq!(rejected_identity["error"]["code"], -32001);
+        assert_eq!(
+            rejected_identity["error"]["message"],
+            "hook session open rejected"
+        );
+        assert!(daemon.shards.lock().await.is_empty());
+
+        write_json_rpc_request(&mut writer, 1, HOOK_SESSION_OPEN_METHOD, params.clone()).await;
+        let opened = read_json_line(&mut reader).await;
+        assert!(opened.get("error").is_none(), "open failed: {opened}");
+        assert_eq!(opened["result"]["resumed"], false);
+        assert!(daemon.shards.lock().await.is_empty());
+
+        write_json_rpc_request(&mut writer, 2, HOOK_SESSION_OPEN_METHOD, params.clone()).await;
+        let exclusive = read_json_line(&mut reader).await;
+        assert_eq!(exclusive["error"]["code"], -32001);
+        assert_eq!(exclusive["error"]["message"], "hook session open rejected");
+
+        let mut resumed_params = params;
+        resumed_params["resume"] = serde_json::json!({
+            "binding_id": opened["result"]["binding_id"],
+            "capability": opened["result"]["capability"],
+        });
+        let mut wrong_tuple = resumed_params.clone();
+        wrong_tuple["host_session_id"] = serde_json::json!("different-host-session");
+        write_json_rpc_request(&mut writer, 3, HOOK_SESSION_OPEN_METHOD, wrong_tuple).await;
+        let rejected_tuple = read_json_line(&mut reader).await;
+        assert_eq!(rejected_tuple["error"]["code"], -32001);
+
+        let mut wrong_capability = resumed_params.clone();
+        wrong_capability["resume"]["capability"] = serde_json::json!("00".repeat(32));
+        write_json_rpc_request(&mut writer, 3, HOOK_SESSION_OPEN_METHOD, wrong_capability).await;
+        let rejected_capability = read_json_line(&mut reader).await;
+        assert_eq!(rejected_capability["error"]["code"], -32001);
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        write_json_rpc_request(&mut writer, 3, HOOK_SESSION_OPEN_METHOD, resumed_params).await;
+        let resumed = read_json_line(&mut reader).await;
+        assert_eq!(resumed["result"]["resumed"], true);
+        assert_eq!(
+            resumed["result"]["binding_id"],
+            opened["result"]["binding_id"]
+        );
+        assert!(
+            resumed["result"]["idle_deadline_ms"].as_i64()
+                > opened["result"]["idle_deadline_ms"].as_i64()
+        );
+        assert!(daemon.shards.lock().await.is_empty());
+
+        drop(writer);
+        drop(reader);
+        server.await.unwrap().unwrap();
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_hook_open_rejects_multi_root_without_loading_shards() {
+        let root = committed_test_repository("hook-open-multi-root");
+        let other = unique_test_root("hook-open-other-root");
+        let state = unique_test_root("hook-open-multi-state");
+        std::fs::create_dir_all(&other).unwrap();
+        let route = HookSessionRoute::open_at(&state).expect("open test hook route");
+        let daemon =
+            Arc::new(GlobalDaemon::new_with_config(8, false).with_hook_session_route(route));
+        let proxy_request = ProxyRequest {
+            workspace_roots: vec![
+                root.to_string_lossy().to_string(),
+                other.to_string_lossy().to_string(),
+            ],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        let (mut reader, mut writer, server) =
+            authenticated_test_connection(Arc::clone(&daemon), &proxy_request).await;
+        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&root).unwrap();
+        write_json_rpc_request(
+            &mut writer,
+            1,
+            HOOK_SESSION_OPEN_METHOD,
+            serde_json::json!({
+                "integration": "codex/v1",
+                "host_session_id": "host-session-1",
+                "checkout_root": identity.checkout_root.to_string_lossy(),
+                "repository_id": identity.repository_id,
+                "checkout_id": identity.checkout_root.to_string_lossy(),
+            }),
+        )
+        .await;
+        let rejected = read_json_line(&mut reader).await;
+        assert_eq!(rejected["error"]["code"], -32001);
+        assert_eq!(rejected["error"]["message"], "hook session open rejected");
+        assert!(daemon.shards.lock().await.is_empty());
+
+        drop(writer);
+        drop(reader);
+        server.await.unwrap().unwrap();
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_ordinary_rpc_loads_its_shard_only_after_first_request() {
+        let root = unique_test_root("ordinary-lazy-shard");
+        std::fs::create_dir_all(&root).expect("create ordinary workspace");
+        let daemon = Arc::new(GlobalDaemon::new_with_config(8, false));
+        let proxy_request = ProxyRequest {
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        let (mut reader, mut writer, server) =
+            authenticated_test_connection(Arc::clone(&daemon), &proxy_request).await;
+
+        assert!(daemon.shards.lock().await.is_empty());
+        write_json_rpc_request(&mut writer, 1, "initialize", serde_json::json!({})).await;
+        let initialized = read_json_line(&mut reader).await;
+        assert!(
+            initialized.get("error").is_none(),
+            "initialize failed: {initialized}"
+        );
+        assert_eq!(daemon.shards.lock().await.len(), 1);
+
+        drop(writer);
+        drop(reader);
+        server.await.unwrap().unwrap();
+        shutdown_all_shards(&daemon).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn overlapping_workspace_views_reuse_primary_shard_without_warming_the_full_view() {
@@ -1889,6 +2134,84 @@ mod tests {
             .expect("system clock before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{nanos}-{}", std::process::id()))
+    }
+
+    fn committed_test_repository(prefix: &str) -> PathBuf {
+        let root = unique_test_root(prefix);
+        std::fs::create_dir_all(&root).expect("create Git fixture");
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.email", "lattice@example.test"]);
+        run_git(&root, &["config", "user.name", "Lattice Test"]);
+        std::fs::write(root.join("fixture.txt"), "fixture\n").expect("write Git fixture");
+        run_git(&root, &["add", "fixture.txt"]);
+        run_git(&root, &["commit", "-m", "fixture"]);
+        root
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run Git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn authenticated_test_connection(
+        daemon: Arc<GlobalDaemon>,
+        request: &ProxyRequest,
+    ) -> (
+        tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        tokio::net::tcp::OwnedWriteHalf,
+        JoinHandle<Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let transport = Arc::new(ServerTransport::issue(&address).unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            handle_proxy_connection(daemon, transport, stream).await
+        });
+        let mut client = TcpStream::connect(&address).await.unwrap();
+        client_handshake(&mut client, &address, ClientKind::Cli, request)
+            .await
+            .unwrap();
+        let (read_half, write_half) = client.into_split();
+        (BufReader::new(read_half).lines(), write_half, server)
+    }
+
+    async fn write_json_rpc_request(
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) {
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .unwrap();
+        request.push(b'\n');
+        writer.write_all(&request).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_json_line(
+        reader: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    ) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(30), reader.next_line())
+            .await
+            .expect("JSON-RPC response timed out")
+            .expect("read JSON-RPC response")
+            .expect("server closed before JSON-RPC response");
+        serde_json::from_str(&line).expect("parse JSON-RPC response")
     }
 
     async fn wait_for_index_work(daemon: &GlobalDaemon, root: &PathBuf) {
