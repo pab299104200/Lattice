@@ -68,6 +68,89 @@ fn cli_query_subcommands_call_public_tools_over_daemon_protocol() {
 }
 
 #[test]
+fn cli_recall_and_status_forward_file_filters() {
+    let workspace = unique_workspace("cli-file-filters");
+    std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener
+        .local_addr()
+        .expect("fake daemon address")
+        .to_string();
+    let server = thread::spawn({
+        let observed = Arc::clone(&observed);
+        move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut hello = String::new();
+                reader.read_line(&mut hello).expect("read hello");
+                let mut request = String::new();
+                reader.read_line(&mut request).expect("read request");
+                let request: Value = serde_json::from_str(request.trim()).expect("request json");
+                observed.lock().expect("observed lock").push(request);
+
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": "### Summary\n- fake daemon accepted file filters"
+                        }]
+                    }
+                });
+                writeln!(stream, "{response}").expect("write response");
+            }
+        }
+    });
+
+    for args in [
+        [
+            "recall",
+            "resume auth task",
+            "--mode",
+            "task",
+            "--focus-files",
+            "src/auth.rs",
+            "--focus-files",
+            "src/session.rs",
+        ]
+        .as_slice(),
+        [
+            "status",
+            "--scope",
+            "docs",
+            "--files",
+            "src/auth.rs",
+            "--files",
+            "docs/auth.md",
+        ]
+        .as_slice(),
+    ] {
+        let output = run_lattice(&addr, &workspace, args, None);
+        assert!(
+            output.status.success(),
+            "CLI file-filter request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    server.join().expect("fake daemon joins");
+    let observed = observed.lock().expect("observed lock");
+    assert_eq!(observed[0]["params"]["name"], "recall");
+    assert_eq!(
+        observed[0]["params"]["arguments"]["focus_files"],
+        json!(["src/auth.rs", "src/session.rs"])
+    );
+    assert_eq!(observed[1]["params"]["name"], "status");
+    assert_eq!(
+        observed[1]["params"]["arguments"]["files"],
+        json!(["src/auth.rs", "docs/auth.md"])
+    );
+}
+
+#[test]
 fn cli_query_daemon_down_exits_two_with_actionable_message() {
     let workspace = unique_workspace("cli-down");
     std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");

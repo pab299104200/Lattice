@@ -1303,6 +1303,7 @@ fn parse_recall(parser: &mut ArgParser) -> Result<CliRequest> {
         .take_flag_value("--mode")?
         .unwrap_or_else(|| "search".to_string());
     let task_id = parser.take_flag_value("--task-id")?;
+    let focus_files = parser.take_repeated("--focus-files")?;
     let query = parser.join_positionals();
     if query.trim().is_empty() {
         return Err(anyhow!("recall requires a query"));
@@ -1316,6 +1317,9 @@ fn parse_recall(parser: &mut ArgParser) -> Result<CliRequest> {
         set_value(&mut arguments, "task_id", json!(id));
         set_value(&mut arguments, "task_statement", json!(query));
     }
+    if !focus_files.is_empty() {
+        set_value(&mut arguments, "focus_files", json!(focus_files));
+    }
     Ok(parser.request("recall", arguments))
 }
 
@@ -1323,10 +1327,14 @@ fn parse_status(parser: &mut ArgParser) -> Result<CliRequest> {
     let scope = parser
         .take_flag_value("--scope")?
         .unwrap_or_else(|| "index".to_string());
+    let files = parser.take_repeated("--files")?;
     let query = parser.join_positionals();
     let mut arguments = json!({ "scope": scope });
     if !query.trim().is_empty() {
         set_value(&mut arguments, "query", json!(query));
+    }
+    if !files.is_empty() {
+        set_value(&mut arguments, "files", json!(files));
     }
     Ok(parser.request("status", arguments))
 }
