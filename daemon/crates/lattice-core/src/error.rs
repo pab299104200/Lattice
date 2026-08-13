@@ -11,6 +11,9 @@ pub enum LatticeError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error("Corrupt derived storage at {path}: {message}")]
+    CorruptStorage { path: String, message: String },
+
     #[error("Query error: {0}")]
     Query(String),
 }

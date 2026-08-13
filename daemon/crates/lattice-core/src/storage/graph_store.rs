@@ -11,6 +11,21 @@ use std::path::{Path, PathBuf};
 pub const FILE_INDEX_PARSER_VERSION: i64 = 1;
 pub const FILE_INDEX_SCHEMA_VERSION: i64 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphStoreRecovery {
+    None,
+    RebuiltCorrupt,
+}
+
+impl GraphStoreRecovery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "healthy",
+            Self::RebuiltCorrupt => "rebuilt_corrupt",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileIndexEntry {
     pub file: String,
@@ -26,23 +41,45 @@ pub struct FileIndexEntry {
 pub struct GraphStore {
     conn: Connection,
     path: Option<PathBuf>,
+    recovery: GraphStoreRecovery,
 }
 
 impl GraphStore {
     /// Open a file-based SQLite database with WAL mode enabled.
     pub fn open(path: &Path) -> Result<Self, LatticeError> {
-        let conn = Connection::open(path)
-            .map_err(|e| LatticeError::Storage(format!("Failed to open database: {}", e)))?;
+        reject_symlink(path)?;
+        let conn =
+            Connection::open(path).map_err(|e| map_sqlite_error(path, "open database", e))?;
+
+        validate_integrity(&conn, path)?;
 
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
+            .map_err(|e| map_sqlite_error(path, "set WAL mode", e))?;
 
         let store = Self {
             conn,
             path: Some(path.to_path_buf()),
+            recovery: GraphStoreRecovery::None,
         };
         store.initialize()?;
         Ok(store)
+    }
+
+    /// Open the derived graph store, replacing it only when SQLite confirms corruption.
+    ///
+    /// Graph state is reconstructed from workspace source. Memory, vector, and event stores
+    /// are separate databases and are never touched by this recovery path.
+    pub fn open_recovering(path: &Path) -> Result<Self, LatticeError> {
+        match Self::open(path) {
+            Ok(store) => Ok(store),
+            Err(LatticeError::CorruptStorage { .. }) => {
+                remove_derived_graph_files(path)?;
+                let mut store = Self::open(path)?;
+                store.recovery = GraphStoreRecovery::RebuiltCorrupt;
+                Ok(store)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Open an in-memory SQLite database (for tests).
@@ -51,7 +88,11 @@ impl GraphStore {
             LatticeError::Storage(format!("Failed to open in-memory database: {}", e))
         })?;
 
-        let store = Self { conn, path: None };
+        let store = Self {
+            conn,
+            path: None,
+            recovery: GraphStoreRecovery::None,
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -60,8 +101,15 @@ impl GraphStore {
     fn initialize(&self) -> Result<(), LatticeError> {
         self.conn
             .execute_batch(CREATE_TABLES)
-            .map_err(|e| LatticeError::Storage(format!("Failed to initialize schema: {}", e)))?;
+            .map_err(|e| match &self.path {
+                Some(path) => map_sqlite_error(path, "initialize schema", e),
+                None => LatticeError::Storage(format!("Failed to initialize schema: {}", e)),
+            })?;
         Ok(())
+    }
+
+    pub fn recovery(&self) -> GraphStoreRecovery {
+        self.recovery
     }
 
     /// Save a CodeGraph to the database, replacing any previous data.
@@ -432,6 +480,79 @@ impl GraphStore {
         total = total.saturating_add(file_len_if_exists(&path.with_extension("db-shm"))?);
         Ok(Some(total))
     }
+}
+
+fn validate_integrity(conn: &Connection, path: &Path) -> Result<(), LatticeError> {
+    let result: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(|error| map_sqlite_error(path, "validate database integrity", error))?;
+    if result.eq_ignore_ascii_case("ok") {
+        Ok(())
+    } else {
+        Err(LatticeError::CorruptStorage {
+            path: path.display().to_string(),
+            message: result,
+        })
+    }
+}
+
+fn map_sqlite_error(path: &Path, operation: &str, error: rusqlite::Error) -> LatticeError {
+    use rusqlite::ErrorCode;
+
+    if matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    ) {
+        LatticeError::CorruptStorage {
+            path: path.display().to_string(),
+            message: format!("Failed to {}: {}", operation, error),
+        }
+    } else {
+        LatticeError::Storage(format!("Failed to {}: {}", operation, error))
+    }
+}
+
+fn reject_symlink(path: &Path) -> Result<(), LatticeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(LatticeError::Storage(format!(
+            "Refusing to open graph database through symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LatticeError::Storage(format!(
+            "Failed to inspect graph database path {}: {}",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+fn remove_derived_graph_files(path: &Path) -> Result<(), LatticeError> {
+    for target in [
+        path.to_path_buf(),
+        sqlite_sidecar(path, "-wal"),
+        sqlite_sidecar(path, "-shm"),
+    ] {
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LatticeError::Storage(format!(
+                    "Failed to remove corrupt derived graph file {}: {}",
+                    target.display(),
+                    error
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn file_len_if_exists(path: &Path) -> Result<u64, LatticeError> {

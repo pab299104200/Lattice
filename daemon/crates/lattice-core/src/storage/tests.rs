@@ -154,6 +154,66 @@ fn test_persisted_graph_disk_bytes_reports_file_backed_size() {
 }
 
 #[test]
+fn test_open_recovering_replaces_only_corrupt_derived_graph_files() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("graph.db");
+    std::fs::write(&db_path, b"not a sqlite database").expect("write corrupt graph");
+    std::fs::write(dir.path().join("graph.db-wal"), b"stale wal").expect("write wal");
+    std::fs::write(dir.path().join("graph.db-shm"), b"stale shm").expect("write shm");
+    std::fs::write(dir.path().join("memories.db"), b"preserve me").expect("write memory db");
+
+    let store = GraphStore::open_recovering(&db_path).expect("recover graph store");
+
+    assert_eq!(
+        store.recovery(),
+        super::graph_store::GraphStoreRecovery::RebuiltCorrupt
+    );
+    assert_eq!(store.persisted_graph_file_count().unwrap(), 0);
+    assert_eq!(
+        std::fs::read(dir.path().join("memories.db")).unwrap(),
+        b"preserve me"
+    );
+}
+
+#[test]
+fn test_open_recovering_keeps_healthy_graph() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("graph.db");
+    {
+        let store = GraphStore::open(&db_path).expect("create graph store");
+        store.save_graph(&build_sample_graph()).expect("save graph");
+    }
+
+    let store = GraphStore::open_recovering(&db_path).expect("reopen healthy graph store");
+
+    assert_eq!(
+        store.recovery(),
+        super::graph_store::GraphStoreRecovery::None
+    );
+    assert_eq!(store.load_graph().unwrap().node_count(), 2);
+}
+
+#[test]
+fn test_open_recovering_does_not_delete_non_corrupt_storage_failures() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("graph.db");
+    std::fs::create_dir(&db_path).expect("create directory at graph path");
+
+    let error = GraphStore::open_recovering(&db_path)
+        .err()
+        .expect("directory path must fail");
+
+    assert!(
+        db_path.is_dir(),
+        "non-corruption failure target was deleted"
+    );
+    assert!(!matches!(
+        error,
+        crate::error::LatticeError::CorruptStorage { .. }
+    ));
+}
+
+#[test]
 fn test_file_index_and_parsed_files_round_trip() {
     let store = GraphStore::open_in_memory().expect("Failed to open in-memory store");
     let entry = FileIndexEntry {

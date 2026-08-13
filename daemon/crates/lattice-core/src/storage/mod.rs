@@ -8,7 +8,8 @@ pub mod vector_store;
 mod tests;
 
 pub use graph_store::{
-    FileIndexEntry, GraphStore, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+    FileIndexEntry, GraphStore, GraphStoreRecovery, FILE_INDEX_PARSER_VERSION,
+    FILE_INDEX_SCHEMA_VERSION,
 };
 pub use usearch_index::UsearchVectorIndex;
 pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};

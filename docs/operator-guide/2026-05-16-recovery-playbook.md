@@ -4,6 +4,14 @@ This playbook covers recovery, replay, rollback, and incident communication for 
 
 ## Recovery procedures
 
+### Derived graph corruption
+
+`.lattice/graph.db` is a disposable current-workspace index, not historical or audit authority. On every file-backed open, Lattice runs SQLite `quick_check`. Confirmed `SQLITE_CORRUPT`, `SQLITE_NOTADB`, or a non-`ok` integrity result causes Lattice to remove exactly `graph.db`, `graph.db-wal`, and `graph.db-shm`, create a clean graph store, and rebuild it from workspace files. It does not remove `memories.db`, `vectors.db`, `events.db`, snapshots, or context handles. Symlinked graph database paths and ordinary permission/I/O failures are rejected rather than deleted.
+
+Run `lattice status --scope index --json` after restart. `graph_storage_state` is `healthy` for an ordinary open, `rebuilt_corrupt` when startup replaced a corrupt graph, and `unhealthy` if status cannot query the store. A rebuilt store may report indexing until the source scan finishes; that is recovery progress, not an empty successful graph.
+
+Do not apply the graph reset policy to memory, vectors, event history, or snapshots. Those stores can carry durable evidence and follow the quarantine/replay procedures below.
+
 1. Daemon will not start.
 Check binary deployment first with the [runbook deploy procedure](./2026-05-16-runbook.md#deploy-sequence), then inspect daemon stderr or service logs for startup failures. If the error references SQLite open, snapshot load, or migration order, continue to [Rollback](#rollback) or [Replay from snapshot](#replay-from-snapshot).
 
@@ -21,6 +29,12 @@ Review the contradiction queue, stale-memory view, and recent consolidation jobs
 
 6. Snapshot file is missing or corrupted.
 If a newer valid sibling snapshot exists, use it. If no valid snapshot exists, continue with [Replay from event log only](#replay-from-event-log-only). Use [Corruption recovery](#corruption-recovery) for the exact failure class.
+
+7. A context request times out.
+Run `lattice status --scope index --json`. Status should still return while context work is active because query traversal runs from an immutable graph snapshot outside the live engine lock. A workflow response with `reason: query_capacity` means both bounded CPU query slots are still occupied; retry after one completes. Repeated status timeouts indicate a daemon or transport fault, not normal query backpressure: capture the daemon PID, CPU usage, and logs, restart the daemon, and verify status plus one representative context request. Do not delete any database to address query saturation.
+
+8. Indexing remains CPU- or memory-heavy during a large change storm.
+Inspect `index_status.index_work`. `active_jobs` must not exceed `capacity`; the default capacity is one. A non-zero `queued_jobs` value is bounded backpressure, while a steadily growing queue or repeated jobs for the same workspace indicates a scheduling defect. `graph_storage_state: "busy"` is a transient snapshot publication state and must not make status block. Confirm `LATTICE_MAX_CONCURRENT_INDEX_JOBS` was not raised without a measured memory budget, and confirm multi-root prewarming was not explicitly enabled. Restarting is appropriate after capturing PID, RSS, CPU, status, and lifecycle logs, but deleting `graph.db` does not fix rebuild amplification and is not a resource-remediation step.
 
 ## Replay from snapshot
 
@@ -77,6 +91,8 @@ Use this path when no valid snapshot is available. It is proved by `test_replay_
 6. Link the quarantine directory from the incident record and the post-incident review.
 
 ## Corruption recovery
+
+The automatic derived-graph reset above is the complete normal recovery for isolated `graph.db` corruption. The procedures in this section apply to durable event, memory, and snapshot corruption or to incidents that span multiple stores.
 
 1. Corrupted payload.
 Expect a quarantined row and continued stream progress, as proved by `test_corrupted_payload_quarantines_row_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:21). Preserve `events.db`, note the affected event id, and replay from the newest valid snapshot or full event log.
