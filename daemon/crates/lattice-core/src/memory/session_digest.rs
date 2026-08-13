@@ -24,6 +24,8 @@ pub const MAX_OBSERVATION_BYTES: usize = 1024;
 pub const MAX_FINAL_SUMMARY_BYTES: usize = 2_000;
 pub const MAX_CHECK_LABEL_BYTES: usize = 256;
 pub const MAX_ERROR_SUMMARY_BYTES: usize = 512;
+pub const MAX_BRANCH_BYTES: usize = 256;
+pub const MAX_REVISION_BYTES: usize = 256;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 300;
 
 /// A normalized, safe-to-store session digest.  This type contains no raw
@@ -34,7 +36,12 @@ pub struct SessionDigest {
     pub session_id: String,
     pub repository_id: String,
     pub checkout_id: Option<String>,
+    /// Daemon-observed branch for this segment; absent for detached HEAD.
     pub branch: Option<String>,
+    /// Daemon-observed revision for this segment.
+    pub revision: String,
+    /// Monotonic daemon-owned branch/revision segment number.
+    pub segment: u64,
     pub ended_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
     pub edited_paths: Vec<String>,
@@ -56,7 +63,6 @@ pub struct SessionDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDigestContent {
     pub schema_version: u32,
-    pub branch: Option<String>,
     pub ended_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
     pub edited_paths: Vec<String>,
@@ -69,7 +75,7 @@ pub struct SessionDigestContent {
     pub dropped_observation_count: usize,
 }
 
-/// Trusted, caller-owned scope to bind to parsed digest content.
+/// Trusted, daemon-owned scope to bind to parsed digest content.
 ///
 /// This is deliberately not part of the digest transport schema. Use
 /// [`bind_session_digest_authority`] after parsing content to create a digest
@@ -79,6 +85,12 @@ pub struct SessionDigestAuthority {
     pub session_id: String,
     pub repository_id: String,
     pub checkout_id: Option<String>,
+    /// Daemon-observed branch; absent for detached HEAD.
+    pub branch: Option<String>,
+    /// Daemon-observed revision at this capture segment.
+    pub revision: String,
+    /// Monotonic daemon-owned branch/revision segment number.
+    pub segment: u64,
 }
 
 /// Compatibility-oriented name that emphasizes that parsed content is always
@@ -165,6 +177,8 @@ pub struct SessionDigestEvidence {
     pub repository_id: String,
     pub checkout_id: Option<String>,
     pub branch: Option<String>,
+    pub revision: String,
+    pub segment: u64,
     pub captured_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub edited_paths: Vec<String>,
@@ -204,6 +218,8 @@ pub enum SessionDigestError {
     InvalidCheckoutId,
     #[error("invalid session digest branch")]
     InvalidBranch,
+    #[error("invalid session digest revision")]
+    InvalidRevision,
     #[error("invalid session digest timestamp")]
     InvalidTimestamp,
     #[error("too many edited paths in session digest")]
@@ -216,8 +232,6 @@ pub enum SessionDigestError {
 #[serde(deny_unknown_fields)]
 struct RawSessionDigest {
     schema_version: u32,
-    #[serde(default)]
-    branch: Option<String>,
     ended_at: String,
     #[serde(default)]
     edited_paths: Vec<String>,
@@ -230,8 +244,8 @@ struct RawSessionDigest {
 /// Parse, normalize, and sanitize authority-free version-one digest content.
 ///
 /// The input schema contains only sanitized content and metadata. Session,
-/// repository, and checkout identities are intentionally rejected as unknown
-/// fields; bind trusted caller-owned values with
+/// repository, checkout, branch, and revision identities are intentionally
+/// rejected as unknown fields; bind trusted daemon-owned values with
 /// [`bind_session_digest_authority`] only after this function succeeds.
 ///
 /// `received_at` is supplied by the daemon so a remote or malformed caller
@@ -250,12 +264,6 @@ pub fn parse_session_digest(
     if raw.schema_version != SESSION_DIGEST_SCHEMA_VERSION {
         return Err(SessionDigestError::UnsupportedSchemaVersion);
     }
-    let branch = match raw.branch {
-        Some(value) if is_safe_branch(&value) => Some(value),
-        Some(_) => return Err(SessionDigestError::InvalidBranch),
-        None => None,
-    };
-
     let ended_at =
         DateTime::parse_rfc3339(&raw.ended_at).map_err(|_| SessionDigestError::InvalidTimestamp)?;
     let ended_at = if ended_at.unix_seconds() > received_at.unix_seconds() + MAX_FUTURE_SKEW_SECONDS
@@ -277,7 +285,6 @@ pub fn parse_session_digest(
     let (observations, dropped_observation_count) = normalize_observations(raw.observations);
     let mut content = SessionDigestContent {
         schema_version: SESSION_DIGEST_SCHEMA_VERSION,
-        branch,
         ended_at,
         received_at,
         edited_paths,
@@ -290,7 +297,7 @@ pub fn parse_session_digest(
     Ok(content)
 }
 
-/// Bind validated, caller-owned authority to already-sanitized digest content.
+/// Bind validated, daemon-owned authority to already-sanitized digest content.
 ///
 /// This is the only transition that creates a [`SessionDigest`]. Keeping it
 /// distinct from parsing prevents the untrusted transport payload from
@@ -310,13 +317,23 @@ pub fn bind_session_digest_authority(
         Some(_) => return Err(SessionDigestError::InvalidCheckoutId),
         None => None,
     };
+    let branch = match authority.branch.as_deref() {
+        Some(value) if is_safe_branch(value) => Some(value.to_owned()),
+        Some(_) => return Err(SessionDigestError::InvalidBranch),
+        None => None,
+    };
+    if !is_safe_opaque_id(&authority.revision, MAX_REVISION_BYTES) {
+        return Err(SessionDigestError::InvalidRevision);
+    }
 
     Ok(SessionDigest {
         schema_version: content.schema_version,
         session_id: authority.session_id.clone(),
         repository_id: authority.repository_id.clone(),
         checkout_id,
-        branch: content.branch,
+        branch,
+        revision: authority.revision.clone(),
+        segment: authority.segment,
         ended_at: content.ended_at,
         received_at: content.received_at,
         edited_paths: content.edited_paths,
@@ -351,6 +368,8 @@ pub fn extract_session_digest_candidates(
                 repository_id: digest.repository_id.clone(),
                 checkout_id: digest.checkout_id.clone(),
                 branch: digest.branch.clone(),
+                revision: digest.revision.clone(),
+                segment: digest.segment,
                 captured_at: digest.received_at,
                 ended_at: digest.ended_at,
                 edited_paths: digest.edited_paths.clone(),
@@ -377,6 +396,8 @@ pub fn extract_session_digest_candidates(
                         repository_id: String::new(),
                         checkout_id: None,
                         branch: None,
+                        revision: String::new(),
+                        segment: 0,
                         captured_at: digest.received_at,
                         ended_at: digest.ended_at,
                         edited_paths: Vec::new(),
@@ -407,6 +428,8 @@ pub fn extract_session_digest_candidates(
                     repository_id: String::new(),
                     checkout_id: None,
                     branch: None,
+                    revision: String::new(),
+                    segment: 0,
                     captured_at: digest.received_at,
                     ended_at: digest.ended_at,
                     edited_paths: Vec::new(),
@@ -434,6 +457,8 @@ pub fn extract_session_digest_candidates(
                     repository_id: String::new(),
                     checkout_id: None,
                     branch: None,
+                    revision: String::new(),
+                    segment: 0,
                     captured_at: digest.received_at,
                     ended_at: digest.ended_at,
                     edited_paths: Vec::new(),
@@ -509,10 +534,12 @@ fn base_evidence(
     evidence.repository_id = digest.repository_id.clone();
     evidence.checkout_id = digest.checkout_id.clone();
     evidence.branch = digest.branch.clone();
+    evidence.revision = digest.revision.clone();
+    evidence.segment = digest.segment;
     evidence
 }
 
-fn normalize_paths(paths: Vec<String>) -> Result<Vec<String>, SessionDigestError> {
+pub(crate) fn normalize_paths(paths: Vec<String>) -> Result<Vec<String>, SessionDigestError> {
     let mut normalized = BTreeSet::new();
     for path in paths {
         if !is_safe_repository_path(&path) {
@@ -723,7 +750,7 @@ fn is_windows_drive_path(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphabetic)
 }
 
-fn is_safe_category(value: &str) -> bool {
+pub(crate) fn is_safe_category(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -731,7 +758,7 @@ fn is_safe_category(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-fn is_sha256_fingerprint(value: &str) -> bool {
+pub(crate) fn is_sha256_fingerprint(value: &str) -> bool {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return false;
     };
@@ -742,7 +769,7 @@ fn is_sha256_fingerprint(value: &str) -> bool {
 /// directory, a likely external path, or a shell/control construct.  Dropping
 /// an ambiguous field is intentional: the caller can still retain unrelated,
 /// safe observations from the same digest.
-fn sanitize_text(value: &str, max_bytes: usize) -> Option<String> {
+pub(crate) fn sanitize_text(value: &str, max_bytes: usize) -> Option<String> {
     if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
         return None;
     }
@@ -846,11 +873,10 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn normalized_payload_hash(content: &SessionDigestContent) -> String {
+pub(crate) fn normalized_payload_hash(content: &SessionDigestContent) -> String {
     #[derive(Serialize)]
     struct Payload<'a> {
         schema_version: u32,
-        branch: &'a Option<String>,
         ended_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
         edited_paths: &'a [String],
@@ -859,7 +885,6 @@ fn normalized_payload_hash(content: &SessionDigestContent) -> String {
     }
     hash_json(&Payload {
         schema_version: content.schema_version,
-        branch: &content.branch,
         ended_at: content.ended_at,
         received_at: content.received_at,
         edited_paths: &content.edited_paths,
@@ -915,6 +940,9 @@ mod tests {
             session_id: "session-1".to_owned(),
             repository_id: "repo-1".to_owned(),
             checkout_id: Some("checkout-1".to_owned()),
+            branch: Some("feature/digest".to_owned()),
+            revision: "0123456789abcdef".to_owned(),
+            segment: 1,
         }
     }
 
@@ -932,7 +960,6 @@ mod tests {
         let input = format!(
             r#"{{
                 "schema_version":1,
-                "branch":"feature/digest",
                 "ended_at":"2026-05-17T14:30:00Z",
                 "edited_paths":["src/z.rs","src/a.rs","src/a.rs"],
                 "final_summary":"  Implemented digest capture.  ",
@@ -975,10 +1002,18 @@ mod tests {
           "session_id":"untrusted-session",
           "repository_id":"untrusted-repository",
           "checkout_id":"untrusted-checkout",
+          "branch":"untrusted-branch",
           "ended_at":"2026-05-17T14:30:00Z"
         }"#;
         assert_eq!(
             parse_session_digest(with_transport_authority, received_at()),
+            Err(SessionDigestError::InvalidJson)
+        );
+        assert_eq!(
+            parse_session_digest(
+                r#"{"schema_version":1,"branch":"forged","ended_at":"2026-05-17T14:30:00Z"}"#,
+                received_at()
+            ),
             Err(SessionDigestError::InvalidJson)
         );
 
@@ -989,6 +1024,9 @@ mod tests {
             session_id: "session-2".to_owned(),
             repository_id: "repo-2".to_owned(),
             checkout_id: None,
+            branch: None,
+            revision: "fedcba9876543210".to_owned(),
+            segment: 2,
         };
         let second = bind_session_digest_authority(content.clone(), &second_authority)
             .expect("second trusted authority should bind");
@@ -1019,6 +1057,9 @@ mod tests {
             session_id: "unsafe/session".to_owned(),
             repository_id: "repo-1".to_owned(),
             checkout_id: None,
+            branch: None,
+            revision: "0123456789abcdef".to_owned(),
+            segment: 1,
         };
         assert_eq!(
             bind_session_digest_authority(content.clone(), &invalid_authority),
