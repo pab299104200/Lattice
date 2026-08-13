@@ -12,8 +12,11 @@ use lattice_core::memory::{
 use lattice_core::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -32,6 +35,8 @@ use crate::workspace_identity::WorkspaceIdentity;
 
 const MAX_HOST_ENVELOPE_BYTES: usize = 64 * 1024;
 const ADAPTER_DEADLINE: Duration = Duration::from_millis(2_000);
+const SESSION_START_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
+const SESSION_START_NOTICE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Integration {
@@ -151,7 +156,7 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
 
     match invocation.kind {
         HookKind::SessionStart | HookKind::UserPromptSubmit => {
-            let presentation = open_or_resume(
+            let presentation = match open_or_resume(
                 &client,
                 &key,
                 invocation.integration,
@@ -160,7 +165,28 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
                 now_ms,
                 fact.presentation.as_ref(),
             )
-            .await?;
+            .await
+            {
+                Ok(presentation) => presentation,
+                Err(error) if invocation.kind == HookKind::SessionStart => {
+                    // A raw host session identifier is not authority.  Only
+                    // a still-valid daemon-minted local binding lets us show
+                    // this one recovery hint, and the marker is claimed
+                    // atomically so a noisy host never receives it twice.
+                    if claim_session_start_notice(
+                        &client,
+                        &key,
+                        invocation.integration,
+                        &fact.host_session_id,
+                        &identity,
+                        now_ms,
+                    )? {
+                        return Ok(Some(render_session_start_notice(invocation.integration)));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             Ok(presentation.map(|result| {
                 render_host_presentation(invocation.integration, invocation.kind, result)
             }))
@@ -204,6 +230,115 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
             Ok(None)
         }
     }
+}
+
+/// Claim the single recovery notice for a locally authenticated host session.
+/// The marker is non-authoritative and stores no host data: it only prevents
+/// a repeated bounded presentation after transport/configuration failure.
+fn claim_session_start_notice(
+    client: &HookSessionClient,
+    key: &HookClientBindingKey,
+    integration: Integration,
+    host_session_id: &str,
+    identity: &WorkspaceIdentity,
+    now_ms: i64,
+) -> Result<bool> {
+    if client.load_binding(key, now_ms).is_err() {
+        return Ok(false);
+    }
+    let marker = session_start_notice_marker(
+        integration,
+        host_session_id,
+        &identity.repository_id,
+        &identity.checkout_root,
+    );
+    claim_session_start_notice_at(&default_notice_root()?, &marker)
+}
+
+fn render_session_start_notice(integration: Integration) -> String {
+    match integration {
+        Integration::Codex => SESSION_START_NOTICE.to_string(),
+        Integration::ClaudeCode => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SESSION_START_NOTICE,
+            }
+        })
+        .to_string(),
+    }
+}
+
+fn session_start_notice_marker(
+    integration: Integration,
+    host_session_id: &str,
+    repository_id: &str,
+    checkout_root: &Path,
+) -> String {
+    stable_digest_hex(
+        format!(
+            "{}\0{}\0{}\0{}",
+            integration.binding_id(),
+            host_session_id,
+            repository_id,
+            checkout_root.to_string_lossy()
+        )
+        .as_bytes(),
+    )
+}
+
+fn default_notice_root() -> Result<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| anyhow!("hook notice state location is unavailable"))?;
+    Ok(state_home.join("lattice").join("hook-notices"))
+}
+
+fn claim_session_start_notice_at(root: &Path, marker: &str) -> Result<bool> {
+    fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(root)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(root, permissions)?;
+    }
+    prune_session_start_notices(root)?;
+    let path = root.join(format!("session-start-{marker}"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prune_session_start_notices(root: &Path) -> Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-start-"))
+        {
+            continue;
+        }
+        let expired = entry
+            .metadata()?
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > SESSION_START_NOTICE_RETENTION);
+        if expired {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 async fn open_or_resume(
@@ -852,5 +987,50 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("hinj_22222222222222222222222222222222"));
+    }
+
+    #[test]
+    fn session_start_transport_notice_is_claimed_once_and_host_formatted() {
+        let root = std::env::temp_dir().join(format!(
+            "lattice-hook-notice-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker = session_start_notice_marker(
+            Integration::Codex,
+            "authenticated-host-session",
+            "repository-id",
+            Path::new("/checkout"),
+        );
+
+        assert!(claim_session_start_notice_at(&root, &marker).unwrap());
+        assert!(!claim_session_start_notice_at(&root, &marker).unwrap());
+        assert_eq!(
+            render_session_start_notice(Integration::Codex),
+            "lattice: daemon unreachable — run 'lattice doctor'"
+        );
+        let claude: Value =
+            serde_json::from_str(&render_session_start_notice(Integration::ClaudeCode)).unwrap();
+        assert_eq!(
+            claude["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        assert_eq!(
+            claude["hookSpecificOutput"]["additionalContext"],
+            "lattice: daemon unreachable — run 'lattice doctor'"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_empty_memory_result_has_no_transport_notice() {
+        let presentation: Option<HostPresentationResult> = None;
+        let output = presentation.map(|result| {
+            render_host_presentation(Integration::Codex, HookKind::SessionStart, result)
+        });
+
+        assert_eq!(output, None);
     }
 }

@@ -20,7 +20,7 @@ Add exactly one registration named `lattice` in each client scope:
 
 The workspace must be the project directory. Never configure the workspace as `$HOME` or `/`; those roots are rejected because they watch too much of the filesystem and hide project-level configuration errors.
 
-Use the built-in installer to reconcile client configuration, then run `lattice doctor` to verify it. Doctor checks daemon reachability, workspace shard health, watcher state, the MCP self-handshake, duplicate registrations, hook timeouts, and binary skew.
+Use the built-in installer to reconcile client configuration, then run `lattice doctor` to verify it. Doctor checks daemon reachability, workspace shard health, watcher state, the MCP self-handshake, duplicate registrations, hook paths and timeouts, bounded configured-hook fixtures, and binary skew.
 
 ```bash
 lattice install mcp --workspace /path/to/workspace --verify
@@ -50,7 +50,7 @@ The installed hooks are:
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
 
-All hooks exit `0` without output if the binary is missing or the daemon is down. Hook failures must never block a coding session.
+All hooks exit `0` without output if the binary is missing or the daemon is down. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session, in Claude Code's hook output envelope. Hook failures must never block a coding session.
 
 ## Codex Hooks
 
@@ -73,7 +73,7 @@ The installed hooks are:
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
 
-All hooks exit `0` without output if the binary is missing, the daemon is down, or its bounded readiness probe does not answer in time. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for session/prompt context and four seconds for post-edit/stop work; internal calls have smaller budgets so shell and serialization overhead cannot consume the entire outer deadline.
+All hooks exit `0` without output if the binary is missing, the daemon is down, or its bounded readiness probe does not answer in time. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for session/prompt context and four seconds for post-edit/stop work; internal calls have smaller budgets so shell and serialization overhead cannot consume the entire outer deadline.
 
 ### D3a session boundary
 
@@ -130,4 +130,4 @@ The command renders the last 14 days of workspace-local adoption counters groupe
 
 Use `lattice metrics --memory` to inspect memory adoption separately. Markdown reports one row per day, client, and channel with `retrievals`, `memories_returned`, `memories_used`, `use_rate`, `injections`, `memories_shown`, `injection_actions`, and `action_rate`. The rates are percentages: used divided by returned, and actions divided by shown. `--json` returns `{ "days": [...] }`; each row contains `day`, `client`, `channel`, `retrievals`, `memories_returned`, `memories_used`, `injections`, `memories_shown`, and `injection_actions` (the derived rate columns are Markdown-only). The command applies the normal workspace and `--days` filters and prints `_no memory metrics recorded_` when there are no matching events.
 
-Doctor is the runtime health check after installation. It checks daemon reachability, each requested workspace's index status, the MCP self-handshake and tool count, discovered registrations and conflicts, hook timeout invariants, orphaned stdio proxies, and binary skew. A `FAIL` contributes to the final failure count and makes the command unsuccessful; a `WARN` is visible but does not fail the command. The final line is a JSON summary with `failures` and `warnings`. Start the daemon with `lattice --daemon` when the reachability check fails, then rerun doctor.
+Doctor is the runtime health check after installation. It checks daemon reachability, each requested workspace's index status, the MCP self-handshake and tool count, discovered registrations and conflicts, hook path/timeout invariants, and executes each valid configured hook with a bounded structured fixture. Fixture runs use disposable protected state and an unavailable loopback endpoint, so they cannot create live capture state. Doctor also checks orphaned stdio proxies and binary skew. A `FAIL` contributes to the final failure count and makes the command unsuccessful; a `WARN` is visible but does not fail the command. The final line is a JSON summary with `failures` and `warnings`. Start the daemon with `lattice --daemon` when the reachability check fails, then rerun doctor.

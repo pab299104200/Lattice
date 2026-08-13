@@ -8,6 +8,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::adoption_metrics::{capture_health_for_workspace, CaptureHealth};
@@ -37,8 +38,17 @@ pub(crate) struct ConfigScanReport {
 pub(crate) struct HookRegistration {
     pub(crate) source: PathBuf,
     pub(crate) json_path: String,
+    pub(crate) event: String,
     pub(crate) command: String,
     pub(crate) timeout_secs: Option<u64>,
+}
+
+const DOCTOR_HOOK_FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HOOK_FIXTURE_OUTPUT_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookFixtureResult {
+    elapsed_ms: u128,
 }
 
 /// A snapshot of the process table.  Keeping this boundary explicit makes the
@@ -179,6 +189,34 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
     for violation in &config_report.hook_timeout_violations {
         failures += 1;
         println!("FAIL hook timeout: {}", violation);
+    }
+    if let Some(workspace) = workspace_roots.first() {
+        match std::env::current_exe() {
+            Ok(executable) => {
+                for registration in &config_report.hook_registrations {
+                    if !hook_fixture_is_eligible(registration, workspace) {
+                        continue;
+                    }
+                    match run_hook_fixture(registration, workspace, &executable) {
+                        Ok(result) => println!(
+                            "PASS hook fixture {} at {} ({} ms)",
+                            registration.event, registration.json_path, result.elapsed_ms
+                        ),
+                        Err(error) => {
+                            failures += 1;
+                            println!(
+                                "FAIL hook fixture {} at {}: {}",
+                                registration.event, registration.json_path, error
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                failures += config_report.hook_registrations.len();
+                println!("FAIL hook fixture setup: cannot resolve lattice executable: {error}");
+            }
+        }
     }
 
     match orphan_proxy_count(&SystemProcessSnapshot) {
@@ -645,6 +683,7 @@ fn collect_lattice_hook_registrations(
                     json_path: format!(
                         "{json_path}.hooks.{event}[{entry_index}].hooks[{command_index}]"
                     ),
+                    event: event.to_string(),
                     command: path.to_string(),
                     timeout_secs: command.get("timeout").and_then(Value::as_u64),
                 });
@@ -746,6 +785,215 @@ fn hook_timeout_violations(registrations: &[HookRegistration]) -> Vec<String> {
             })
         }))
         .collect()
+}
+
+/// Execute an installed hook with a synthetic, allowlisted host envelope.
+/// This is a doctor-only wiring check: protected state is disposable and the
+/// loopback address is intentionally unreachable, so no binding or delivery
+/// can be created on an operator's live daemon.
+fn run_hook_fixture(
+    registration: &HookRegistration,
+    workspace: &Path,
+    executable: &Path,
+) -> Result<HookFixtureResult> {
+    let timeout_secs = registration
+        .timeout_secs
+        .ok_or_else(|| anyhow::anyhow!("configured hook has no numeric outer timeout"))?;
+    if timeout_secs <= crate::install::MAX_INNER_HOOK_TIMEOUT_SECS {
+        anyhow::bail!(
+            "configured outer timeout ({timeout_secs}s) must exceed the {}s internal query timeout",
+            crate::install::MAX_INNER_HOOK_TIMEOUT_SECS
+        );
+    }
+    let command = hook_command_path(registration, workspace);
+    if !command.is_file() {
+        anyhow::bail!("configured hook path is missing: {}", command.display());
+    }
+    let state_root = doctor_hook_fixture_state_root()?;
+    let result = run_hook_fixture_at(
+        &command,
+        &registration.event,
+        workspace,
+        executable,
+        &state_root,
+        Duration::from_secs(timeout_secs).min(DOCTOR_HOOK_FIXTURE_TIMEOUT),
+    );
+    let cleanup = fs::remove_dir_all(&state_root);
+    match result {
+        Ok(result) => {
+            cleanup.with_context(|| {
+                format!(
+                    "remove doctor hook fixture state `{}`",
+                    state_root.display()
+                )
+            })?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
+}
+
+fn hook_command_path(registration: &HookRegistration, workspace: &Path) -> PathBuf {
+    let command = PathBuf::from(&registration.command);
+    if command.is_absolute() {
+        command
+    } else {
+        workspace.join(command)
+    }
+}
+
+fn hook_fixture_is_eligible(registration: &HookRegistration, workspace: &Path) -> bool {
+    registration
+        .timeout_secs
+        .is_some_and(|timeout| timeout > crate::install::MAX_INNER_HOOK_TIMEOUT_SECS)
+        && hook_command_path(registration, workspace).is_file()
+}
+
+fn doctor_hook_fixture_state_root() -> Result<PathBuf> {
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("read clock for doctor hook fixture state")?
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(format!("lattice-doctor-hook-fixture-{nonce}"));
+    fs::create_dir(&root)
+        .with_context(|| format!("create doctor hook fixture state `{}`", root.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&root)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&root, permissions)?;
+    }
+    Ok(root)
+}
+
+fn run_hook_fixture_at(
+    command: &Path,
+    event: &str,
+    workspace: &Path,
+    executable: &Path,
+    state_root: &Path,
+    timeout: Duration,
+) -> Result<HookFixtureResult> {
+    let started = Instant::now();
+    let mut child = Command::new(command)
+        .current_dir(workspace)
+        .env("LATTICE_BIN", executable)
+        .env("LATTICE_SKIP_METRICS", "1")
+        .env("XDG_STATE_HOME", state_root)
+        .env("LATTICE_DAEMON_ADDR", "127.0.0.1:0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not spawn `{}`", command.display()))?;
+    child
+        .stdin
+        .as_mut()
+        .context("configured hook has no stdin")?
+        .write_all(hook_fixture_payload(event).as_bytes())?;
+    drop(child.stdin.take());
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("configured hook has no stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("configured hook has no stderr")?;
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = stdout_sender.send(read_limited_output(stdout));
+    });
+    std::thread::spawn(move || {
+        let _ = stderr_sender.send(read_limited_output(stderr));
+    });
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("exceeded the {} ms fixture deadline", timeout.as_millis());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_receiver
+        .recv_timeout(Duration::from_millis(250))
+        .map_err(|_| anyhow::anyhow!("closed without readable stdout"))??;
+    let stderr = stderr_receiver
+        .recv_timeout(Duration::from_millis(250))
+        .map_err(|_| anyhow::anyhow!("closed without readable stderr"))??;
+    if !status.success() {
+        anyhow::bail!("exited with {status}: {}", fixture_output_summary(&stderr));
+    }
+    if !stdout.bytes.is_empty() || stdout.truncated {
+        anyhow::bail!("wrote stdout: {}", fixture_output_summary(&stdout));
+    }
+    Ok(HookFixtureResult {
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+struct LimitedFixtureOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_limited_output(mut reader: impl Read) -> std::io::Result<LimitedFixtureOutput> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(LimitedFixtureOutput { bytes, truncated });
+        }
+        let remaining = MAX_HOOK_FIXTURE_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let copied = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..copied]);
+        truncated |= copied < read;
+    }
+}
+
+fn fixture_output_summary(output: &LimitedFixtureOutput) -> String {
+    let text = String::from_utf8_lossy(&output.bytes).trim().to_string();
+    if output.truncated {
+        if text.is_empty() {
+            "output exceeded the 8 KiB diagnostic limit".to_string()
+        } else {
+            format!("{text} (truncated at 8 KiB)")
+        }
+    } else if text.is_empty() {
+        "no diagnostic output".to_string()
+    } else {
+        text
+    }
+}
+
+fn hook_fixture_payload(event: &str) -> &'static str {
+    match event {
+        "SessionStart" => r#"{"session_id":"doctor-hook-fixture","source":"startup"}"#,
+        "UserPromptSubmit" => {
+            r#"{"session_id":"doctor-hook-fixture","prompt":"doctor bounded hook fixture"}"#
+        }
+        "PostToolUse" => {
+            r#"{"session_id":"doctor-hook-fixture","tool_name":"apply_patch","file_path":"README.md"}"#
+        }
+        "Stop" => r#"{"session_id":"doctor-hook-fixture"}"#,
+        _ => "{}",
+    }
 }
 
 fn orphan_proxy_count(snapshot: &dyn ProcessSnapshot) -> Result<usize> {
@@ -908,7 +1156,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = scan_configs(None, Some(workspace));
+        let report = scan_configs(None, Some(workspace.clone()));
 
         assert_eq!(report.registrations.len(), 1);
         assert!(report.conflicts.is_empty());
@@ -942,7 +1190,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = scan_configs(None, Some(workspace));
+        let report = scan_configs(None, Some(workspace.clone()));
 
         assert_eq!(report.stale_paths.len(), 1);
         assert!(report.stale_paths[0].contains("/missing/lattice"));
@@ -967,12 +1215,16 @@ mod tests {
         )
         .unwrap();
 
-        let report = scan_configs(None, Some(workspace));
+        let report = scan_configs(None, Some(workspace.clone()));
 
         assert_eq!(report.hook_registrations.len(), 1);
         assert!(report.stale_paths.is_empty());
         assert_eq!(report.hook_timeout_violations.len(), 1);
         assert!(report.hook_timeout_violations[0].contains("must exceed"));
+        assert!(!hook_fixture_is_eligible(
+            &report.hook_registrations[0],
+            &workspace
+        ));
     }
 
     #[test]
@@ -986,12 +1238,89 @@ mod tests {
         )
         .unwrap();
 
-        let report = scan_configs(None, Some(workspace));
+        let report = scan_configs(None, Some(workspace.clone()));
 
         assert_eq!(report.hook_registrations.len(), 1);
         assert_eq!(report.stale_paths.len(), 1);
         assert!(report.stale_paths[0].contains("session-start.sh"));
         assert!(report.hook_timeout_violations.is_empty());
+        assert!(!hook_fixture_is_eligible(
+            &report.hook_registrations[0],
+            &workspace
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_bounded_hook_fixture_executes_with_sanitized_input() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("doctor-hook-fixture");
+        let workspace = root.join("workspace");
+        let hook = workspace.join("integrations/codex/hooks/session-start.sh");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            &hook,
+            "#!/bin/sh\ninput=$(cat)\nprintf '%s' \"$input\" | grep -q '\"session_id\":\"doctor-hook-fixture\"'\ntest -n \"$LATTICE_BIN\"\ntest \"$LATTICE_DAEMON_ADDR\" = '127.0.0.1:0'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let registration = HookRegistration {
+            source: workspace.join(".codex/hooks.json"),
+            json_path: "$.hooks.SessionStart[0].hooks[0]".to_string(),
+            event: "SessionStart".to_string(),
+            command: hook.to_string_lossy().into_owned(),
+            timeout_secs: Some(5),
+        };
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+
+        let result = run_hook_fixture_at(
+            &hook,
+            &registration.event,
+            &workspace,
+            Path::new("/fixture/lattice"),
+            &state,
+            Duration::from_secs(2),
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(hook_fixture_is_eligible(&registration, &workspace));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_fixture_deadline_is_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("doctor-hook-fixture-timeout");
+        let workspace = root.join("workspace");
+        let hook = workspace.join("integrations/codex/hooks/session-start.sh");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = run_hook_fixture_at(
+            &hook,
+            "SessionStart",
+            &workspace,
+            Path::new("/fixture/lattice"),
+            &state,
+            Duration::from_millis(25),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fixture deadline"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
