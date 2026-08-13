@@ -205,9 +205,64 @@ PY
   kill "$daemon_pid"
   wait "$daemon_pid" 2>/dev/null || true
   daemon_pid=""
+
+  # A first SessionStart must expose daemon unavailability even when this
+  # host session has no prior binding or local state. The private marker is
+  # atomic, so a repeated hook delivery for the same session remains silent.
+  fresh_notice_state="$e2e_root/fresh-notice-state"
+  mkdir -p "$fresh_notice_state"
+  chmod 700 "$fresh_notice_state"
+  fresh_notice_session="fresh-daemon-down-private-session"
+  fresh_notice_env=(
+    "HOME=$e2e_home"
+    "XDG_RUNTIME_DIR=$e2e_runtime"
+    "XDG_STATE_HOME=$fresh_notice_state"
+    "LATTICE_DAEMON_ADDR=$e2e_address"
+    "LATTICE_BIN=$LATTICE_HOOK_E2E_BIN"
+  )
+  first_notice="$({
+    cd "$e2e_repo"
+    env "${fresh_notice_env[@]}" "$codex_hooks_dir/session-start.sh" \
+      <<<"{\"session_id\":\"$fresh_notice_session\"}"
+  })"
+  second_notice="$({
+    cd "$e2e_repo"
+    env "${fresh_notice_env[@]}" "$codex_hooks_dir/session-start.sh" \
+      <<<"{\"session_id\":\"$fresh_notice_session\"}"
+  })"
+  [[ "$first_notice" == "lattice: daemon unreachable — run 'lattice doctor'" ]]
+  [[ -z "$second_notice" ]]
+  notice_marker_count="$(
+    find "$fresh_notice_state/lattice/hook-notices" -maxdepth 1 -type f | wc -l | tr -d ' '
+  )"
+  notice_marker="$(
+    find "$fresh_notice_state/lattice/hook-notices" -maxdepth 1 -type f -print
+  )"
+  [[ "$notice_marker_count" -eq 1 ]]
+  [[ "$(basename "$notice_marker")" =~ ^session-start-[0-9a-f]{32}$ ]]
+  [[ "$notice_marker" != *"$fresh_notice_session"* ]]
+
+  # Malformed envelopes remain silent and do not consume a notice claim.
+  invalid_notice_state="$e2e_root/invalid-notice-state"
+  mkdir -p "$invalid_notice_state"
+  chmod 700 "$invalid_notice_state"
+  invalid_notice="$({
+    cd "$e2e_repo"
+    HOME="$e2e_home" XDG_RUNTIME_DIR="$e2e_runtime" \
+      XDG_STATE_HOME="$invalid_notice_state" LATTICE_DAEMON_ADDR="$e2e_address" \
+      LATTICE_BIN="$LATTICE_HOOK_E2E_BIN" \
+      "$codex_hooks_dir/session-start.sh" <<<'{"missing_session_id":true}'
+  })"
+  [[ -z "$invalid_notice" ]]
+  [[ ! -e "$invalid_notice_state/lattice/hook-notices" ]]
+
   if rg -a -n 'never-open|forged-|sentinel-|e2e-codex|e2e-claude' \
     "$e2e_state" "$e2e_repo/.lattice" "$e2e_root/daemon.out" "$e2e_root/daemon.err"; then
     printf 'raw host envelope crossed the protected adapter boundary\n' >&2
+    exit 1
+  fi
+  if rg -a -n "$fresh_notice_session" "$fresh_notice_state"; then
+    printf 'raw host session identity leaked into notice state\n' >&2
     exit 1
   fi
   python3 - "$e2e_repo/.lattice/memories.db" <<'PY'

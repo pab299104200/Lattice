@@ -125,6 +125,10 @@ struct HostPresentationResult {
     context: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("hook daemon transport unavailable")]
+struct HookDaemonUnavailable(#[source] anyhow::Error);
+
 pub(crate) fn is_hook_adapter_command() -> bool {
     std::env::args().nth(1).as_deref() == Some("__hook-adapter")
 }
@@ -168,18 +172,19 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
             .await
             {
                 Ok(presentation) => presentation,
-                Err(error) if invocation.kind == HookKind::SessionStart => {
+                Err(error)
+                    if invocation.kind == HookKind::SessionStart
+                        && session_start_notice_eligible(&error) =>
+                {
                     // A raw host session identifier is not authority.  Only
-                    // a still-valid daemon-minted local binding lets us show
-                    // this one recovery hint, and the marker is claimed
-                    // atomically so a noisy host never receives it twice.
+                    // the validated host envelope and checkout identity scope
+                    // this non-authoritative recovery hint. The marker is
+                    // privacy-preserving and claimed atomically, including
+                    // before the daemon has minted the session's first binding.
                     if claim_session_start_notice(
-                        &client,
-                        &key,
                         invocation.integration,
                         &fact.host_session_id,
                         &identity,
-                        now_ms,
                     )? {
                         return Ok(Some(render_session_start_notice(invocation.integration)));
                     }
@@ -236,16 +241,10 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
 /// The marker is non-authoritative and stores no host data: it only prevents
 /// a repeated bounded presentation after transport/configuration failure.
 fn claim_session_start_notice(
-    client: &HookSessionClient,
-    key: &HookClientBindingKey,
     integration: Integration,
     host_session_id: &str,
     identity: &WorkspaceIdentity,
-    now_ms: i64,
 ) -> Result<bool> {
-    if client.load_binding(key, now_ms).is_err() {
-        return Ok(false);
-    }
     let marker = session_start_notice_marker(
         integration,
         host_session_id,
@@ -253,6 +252,10 @@ fn claim_session_start_notice(
         &identity.checkout_root,
     );
     claim_session_start_notice_at(&default_notice_root()?, &marker)
+}
+
+fn session_start_notice_eligible(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HookDaemonUnavailable>().is_some()
 }
 
 fn render_session_start_notice(integration: Integration) -> String {
@@ -537,14 +540,18 @@ struct HookWire {
 impl HookWire {
     async fn connect(identity: &WorkspaceIdentity) -> Result<Self> {
         let address = daemon_addr();
-        let mut stream = TcpStream::connect(&address).await?;
+        let mut stream = TcpStream::connect(&address)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(HookDaemonUnavailable)?;
         let request = ProxyRequest {
             workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
             focus_files: Vec::new(),
             focus_dirs: Vec::new(),
         };
         transport::client_handshake(&mut stream, &address, ClientKind::HookAdapter, &request)
-            .await?;
+            .await
+            .map_err(HookDaemonUnavailable)?;
         let (read, writer) = stream.into_split();
         Ok(Self {
             reader: BufReader::new(read).lines(),
@@ -998,15 +1005,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let host_session_id = "authenticated-host-session";
+        let repository_id = "repository-id";
+        let checkout_root = Path::new("/private/checkout");
         let marker = session_start_notice_marker(
             Integration::Codex,
-            "authenticated-host-session",
-            "repository-id",
-            Path::new("/checkout"),
+            host_session_id,
+            repository_id,
+            checkout_root,
         );
 
         assert!(claim_session_start_notice_at(&root, &marker).unwrap());
         assert!(!claim_session_start_notice_at(&root, &marker).unwrap());
+        let entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![format!("session-start-{marker}")]);
+        let filename = &entries[0];
+        for private_value in [host_session_id, repository_id, "/private", "checkout"] {
+            assert!(
+                !filename.contains(private_value),
+                "notice filename leaked {private_value}"
+            );
+        }
         assert_eq!(
             render_session_start_notice(Integration::Codex),
             "lattice: daemon unreachable — run 'lattice doctor'"
@@ -1032,5 +1054,18 @@ mod tests {
         });
 
         assert_eq!(output, None);
+    }
+
+    #[test]
+    fn session_start_notice_rejects_non_transport_failures() {
+        let transport =
+            anyhow::Error::new(HookDaemonUnavailable(anyhow!("private transport detail")));
+        assert!(session_start_notice_eligible(&transport));
+        assert!(!session_start_notice_eligible(&anyhow!(
+            "invalid daemon presentation"
+        )));
+        assert!(!session_start_notice_eligible(&anyhow::Error::new(
+            HookSessionClientError::BindingMissing
+        )));
     }
 }
