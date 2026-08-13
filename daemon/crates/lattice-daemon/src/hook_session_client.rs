@@ -367,6 +367,33 @@ impl HookSessionClient {
         })
     }
 
+    /// Persists daemon-renewed deadlines only when the returned binding is
+    /// exactly the locally held capability and authority. This cannot replace
+    /// a binding or reset local delivery bookkeeping.
+    pub fn refresh_binding(
+        &self,
+        key: &HookClientBindingKey,
+        renewed: &HookClientBinding,
+    ) -> Result<(), HookSessionClientError> {
+        self.with_lock(|| {
+            let fingerprint = key.fingerprint(&self.cryptography)?;
+            let mut record = self.load_record_by_fingerprint(&fingerprint)?;
+            if record.binding_id != renewed.binding_id.0
+                || record.capability != renewed.capability.0
+                || record.integration != renewed.integration
+                || record.repository_id != renewed.repository_id
+                || record.checkout_id != renewed.checkout_id
+                || renewed.absolute_deadline_ms != record.absolute_deadline_ms
+                || renewed.idle_deadline_ms < record.idle_deadline_ms
+                || renewed.idle_deadline_ms > renewed.absolute_deadline_ms
+            {
+                return Err(HookSessionClientError::InvalidInput);
+            }
+            record.idle_deadline_ms = renewed.idle_deadline_ms;
+            atomic_write_json(&self.root, &self.binding_path(&fingerprint), &record)
+        })
+    }
+
     /// Atomically allocates a sequence and random delivery ID before persisting
     /// the typed payload.  A close is terminal locally: no later new event can
     /// be enqueued under this binding.
@@ -559,7 +586,7 @@ impl HookSessionClient {
         record: &CapabilityRecord,
     ) -> Result<Vec<PendingRecord>, HookSessionClientError> {
         let mut pending = Vec::new();
-        for sequence in 0..record.next_sequence {
+        for sequence in 1..record.next_sequence {
             let path = self.pending_path(fingerprint, sequence);
             match read_private_json(&path) {
                 Ok(record) => pending.push(record),
@@ -620,7 +647,8 @@ impl CapabilityRecord {
             checkout_id: binding.checkout_id.clone(),
             idle_deadline_ms: binding.idle_deadline_ms,
             absolute_deadline_ms: binding.absolute_deadline_ms,
-            next_sequence: 0,
+            // Sequence zero is reserved/invalid on the daemon wire contract.
+            next_sequence: 1,
             close_sequence: None,
             close_retire_after_ms: None,
         }
@@ -1240,7 +1268,7 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect();
         sequences.sort_unstable();
-        assert_eq!(sequences, (0..8).collect::<Vec<_>>());
+        assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
         assert_eq!(
             initial
                 .pending(&key)
@@ -1268,7 +1296,7 @@ mod tests {
                 .iter()
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![1, 2, 3]
         );
         assert!(matches!(
             client.enqueue(&key, event("src/c.rs"), 4),
@@ -1305,6 +1333,43 @@ mod tests {
             .join("\n");
         assert!(!contents.contains("transcript") && !contents.contains("host-session-private"));
         assert!(contents.contains("edited_path"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_preserves_queue_and_rejects_authority_replacement() {
+        let (client, root) = client("refresh");
+        let key = key();
+        let original = binding();
+        client.store_binding(&key, &original).unwrap();
+        let delivery = client.enqueue(&key, event("src/a.rs"), 1).unwrap().delivery;
+        let renewed = HookClientBinding::new(
+            original.binding_id.clone(),
+            original.capability.clone(),
+            original.integration.clone(),
+            original.repository_id.clone(),
+            original.checkout_id.clone(),
+            15_000,
+            20_000,
+        )
+        .unwrap();
+        client.refresh_binding(&key, &renewed).unwrap();
+        assert_eq!(client.load_binding(&key, 11_000).unwrap().idle_deadline_ms(), 15_000);
+        assert_eq!(client.pending(&key).unwrap()[0].delivery_id, delivery.delivery_id);
+        let replaced = HookClientBinding::new(
+            HookClientOpaqueId::new("other-binding-private").unwrap(),
+            original.capability.clone(),
+            original.integration.clone(),
+            original.repository_id.clone(),
+            original.checkout_id.clone(),
+            15_000,
+            20_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            client.refresh_binding(&key, &replaced),
+            Err(HookSessionClientError::InvalidInput)
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }
