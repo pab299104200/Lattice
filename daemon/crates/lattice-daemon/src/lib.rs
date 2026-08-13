@@ -6,6 +6,7 @@ pub(crate) mod index_health;
 #[allow(dead_code)]
 pub(crate) mod index_work;
 pub(crate) mod lifecycle_log;
+pub(crate) mod memory_attribution;
 pub(crate) mod repo_state;
 pub mod rpc;
 pub(crate) mod runtime_support;
