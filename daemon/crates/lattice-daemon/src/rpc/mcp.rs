@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, MutexGuard, Semaphore};
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::Instrument;
 
 use lattice_core::consolidation::{
@@ -30,6 +30,7 @@ use lattice_core::memory::{
     Memory, MemoryClass, MemoryQueryAuthority, MemoryRecallTier, MemoryScope, MemoryStore,
     MemoryStoreRouter, MemoryType, MemoryVerificationStatus,
 };
+use lattice_core::query::engine::{QueryAdmission, QueryAdmissionError};
 use lattice_core::query::{ContextCapsule, QueryEngine};
 use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::symbols::stable_file_handle;
@@ -66,7 +67,10 @@ use crate::watcher_health::WatcherHealth;
 /// to the appropriate tool implementations.
 pub struct McpHandler {
     engine: Arc<Mutex<QueryEngine>>,
-    query_jobs: Arc<Semaphore>,
+    /// The shared, non-queueing CPU query gate. A blocking worker owns its
+    /// permit until it exits, so caller cancellation cannot create hidden
+    /// background work beyond the configured bound.
+    query_admission: QueryAdmission,
     indexer: Arc<Mutex<Indexer>>,
     memory_store: Arc<Mutex<MemoryStore>>,
     shared_memory: Option<SharedMemoryRuntime>,
@@ -478,7 +482,8 @@ impl McpHandler {
         });
         Self {
             engine,
-            query_jobs: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERY_JOBS)),
+            query_admission: QueryAdmission::new(MAX_CONCURRENT_QUERY_JOBS)
+                .expect("fixed query admission capacity must be positive"),
             indexer,
             memory_store,
             shared_memory,
@@ -755,9 +760,15 @@ impl McpHandler {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let permit = Arc::clone(&self.query_jobs)
-            .try_acquire_owned()
-            .map_err(|_| QueryJobError::Busy)?;
+        let permit = self
+            .query_admission
+            .try_acquire()
+            .map_err(|error| match error {
+                QueryAdmissionError::CapacityExhausted { .. } => QueryJobError::Busy,
+                QueryAdmissionError::InvalidCapacity => {
+                    unreachable!("McpHandler constructs query admission with a positive capacity")
+                }
+            })?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             job()
@@ -10681,6 +10692,11 @@ mod tests {
         });
 
         started_rx.await.expect("query worker started");
+        assert_eq!(
+            handler.query_admission.active_jobs(),
+            1,
+            "the blocking query worker must retain the core admission permit"
+        );
         tokio::time::timeout(
             Duration::from_millis(250),
             handler.tool_agent_status(&json!({})),
@@ -10690,6 +10706,7 @@ mod tests {
         .expect("status response");
         release_tx.send(()).expect("release query worker");
         worker.await.expect("worker join").expect("query job");
+        assert_eq!(handler.query_admission.active_jobs(), 0);
         std::fs::remove_dir_all(workspace_root).expect("remove temp workspace");
     }
 
