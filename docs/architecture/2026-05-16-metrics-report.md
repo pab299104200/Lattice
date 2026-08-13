@@ -1,6 +1,6 @@
 # Metrics Report Architecture
 
-This document describes the Phase 9 regression report shipped by [daemon/crates/lattice-daemon/src/bin/lattice_report.rs](/home/pete/cadres/lattice/daemon/crates/lattice-daemon/src/bin/lattice_report.rs:1) and [daemon/crates/lattice-core/src/metrics/report.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/metrics/report.rs:1).
+This document describes the Phase 9 regression report shipped by [daemon/crates/lattice-daemon/src/bin/lattice_report.rs](../../daemon/crates/lattice-daemon/src/bin/lattice_report.rs:1) and [daemon/crates/lattice-core/src/metrics/report.rs](../../daemon/crates/lattice-core/src/metrics/report.rs:1).
 
 Spec anchors:
 
@@ -33,7 +33,7 @@ The report does not define new metrics. It consumes the T65 canonical signals:
 - `tests_recommended_vs_needed`
 - `workflow_success_after_first_plan`
 
-Definitions, collection boundaries, honest-null behavior, and provenance sources live in [daemon/crates/lattice-core/src/metrics/signals.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/metrics/signals.rs:1). The report layer preserves that contract; it does not reinterpret missing data as zero.
+Definitions, collection boundaries, honest-null behavior, and provenance sources live in [daemon/crates/lattice-core/src/metrics/signals.rs](../../daemon/crates/lattice-core/src/metrics/signals.rs:1). The report layer preserves that contract; it does not reinterpret missing data as zero.
 
 ## Thresholds
 

@@ -39,9 +39,9 @@ memories, contradiction links, supersession links, access history, usefulness
 scores, and last verified state.
 
 The Rust source of truth is
-[classes.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/classes.rs).
+[classes.rs](../../daemon/crates/lattice-core/src/memory_graph/classes.rs).
 The SQLite DDL source of truth is
-[schema.sql](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/schema.sql).
+[schema.sql](../../daemon/crates/lattice-core/src/memory_graph/schema.sql).
 
 ## Scopes
 
@@ -76,7 +76,7 @@ The memory graph is partitioned into seven typed streams:
 - `docs_and_contract_state`
 
 The Rust source of truth is
-[streams.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/streams.rs).
+[streams.rs](../../daemon/crates/lattice-core/src/memory_graph/streams.rs).
 `classify_stream(class, assertion_type)` is deterministic and uses the memory
 class as the primary signal:
 
@@ -115,7 +115,7 @@ Phase 4; stream metadata must not embed ranking algorithms directly.
 ## Scope Enforcement
 
 The Rust source of truth is
-[scope.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/scope.rs).
+[scope.rs](../../daemon/crates/lattice-core/src/memory_graph/scope.rs).
 
 Scope queries are deny-by-default:
 
@@ -137,7 +137,7 @@ Scope queries are deny-by-default:
 The legacy `memory::MemoryStore` remains in use while retrieval,
 consolidation, and workflow code migrate onto the memory graph. Its enforced
 boundary is
-[scope_enforcement.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/verification/scope_enforcement.rs):
+[scope_enforcement.rs](../../daemon/crates/lattice-core/src/verification/scope_enforcement.rs):
 callers pass the canonical `ScopeFilter` with `workspace_id`, optional branch,
 optional organization id, and optional session id. Branch memories require the
 same workspace and branch, repo memories require the same workspace,
@@ -179,7 +179,7 @@ verification code must treat these as lifecycle states, not display labels.
 - `verification_status`
 
 The Rust source of truth is
-[links.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/links.rs).
+[links.rs](../../daemon/crates/lattice-core/src/memory_graph/links.rs).
 Links replace the denormalized contradiction and supersession JSON blobs as the
 authoritative query surface for graph traversal and explanation.
 
@@ -200,7 +200,7 @@ embedding all provenance into one memory JSON column. Each row stores stable
 
 The span and doc-section hashes are required for exact re-verification in Phase
 7. The Rust source of truth is
-[evidence.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/evidence.rs).
+[evidence.rs](../../daemon/crates/lattice-core/src/memory_graph/evidence.rs).
 
 ## Accesses
 
@@ -211,7 +211,7 @@ stable `access_id`, owning `memory_id`, `accessed_at`, `accessed_in_event`,
 
 `was_used` remains nullable on first write because retrieval and downstream
 outcome correlation are separate phases. The Rust source of truth is
-[accesses.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/accesses.rs).
+[accesses.rs](../../daemon/crates/lattice-core/src/memory_graph/accesses.rs).
 
 ## Scores
 
@@ -228,7 +228,7 @@ rows per memory and kind while preserving deterministic latest-value lookup.
 
 Each row stores `value`, `computed_at`, `computed_from_window_secs`, and
 `sample_size`. The Rust source of truth is
-[scores.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/memory_graph/scores.rs).
+[scores.rs](../../daemon/crates/lattice-core/src/memory_graph/scores.rs).
 
 ## Freshness, Validity, Invalidation
 

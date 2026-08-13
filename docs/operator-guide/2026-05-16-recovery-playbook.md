@@ -91,7 +91,7 @@ Inspect `index_status.index_work`. `active_jobs` must not exceed `capacity`; the
 
 ## Replay from snapshot
 
-This is the binding recovery path proved by `test_replay_from_snapshot_plus_tail_reconstructs_state` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/recovery_tests.rs:21). It also relies on the snapshot invariants in [## Storage Design](../plans/2026-05-16-cognitive-workspace-fork-plan.md#storage-design) and the append-only replay contract in [### 3. Event Log](../plans/2026-05-16-cognitive-workspace-fork-plan.md#3-event-log).
+This is the binding recovery path proved by `test_replay_from_snapshot_plus_tail_reconstructs_state` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](../../daemon/crates/lattice-core/src/hardening/recovery_tests.rs:21). It also relies on the snapshot invariants in [## Storage Design](../plans/2026-05-16-cognitive-workspace-fork-plan.md#storage-design) and the append-only replay contract in [### 3. Event Log](../plans/2026-05-16-cognitive-workspace-fork-plan.md#3-event-log).
 
 1. Stop the daemon with `pkill -f lattice`.
 2. Resolve the newest snapshot payload under `.lattice/snapshots/`; if your operational wrapper publishes a convenience alias such as `.lattice/snapshots/<latest>.snap`, use that alias, otherwise use the current implementation path `snapshot-<event_row_id>-<unix_micros>.bin`.
@@ -99,7 +99,7 @@ This is the binding recovery path proved by `test_replay_from_snapshot_plus_tail
 4. Verify the 64-byte header is readable and that the format version is supported before reading the body.
 5. Verify the snapshot checksum with the stored content hash before attempting bootstrap.
 6. Move the current `graph.db` and `memories.db` into a timestamped quarantine directory so recovery does not destroy forensic evidence.
-7. Start the daemon in snapshot-bootstrap mode with the resolved snapshot path; when your launcher exposes the flag directly, the operator-facing form is `lattice --bootstrap-from-snapshot <path>`, and the underlying code path is `Bootstrap::load(...)` in [daemon/crates/lattice-core/src/events/compaction.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/events/compaction.rs:284).
+7. Start the daemon using the installed/current Lattice launcher in snapshot-bootstrap mode with the resolved snapshot path; when your launcher exposes the flag directly, the operator-facing form is `lattice --bootstrap-from-snapshot <path>`, and the underlying code path is `Bootstrap::load(...)` in [daemon/crates/lattice-core/src/events/compaction.rs](../../daemon/crates/lattice-core/src/events/compaction.rs:284).
 8. Confirm bootstrap evidence; prefer a dedicated `SnapshotBootstrap` event if your deployment wrapper emits one, but the checked codebase currently proves success with the log line `event log recovery completed from snapshot plus tail`.
 9. Run a scoped query and confirm it returns the expected pre-snapshot state plus post-snapshot tail events, which is the behavior asserted by `test_replay_from_snapshot_plus_tail_reconstructs_state`.
 10. Record the post-recovery audit results: snapshot path, bootstrap evidence, replayed tail count, query spot checks, and any remaining stale or contradiction findings.
@@ -124,7 +124,7 @@ Post-recovery audit checklist:
 
 ## Replay from event log only
 
-Use this path when no valid snapshot is available. It is proved by `test_replay_from_event_log_only_survives_without_snapshot` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/recovery_tests.rs:49).
+Use this path when no valid snapshot is available. It is proved by `test_replay_from_event_log_only_survives_without_snapshot` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](../../daemon/crates/lattice-core/src/hardening/recovery_tests.rs:49).
 
 1. Stop the daemon with `pkill -f lattice`.
 2. Quarantine the current `graph.db` and `memories.db`.
@@ -148,25 +148,25 @@ Use this path when no valid snapshot is available. It is proved by `test_replay_
 The automatic derived-graph reset above is the complete normal recovery for isolated `graph.db` corruption. The procedures in this section apply to durable event, memory, and snapshot corruption or to incidents that span multiple stores.
 
 1. Corrupted payload.
-Expect a quarantined row and continued stream progress, as proved by `test_corrupted_payload_quarantines_row_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:21). Preserve `events.db`, note the affected event id, and replay from the newest valid snapshot or full event log.
+Expect a quarantined row and continued stream progress, as proved by `test_corrupted_payload_quarantines_row_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:21). Preserve `events.db`, note the affected event id, and replay from the newest valid snapshot or full event log.
 
 2. Mismatched hash.
-Expect the reader to log a hash-mismatch corruption signal and continue, as proved by `test_mismatched_payload_hash_logs_corruption_and_continues` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:49). Preserve the damaged spill row, then replay from a valid snapshot or the full log.
+Expect the reader to log a hash-mismatch corruption signal and continue, as proved by `test_mismatched_payload_hash_logs_corruption_and_continues` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:49). Preserve the damaged spill row, then replay from a valid snapshot or the full log.
 
 3. Invalid kind.
-Expect the reader to reject the bad row with a clear error instead of panicking, as proved by `test_invalid_event_kind_returns_clear_error_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:77). Quarantine the store, then rebuild from an earlier valid snapshot or full replay.
+Expect the reader to reject the bad row with a clear error instead of panicking, as proved by `test_invalid_event_kind_returns_clear_error_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:77). Quarantine the store, then rebuild from an earlier valid snapshot or full replay.
 
 4. Invalid stable reference.
-Expect bootstrap to reject the tail with a dangling-reference signal, as proved by `test_invalid_stable_reference_emits_dangling_reference_signal` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:95). Fix or remove the invalid producer only after evidence is preserved.
+Expect bootstrap to reject the tail with a dangling-reference signal, as proved by `test_invalid_stable_reference_emits_dangling_reference_signal` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:95). Fix or remove the invalid producer only after evidence is preserved.
 
 5. Truncated file.
-Expect a recovery-relevant SQLite or replay error without invented rows, as proved by `test_truncated_event_log_file_reports_recovery_or_sqlite_error_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:133). Quarantine the truncated file and replay from the last valid snapshot or a clean backup.
+Expect a recovery-relevant SQLite or replay error without invented rows, as proved by `test_truncated_event_log_file_reports_recovery_or_sqlite_error_without_panic` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:133). Quarantine the truncated file and replay from the last valid snapshot or a clean backup.
 
 6. Snapshot version mismatch.
-Expect bootstrap refusal with a clear `snapshot format too new` signal, as proved by `test_snapshot_version_mismatch_refuses_bootstrap_with_clear_error` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/corruption_tests.rs:161). Use an older daemon that supports that format or fall back to event-log-only replay.
+Expect bootstrap refusal with a clear `snapshot format too new` signal, as proved by `test_snapshot_version_mismatch_refuses_bootstrap_with_clear_error` in [daemon/crates/lattice-core/src/hardening/corruption_tests.rs](../../daemon/crates/lattice-core/src/hardening/corruption_tests.rs:161). Use an older daemon that supports that format or fall back to event-log-only replay.
 
 7. Partial snapshot or missing sibling snapshot.
-Expect bootstrap to ignore the corrupt candidate and fall back to the newest valid sibling, as proved by `test_partial_snapshot_falls_back_to_full_replay_without_data_loss` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](/home/pete/cadres/lattice/daemon/crates/lattice-core/src/hardening/recovery_tests.rs:65). Record which sibling was selected and why.
+Expect bootstrap to ignore the corrupt candidate and fall back to the newest valid sibling, as proved by `test_partial_snapshot_falls_back_to_full_replay_without_data_loss` in [daemon/crates/lattice-core/src/hardening/recovery_tests.rs](../../daemon/crates/lattice-core/src/hardening/recovery_tests.rs:65). Record which sibling was selected and why.
 
 ## Rollback
 
