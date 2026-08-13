@@ -125,7 +125,10 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
 
     let config_report = scan_configs(
         std::env::var_os("HOME").map(PathBuf::from),
-        std::env::current_dir().ok(),
+        workspace_roots
+            .first()
+            .cloned()
+            .or_else(|| std::env::current_dir().ok()),
     );
     if config_report.registrations.is_empty() {
         warnings += 1;
@@ -438,6 +441,7 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
         files.push(home.join(".claude.json"));
     }
     if let Some(workspace) = workspace {
+        let workspace = config_workspace_root(&workspace);
         files.push(workspace.join(".mcp.json"));
         files.push(workspace.join(".codex").join("hooks.json"));
         let claude_dir = workspace.join(".claude");
@@ -511,6 +515,16 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
         registration_issues,
         hook_timeout_violations,
     }
+}
+
+/// Resolve configuration from the project root when doctor is invoked in a
+/// descendant such as `daemon/`.  The command's default workspace is its cwd,
+/// but MCP registration is conventionally kept at the repository root.
+fn config_workspace_root(workspace: &Path) -> &Path {
+    workspace
+        .ancestors()
+        .find(|candidate| candidate.join(".mcp.json").is_file())
+        .unwrap_or(workspace)
 }
 
 fn collect_lattice_registrations(
@@ -729,10 +743,10 @@ fn is_lattice_stdio_proxy(command: &str) -> bool {
 
 fn binary_skew_report() -> Result<Vec<String>> {
     let current = std::env::current_exe()?;
-    let mut paths = vec![current.clone()];
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join("daemon/target/release/lattice"));
-    }
+    let paths = std::env::current_dir()
+        .ok()
+        .map(|cwd| binary_paths_for(&current, &cwd))
+        .unwrap_or_else(|| vec![current.clone()]);
 
     let mut lines = Vec::new();
     let current_digest = file_digest(&current).ok();
@@ -766,6 +780,34 @@ fn binary_skew_report() -> Result<Vec<String>> {
         }
     }
     Ok(lines)
+}
+
+fn binary_paths_for(current: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![current.to_path_buf()];
+    let Some(daemon_dir) = daemon_directory_for(cwd) else {
+        return paths;
+    };
+    let release_binary = daemon_dir.join("target/release/lattice");
+    if release_binary != current {
+        paths.push(release_binary);
+    }
+    paths
+}
+
+/// Locate the daemon Cargo workspace from either the repository root, the
+/// `daemon/` directory itself, or one of its descendants.
+fn daemon_directory_for(cwd: &Path) -> Option<PathBuf> {
+    let nested_daemon = cwd.join("daemon");
+    if is_daemon_workspace(&nested_daemon) {
+        return Some(nested_daemon);
+    }
+    cwd.ancestors()
+        .find(|candidate| is_daemon_workspace(candidate))
+        .map(Path::to_path_buf)
+}
+
+fn is_daemon_workspace(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file() && path.join("crates/lattice-daemon/Cargo.toml").is_file()
 }
 
 fn modified_epoch_secs(meta: &fs::Metadata) -> Option<u64> {
@@ -833,6 +875,23 @@ mod tests {
 
         assert_eq!(report.registrations.len(), 1);
         assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn config_scan_finds_project_mcp_registration_from_daemon_directory() {
+        let root = unique_test_dir("doctor-project-root-config");
+        let daemon = root.join("daemon");
+        fs::create_dir_all(&daemon).unwrap();
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"lattice":{"command":"/bin/false","args":["--stdio"]}}}"#,
+        )
+        .unwrap();
+
+        let report = scan_configs(None, Some(daemon));
+
+        assert_eq!(report.registrations.len(), 1);
+        assert_eq!(report.registrations[0].source, root.join(".mcp.json"));
     }
 
     #[test]
@@ -935,6 +994,45 @@ mod tests {
         assert_eq!(
             output,
             "WARN workspace /workspace status=ready files=42 index=partial parse_failures=2 failed_files=src/a.rs,src/z.rs"
+        );
+    }
+
+    #[test]
+    fn binary_paths_use_daemon_target_when_invoked_from_daemon_directory() {
+        let root = unique_test_dir("doctor-binary-path");
+        let daemon = root.join("daemon");
+        fs::create_dir_all(daemon.join("crates/lattice-daemon")).unwrap();
+        fs::write(daemon.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        fs::write(
+            daemon.join("crates/lattice-daemon/Cargo.toml"),
+            "[package]\nname = \"fixture-daemon\"\n",
+        )
+        .unwrap();
+        let current = daemon.join("target/release/lattice");
+
+        assert_eq!(
+            binary_paths_for(&current, &daemon),
+            vec![current],
+            "the current daemon binary must not produce a daemon/daemon target candidate"
+        );
+    }
+
+    #[test]
+    fn binary_paths_use_daemon_target_when_invoked_from_repository_root() {
+        let root = unique_test_dir("doctor-repository-binary-path");
+        let daemon = root.join("daemon");
+        fs::create_dir_all(daemon.join("crates/lattice-daemon")).unwrap();
+        fs::write(daemon.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        fs::write(
+            daemon.join("crates/lattice-daemon/Cargo.toml"),
+            "[package]\nname = \"fixture-daemon\"\n",
+        )
+        .unwrap();
+        let current = PathBuf::from("/installed/lattice");
+
+        assert_eq!(
+            binary_paths_for(&current, &root),
+            vec![current, daemon.join("target/release/lattice")]
         );
     }
 
