@@ -1,5 +1,6 @@
 # Rust
 daemon/target/
+**/target/
 
 # Node
 /node_modules/
