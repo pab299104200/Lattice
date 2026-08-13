@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -17,15 +16,7 @@ use tokio::process::Command;
 
 use crate::lifecycle_log;
 use crate::rpc::server::read_message_sync;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ProxyHello {
-    pub workspace_roots: Vec<String>,
-    #[serde(default)]
-    pub focus_files: Vec<String>,
-    #[serde(default)]
-    pub focus_dirs: Vec<String>,
-}
+use crate::transport::{self, ClientKind, ProxyRequest};
 
 pub(crate) fn daemon_addr() -> String {
     std::env::var("LATTICE_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:47659".to_string())
@@ -53,8 +44,7 @@ fn proxy_idle_timeout_from(value: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_PROXY_IDLE_TIMEOUT)
 }
 
-pub(crate) async fn run_stdio_proxy(hello: ProxyHello) -> Result<()> {
-    let hello = serde_json::to_string(&hello)?;
+pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     std::thread::spawn(move || {
@@ -75,7 +65,7 @@ pub(crate) async fn run_stdio_proxy(hello: ProxyHello) -> Result<()> {
         }
     });
 
-    let (mut lines, mut write_half) = connect_with_hello(&hello)
+    let (mut lines, mut write_half) = connect_with_hello(&request)
         .await
         .context("failed to connect to lattice daemon")?;
     lifecycle_log::log_event(
@@ -100,7 +90,7 @@ pub(crate) async fn run_stdio_proxy(hello: ProxyHello) -> Result<()> {
                         "daemon_write_failed",
                         &[("error", serde_json::json!(error.to_string()))],
                     );
-                    let (new_lines, new_write_half) = connect_with_hello(&hello)
+                    let (new_lines, new_write_half) = connect_with_hello(&request)
                         .await
                         .context("failed to reconnect to lattice daemon after write failure")?;
                     lines = new_lines;
@@ -145,7 +135,7 @@ pub(crate) async fn run_stdio_proxy(hello: ProxyHello) -> Result<()> {
                     Ok(None) => {
                         tracing::warn!("proxy daemon connection closed; reconnecting");
                         lifecycle_log::log_event("proxy", "daemon_connection_closed", &[]);
-                        let (new_lines, new_write_half) = connect_with_hello(&hello)
+                        let (new_lines, new_write_half) = connect_with_hello(&request)
                             .await
                             .context("failed to reconnect to lattice daemon after disconnect")?;
                         lines = new_lines;
@@ -159,7 +149,7 @@ pub(crate) async fn run_stdio_proxy(hello: ProxyHello) -> Result<()> {
                             "daemon_read_failed",
                             &[("error", serde_json::json!(error.to_string()))],
                         );
-                        let (new_lines, new_write_half) = connect_with_hello(&hello)
+                        let (new_lines, new_write_half) = connect_with_hello(&request)
                             .await
                             .context("failed to reconnect to lattice daemon after read failure")?;
                         lines = new_lines;
@@ -234,13 +224,14 @@ fn json_rpc_id_key(value: &Value) -> Option<String> {
 }
 
 async fn connect_with_hello(
-    hello: &str,
+    request: &ProxyRequest,
 ) -> Result<(
     tokio::io::Lines<AsyncBufReader<OwnedReadHalf>>,
     OwnedWriteHalf,
 )> {
     let mut stream = connect_or_start_daemon().await?;
-    write_message(&mut stream, hello).await?;
+    let addr = daemon_addr();
+    transport::client_handshake(&mut stream, &addr, ClientKind::StdioProxy, request).await?;
     let (read_half, write_half) = stream.into_split();
     Ok((AsyncBufReader::new(read_half).lines(), write_half))
 }

@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::proxy::{daemon_addr, ProxyHello};
+use crate::proxy::daemon_addr;
 use crate::rpc::server::read_message_sync;
+use crate::transport::{self, ClientKind, ProxyRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpRegistration {
@@ -81,11 +82,12 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
     println!("==============");
 
     match daemon_ping(&workspace_roots) {
-        Ok(latency_ms) => {
+        Ok((latency_ms, connection)) => {
             println!(
-                "PASS daemon reachable at {} ({} ms)",
+                "PASS daemon reachable at {} ({} ms); authenticated transport protocol v{}",
                 daemon_addr(),
-                latency_ms
+                latency_ms,
+                connection.protocol_version
             );
         }
         Err(error) => {
@@ -196,7 +198,7 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
     Ok(failures == 0)
 }
 
-fn daemon_ping(workspace_roots: &[PathBuf]) -> Result<u128> {
+fn daemon_ping(workspace_roots: &[PathBuf]) -> Result<(u128, transport::ConnectionMetadata)> {
     let started = Instant::now();
     let mut stream = TcpStream::connect(daemon_addr()).context("TCP connect failed")?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -212,12 +214,17 @@ fn daemon_ping(workspace_roots: &[PathBuf]) -> Result<u128> {
             .map(|root| root.to_string_lossy().to_string())
             .collect()
     };
-    let hello = serde_json::to_string(&ProxyHello {
+    let request = ProxyRequest {
         workspace_roots: roots,
         focus_files: Vec::new(),
         focus_dirs: Vec::new(),
-    })?;
-    writeln!(stream, "{hello}")?;
+    };
+    let connection = transport::client_handshake_sync(
+        &mut stream,
+        &daemon_addr(),
+        ClientKind::Doctor,
+        &request,
+    )?;
     writeln!(
         stream,
         "{}",
@@ -246,7 +253,7 @@ fn daemon_ping(workspace_roots: &[PathBuf]) -> Result<u128> {
     response
         .result
         .ok_or_else(|| anyhow::anyhow!("JSON-RPC initialize returned no result"))?;
-    Ok(started.elapsed().as_millis())
+    Ok((started.elapsed().as_millis(), connection))
 }
 
 fn index_status_for(root: &Path) -> Result<Value> {

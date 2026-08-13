@@ -1,7 +1,11 @@
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -85,6 +89,7 @@ fn cli_recall_and_status_forward_file_filters() {
                 let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut hello = String::new();
                 reader.read_line(&mut hello).expect("read hello");
+                acknowledge_hello(&mut stream, &hello);
                 let mut request = String::new();
                 reader.read_line(&mut request).expect("read request");
                 let request: Value = serde_json::from_str(request.trim()).expect("request json");
@@ -228,6 +233,9 @@ fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
             hello.contains("workspace_roots"),
             "expected proxy hello: {hello}"
         );
+        let mut stream = reader.into_inner();
+        acknowledge_hello(&mut stream, &hello);
+        let mut reader = BufReader::new(stream);
         let mut remainder = String::new();
         while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
             remainder.clear();
@@ -237,7 +245,8 @@ fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
         .args(["--stdio", "--workspace"])
         .arg(&workspace)
-        .env("LATTICE_DAEMON_ADDR", addr)
+        .env("LATTICE_DAEMON_ADDR", &addr)
+        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -274,6 +283,7 @@ fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
         let mut reader = BufReader::new(stream.try_clone().expect("clone proxy stream"));
         let mut hello = String::new();
         reader.read_line(&mut hello).expect("read proxy hello");
+        acknowledge_hello(&mut stream, &hello);
         let mut request = String::new();
         reader.read_line(&mut request).expect("read proxy request");
         request_received_tx.send(()).expect("signal proxy request");
@@ -290,7 +300,8 @@ fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
         .args(["--stdio", "--workspace"])
         .arg(&workspace)
-        .env("LATTICE_DAEMON_ADDR", addr)
+        .env("LATTICE_DAEMON_ADDR", &addr)
+        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
         .env("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "2")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -359,6 +370,8 @@ fn handle_connection(stream: TcpStream, observed: &Arc<Mutex<Vec<String>>>, mode
             .len()
             == 1
     );
+    let mut stream = stream;
+    acknowledge_hello(&mut stream, &hello);
 
     let mut request = String::new();
     reader.read_line(&mut request).expect("read request");
@@ -399,6 +412,7 @@ fn run_lattice(
         .args(args)
         .current_dir(cwd)
         .env("LATTICE_DAEMON_ADDR", addr)
+        .env("XDG_RUNTIME_DIR", install_fake_credential(addr))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if stdin_text.is_some() {
@@ -414,6 +428,54 @@ fn run_lattice(
             .expect("write stdin");
     }
     child.wait_with_output().expect("wait")
+}
+
+fn acknowledge_hello(stream: &mut TcpStream, hello: &str) {
+    let hello: Value = serde_json::from_str(hello.trim()).expect("authenticated hello json");
+    assert_eq!(hello["protocol_version"], 1);
+    assert_eq!(hello["transport_token"], "22".repeat(32));
+    let ack = json!({
+        "protocol_version": 1,
+        "daemon_epoch": hello["daemon_epoch"],
+        "connection_id": "33".repeat(16),
+        "accepted_features": ["json_rpc_2_0"]
+    });
+    writeln!(stream, "{ack}").expect("write transport ack");
+    stream.flush().expect("flush transport ack");
+}
+
+fn install_fake_credential(addr: &str) -> PathBuf {
+    let base = fake_runtime_base(addr);
+    let directory = base.join("lattice");
+    std::fs::create_dir_all(&directory).expect("create fake protected runtime");
+    #[cfg(unix)]
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("protect fake runtime");
+    let mut hasher = DefaultHasher::new();
+    addr.hash(&mut hasher);
+    let path = directory.join(format!("transport-{:016x}.json", hasher.finish()));
+    let record = json!({
+        "protocol_version": 1,
+        "daemon_epoch": "11".repeat(32),
+        "transport_token": "22".repeat(32),
+        "listener_address": addr,
+        "daemon_pid": std::process::id()
+    });
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).expect("write fake credential");
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("protect fake credential");
+    base
+}
+
+fn fake_runtime_base(addr: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    addr.hash(&mut hasher);
+    std::env::temp_dir().join(format!(
+        "lattice-cli-query-runtime-{}-{:016x}",
+        std::process::id(),
+        hasher.finish()
+    ))
 }
 
 fn wait_for_exit(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {

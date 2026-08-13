@@ -11,9 +11,10 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::lifecycle_log;
-use crate::proxy::{daemon_addr, ProxyHello};
+use crate::proxy::daemon_addr;
 use crate::rpc::protocol::{format_response, parse_request, JsonRpcResponse};
 use crate::rpc::server::RequestHandler;
+use crate::transport::{ConnectionMetadata, ProxyRequest, ServerTransport};
 
 struct ActiveRequest {
     generation: u64,
@@ -567,8 +568,8 @@ impl GlobalDaemon {
         }
     }
 
-    async fn handler_for(self: &Arc<Self>, hello: &ProxyHello) -> Result<RuntimeLease> {
-        let roots = canonical_roots(&hello.workspace_roots)?;
+    async fn handler_for(self: &Arc<Self>, request: &ProxyRequest) -> Result<RuntimeLease> {
+        let roots = canonical_roots(&request.workspace_roots)?;
         let view_key = workspace_key(&roots);
         self.evict_idle().await;
 
@@ -579,8 +580,8 @@ impl GlobalDaemon {
         let primary = RetainedShard::from_retained(
             self.shard_for(
                 primary_root.clone(),
-                hello.focus_files.clone(),
-                hello.focus_dirs.clone(),
+                request.focus_files.clone(),
+                request.focus_dirs.clone(),
                 true,
             )
             .await?,
@@ -594,8 +595,8 @@ impl GlobalDaemon {
                 roots: roots.clone(),
                 primary_root: primary_root.clone(),
                 primary_handler,
-                focus_files: hello.focus_files.clone(),
-                focus_dirs: hello.focus_dirs.clone(),
+                focus_files: request.focus_files.clone(),
+                focus_dirs: request.focus_dirs.clone(),
                 handle_owners: Mutex::new(HashMap::new()),
             })
         } else {
@@ -605,8 +606,8 @@ impl GlobalDaemon {
             self.spawn_view_prewarm(
                 view_key.clone(),
                 roots[1..].to_vec(),
-                hello.focus_files.clone(),
-                hello.focus_dirs.clone(),
+                request.focus_files.clone(),
+                request.focus_dirs.clone(),
             );
         }
         lifecycle_log::log_event(
@@ -873,6 +874,14 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind lattice daemon listener {addr}"))?;
+    let bound_address = listener.local_addr()?;
+    if !bound_address.ip().is_loopback() {
+        anyhow::bail!("lattice daemon listener must bind to a loopback address");
+    }
+    let transport =
+        Arc::new(ServerTransport::issue(&addr).with_context(|| {
+            format!("failed to establish protected daemon transport for {addr}")
+        })?);
     tracing::info!("lattice daemon listening on {}", addr);
     lifecycle_log::log_event(
         "daemon",
@@ -890,8 +899,9 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let daemon = Arc::clone(&daemon);
+                let transport = Arc::clone(&transport);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_proxy_connection(daemon, stream).await {
+                    if let Err(err) = handle_proxy_connection(daemon, transport, stream).await {
                         tracing::warn!("proxy connection failed: {}", err);
                     }
                 });
@@ -909,51 +919,59 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
     Ok(())
 }
 
-async fn handle_proxy_connection(daemon: Arc<GlobalDaemon>, stream: TcpStream) -> Result<()> {
-    let peer_addr = stream
+async fn handle_proxy_connection(
+    daemon: Arc<GlobalDaemon>,
+    transport: Arc<ServerTransport>,
+    stream: TcpStream,
+) -> Result<()> {
+    let peer = stream
         .peer_addr()
-        .ok()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .context("failed to identify transport peer")?;
+    let peer_addr = peer.to_string();
     lifecycle_log::log_event(
         "daemon",
         "proxy_connection_accepted",
         &[("peer_addr", serde_json::json!(peer_addr.clone()))],
     );
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     let hello_line = lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow::anyhow!("proxy disconnected before hello"))?;
-    let hello: ProxyHello = match serde_json::from_str(&hello_line) {
-        Ok(hello) => hello,
+    let authenticated = match transport.authenticate(peer, &hello_line) {
+        Ok(authenticated) => authenticated,
         Err(error) => {
             lifecycle_log::log_event(
                 "daemon",
-                "proxy_hello_invalid",
-                &[
-                    ("peer_addr", serde_json::json!(peer_addr)),
-                    ("error", serde_json::json!(error.to_string())),
-                ],
+                "transport_auth_failed",
+                &[("peer_addr", serde_json::json!(peer_addr))],
             );
-            return Err(error).context("invalid proxy hello");
+            return Err(error);
         }
     };
+    let metadata = authenticated.metadata;
+    let request = authenticated.request;
+    write_response_line(&mut write_half, &authenticated.ack).await?;
     lifecycle_log::log_event(
         "daemon",
-        "proxy_hello_received",
+        "proxy_transport_authenticated",
         &[
             (
                 "workspace_roots",
-                serde_json::json!(hello.workspace_roots.clone()),
+                serde_json::json!(request.workspace_roots.clone()),
             ),
             ("peer_addr", serde_json::json!(peer_addr.clone())),
+            (
+                "connection_id",
+                serde_json::json!(metadata.connection_id.clone()),
+            ),
+            ("client_kind", serde_json::json!(metadata.client_kind)),
         ],
     );
-    let lease = daemon.handler_for(&hello).await?;
-    let workspace_key = workspace_key(&canonical_roots(&hello.workspace_roots)?);
-    let result = run_json_rpc_connection(lease, lines, write_half).await;
+    let lease = daemon.handler_for(&request).await?;
+    let workspace_key = workspace_key(&canonical_roots(&request.workspace_roots)?);
+    let result = run_json_rpc_connection(lease, metadata, lines, write_half).await;
     match &result {
         Ok(()) => lifecycle_log::log_event(
             "daemon",
@@ -980,6 +998,7 @@ async fn handle_proxy_connection(daemon: Arc<GlobalDaemon>, stream: TcpStream) -
 
 async fn run_json_rpc_connection(
     lease: RuntimeLease,
+    _connection: ConnectionMetadata,
     mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
@@ -1097,6 +1116,17 @@ async fn run_json_rpc_connection(
     Ok(())
 }
 
+async fn write_response_line<T: serde::Serialize>(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    value: &T,
+) -> Result<()> {
+    let mut encoded = serde_json::to_vec(value)?;
+    encoded.push(b'\n');
+    writer.write_all(&encoded).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 async fn write_response(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     response: &JsonRpcResponse,
@@ -1158,12 +1188,12 @@ mod tests {
         std::fs::create_dir_all(&root_b).expect("create root b");
 
         let daemon = Arc::new(GlobalDaemon::new_with_config(8, false));
-        let hello_a = ProxyHello {
+        let hello_a = ProxyRequest {
             workspace_roots: vec![root_a.to_string_lossy().to_string()],
             focus_files: Vec::new(),
             focus_dirs: Vec::new(),
         };
-        let hello_ab = ProxyHello {
+        let hello_ab = ProxyRequest {
             workspace_roots: vec![
                 root_a.to_string_lossy().to_string(),
                 root_b.to_string_lossy().to_string(),
@@ -1213,7 +1243,7 @@ mod tests {
         std::fs::create_dir_all(&root_b).expect("create root b");
 
         let daemon = Arc::new(GlobalDaemon::new_with_config(8, true));
-        let hello_ab = ProxyHello {
+        let hello_ab = ProxyRequest {
             workspace_roots: vec![
                 root_a.to_string_lossy().to_string(),
                 root_b.to_string_lossy().to_string(),
@@ -1286,7 +1316,7 @@ mod tests {
 
         for root in &roots {
             let lease = daemon
-                .handler_for(&ProxyHello {
+                .handler_for(&ProxyRequest {
                     workspace_roots: vec![root.to_string_lossy().to_string()],
                     focus_files: Vec::new(),
                     focus_dirs: Vec::new(),

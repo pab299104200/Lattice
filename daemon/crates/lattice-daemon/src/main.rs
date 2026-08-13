@@ -14,6 +14,8 @@ mod repo_state;
 mod rpc;
 mod runtime_support;
 mod socket_server;
+mod transport;
+mod transport_credentials;
 mod vector_sync;
 mod watcher;
 mod watcher_health;
@@ -44,6 +46,7 @@ use lattice_core::storage::{
 };
 use lattice_core::symbols::ParsedFile;
 use lattice_core::workspace::WorkspaceManager;
+use rpc::mcp::GitIntelligenceSnapshotHandle;
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
 use runtime_support::{
@@ -110,7 +113,7 @@ async fn main() -> Result<()> {
         let workspace_roots = parse_workspace_roots()?;
         let workspace_root = workspace_roots[0].clone();
         let default_focus = parse_focus_args(&workspace_root);
-        let hello = proxy::ProxyHello {
+        let request = transport::ProxyRequest {
             workspace_roots: workspace_roots
                 .iter()
                 .map(|root| root.to_string_lossy().to_string())
@@ -125,12 +128,12 @@ async fn main() -> Result<()> {
             &[
                 (
                     "workspace_roots",
-                    serde_json::json!(hello.workspace_roots.clone()),
+                    serde_json::json!(request.workspace_roots.clone()),
                 ),
                 ("daemon_addr", serde_json::json!(proxy::daemon_addr())),
             ],
         );
-        let result = proxy::run_stdio_proxy(hello).await;
+        let result = proxy::run_stdio_proxy(request).await;
         match &result {
             Ok(()) => lifecycle_log::log_event(
                 "proxy",
@@ -588,6 +591,7 @@ pub(crate) async fn build_workspace_runtime(
     // active-generation audit must fail workspace construction, not surface
     // later as a detached background error.
     let mut git_refresh_handles = HashMap::new();
+    let git_intelligence_snapshots = GitIntelligenceSnapshotHandle::default();
     for root in &workspace_roots {
         let identity = crate::workspace_identity::WorkspaceIdentity::resolve(root)?;
         let (handle, runtime) = crate::git_intelligence_runtime::GitIntelligenceRuntime::open(
@@ -595,6 +599,7 @@ pub(crate) async fn build_workspace_runtime(
             &graph_path,
             identity.repository_id,
             Arc::clone(&index_work),
+            git_intelligence_snapshots.clone(),
         )?;
         git_refresh_handles.insert(root.clone(), handle);
         background_tasks.push(runtime.spawn());
@@ -807,29 +812,32 @@ pub(crate) async fn build_workspace_runtime(
         workspace_root.display(),
         session_id
     );
-    let handler = Arc::new(McpHandler::new_with_shared_repo_state(
-        engine,
-        indexer,
-        memory_store,
-        graph_store,
-        embedding_engine,
-        vector_index,
-        workspace_root,
-        memory_identity.repository_id,
-        memories_path.clone(),
-        context_cache_path,
-        session_id,
-        workspace_manager,
-        workspace_roots,
-        indexing,
-        Some(event_writer),
-        default_focus_files,
-        default_focus_dirs,
-        repo_state,
-        index_work,
-        watcher_health,
-        index_health,
-    ));
+    let handler = Arc::new(
+        McpHandler::new_with_shared_repo_state(
+            engine,
+            indexer,
+            memory_store,
+            graph_store,
+            embedding_engine,
+            vector_index,
+            workspace_root,
+            memory_identity.repository_id,
+            memories_path.clone(),
+            context_cache_path,
+            session_id,
+            workspace_manager,
+            workspace_roots,
+            indexing,
+            Some(event_writer),
+            default_focus_files,
+            default_focus_dirs,
+            repo_state,
+            index_work,
+            watcher_health,
+            index_health,
+        )
+        .with_git_intelligence_snapshot_handle(git_intelligence_snapshots),
+    );
     {
         let handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {

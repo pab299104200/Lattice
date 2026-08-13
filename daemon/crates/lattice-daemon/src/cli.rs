@@ -13,7 +13,8 @@ use crate::adoption_metrics::render_metrics_for_workspace;
 use crate::install::{
     reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, InstallPaths,
 };
-use crate::proxy::{daemon_addr, ProxyHello};
+use crate::proxy::daemon_addr;
+use crate::transport::{self, ClientKind, ProxyRequest};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -899,14 +900,16 @@ async fn call_daemon(request: &CliRequest) -> Result<Value, CliError> {
     let mut stream = TcpStream::connect(daemon_addr())
         .await
         .map_err(CliError::DaemonConnection)?;
-    let hello = ProxyHello {
+    let transport_request = ProxyRequest {
         workspace_roots: vec![request.workspace.to_string_lossy().to_string()],
         focus_files: Vec::new(),
         focus_dirs: Vec::new(),
     };
-    write_json_line(
+    transport::client_handshake(
         &mut stream,
-        &serde_json::to_value(hello).map_err(anyhow::Error::from)?,
+        &daemon_addr(),
+        ClientKind::Cli,
+        &transport_request,
     )
     .await?;
     let mut arguments = request.arguments.clone();
