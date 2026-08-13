@@ -100,6 +100,32 @@ fn cli_query_timeout_exits_three() {
     server.join().expect("fake daemon joins");
 }
 
+#[test]
+fn bare_help_and_unknown_invocations_do_not_start_a_daemon() {
+    let workspace = unique_workspace("cli-usage");
+    let cases = [
+        (Vec::<&str>::new(), 0, "Usage: lattice <command>"),
+        (vec!["--help"], 0, "Runtime modes (explicit only)"),
+        (vec!["frobnicate"], 64, "unknown subcommand `frobnicate`"),
+        (
+            vec!["--workspace", ".", "status"],
+            64,
+            "a command must come before --workspace",
+        ),
+    ];
+
+    for (args, status, expected) in cases {
+        let output = run_lattice("127.0.0.1:9", &workspace, &args, None);
+        assert_eq!(output.status.code(), Some(status), "args={args:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains(expected), "args={args:?}, output={text}");
+    }
+}
+
 enum FakeMode {
     Immediate,
     Delay,

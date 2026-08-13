@@ -141,6 +141,10 @@ async fn main() -> Result<()> {
         return result;
     }
 
+    if !has_arg("--daemon") && !has_arg("--stdio") {
+        std::process::exit(cli::run_usage_or_error());
+    }
+
     tracing::info!("Lattice daemon starting...");
 
     // ── Parse workspace roots ────────────────────────────────────────

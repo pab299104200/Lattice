@@ -48,6 +48,32 @@ pub(crate) fn is_cli_query_command() -> bool {
     )
 }
 
+/// Reject invocations which are neither an explicit runtime mode nor a public
+/// query command, so malformed commands cannot silently start a daemon.
+pub(crate) fn run_usage_or_error() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        None | Some("--help") | Some("-h") => {
+            println!("{}", usage());
+            0
+        }
+        Some("--workspace") | Some("-w") => {
+            eprintln!(
+                "lattice: a command must come before --workspace; try `lattice status --workspace <path>`"
+            );
+            64
+        }
+        Some(command) => {
+            eprintln!("lattice: unknown subcommand `{command}`\n\n{}", usage());
+            64
+        }
+    }
+}
+
+fn usage() -> &'static str {
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+}
+
 pub(crate) async fn run_from_env() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("metrics") {
