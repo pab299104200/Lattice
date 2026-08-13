@@ -60,7 +60,7 @@ pub use proposal::{
 };
 pub use queue::{
     BoundedJobQueue, ConsolidationJobMode, ConsolidationJobRecord, ConsolidationJobSpec,
-    ConsolidationJobStatus, EnqueueOutcome, PendingProposalSpec,
+    ConsolidationJobStatus, ConsolidationSkipReason, EnqueueOutcome, PendingProposalSpec,
 };
 pub use refresh::RefreshScanner;
 pub use replay::{
@@ -397,6 +397,34 @@ impl ConsolidationJobRuntime {
 
     pub fn depth(&self) -> usize {
         self.queue.depth()
+    }
+
+    /// Return the number of repo/organization review proposals that a bounded
+    /// background producer may still submit. A full in-memory work queue also
+    /// closes admission so expensive producers can check before doing work.
+    pub(crate) fn available_review_slots(
+        &self,
+        workspace_id: &str,
+        max_pending_review_proposals: usize,
+    ) -> Result<usize, LatticeError> {
+        if !self.queue.has_capacity() || max_pending_review_proposals == 0 {
+            return Ok(0);
+        }
+        let conn = self.lock_conn()?;
+        let pending = review_queue::pending_manual_review_count(&conn, workspace_id)?;
+        Ok(max_pending_review_proposals.saturating_sub(pending))
+    }
+
+    /// Persist an intentionally content-free skip record. The closed reason
+    /// enum is the only variable diagnostic accepted by this API.
+    pub(crate) fn record_content_free_skip(
+        &self,
+        workspace_id: &str,
+        kind: &str,
+        reason: ConsolidationSkipReason,
+    ) -> Result<String, LatticeError> {
+        self.queue
+            .persist_content_free_skip(workspace_id, kind, reason)
     }
 
     pub fn drain_for_shutdown(&mut self) -> Vec<ConsolidationJobSpec> {

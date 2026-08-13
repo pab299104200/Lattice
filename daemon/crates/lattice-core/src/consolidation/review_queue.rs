@@ -168,6 +168,10 @@ impl<'a> ReviewQueue<'a> {
         Ok(items)
     }
 
+    pub fn pending_count(&self, workspace_id: &str) -> Result<usize, ReviewQueueError> {
+        pending_manual_review_count(self.conn, workspace_id).map_err(Into::into)
+    }
+
     /// Internal review-queue API for the Phase 10 memory inbox described in
     /// `## 10. Human Review Surface` "Required operator views".
     pub fn inspect(&self, proposal_id: &str) -> Result<ReviewItem, ReviewQueueError> {
@@ -238,6 +242,36 @@ impl<'a> ReviewQueue<'a> {
             }
         }
     }
+}
+
+pub(crate) fn pending_manual_review_count(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<usize, LatticeError> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM consolidation_proposals p
+             INNER JOIN consolidation_jobs j ON j.job_id = p.job_id
+             WHERE p.decision = 'pending'
+               AND j.workspace_id = ?1
+               AND lower(COALESCE(
+                    json_extract(p.proposed_state, '$.memory.scope'),
+                    json_extract(p.proposed_state, '$.scope'),
+                    json_extract(p.prior_state, '$.memory.scope'),
+                    json_extract(p.prior_state, '$.scope')
+               )) IN ('repo', 'organization')",
+            params![workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to count pending manual-review proposals: {error}"
+            ))
+        })?;
+    usize::try_from(count).map_err(|_| {
+        LatticeError::Storage("pending manual-review proposal count overflowed".to_string())
+    })
 }
 
 fn storage_error(error: rusqlite::Error) -> ReviewQueueError {

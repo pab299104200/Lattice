@@ -43,11 +43,14 @@ pub mod episode;
 pub mod failure_pattern;
 pub mod procedure;
 pub mod provenance;
+pub mod session_digest;
 
 #[cfg(test)]
 mod llm_tests;
 #[cfg(test)]
 mod provenance_tests;
+#[cfg(test)]
+mod session_digest_tests;
 
 pub use budget::{
     BudgetCatalog, BudgetError, BudgetOutcome, BudgetUsage, DeterministicFallback, LlmBudget,
@@ -57,6 +60,10 @@ pub use episode::{EpisodeMemoryCandidate, EpisodeSummaryJob};
 pub use failure_pattern::{DiagnosticCluster, FailurePatternJob, FailurePatternMemoryCandidate};
 pub use procedure::{ProcedureExtractionJob, ProcedureMemoryCandidate, WorkflowOccurrence};
 pub use provenance::{LlmProvenance, ProvenanceError};
+pub use session_digest::{
+    SessionDigestConsolidationConfig, SessionDigestConsolidationConfigError,
+    SessionDigestConsolidationOutcome, SessionDigestLlmConsolidator, SessionDigestLlmProvider,
+};
 
 pub type ConsolidationMode = ConsolidationJobMode;
 
@@ -102,6 +109,7 @@ pub enum ConsolidationJobKind {
     ProcedureExtraction,
     ContradictionDetection,
     FailurePatternExtraction,
+    SessionDigestConsolidation,
 }
 
 impl ConsolidationJobKind {
@@ -111,6 +119,7 @@ impl ConsolidationJobKind {
             Self::ProcedureExtraction => "procedure_extraction",
             Self::ContradictionDetection => "contradiction_detection",
             Self::FailurePatternExtraction => "failure_pattern_extraction",
+            Self::SessionDigestConsolidation => "session_digest_llm_consolidation",
         }
     }
 }

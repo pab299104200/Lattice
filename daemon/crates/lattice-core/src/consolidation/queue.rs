@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
@@ -10,6 +11,8 @@ use crate::events::{
     Actor, BranchRef, CompactSummary, ConsolidationFailedPayload, EventKind, EventPayload,
     EventWriter, PartialEnvelope, SessionId,
 };
+
+static CONTENT_FREE_SKIP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsolidationJobSpec {
@@ -96,6 +99,32 @@ pub enum EnqueueOutcome {
     Dropped { reason: String },
 }
 
+/// Content-free reason recorded when a consolidation job is not admitted.
+///
+/// Keeping this as a closed enum prevents callers from accidentally storing
+/// capture content, provider secrets, or model input in skip telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationSkipReason {
+    Disabled,
+    MissingProviderKey,
+    QueueFull,
+    NoEligibleCaptureFacts,
+    BudgetExceeded,
+}
+
+impl ConsolidationSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::MissingProviderKey => "missing_provider_key",
+            Self::QueueFull => "queue_full",
+            Self::NoEligibleCaptureFacts => "no_eligible_capture_facts",
+            Self::BudgetExceeded => "budget_exceeded",
+        }
+    }
+}
+
 pub struct BoundedJobQueue {
     max_depth: usize,
     per_kind_max_depth: Option<usize>,
@@ -120,6 +149,10 @@ impl BoundedJobQueue {
 
     pub fn depth(&self) -> usize {
         self.jobs.len()
+    }
+
+    pub fn has_capacity(&self) -> bool {
+        self.jobs.len() < self.max_depth
     }
 
     pub fn enqueue(&mut self, job: ConsolidationJobSpec) -> Result<EnqueueOutcome, LatticeError> {
@@ -181,6 +214,32 @@ impl BoundedJobQueue {
         Ok(EnqueueOutcome::Queued {
             depth: self.depth(),
         })
+    }
+
+    pub(crate) fn persist_content_free_skip(
+        &self,
+        workspace_id: &str,
+        kind: &str,
+        reason: ConsolidationSkipReason,
+    ) -> Result<String, LatticeError> {
+        let recorded_at = now_unix_micros();
+        let sequence = CONTENT_FREE_SKIP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let job_id = format!("{kind}-skip-{recorded_at}-{sequence}");
+        let conn = self.conn.lock().map_err(|_| {
+            LatticeError::Storage("consolidation queue storage lock was poisoned".to_string())
+        })?;
+        conn.execute(
+            "INSERT INTO consolidation_jobs
+                (job_id, workspace_id, kind, mode, status, enqueued_at, finished_at, error_kind)
+             VALUES (?1, ?2, ?3, 'background', 'dropped', ?4, ?4, ?5)",
+            params![job_id, workspace_id, kind, recorded_at, reason.as_str()],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to persist content-free consolidation skip: {error}"
+            ))
+        })?;
+        Ok(job_id)
     }
 
     pub fn pop(&mut self) -> Option<ConsolidationJobSpec> {

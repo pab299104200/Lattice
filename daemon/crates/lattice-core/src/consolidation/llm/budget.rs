@@ -39,6 +39,7 @@ pub struct BudgetCatalog {
     pub procedure_extraction: LlmBudget,
     pub contradiction_detection: LlmBudget,
     pub failure_pattern_extraction: LlmBudget,
+    pub session_digest_consolidation: LlmBudget,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +76,7 @@ impl BudgetCatalog {
             ConsolidationJobKind::ProcedureExtraction => self.procedure_extraction,
             ConsolidationJobKind::ContradictionDetection => self.contradiction_detection,
             ConsolidationJobKind::FailurePatternExtraction => self.failure_pattern_extraction,
+            ConsolidationJobKind::SessionDigestConsolidation => self.session_digest_consolidation,
         }
     }
 
@@ -145,6 +147,12 @@ impl Default for BudgetCatalog {
                 max_latency_ms: 9_000,
                 max_cost_micro_usd: 300,
             },
+            session_digest_consolidation: LlmBudget {
+                max_prompt_tokens: 6_000,
+                max_response_tokens: 1_200,
+                max_latency_ms: 8_000,
+                max_cost_micro_usd: 250,
+            },
         }
     }
 }
@@ -177,5 +185,6 @@ fn exceeded_outcome(kind: ConsolidationJobKind) -> BudgetOutcome {
             DeterministicFallback::ContradictionSupersessionCandidate,
         ),
         ConsolidationJobKind::FailurePatternExtraction => BudgetOutcome::ExceededSkipWithStale,
+        ConsolidationJobKind::SessionDigestConsolidation => BudgetOutcome::ExceededSkipWithStale,
     }
 }
