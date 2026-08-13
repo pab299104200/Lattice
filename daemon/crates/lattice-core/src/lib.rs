@@ -8,6 +8,7 @@ pub mod embeddings;
 pub mod error;
 pub mod events;
 pub mod git_intelligence;
+mod git_intelligence_adapter;
 pub mod graph;
 pub mod identity;
 pub mod indexer;

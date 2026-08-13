@@ -27,6 +27,9 @@ ndarray = { workspace = true }
 tokenizers = { workspace = true }
 ignore = { workspace = true }
 usearch = { workspace = true }
+# History mining reads local object databases only; do not pull in remote
+# transport, SSH, or TLS support that this adapter cannot use.
+git2 = { version = "0.19", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
