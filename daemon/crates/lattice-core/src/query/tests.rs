@@ -588,7 +588,25 @@ fn test_query_engine_produces_capsule() {
 
 #[test]
 fn indexed_query_engine_selects_at_most_two_cached_digests_with_citations() {
-    let graph = build_test_graph();
+    let mut graph = build_test_graph();
+    let refresh_id = make_id("src/auth_sessions.ts", "refreshAuthToken", 0);
+    graph.add_node(
+        refresh_id.clone(),
+        SymbolKind::Function,
+        "refreshAuthToken".to_string(),
+        "function refreshAuthToken(token: string): Session".to_string(),
+        "function refreshAuthToken(token) { return renew(token); }".to_string(),
+        "src/auth_sessions.ts".to_string(),
+        4,
+        8,
+        true,
+        Language::TypeScript,
+    );
+    graph.add_edge(
+        &make_id("src/auth.ts", "validateToken", 100),
+        &refresh_id,
+        EdgeKind::Calls,
+    );
     let mut engine = indexed_query_engine(&graph);
 
     let capsule = engine.query("How does the auth token flow work?", None, false);
@@ -598,8 +616,8 @@ fn indexed_query_engine_selects_at_most_two_cached_digests_with_citations() {
         .map(|node| node.file.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(digest_files, ["src/auth.ts", "src/crypto.ts"]);
-    assert!(digests.len() <= 2);
+    assert_eq!(digests.len(), 2, "three ranked files must still be capped");
+    assert_eq!(digest_files, ["src/auth.ts", "src/auth_sessions.ts"]);
     for digest in digests {
         assert!(digest.line > 0);
         assert!(
