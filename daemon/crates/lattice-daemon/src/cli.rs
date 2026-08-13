@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -453,24 +453,12 @@ fn verify_configured_mcp_server(config: &Value, config_path: &Path) -> Result<()
         ));
     }
 
-    let output = run_fixture_process(
+    let responses = run_mcp_verification_process(
         Path::new(executable),
         &args,
         &mcp_verification_payload(),
-        None,
         "configured MCP command",
     )?;
-    let responses = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<Value>(line).with_context(|| {
-                format!(
-                    "verification failed: configured MCP command emitted non-JSON response `{line}`"
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
     let initialize = json_rpc_result_for(&responses, 1, "initialize")?;
     if initialize.is_null() {
         return Err(anyhow!(
@@ -488,6 +476,141 @@ fn verify_configured_mcp_server(config: &Value, config_path: &Path) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// Exercise an MCP proxy without closing its stdin before it has returned the
+/// requested responses. Closing stdin is a client-disconnect signal for the
+/// lightweight proxy; doing so immediately after writing the fixture can make
+/// the proxy close its daemon socket before a freshly started daemon replies.
+fn run_mcp_verification_process(
+    program: &Path,
+    args: &[String],
+    input: &str,
+    label: &str,
+) -> Result<Vec<Value>> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "verification failed: could not spawn {label} `{}`",
+                program.display()
+            )
+        })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        anyhow!(
+            "verification failed: {label} `{}` has no stdin",
+            program.display()
+        )
+    })?;
+    stdin.write_all(input.as_bytes())?;
+    stdin.flush()?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        anyhow!(
+            "verification failed: {label} `{}` has no stdout",
+            program.display()
+        )
+    })?;
+    let (sender, receiver) = mpsc::sync_channel(4);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(Ok(None));
+                    break;
+                }
+                Ok(_) => {
+                    if sender.send(Ok(Some(line))).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+
+    let deadline = Instant::now() + INSTALL_VERIFY_TIMEOUT;
+    let mut responses = Vec::new();
+    let result = loop {
+        if responses
+            .iter()
+            .any(|response: &Value| response.get("id") == Some(&json!(1)))
+            && responses
+                .iter()
+                .any(|response: &Value| response.get("id") == Some(&json!(2)))
+        {
+            break Ok(responses);
+        }
+        if let Some(status) = child.try_wait()? {
+            let mut stderr = String::new();
+            if let Some(mut stream) = child.stderr.take() {
+                let _ = stream.read_to_string(&mut stderr);
+            }
+            break Err(anyhow!(
+                "verification failed: {label} exited with {status} before returning initialize and tools/list responses: {}",
+                stderr.trim()
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(anyhow!(
+                "verification failed: {label} exceeded {} seconds while waiting for initialize and tools/list responses",
+                INSTALL_VERIFY_TIMEOUT.as_secs()
+            ));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(Ok(Some(line))) if line.trim().is_empty() => {}
+            Ok(Ok(Some(line))) => match serde_json::from_str::<Value>(line.trim()) {
+                Ok(response) => responses.push(response),
+                Err(error) => break Err(error).with_context(|| {
+                    format!(
+                        "verification failed: configured MCP command emitted non-JSON response `{}`",
+                        line.trim()
+                    )
+                }),
+            },
+            Ok(Ok(None)) => {
+                if let Some(status) = child.try_wait()? {
+                    let mut stderr = String::new();
+                    if let Some(mut stream) = child.stderr.take() {
+                        let _ = stream.read_to_string(&mut stderr);
+                    }
+                    break Err(anyhow!(
+                        "verification failed: {label} exited with {status} before returning initialize and tools/list responses: {}",
+                        stderr.trim()
+                    ));
+                }
+                break Err(anyhow!(
+                    "verification failed: {label} closed stdout before returning initialize and tools/list responses"
+                ));
+            }
+            Ok(Err(error)) => break Err(anyhow!(error).context(format!(
+                "verification failed: could not read {label} stdout"
+            ))),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(anyhow!(
+                "verification failed: {label} stdout reader stopped before returning initialize and tools/list responses"
+            )),
+        }
+    };
+
+    // The verifier owns this temporary proxy. Keep stdin open until responses
+    // arrive, then terminate it rather than waiting for the normal idle timer.
+    drop(stdin);
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 fn mcp_verification_payload() -> String {
@@ -1798,6 +1921,33 @@ mod tests {
             .to_string();
 
         assert!(error.contains("returned 1 tools, expected 8"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_keeps_mcp_stdin_open_until_responses_arrive() {
+        let (root, _workspace, runtime) = install_fixture();
+        write_executable(
+            &runtime.executable,
+            "#!/bin/sh\n\
+             IFS= read -r _ || exit 1\n\
+             IFS= read -r _ || exit 1\n\
+             IFS= read -r _ || exit 1\n\
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n\
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{}, {}, {}, {}, {}, {}, {}, {}]}}'\n\
+             while IFS= read -r _; do :; done\n",
+        );
+        let config = json!({
+            "mcpServers": {
+                "lattice": {
+                    "type": "stdio",
+                    "command": runtime.executable,
+                    "args": ["--stdio"]
+                }
+            }
+        });
+
+        verify_configured_mcp_server(&config, Path::new("/fixture/.mcp.json")).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
