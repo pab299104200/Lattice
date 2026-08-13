@@ -42,7 +42,6 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_ENDPOINT_BYTES: usize = 2048;
-const MAX_CAPTURE_KEYS_PER_WATERMARK: usize = 4096;
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -568,13 +567,13 @@ impl RuntimeWorker {
                 |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
             )
             .map_err(|error| error.to_string())?;
-        if state.1 > now && state.0.as_deref() != Some(self.owner.as_str()) {
+        if state.1 > now {
             return Ok(None);
         }
         if state.2 > now {
             return Ok(None);
         }
-        let latest = transaction
+        let oldest = transaction
             .query_row(
                 "SELECT d.created_at, d.delivery_key
                  FROM memory.session_digest_deliveries d
@@ -589,47 +588,19 @@ impl RuntimeWorker {
                                WHERE w.delivery_key = d.delivery_key
                            ))
                    )
-                 ORDER BY d.created_at DESC, d.delivery_key DESC
+                 ORDER BY d.created_at ASC, d.delivery_key ASC
                  LIMIT 1",
                 params![self.repository_id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((created_at, delivery_key)) = latest else {
+        let Some((created_at, delivery_key)) = oldest else {
             return Ok(None);
         };
-        let delivery_keys = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT delivery_key
-                     FROM memory.session_digest_deliveries
-                     WHERE repository_id = ?1 AND created_at = ?2
-                       AND committed_count = candidate_count
-                     ORDER BY delivery_key ASC
-                     LIMIT ?3",
-                )
-                .map_err(|error| error.to_string())?;
-            let rows = statement
-                .query_map(
-                    params![
-                        self.repository_id,
-                        created_at,
-                        (MAX_CAPTURE_KEYS_PER_WATERMARK + 1) as i64
-                    ],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(|error| error.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?
-        };
-        if delivery_keys.len() > MAX_CAPTURE_KEYS_PER_WATERMARK {
-            return Err("session-digest capture watermark exceeded its safety bound".to_string());
-        }
-        debug_assert!(delivery_keys.contains(&delivery_key));
         let watermark = CaptureWatermark {
             created_at,
-            delivery_keys,
+            delivery_keys: vec![delivery_key],
         };
         let lease_seconds = self
             .config
@@ -654,12 +625,24 @@ impl RuntimeWorker {
             .map_err(|error| error.to_string())?;
         let current_watermark = transaction
             .query_row(
-                "SELECT watermark_created_at FROM runtime_state WHERE singleton = 1",
+                "SELECT lease_owner, lease_expires_at, watermark_created_at
+                 FROM runtime_state WHERE singleton = 1",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .map_err(|error| error.to_string())?;
-        if watermark.created_at > current_watermark {
+        if current_watermark.0.as_deref() != Some(self.owner.as_str())
+            || current_watermark.1 <= now_seconds()
+        {
+            return Err("session-digest consolidation lease is no longer held".to_string());
+        }
+        if watermark.created_at > current_watermark.2 {
             transaction
                 .execute("DELETE FROM watermark_capture_keys", [])
                 .map_err(|error| error.to_string())?;
@@ -963,6 +946,17 @@ mod tests {
                 .unwrap();
         }
 
+        fn capture_at(&self, session: &str, created_at: i64) {
+            self.capture(session);
+            let connection = Connection::open(&self.memory_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE session_digest_deliveries SET created_at = ?1 WHERE session_id = ?2",
+                    params![created_at, session],
+                )
+                .unwrap();
+        }
+
         fn worker(&self, driver: Arc<dyn LlmDriver + Send + Sync>) -> RuntimeWorker {
             let config = SessionDigestRuntimeConfig::test(
                 SessionDigestLlmProvider::OpenAi,
@@ -1022,7 +1016,6 @@ mod tests {
     fn enabled_worker_runs_committed_capture_once_and_creates_only_pending_review_proposals() {
         let fixture = Fixture::new();
         fixture.capture("session-one");
-        fixture.capture("session-two");
         let driver = Arc::new(MockDriver::default());
         driver.push(Ok(RESPONSE));
         let worker = fixture.worker(driver.clone());
@@ -1108,6 +1101,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_lease_cannot_advance_the_checkpoint() {
+        let fixture = Fixture::new();
+        fixture.capture("session-expired-lease");
+        let worker = fixture.worker(Arc::new(MockDriver::default()));
+        let claimed = worker.claim_due_captures().unwrap().unwrap();
+        let connection = worker.open_state().unwrap();
+        connection
+            .execute("UPDATE runtime_state SET lease_expires_at = 0", [])
+            .unwrap();
+
+        assert_eq!(
+            worker.finish_success(&claimed).unwrap_err(),
+            "session-digest consolidation lease is no longer held"
+        );
+        let connection = worker.open_state().unwrap();
+        let checkpoint: (i64, String) = connection
+            .query_row(
+                "SELECT watermark_created_at, watermark_delivery_key
+                 FROM runtime_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, (-1, String::new()));
+    }
+
+    #[test]
     fn checkpoint_never_consumes_an_incomplete_same_second_capture() {
         let fixture = Fixture::new();
         fixture.capture("session-committed");
@@ -1136,8 +1156,48 @@ mod tests {
             )
             .unwrap();
         let second = worker.claim_due_captures().unwrap().unwrap();
-        assert_eq!(second.delivery_keys.len(), 2);
+        assert_eq!(second.delivery_keys.len(), 1);
+        assert_ne!(first.delivery_keys, second.delivery_keys);
         assert_eq!(driver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn oldest_pending_checkpoint_drains_backlog_beyond_source_limit_without_skips() {
+        let fixture = Fixture::new();
+        for index in 0..5 {
+            fixture.capture_at(&format!("session-backlog-{index}"), 10_000 + index);
+        }
+        let driver = Arc::new(MockDriver::default());
+        let mut worker = fixture.worker(driver);
+        worker.config.max_source_facts = 2;
+
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let expected = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT delivery_key
+                     FROM session_digest_deliveries
+                     WHERE repository_id = ?1 AND committed_count = candidate_count
+                     ORDER BY created_at ASC, delivery_key ASC",
+                )
+                .unwrap();
+            statement
+                .query_map(params![REPOSITORY], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let mut claimed = Vec::new();
+        for expected_key in &expected {
+            let watermark = worker.claim_due_captures().unwrap().unwrap();
+            assert_eq!(watermark.delivery_keys, vec![expected_key.clone()]);
+            claimed.extend(watermark.delivery_keys.iter().cloned());
+            worker.finish_success(&watermark).unwrap();
+        }
+
+        assert_eq!(claimed, expected);
+        assert!(worker.claim_due_captures().unwrap().is_none());
     }
 
     #[test]
