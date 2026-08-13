@@ -63,6 +63,24 @@ assert expected in records, (expected, records)
 PY
 }
 
+assert_startup_working_set_delivery() {
+  python3 - "$temp_dir/commands" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+
+recalls = [record["argv"] for record in records if record["argv"][:1] == ["recall"]]
+assert recalls, records
+assert all("working set: branch " in argv[1] for argv in recalls), recalls
+
+working_sets = [record["argv"] for record in records if record["argv"][:1] == ["context"] and "--mode" in record["argv"] and record["argv"][record["argv"].index("--mode") + 1] == "working_set"]
+assert len(working_sets) == 2, working_sets
+assert all("working set: branch " in argv[1] for argv in working_sets), working_sets
+assert all("--timeout" in argv for argv in working_sets), working_sets
+PY
+}
+
 assert_claude_envelope() {
   local event="$1"
   local output="$2"
@@ -86,6 +104,7 @@ exercise_package() {
   [[ "$session_output" == *'## Lattice Session Context'* ]]
   [[ "$session_output" == *'remembered task'* ]]
   [[ "$session_output" == *'repository rules'* ]]
+  [[ "$session_output" == *'### Working Set'* ]]
 
   prompt_output="$(run_hook "$hooks_dir" user-prompt-submit.sh '{"prompt":"explain hook delivery"}')"
   [[ "$prompt_output" == *'## Lattice Prompt Context'* ]]
@@ -106,6 +125,7 @@ exercise_package() {
 
 exercise_package codex "$codex_hooks_dir"
 exercise_package claude-code "$claude_hooks_dir"
+assert_startup_working_set_delivery
 
 # The probe and real calls must put the verb first. This catches the old Claude
 # invocation that formed `lattice --workspace <path> status`, which the CLI

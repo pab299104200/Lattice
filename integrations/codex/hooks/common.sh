@@ -26,10 +26,75 @@ lattice_hook_ready() {
   LATTICE_SKIP_METRICS=1 "$lattice_bin" status --timeout "${LATTICE_HOOK_PROBE_TIMEOUT:-0.5}" >/dev/null 2>&1
 }
 
-lattice_hook_call() {
+lattice_hook_call_raw() {
   LATTICE_CLIENT_NAME="${LATTICE_CLIENT_NAME:-${lattice_client_name:-codex}}" \
     LATTICE_CLIENT_CHANNEL="${LATTICE_CLIENT_CHANNEL:-hook}" \
     "$lattice_bin" "$@"
+}
+
+# Collect a small, local startup anchor without reading repository content. The
+# public CLI can use these paths to build a memory-aware working-set capsule.
+lattice_collect_session_working_set() {
+  LATTICE_SESSION_WORKING_SET_QUERY=""
+  LATTICE_SESSION_WORKING_SET_FILES=()
+
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+
+  local branch status path files_summary=""
+  branch="$(git branch --show-current 2>/dev/null || true)"
+  [[ -n "$branch" ]] || branch="detached HEAD"
+
+  while IFS= read -r status; do
+    path="${status:3}"
+    # Porcelain v1 represents a rename as "old -> new". The destination is
+    # the relevant current working-set file.
+    [[ "$path" == *" -> "* ]] && path="${path##* -> }"
+    [[ -n "${path//[[:space:]]/}" ]] || continue
+    LATTICE_SESSION_WORKING_SET_FILES+=("$path")
+    [[ ${#LATTICE_SESSION_WORKING_SET_FILES[@]} -ge "${LATTICE_HOOK_WORKING_SET_FILE_LIMIT:-8}" ]] && break
+  done < <(git status --porcelain=v1 --untracked-files=normal 2>/dev/null)
+
+  if [[ ${#LATTICE_SESSION_WORKING_SET_FILES[@]} -gt 0 ]]; then
+    files_summary="$(IFS=', '; printf '%s' "${LATTICE_SESSION_WORKING_SET_FILES[*]}")"
+  else
+    files_summary="no dirty files"
+  fi
+  LATTICE_SESSION_WORKING_SET_QUERY="session startup working set: branch $branch; $files_summary"
+}
+
+lattice_hook_call() {
+  # SessionStart previously recalled only the literal task "session start".
+  # Replacing that query with bounded local anchors lets the existing public
+  # recall endpoint rank memories against the actual branch and changed files.
+  if [[ "${1:-}" == "recall" && "${2:-}" == "session start" ]]; then
+    lattice_collect_session_working_set || {
+      lattice_hook_call_raw "$@"
+      return
+    }
+    shift 2
+    lattice_hook_call_raw recall "$LATTICE_SESSION_WORKING_SET_QUERY" "$@"
+    return
+  fi
+
+  # Keep the rules response, then add the CLI's memory-aware working-set
+  # capsule. This exact call shape is used only by the SessionStart hooks.
+  if [[ "${1:-}" == "context" && "${2:-}" == "repo rules and operator workflow" ]]; then
+    lattice_hook_call_raw "$@"
+    local primary_status=$?
+    lattice_collect_session_working_set || return "$primary_status"
+
+    local -a working_set_call=(context "$LATTICE_SESSION_WORKING_SET_QUERY" --mode working_set)
+    local file
+    for file in "${LATTICE_SESSION_WORKING_SET_FILES[@]}"; do
+      working_set_call+=(--files "$file")
+    done
+    working_set_call+=(--timeout "${LATTICE_HOOK_WORKING_SET_TIMEOUT:-3.5}")
+    printf '\n### Working Set\n'
+    lattice_hook_call_raw "${working_set_call[@]}" || true
+    return "$primary_status"
+  fi
+
+  lattice_hook_call_raw "$@"
 }
 
 lattice_limit_chars() {
