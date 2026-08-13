@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,6 +132,8 @@ enum AdoptionEvent {
     },
     MemoryRetrieval {
         timestamp_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_id: Option<String>,
         session_id: String,
         client: String,
         channel: String,
@@ -138,6 +142,8 @@ enum AdoptionEvent {
     },
     MemoryUse {
         timestamp_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_id: Option<String>,
         retrieval_id: String,
         used_count: u64,
     },
@@ -225,6 +231,7 @@ impl AdoptionMetricsStore {
     pub(crate) fn record_memory_retrieval(&self, record: MemoryRetrievalRecord) -> Result<()> {
         self.append_event(AdoptionEvent::MemoryRetrieval {
             timestamp_secs: now_secs(),
+            metric_id: None,
             session_id: clean_key(&record.session_id, "unknown-session"),
             client: clean_key(&record.client, "unknown-client"),
             channel: clean_key(&record.channel, "unknown-channel"),
@@ -239,9 +246,57 @@ impl AdoptionMetricsStore {
     pub(crate) fn record_memory_use(&self, record: MemoryUseRecord) -> Result<()> {
         self.append_event(AdoptionEvent::MemoryUse {
             timestamp_secs: now_secs(),
+            metric_id: None,
             retrieval_id: clean_identifier(&record.retrieval_id, "unknown-retrieval"),
             used_count: record.used_count,
         })
+    }
+
+    /// Appends a retrieval metric exactly once for a caller-supplied stable
+    /// metric id. Returns true only when this call appends the event; a
+    /// recovered retry of the same event returns false.
+    ///
+    /// The id lookup and append occur under both the in-process mutex and a
+    /// workspace-local advisory file lock. The event is synced before return,
+    /// so a process crash after the append is safe to retry.
+    pub(crate) fn record_memory_retrieval_once(
+        &self,
+        metric_id: &str,
+        record: MemoryRetrievalRecord,
+    ) -> Result<bool> {
+        let metric_id = stable_metric_id(metric_id)?;
+        self.append_event_once(
+            metric_id.clone(),
+            AdoptionEvent::MemoryRetrieval {
+                timestamp_secs: now_secs(),
+                metric_id: Some(metric_id),
+                session_id: clean_key(&record.session_id, "unknown-session"),
+                client: clean_key(&record.client, "unknown-client"),
+                channel: clean_key(&record.channel, "unknown-channel"),
+                retrieval_id: clean_identifier(&record.retrieval_id, "unknown-retrieval"),
+                retrieved_count: record.retrieved_count,
+            },
+        )
+    }
+
+    /// Appends a use metric exactly once for a caller-supplied stable metric
+    /// id. It has the same atomic recovery and return-value contract as
+    /// record_memory_retrieval_once.
+    pub(crate) fn record_memory_use_once(
+        &self,
+        metric_id: &str,
+        record: MemoryUseRecord,
+    ) -> Result<bool> {
+        let metric_id = stable_metric_id(metric_id)?;
+        self.append_event_once(
+            metric_id.clone(),
+            AdoptionEvent::MemoryUse {
+                timestamp_secs: now_secs(),
+                metric_id: Some(metric_id),
+                retrieval_id: clean_identifier(&record.retrieval_id, "unknown-retrieval"),
+                used_count: record.used_count,
+            },
+        )
     }
 
     pub(crate) fn record_memory_injection(&self, record: MemoryInjectionRecord) -> Result<()> {
@@ -277,12 +332,36 @@ impl AdoptionMetricsStore {
     }
 
     fn append_event(&self, event: AdoptionEvent) -> Result<()> {
-        let mut state = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
+        let mut state = self.lock_state()?;
         self.ensure_parent_dir()?;
+        let _file_lock = self.acquire_file_lock()?;
         self.compact_if_due(&mut state)?;
+        self.append_event_unlocked(&event)
+    }
+
+    fn append_event_once(&self, metric_id: String, event: AdoptionEvent) -> Result<bool> {
+        let mut state = self.lock_state()?;
+        self.ensure_parent_dir()?;
+        let _file_lock = self.acquire_file_lock()?;
+        self.compact_if_due(&mut state)?;
+        let events = self.read_events_unlocked()?;
+        if events
+            .iter()
+            .any(|existing| event_metric_id(existing) == Some(metric_id.as_str()))
+        {
+            return Ok(false);
+        }
+        self.append_event_unlocked(&event)?;
+        Ok(true)
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StoreState>> {
+        self.lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))
+    }
+
+    fn append_event_unlocked(&self, event: &AdoptionEvent) -> Result<()> {
         let mut line = serde_json::to_string(&event)?;
         line.push('\n');
         let mut file = OpenOptions::new()
@@ -290,19 +369,26 @@ impl AdoptionMetricsStore {
             .append(true)
             .open(&self.path)
             .with_context(|| format!("failed to open {}", self.path.display()))?;
-        // Keep an event and its delimiter in one append operation. O_APPEND
-        // then prevents separate daemon processes from interleaving records.
-        file.write_all(line.as_bytes())?;
-        file.flush()
-            .with_context(|| format!("failed to append {}", self.path.display()))
+        // Keep an event and its delimiter in one append operation. O_APPEND,
+        // combined with the sidecar lock, keeps records from interleaving;
+        // sync_data makes an acknowledged metric durable before retry logic
+        // can treat its id as consumed.
+        let written = file.write(line.as_bytes())?;
+        if written != line.len() {
+            return Err(anyhow::anyhow!(
+                "short append to {}: wrote {written} of {} bytes",
+                self.path.display(),
+                line.len()
+            ));
+        }
+        file.sync_data()
+            .with_context(|| format!("failed to sync appended {}", self.path.display()))
     }
 
     fn read_ledger(&self) -> Result<AdoptionLedger> {
-        let mut state = self
-            .lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))?;
+        let mut state = self.lock_state()?;
         self.ensure_parent_dir()?;
+        let _file_lock = self.acquire_file_lock()?;
         self.compact_if_due(&mut state)?;
         let events = self.read_events_unlocked()?;
         Ok(ledger_from_events(&events))
@@ -316,13 +402,35 @@ impl AdoptionMetricsStore {
         Ok(())
     }
 
+    fn acquire_file_lock(&self) -> Result<File> {
+        let lock_path = self.path.with_extension("jsonl.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open adoption metrics lock {}",
+                    lock_path.display()
+                )
+            })?;
+        lock_file_exclusive(&file).with_context(|| {
+            format!(
+                "failed to acquire adoption metrics lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(file)
+    }
+
     fn compact_if_due(&self, state: &mut StoreState) -> Result<()> {
         let today = current_epoch_day();
         if state.last_compaction_day == Some(today) {
             return Ok(());
         }
-        state.last_compaction_day = Some(today);
         if !self.path.exists() {
+            state.last_compaction_day = Some(today);
             return Ok(());
         }
 
@@ -339,21 +447,35 @@ impl AdoptionMetricsStore {
             serde_json::to_writer(&mut file, &event)?;
             file.write_all(b"\n")?;
         }
-        file.flush()?;
+        file.sync_all()?;
         fs::rename(&temp, &self.path).with_context(|| {
             format!(
                 "failed to replace adoption metrics {} with compacted ledger",
                 self.path.display()
             )
-        })
+        })?;
+        sync_parent_directory(&self.path)?;
+        state.last_compaction_day = Some(today);
+        Ok(())
     }
 
     fn read_events_unlocked(&self) -> Result<Vec<AdoptionEvent>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let text = fs::read_to_string(&self.path)
+        let mut text = fs::read_to_string(&self.path)
             .with_context(|| format!("failed to read {}", self.path.display()))?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            let final_line_start = text.rfind('\n').map_or(0, |index| index + 1);
+            let final_line = &text[final_line_start..];
+            if serde_json::from_str::<AdoptionEvent>(final_line).is_ok() {
+                self.append_delimiter_unlocked()?;
+                text.push('\n');
+            } else {
+                self.discard_torn_tail_unlocked(final_line_start)?;
+                text.truncate(final_line_start);
+            }
+        }
         let mut events = Vec::new();
         for (line_number, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -370,6 +492,83 @@ impl AdoptionMetricsStore {
         }
         Ok(events)
     }
+
+    fn append_delimiter_unlocked(&self) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        file.write_all(b"\n")?;
+        file.sync_data()
+            .with_context(|| format!("failed to sync repaired {}", self.path.display()))
+    }
+
+    fn discard_torn_tail_unlocked(&self, retained_len: usize) -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        file.set_len(retained_len as u64)
+            .with_context(|| format!("failed to discard torn tail from {}", self.path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync repaired {}", self.path.display()))
+    }
+}
+
+fn stable_metric_id(metric_id: &str) -> Result<String> {
+    let metric_id = metric_id.trim();
+    if metric_id.is_empty() {
+        return Err(anyhow::anyhow!("adoption metric id must not be empty"));
+    }
+    if metric_id.chars().any(char::is_control) {
+        return Err(anyhow::anyhow!(
+            "adoption metric id must not contain control characters"
+        ));
+    }
+    Ok(metric_id.to_string())
+}
+
+fn event_metric_id(event: &AdoptionEvent) -> Option<&str> {
+    match event {
+        AdoptionEvent::MemoryRetrieval { metric_id, .. }
+        | AdoptionEvent::MemoryUse { metric_id, .. } => metric_id.as_deref(),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    // SAFETY: flock only reads the valid file descriptor and retains no pointer state.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "adoption metric deduplication requires Unix flock",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("adoption metrics path has no parent"))?;
+    File::open(parent)
+        .with_context(|| format!("failed to open {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn source_from_arguments(
@@ -807,6 +1006,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn watcher_edit_credits_only_same_session_and_suggested_file() {
@@ -949,6 +1149,120 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn stable_metric_id_appends_once_even_when_recovery_metadata_changes() {
+        let root = unique_root("metric-id-deduplication");
+        let store = AdoptionMetricsStore::new(&root);
+        let record = MemoryRetrievalRecord {
+            session_id: "session-a".to_string(),
+            client: "codex".to_string(),
+            channel: "hook".to_string(),
+            retrieval_id: "retrieval-a".to_string(),
+            retrieved_count: 2,
+        };
+
+        assert!(store
+            .record_memory_retrieval_once("retrieval:retrieval-a", record.clone())
+            .expect("first append"));
+        assert!(!store
+            .record_memory_retrieval_once("retrieval:retrieval-a", record.clone())
+            .expect("recovered retry"));
+        assert!(!store
+            .record_memory_retrieval_once(
+                "retrieval:retrieval-a",
+                MemoryRetrievalRecord {
+                    session_id: "session-after-restart".to_string(),
+                    retrieved_count: 3,
+                    ..record
+                },
+            )
+            .expect("recovery retry with a new request session"));
+
+        let contents = fs::read_to_string(&store.path).expect("read log");
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("\"metric_id\":\"retrieval:retrieval-a\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_metric_id_deduplicates_across_independent_store_instances() {
+        let root = unique_root("cross-store-metric-id-deduplication");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let store = AdoptionMetricsStore::new(&root);
+                barrier.wait();
+                store.record_memory_use_once(
+                    "use:terminal-a",
+                    MemoryUseRecord {
+                        retrieval_id: "retrieval-a".to_string(),
+                        used_count: 1,
+                    },
+                )
+            }));
+        }
+        barrier.wait();
+        let inserted = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("worker panicked")
+                    .expect("metric append")
+            })
+            .filter(|inserted| *inserted)
+            .count();
+
+        assert_eq!(inserted, 1);
+        let store = AdoptionMetricsStore::new(&root);
+        let contents = fs::read_to_string(&store.path).expect("read log");
+        assert_eq!(contents.lines().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_metric_append_discards_a_torn_final_jsonl_record_before_deduping() {
+        let root = unique_root("torn-metric-id-append");
+        let store = AdoptionMetricsStore::new(&root);
+        let durable = AdoptionEvent::ObservedEdit {
+            timestamp_secs: now_secs(),
+            session_id: "session-a".to_string(),
+            file: "src/auth.rs".to_string(),
+        };
+        store.ensure_parent_dir().expect("metrics parent");
+        fs::write(
+            &store.path,
+            format!(
+                "{}\n{{\"kind\":\"memory_retrieval\",\"timestamp_secs\":",
+                serde_json::to_string(&durable).expect("serialize durable event")
+            ),
+        )
+        .expect("seed torn log");
+
+        assert!(store
+            .record_memory_retrieval_once(
+                "retrieval:after-crash",
+                MemoryRetrievalRecord {
+                    session_id: "session-a".to_string(),
+                    client: "codex".to_string(),
+                    channel: "hook".to_string(),
+                    retrieval_id: "retrieval-after-crash".to_string(),
+                    retrieved_count: 1,
+                },
+            )
+            .expect("recover torn log and append"));
+
+        let contents = fs::read_to_string(&store.path).expect("read repaired log");
+        assert_eq!(contents.lines().count(), 2);
+        assert!(contents
+            .lines()
+            .all(|line| serde_json::from_str::<AdoptionEvent>(line).is_ok()));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn call(timestamp: u64, session: &str, tool: &str, files: &[&str]) -> AdoptionEvent {
         AdoptionEvent::ToolCall {
             timestamp_secs: timestamp,
@@ -972,6 +1286,7 @@ mod tests {
     fn memory_retrieval(timestamp: u64, retrieval_id: &str, retrieved_count: u64) -> AdoptionEvent {
         AdoptionEvent::MemoryRetrieval {
             timestamp_secs: timestamp,
+            metric_id: None,
             session_id: "session-a".to_string(),
             client: "codex".to_string(),
             channel: "hook".to_string(),
@@ -983,6 +1298,7 @@ mod tests {
     fn memory_use(timestamp: u64, retrieval_id: &str, used_count: u64) -> AdoptionEvent {
         AdoptionEvent::MemoryUse {
             timestamp_secs: timestamp,
+            metric_id: None,
             retrieval_id: retrieval_id.to_string(),
             used_count,
         }

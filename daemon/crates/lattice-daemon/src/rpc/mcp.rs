@@ -12,7 +12,8 @@ use lattice_core::consolidation::{
 };
 use lattice_core::embeddings::EmbeddingEngine;
 use lattice_core::events::{
-    BranchRef, EventPage, EventQuery, EventReader, EventWriter, QueryOrder, SessionId,
+    Actor, BranchRef, EventKind, EventPage, EventQuery, EventReader, EventWriter, QueryOrder,
+    SessionId,
 };
 use lattice_core::graph::model::CodeGraph;
 use lattice_core::identity::MemoryId;
@@ -29,6 +30,10 @@ use lattice_core::memory::model::MemoryStructuredFields;
 use lattice_core::memory::{
     Memory, MemoryClass, MemoryQueryAuthority, MemoryRecallTier, MemoryScope, MemoryStore,
     MemoryStoreRouter, MemoryType, MemoryVerificationStatus,
+};
+use lattice_core::memory_graph::{
+    initialize_schema as initialize_memory_graph_schema, list_accesses_for, mark_used,
+    record_access, MemoryAccess, MemoryAccessId,
 };
 use lattice_core::query::engine::{QueryAdmission, QueryAdmissionError};
 use lattice_core::query::{ContextCapsule, QueryEngine};
@@ -52,10 +57,15 @@ use super::workflow_v2::{
 use super::working_memory_tool;
 use crate::adoption_metrics::{
     source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore,
-    MemoryRetrievalRecord, ToolCallRecord,
+    MemoryRetrievalRecord, MemoryUseRecord, ToolCallRecord,
 };
 use crate::index_health::IndexHealth;
 use crate::index_work::IndexWorkCoordinator;
+use crate::memory_attribution::{
+    AccessDisposition, AccessResolution, MemoryAttributionBridge, MemoryAttributionEvents,
+    MemoryAttributionGraph, MemoryAttributionMetrics, PendingMemoryAccess, RetrievalRecord,
+    RetrievedMemory,
+};
 use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
 use crate::runtime_support::{
     background_vector_sync_enabled, build_incremental_index_for_roots, load_incremental_cache,
@@ -92,6 +102,8 @@ pub struct McpHandler {
     context_cache: Arc<Mutex<ContextHandleCache>>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
+    memory_attribution: Option<Arc<McpMemoryAttributionRuntime>>,
+    memory_attribution_error: Option<String>,
     /// Monotonic per-handler sequence so every observed retrieval has a
     /// durable, joinable id without exposing internal ledger details on MCP.
     memory_retrieval_sequence: AtomicU64,
@@ -116,6 +128,243 @@ pub struct McpHandler {
 struct SharedMemoryRuntime {
     store: Arc<Mutex<MemoryStore>>,
     organization_id: String,
+}
+
+struct McpMemoryAttributionRuntime {
+    workspace_id: String,
+    branch: String,
+    graph: StdMutex<rusqlite::Connection>,
+    index_path: PathBuf,
+    event_writer: Arc<EventWriter>,
+}
+
+struct McpAttributionMetrics<'a> {
+    store: &'a AdoptionMetricsStore,
+    session_id: &'a str,
+    client: String,
+    channel: String,
+}
+
+impl McpMemoryAttributionRuntime {
+    fn open(
+        workspace_root: &Path,
+        workspace_id: String,
+        branch: String,
+        event_writer: Arc<EventWriter>,
+    ) -> Result<Self, String> {
+        let lattice_dir = workspace_root.join(".lattice");
+        std::fs::create_dir_all(&lattice_dir)
+            .map_err(|error| format!("failed to create attribution directory: {error}"))?;
+        let graph = rusqlite::Connection::open(lattice_dir.join("memory_graph.db"))
+            .map_err(|error| format!("failed to open memory graph: {error}"))?;
+        initialize_memory_graph_schema(&graph)
+            .map_err(|error| format!("failed to initialize memory graph: {error}"))?;
+        Ok(Self {
+            workspace_id,
+            branch,
+            graph: StdMutex::new(graph),
+            index_path: lattice_dir.join("memory_attribution.db"),
+            event_writer,
+        })
+    }
+
+    fn bridge<'a>(
+        &'a self,
+        metrics: &'a dyn MemoryAttributionMetrics,
+    ) -> Result<MemoryAttributionBridge<'a>, String> {
+        MemoryAttributionBridge::open(
+            &self.index_path,
+            self.workspace_id.clone(),
+            self,
+            self,
+            metrics,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn session_events(
+        &self,
+        event: &lattice_core::identity::EventId,
+    ) -> Result<Vec<lattice_core::events::EventEnvelope>, String> {
+        if event.workspace_id != self.workspace_id {
+            return Err(format!(
+                "event workspace `{}` does not match runtime workspace `{}`",
+                event.workspace_id, self.workspace_id
+            ));
+        }
+        EventReader::new(self.event_writer.store())
+            .execute(
+                EventQuery::new()
+                    .workspace(self.workspace_id.clone())
+                    .branch(self.branch.clone())
+                    .limit(10_000)
+                    .order(QueryOrder::NewestFirst),
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl MemoryAttributionEvents for McpMemoryAttributionRuntime {
+    fn validate_retrieval(
+        &self,
+        retrieval_event: &lattice_core::identity::EventId,
+        tool_call_event: &lattice_core::identity::EventId,
+    ) -> Result<(), String> {
+        let events = self.session_events(retrieval_event)?;
+        let call_position = events
+            .iter()
+            .position(|event| {
+                event.event_id == *tool_call_event && event.kind == EventKind::ToolCalled
+            })
+            .ok_or_else(|| "tool call event is absent or has the wrong kind".to_string())?;
+        let retrieval_position = events
+            .iter()
+            .position(|event| {
+                event.event_id == *retrieval_event && event.kind == EventKind::MemoryRetrieved
+            })
+            .ok_or_else(|| "retrieval event is absent or has the wrong kind".to_string())?;
+        if retrieval_position >= call_position {
+            return Err("retrieval event must follow its tool call event".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_outcome(
+        &self,
+        retrieval_event: &lattice_core::identity::EventId,
+        terminal_outcome_event: &lattice_core::identity::EventId,
+    ) -> Result<(), String> {
+        let events = self.session_events(retrieval_event)?;
+        let retrieval_position = events
+            .iter()
+            .position(|event| {
+                event.event_id == *retrieval_event && event.kind == EventKind::MemoryRetrieved
+            })
+            .ok_or_else(|| "retrieval event is absent or has the wrong kind".to_string())?;
+        let terminal_position = events
+            .iter()
+            .position(|event| {
+                event.event_id == *terminal_outcome_event
+                    && matches!(
+                        event.kind,
+                        EventKind::WorkflowSucceeded | EventKind::WorkflowFailed
+                    )
+            })
+            .ok_or_else(|| "terminal outcome event is absent or has the wrong kind".to_string())?;
+        if terminal_position >= retrieval_position {
+            return Err("terminal outcome event must follow the retrieval event".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl MemoryAttributionGraph for McpMemoryAttributionRuntime {
+    fn record_pending_accesses(&self, accesses: &[PendingMemoryAccess]) -> Result<(), String> {
+        let mut connection = self
+            .graph
+            .lock()
+            .map_err(|_| "memory graph lock poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for pending in accesses {
+            let existing = list_accesses_for(&transaction, &pending.memory_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|access| access.access_id == pending.access_id);
+            let expected = MemoryAccess {
+                access_id: pending.access_id.clone(),
+                memory_id: pending.memory_id.clone(),
+                accessed_at: lattice_core::Utc::now(),
+                accessed_in_event: pending.retrieval_event.clone(),
+                accessor: pending.accessor.clone(),
+                inclusion_reason: pending.inclusion_reason.clone(),
+                was_used: None,
+                downstream_outcome_event: None,
+            };
+            match existing {
+                Some(existing)
+                    if existing.access_id == expected.access_id
+                        && existing.memory_id == expected.memory_id
+                        && existing.accessed_in_event == expected.accessed_in_event
+                        && existing.accessor == expected.accessor
+                        && existing.inclusion_reason == expected.inclusion_reason
+                        && existing.was_used.is_none()
+                        && existing.downstream_outcome_event.is_none() => {}
+                Some(_) => {
+                    return Err(format!(
+                        "memory access `{}` already exists with a different payload",
+                        pending.access_id
+                    ))
+                }
+                None => {
+                    record_access(&transaction, &expected).map_err(|error| error.to_string())?
+                }
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn resolve_accesses(&self, resolutions: &[AccessResolution]) -> Result<(), String> {
+        let mut connection = self
+            .graph
+            .lock()
+            .map_err(|_| "memory graph lock poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for resolution in resolutions {
+            mark_used(
+                &transaction,
+                &resolution.access_id,
+                resolution.was_used,
+                Some(&resolution.terminal_outcome_event),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+impl MemoryAttributionMetrics for McpAttributionMetrics<'_> {
+    fn record_retrieval(
+        &self,
+        metric_id: &str,
+        retrieval_id: &str,
+        retrieved_count: u64,
+    ) -> Result<(), String> {
+        self.store
+            .record_memory_retrieval_once(
+                metric_id,
+                MemoryRetrievalRecord {
+                    session_id: self.session_id.to_string(),
+                    client: self.client.clone(),
+                    channel: self.channel.clone(),
+                    retrieval_id: retrieval_id.to_string(),
+                    retrieved_count,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_use(
+        &self,
+        metric_id: &str,
+        retrieval_id: &str,
+        used_count: u64,
+    ) -> Result<(), String> {
+        self.store
+            .record_memory_use_once(
+                metric_id,
+                MemoryUseRecord {
+                    retrieval_id: retrieval_id.to_string(),
+                    used_count,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -456,7 +705,7 @@ impl McpHandler {
             match EventCapture::new(
                 writer.clone(),
                 workspace_id,
-                branch,
+                branch.clone(),
                 SessionId {
                     value: session_id.clone(),
                 },
@@ -484,6 +733,25 @@ impl McpHandler {
                 }
             }
         });
+        let adoption_metrics = Arc::new(AdoptionMetricsStore::new(&workspace_root));
+        let (memory_attribution, memory_attribution_error) = match event_writer.as_ref() {
+            Some(writer) => match McpMemoryAttributionRuntime::open(
+                &workspace_root,
+                memory_workspace_id.clone(),
+                branch.clone(),
+                writer.clone(),
+            ) {
+                Ok(runtime) => (Some(Arc::new(runtime)), None),
+                Err(error) => {
+                    tracing::error!(%error, "memory attribution disabled for session");
+                    (None, Some(error))
+                }
+            },
+            None => (
+                None,
+                Some("event capture is unavailable for this MCP session".to_string()),
+            ),
+        };
         Self {
             engine,
             query_admission: QueryAdmission::new(MAX_CONCURRENT_QUERY_JOBS)
@@ -506,7 +774,9 @@ impl McpHandler {
                 context_cache_path,
             ))),
             session_metrics: Arc::new(Mutex::new(SessionMetrics::new())),
-            adoption_metrics: Arc::new(AdoptionMetricsStore::new(&workspace_root)),
+            adoption_metrics,
+            memory_attribution,
+            memory_attribution_error,
             memory_retrieval_sequence: AtomicU64::new(0),
             client_name: Arc::new(Mutex::new(None)),
             event_capture,
@@ -1056,7 +1326,18 @@ impl McpHandler {
                             "linked_tests": { "type": "array", "items": { "type": "string" } },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
-                            "tests": { "type": "array", "items": { "type": "string" } }
+                            "tests": { "type": "array", "items": { "type": "string" } },
+                            "memory_attribution": {
+                                "type": "object",
+                                "description": "Optional exact attribution claim from a prior recall result. No memory use is inferred when omitted.",
+                                "properties": {
+                                    "retrieval_id": { "type": "string" },
+                                    "access_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                                    "disposition": { "type": "string", "enum": ["used", "not_used"] }
+                                },
+                                "required": ["retrieval_id", "access_ids", "disposition"],
+                                "additionalProperties": false
+                            }
                         },
                         "required": ["content"]
                     }
@@ -1111,11 +1392,12 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing tool name".to_string()))?;
         let arguments = &params["arguments"];
+        validate_memory_attribution_arguments(tool_name, arguments)?;
         let span = tracing::info_span!("tool", name = tool_name);
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
         let started = Instant::now();
 
-        let result = match tokio::time::timeout(Duration::from_secs(5), async {
+        let mut result = match tokio::time::timeout(Duration::from_secs(5), async {
             match tool_name {
                 "context" => self.tool_agent_context(arguments).await,
                 "prepare_change" => self.tool_agent_prepare_change(arguments).await,
@@ -1140,6 +1422,14 @@ impl McpHandler {
             }))),
         };
 
+        self.attach_memory_attribution(
+            tool_name,
+            arguments,
+            tool_called_event.as_ref(),
+            &mut result,
+        )
+        .await;
+
         if let Ok(ref value) = result {
             self.record_tool_metrics(tool_name, value).await;
         }
@@ -1149,7 +1439,7 @@ impl McpHandler {
             result.as_ref().ok(),
             started.elapsed(),
         )
-            .await;
+        .await;
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
             .await;
 
@@ -1994,6 +2284,17 @@ impl McpHandler {
                                 "description": "Optional tests that verified the outcome",
                                 "items": { "type": "string" }
                             },
+                            "memory_attribution": {
+                                "type": "object",
+                                "description": "Optional exact attribution claim from a prior recall result. No memory use is inferred when omitted.",
+                                "properties": {
+                                    "retrieval_id": { "type": "string" },
+                                    "access_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                                    "disposition": { "type": "string", "enum": ["used", "not_used"] }
+                                },
+                                "required": ["retrieval_id", "access_ids", "disposition"],
+                                "additionalProperties": false
+                            },
                             "dry_run": {
                                 "type": "boolean",
                                 "description": "When true, compute the durable memory content, refresh key, identifiers, and scope without writing memory. Use for live MCP verification probes.",
@@ -2309,11 +2610,12 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing tool name".to_string()))?;
         let arguments = &params["arguments"];
+        validate_memory_attribution_arguments(tool_name, arguments)?;
         let span = tracing::info_span!("tool", name = tool_name);
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
         let started = Instant::now();
 
-        let result = async {
+        let mut result = async {
             match tool_name {
                 "get_context_capsule" => self.tool_query_context(arguments).await,
                 "prepare_change" => self.tool_prepare_change(arguments).await,
@@ -2363,6 +2665,14 @@ impl McpHandler {
         .instrument(span)
         .await;
 
+        self.attach_memory_attribution(
+            tool_name,
+            arguments,
+            tool_called_event.as_ref(),
+            &mut result,
+        )
+        .await;
+
         if let Ok(ref value) = result {
             if tool_name != "get_session_metrics" {
                 self.record_tool_metrics(tool_name, value).await;
@@ -2375,7 +2685,7 @@ impl McpHandler {
                 result.as_ref().ok(),
                 started.elapsed(),
             )
-                .await;
+            .await;
         }
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
             .await;
@@ -2398,6 +2708,157 @@ impl McpHandler {
                 tracing::warn!(tool = tool_name, %error, "failed to capture tool call event");
                 None
             }
+        }
+    }
+
+    async fn attach_memory_attribution(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        tool_called_event: Option<&lattice_core::identity::EventId>,
+        result: &mut Result<Value, (i32, String)>,
+    ) {
+        if !tool_attempts_memory_retrieval(tool_name, arguments) {
+            return;
+        }
+        let Some(response) = result.as_mut().ok() else {
+            return;
+        };
+        let Some(mut payload) = unwrap_tool_text_json(response) else {
+            return;
+        };
+        let Some(retrieved) =
+            extract_attributable_memories(&payload, &self.memory_workspace_id, tool_name)
+        else {
+            return;
+        };
+
+        let Some(runtime) = self.memory_attribution.as_ref() else {
+            if let Some(error) = self.memory_attribution_error.as_deref() {
+                attach_memory_attribution_diagnostic(&mut payload, error);
+                replace_wrapped_tool_payload(response, &payload);
+            }
+            return;
+        };
+        let Some(tool_called_event) = tool_called_event else {
+            attach_memory_attribution_diagnostic(
+                &mut payload,
+                "the durable tool-call event was not recorded",
+            );
+            replace_wrapped_tool_payload(response, &payload);
+            return;
+        };
+        let Some(capture) = self.event_capture.as_ref() else {
+            return;
+        };
+        let ids = retrieved
+            .iter()
+            .map(|memory| memory.memory_id.clone())
+            .collect::<Vec<_>>();
+        let reasons = retrieved
+            .iter()
+            .map(|memory| memory.inclusion_reason.clone())
+            .collect::<Vec<_>>();
+        let retrieval_event = match capture.record_memory_retrieved(&ids, &reasons) {
+            Ok(event) => event,
+            Err(error) => {
+                attach_memory_attribution_diagnostic(
+                    &mut payload,
+                    &format!("failed to persist retrieval event: {error}"),
+                );
+                replace_wrapped_tool_payload(response, &payload);
+                return;
+            }
+        };
+        let default_client = self
+            .client_name
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "mcp".to_string());
+        let source = source_from_arguments(arguments, &default_client, "mcp");
+        let metrics = McpAttributionMetrics {
+            store: self.adoption_metrics.as_ref(),
+            session_id: &self.session_id,
+            client: source.client,
+            channel: source.channel,
+        };
+        let pending = runtime.bridge(&metrics).and_then(|bridge| {
+            bridge
+                .record_retrieval(RetrievalRecord {
+                    retrieval_event: retrieval_event.clone(),
+                    tool_call_event: tool_called_event.clone(),
+                    accessor: Actor::Daemon,
+                    memories: retrieved.clone(),
+                })
+                .map_err(|error| error.to_string())
+        });
+        match pending {
+            Ok(pending) => {
+                let accesses = retrieved
+                    .iter()
+                    .zip(pending.access_ids.iter())
+                    .map(|(memory, access_id)| {
+                        json!({
+                            "memory_id": memory.memory_id.ulid,
+                            "access_id": access_id.as_str(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "memory_attribution".to_string(),
+                        json!({
+                            "status": "recorded",
+                            "retrieval_id": pending.retrieval_id,
+                            "retrieval_event_id": pending.retrieval_event,
+                            "accesses": accesses,
+                        }),
+                    );
+                }
+            }
+            Err(error) => attach_memory_attribution_diagnostic(&mut payload, &error),
+        }
+        replace_wrapped_tool_payload(response, &payload);
+    }
+
+    fn resolve_explicit_memory_attribution(
+        &self,
+        arguments: &Value,
+        terminal_event: lattice_core::identity::EventId,
+    ) {
+        let Some(claim) = parse_memory_attribution_claim(arguments) else {
+            return;
+        };
+        let Some(runtime) = self.memory_attribution.as_ref() else {
+            tracing::warn!(
+                error = self
+                    .memory_attribution_error
+                    .as_deref()
+                    .unwrap_or("unavailable"),
+                "explicit memory attribution could not be resolved"
+            );
+            return;
+        };
+        let metrics = McpAttributionMetrics {
+            store: self.adoption_metrics.as_ref(),
+            session_id: &self.session_id,
+            client: "mcp".to_string(),
+            channel: "mcp".to_string(),
+        };
+        let result = runtime.bridge(&metrics).and_then(|bridge| {
+            bridge
+                .resolve_accesses(
+                    &claim.retrieval_id,
+                    terminal_event,
+                    claim.disposition,
+                    &claim.access_ids,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, retrieval_id = claim.retrieval_id, "explicit memory attribution resolution failed");
         }
     }
 
@@ -2428,23 +2889,45 @@ impl McpHandler {
                 return;
             }
         };
-        if !WorkflowOutcomeRecorder::should_record(tool_name) {
-            if let Err(error) = capture.record_workflow_events(tool_name, &outcome, tool_result) {
-                tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+        let terminal_event = if !WorkflowOutcomeRecorder::should_record(tool_name) {
+            let captured = if result_contains_recorded_memory_attribution(result) {
+                capture
+                    .record_workflow_outcome(
+                        result.is_ok(),
+                        tool_name,
+                        &result_summary_for_attribution(result),
+                        std::slice::from_ref(&tool_result),
+                    )
+                    .map(|event| vec![event])
+            } else {
+                capture.record_workflow_events(tool_name, &outcome, tool_result)
+            };
+            match captured {
+                Ok(events) => events.last().cloned(),
+                Err(error) => {
+                    tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+                    None
+                }
             }
-            return;
-        }
-
-        let mut metrics = self.session_metrics.lock().await;
-        if let Err(error) = self.workflow_outcome_recorder.record(
-            capture,
-            &mut metrics,
-            tool_name,
-            arguments,
-            result,
-            &tool_result,
-        ) {
-            tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+        } else {
+            let mut metrics = self.session_metrics.lock().await;
+            match self.workflow_outcome_recorder.record(
+                capture,
+                &mut metrics,
+                tool_name,
+                arguments,
+                result,
+                &tool_result,
+            ) {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    tracing::warn!(tool = tool_name, %error, "failed to capture workflow outcome events");
+                    None
+                }
+            }
+        };
+        if let Some(terminal_event) = terminal_event {
+            self.resolve_explicit_memory_attribution(arguments, terminal_event);
         }
     }
 
@@ -5008,8 +5491,10 @@ impl McpHandler {
         annotate_memory_freshness_values(&mut memory_values, &memories, &self.workspace_root);
         let retrieved_count = memory_values.len();
         drop(store);
-        self.record_memory_retrieval("search_memory", args, retrieved_count)
-            .await;
+        if self.memory_attribution.is_none() {
+            self.record_memory_retrieval("search_memory", args, retrieved_count)
+                .await;
+        }
 
         Ok(wrap_tool_result(json!({
             "query": query,
@@ -5090,8 +5575,10 @@ impl McpHandler {
         let retrieved_count = values.len();
         drop(shared_store);
         drop(repository_store);
-        self.record_memory_retrieval("search_memory", args, retrieved_count)
-            .await;
+        if self.memory_attribution.is_none() {
+            self.record_memory_retrieval("search_memory", args, retrieved_count)
+                .await;
+        }
         Ok(wrap_tool_result(json!({
             "query": query,
             "memories": values,
@@ -5535,26 +6022,28 @@ impl McpHandler {
         .map_err(|error| (-32603, error))?;
         let retrieved_count = bundle.memories.len();
         drop(store);
-        if let Some(capture) = &self.event_capture {
-            let ids: Vec<_> = bundle
-                .memories
-                .iter()
-                .map(|memory| MemoryId {
-                    workspace_id: self.memory_workspace_id.clone(),
-                    ulid: memory.id.clone(),
-                })
-                .collect();
-            let reasons: Vec<String> = bundle
-                .memories
-                .iter()
-                .map(|memory| memory.inclusion_reason.clone())
-                .collect();
-            if let Err(error) = capture.record_memory_retrieved(&ids, &reasons) {
-                tracing::warn!(tool = "get_task_memory", %error, "failed to capture memory retrieval");
+        if self.memory_attribution.is_none() {
+            if let Some(capture) = &self.event_capture {
+                let ids: Vec<_> = bundle
+                    .memories
+                    .iter()
+                    .map(|memory| MemoryId {
+                        workspace_id: self.memory_workspace_id.clone(),
+                        ulid: memory.id.clone(),
+                    })
+                    .collect();
+                let reasons: Vec<String> = bundle
+                    .memories
+                    .iter()
+                    .map(|memory| memory.inclusion_reason.clone())
+                    .collect();
+                if let Err(error) = capture.record_memory_retrieved(&ids, &reasons) {
+                    tracing::warn!(tool = "get_task_memory", %error, "failed to capture memory retrieval");
+                }
             }
+            self.record_memory_retrieval("get_task_memory", args, retrieved_count)
+                .await;
         }
-        self.record_memory_retrieval("get_task_memory", args, retrieved_count)
-            .await;
         serde_json::to_value(&bundle)
             .map(wrap_tool_result)
             .map_err(|error| (-32603, format!("Serialization error: {error}")))
@@ -9723,12 +10212,10 @@ fn extract_wrapped_tool_metrics(
 }
 
 fn parse_wrapped_tool_payload(text: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .or_else(|| {
-            text.split_once("\n\nStructured payload:\n")
-                .and_then(|(_, payload)| serde_json::from_str::<Value>(payload).ok())
-        })
+    serde_json::from_str::<Value>(text).ok().or_else(|| {
+        text.split_once("\n\nStructured payload:\n")
+            .and_then(|(_, payload)| serde_json::from_str::<Value>(payload).ok())
+    })
 }
 
 fn dedupe_memory_values(values: &mut Vec<Value>) {
@@ -9883,14 +10370,16 @@ fn summarize_repo_playbook_memory_content(report: &RepoPlaybook) -> String {
 mod tests {
     use super::{
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
-        memory_seed_values, parse_wrapped_tool_payload, report_memory_highlights,
-        parse_shared_memory_config, parse_workflow_response_options,
-        seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
-        stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
-        wrap_tool_result, wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler,
-        SharedMemoryRuntime, WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
+        memory_seed_values, parse_shared_memory_config, parse_workflow_response_options,
+        parse_wrapped_tool_payload, report_memory_highlights, seed_from_plan_edit_bundle,
+        seed_from_task_bundle, seed_from_trace_scenario_bundle, stable_refresh_key,
+        summarize_workflow_outcome_content, workflow_outcome_identifiers, wrap_tool_result,
+        wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler, SharedMemoryRuntime,
+        WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
     };
+    use lattice_core::events::{EventStore, EventWriter};
     use lattice_core::graph::CodeGraph;
+    use lattice_core::identity::{encode_identity, Identity, MemoryId as GraphMemoryId};
     use lattice_core::indexer::Indexer;
     use lattice_core::intelligence::ExpandContextSeed;
     use lattice_core::intelligence::{
@@ -10625,6 +11114,194 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[test]
+    fn memory_attribution_helpers_require_exact_repository_ids_and_claim_fields() {
+        let memories = super::extract_attributable_memories(
+            &json!({
+                "memories": [
+                    {"id": "repo-memory", "workspace_id": "repo-a", "inclusion_reason": "exact task match"},
+                    {"id": "shared-memory", "source_tier": "organization"},
+                    {"id": "foreign-memory", "workspace_id": "repo-b"}
+                ]
+            }),
+            "repo-a",
+            "recall",
+        )
+        .expect("memory collection");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id.ulid, "repo-memory");
+        assert_eq!(memories[0].inclusion_reason, "exact task match");
+
+        let claim = super::parse_memory_attribution_claim(&json!({
+            "memory_attribution": {
+                "retrieval_id": "retrieval-1",
+                "access_ids": ["access-1"],
+                "disposition": "used"
+            }
+        }))
+        .expect("exact claim");
+        assert_eq!(claim.retrieval_id, "retrieval-1");
+        assert_eq!(claim.access_ids[0].as_str(), "access-1");
+        assert_eq!(claim.disposition, super::AccessDisposition::Used);
+        assert!(super::parse_memory_attribution_claim(&json!({
+            "memory_attribution": {
+                "retrieval_id": "retrieval-1",
+                "access_ids": [],
+                "disposition": "used"
+            }
+        }))
+        .is_none());
+        assert!(super::parse_memory_attribution_claim(&json!({
+            "memory_attribution": {
+                "retrieval_id": "retrieval-1",
+                "memory_ids": ["repo-memory"],
+                "disposition": "used"
+            }
+        }))
+        .is_none());
+        assert!(super::validate_memory_attribution_arguments(
+            "search_memory",
+            &json!({
+                "memory_attribution": {
+                    "retrieval_id": "retrieval-1",
+                    "access_ids": ["access-1"],
+                    "disposition": "used"
+                }
+            })
+        )
+        .is_err());
+        assert!(super::validate_memory_attribution_arguments(
+            "record_workflow_outcome",
+            &json!({
+                "dry_run": true,
+                "memory_attribution": {
+                    "retrieval_id": "retrieval-1",
+                    "access_ids": ["access-1"],
+                    "disposition": "used"
+                }
+            })
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_recall_records_graph_access_and_only_explicit_outcome_resolves_it() {
+        let (handler, memory_store, workspace_root) =
+            build_attributed_memory_test_handler("attribution-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        let canonical_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let memory_id = {
+            let store = memory_store.lock().await;
+            store
+                .store(Memory {
+                    id: canonical_memory_id.to_string(),
+                    session_id: "prior-session".to_string(),
+                    content: "Exact attribution integration memory".to_string(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 0.95,
+                    linked_symbols: Vec::new(),
+                    linked_files: vec!["src/attribution.rs".to_string()],
+                    workspace_id: Some(workspace_id.clone()),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: Some("attribution integration".to_string()),
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Verified,
+                })
+                .expect("seed repository memory")
+        };
+        seed_memory_graph_identity(&handler, &memory_id);
+
+        let response = RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "search_memory",
+                "arguments": {
+                    "query": "attribution integration",
+                    "_lattice_client": "codex",
+                    "_lattice_channel": "mcp"
+                }
+            }),
+        )
+        .await
+        .expect("memory retrieval succeeds");
+        let payload = super::unwrap_tool_text_json(&response).expect("retrieval payload");
+        assert_eq!(payload["memory_attribution"]["status"], "recorded");
+        let retrieval_id = payload["memory_attribution"]["retrieval_id"]
+            .as_str()
+            .expect("retrieval id")
+            .to_string();
+        let access_id = payload["memory_attribution"]["accesses"][0]["access_id"]
+            .as_str()
+            .expect("access id")
+            .to_string();
+
+        let graph_memory_id = GraphMemoryId {
+            workspace_id: workspace_id.clone(),
+            ulid: memory_id.clone(),
+        };
+        let before = {
+            let runtime = handler.memory_attribution.as_ref().expect("runtime");
+            let graph = runtime.graph.lock().expect("graph lock");
+            lattice_core::memory_graph::list_accesses_for(&graph, &graph_memory_id)
+                .expect("access rows")
+        };
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].access_id.as_str(), access_id);
+        assert_eq!(before[0].was_used, None);
+        assert_eq!(before[0].downstream_outcome_event, None);
+
+        RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "record_workflow_outcome",
+                "arguments": {
+                    "task": "verify attribution integration",
+                    "status": "success",
+                    "summary": "the retrieved memory directly informed the completed work",
+                    "memory_attribution": {
+                        "retrieval_id": retrieval_id,
+                        "access_ids": [access_id],
+                        "disposition": "used"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("explicit terminal outcome succeeds");
+
+        let after = {
+            let runtime = handler.memory_attribution.as_ref().expect("runtime");
+            let graph = runtime.graph.lock().expect("graph lock");
+            lattice_core::memory_graph::list_accesses_for(&graph, &graph_memory_id)
+                .expect("resolved access rows")
+        };
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].was_used, Some(true));
+        assert!(after[0].downstream_outcome_event.is_some());
+
+        let metric_events =
+            std::fs::read_to_string(workspace_root.join(".lattice/adoption_metrics.jsonl"))
+                .expect("adoption ledger");
+        assert_eq!(
+            metric_events
+                .matches("\"kind\":\"memory_retrieval\"")
+                .count(),
+            1
+        );
+        assert_eq!(metric_events.matches("\"kind\":\"memory_use\"").count(), 1);
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
     async fn workflow_memory_results_record_empty_recall_misses() {
         let (handler, _, workspace_root) = build_memory_test_handler("workflow-metrics-session");
@@ -10801,6 +11478,78 @@ mod tests {
         (handler, memory_store, workspace_root)
     }
 
+    fn build_attributed_memory_test_handler(
+        session_id: &str,
+    ) -> (McpHandler, Arc<Mutex<MemoryStore>>, PathBuf) {
+        let workspace_root = unique_test_path("lattice-mcp-attributed-memory");
+        std::fs::create_dir_all(workspace_root.join(".lattice"))
+            .expect("failed to create temp workspace");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        let event_store = Arc::new(
+            EventStore::open(&workspace_root.join(".lattice/events.db"))
+                .expect("event store opens"),
+        );
+        let event_writer = Arc::new(EventWriter::new(event_store, workspace_id, 4096));
+        let memory_store = Arc::new(Mutex::new(
+            MemoryStore::open_in_memory().expect("memory store"),
+        ));
+        let handler = McpHandler::new(
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+            memory_store.clone(),
+            Arc::new(Mutex::new(
+                GraphStore::open_in_memory().expect("graph store"),
+            )),
+            Arc::new(OnceLock::new()),
+            None,
+            workspace_root.clone(),
+            workspace_root.join("context_handles.json"),
+            session_id.to_string(),
+            None,
+            vec![workspace_root.clone()],
+            Arc::new(AtomicBool::new(false)),
+            Some(event_writer),
+            Vec::new(),
+            Vec::new(),
+        );
+        (handler, memory_store, workspace_root)
+    }
+
+    fn seed_memory_graph_identity(handler: &McpHandler, memory_id: &str) {
+        let runtime = handler
+            .memory_attribution
+            .as_ref()
+            .expect("attribution runtime");
+        let encoded = encode_identity(&Identity::Memory(GraphMemoryId {
+            workspace_id: handler.memory_workspace_id.clone(),
+            ulid: memory_id.to_string(),
+        }));
+        runtime
+            .graph
+            .lock()
+            .expect("memory graph lock")
+            .execute(
+                "INSERT INTO memories (
+                    memory_id, content, class, assertion_type, scope,
+                    scope_session_id, scope_branch, scope_workspace_id, scope_user_id, scope_org_id,
+                    verification_status, confidence, confidence_reason, freshness_policy_json,
+                    validity_conditions_json, invalidation_triggers_json, provenance_event_ids_json,
+                    evidence_references_json, linked_files_json, linked_symbols_json, linked_docs_json,
+                    linked_tests_json, linked_memories_json, contradiction_links_json,
+                    supersession_links_json, access_history_json, last_verified_event_id,
+                    last_verified_state, usefulness_score, usefulness_score_updated_at,
+                    created_at, created_by, updated_at, updated_by, superseded_by, schema_version
+                 ) VALUES (
+                    ?1, 'attribution test memory', 'pattern', 'observation', 'repo',
+                    NULL, NULL, ?2, NULL, NULL, 'verified', 0.9, 'test evidence', '{}',
+                    '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]',
+                    NULL, NULL, 0, 0, 0, 'test', 0, 'test', NULL, 1
+                 )",
+                rusqlite::params![encoded, handler.memory_workspace_id],
+            )
+            .expect("seed graph memory identity");
+    }
+
     #[test]
     fn shared_memory_config_accepts_only_absolute_store_paths() {
         let config = parse_shared_memory_config(
@@ -10812,9 +11561,11 @@ mod tests {
             config.shared_store_path.as_deref(),
             Some(std::path::Path::new("/var/tmp/cadres-memories.db"))
         );
-        assert!(parse_shared_memory_config("[memory]\nshared_store_path = \"relative.db\"\n")
-            .unwrap_err()
-            .contains("absolute"));
+        assert!(
+            parse_shared_memory_config("[memory]\nshared_store_path = \"relative.db\"\n")
+                .unwrap_err()
+                .contains("absolute")
+        );
     }
 
     #[tokio::test]
@@ -12774,6 +13525,178 @@ fn workflow_memory_result_count(value: &Value) -> Option<usize> {
         .or_else(|| object.get("memories"))
         .and_then(Value::as_array)
         .map(Vec::len)
+}
+
+#[derive(Debug)]
+struct MemoryAttributionClaim {
+    retrieval_id: String,
+    disposition: AccessDisposition,
+    access_ids: Vec<MemoryAccessId>,
+}
+
+fn tool_attempts_memory_retrieval(tool_name: &str, arguments: &Value) -> bool {
+    match tool_name {
+        "search_memory" | "get_task_memory" => true,
+        "recall" => matches!(
+            arguments["mode"]
+                .as_str()
+                .unwrap_or(AGENT_RECALL_MODE_DEFAULT),
+            "search" | "task"
+        ),
+        _ => false,
+    }
+}
+
+fn extract_attributable_memories(
+    payload: &Value,
+    workspace_id: &str,
+    tool_name: &str,
+) -> Option<Vec<RetrievedMemory>> {
+    let values = payload
+        .get("memory_highlights")
+        .or_else(|| payload.get("memories"))?
+        .as_array()?;
+    let mut memories = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        if value.get("source_tier").and_then(Value::as_str) == Some("organization")
+            || value.get("memory_tier").and_then(Value::as_str) == Some("organization")
+        {
+            continue;
+        }
+        let id = value
+            .get("id")
+            .or_else(|| value.get("memory_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let item_workspace = value
+            .get("workspace_id")
+            .or_else(|| value.get("workspace"))
+            .and_then(Value::as_str)
+            .unwrap_or(workspace_id);
+        if item_workspace != workspace_id || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let inclusion_reason = value
+            .get("inclusion_reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!("{tool_name} selected this repository memory for the requested retrieval")
+            });
+        memories.push(RetrievedMemory {
+            memory_id: MemoryId {
+                workspace_id: workspace_id.to_string(),
+                ulid: id.to_string(),
+            },
+            inclusion_reason,
+        });
+    }
+    Some(memories)
+}
+
+fn attach_memory_attribution_diagnostic(payload: &mut Value, error: &str) {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "memory_attribution".to_string(),
+            json!({
+                "status": "unavailable",
+                "error": truncate_text_value(error, 240),
+            }),
+        );
+    }
+}
+
+fn replace_wrapped_tool_payload(response: &mut Value, payload: &Value) {
+    let Some(text) = response
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.first_mut())
+        .and_then(|item| item.get_mut("text"))
+    else {
+        return;
+    };
+    *text = Value::String(serde_json::to_string(payload).unwrap_or_else(|_| payload.to_string()));
+}
+
+fn result_contains_recorded_memory_attribution(result: &Result<Value, (i32, String)>) -> bool {
+    result
+        .as_ref()
+        .ok()
+        .and_then(unwrap_tool_text_json)
+        .and_then(|payload| payload.get("memory_attribution").cloned())
+        .and_then(|attribution| attribution.get("status").cloned())
+        .and_then(|status| status.as_str().map(ToString::to_string))
+        .as_deref()
+        == Some("recorded")
+}
+
+fn result_summary_for_attribution(result: &Result<Value, (i32, String)>) -> String {
+    match result {
+        Ok(_) => "memory retrieval completed".to_string(),
+        Err((_, message)) => truncate_text_value(message, 240),
+    }
+}
+
+fn parse_memory_attribution_claim(arguments: &Value) -> Option<MemoryAttributionClaim> {
+    let value = arguments.get("memory_attribution")?.as_object()?;
+    let retrieval_id = value.get("retrieval_id")?.as_str()?.trim().to_string();
+    if retrieval_id.is_empty() {
+        return None;
+    }
+    let disposition = match value.get("disposition")?.as_str()? {
+        "used" => AccessDisposition::Used,
+        "not_used" => AccessDisposition::NotUsed,
+        _ => return None,
+    };
+    let access_ids = value
+        .get("access_ids")?
+        .as_array()?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| MemoryAccessId(value.to_string()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if access_ids.is_empty() {
+        return None;
+    }
+    Some(MemoryAttributionClaim {
+        retrieval_id,
+        disposition,
+        access_ids,
+    })
+}
+
+fn validate_memory_attribution_arguments(
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<(), (i32, String)> {
+    if arguments.get("memory_attribution").is_none() {
+        return Ok(());
+    }
+    let terminal_tool = tool_name == "record_workflow_outcome"
+        || (tool_name == "remember" && arguments["kind"].as_str() == Some("outcome"));
+    if !terminal_tool || arguments["dry_run"].as_bool().unwrap_or(false) {
+        return Err((
+            -32602,
+            "memory_attribution is accepted only on a non-dry-run workflow outcome".to_string(),
+        ));
+    }
+    if parse_memory_attribution_claim(arguments).is_none() {
+        return Err((
+            -32602,
+            "memory_attribution requires a non-empty retrieval_id, at least one exact access_id, and disposition 'used' or 'not_used'"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn object_get<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
