@@ -15,6 +15,11 @@ use lattice_core::events::{
     Actor, BranchRef, EventKind, EventPage, EventQuery, EventReader, EventWriter, QueryOrder,
     SessionId,
 };
+use lattice_core::git_intelligence::GitIntelligenceSnapshot;
+use lattice_core::git_intelligence_consumers::{
+    missing_cochange_partners, order_impact_within_tier, secondary_ranking_evidence,
+    GitIntelligenceView, ImpactCandidate,
+};
 use lattice_core::graph::model::CodeGraph;
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
@@ -37,7 +42,7 @@ use lattice_core::memory_graph::{
 };
 use lattice_core::query::engine::{QueryAdmission, QueryAdmissionError};
 use lattice_core::query::{ContextCapsule, QueryEngine};
-use lattice_core::storage::{GraphStore, SharedVectorIndex};
+use lattice_core::storage::{GraphStore, SharedVectorIndex, StoredGitIntelligenceSnapshot};
 use lattice_core::symbols::stable_file_handle;
 use lattice_core::verification::ScopeFilter;
 use lattice_core::watcher::should_index_file;
@@ -122,6 +127,67 @@ pub struct McpHandler {
     refresh_running: Arc<AtomicBool>,
     watcher_health: Arc<WatcherHealth>,
     index_health: Arc<IndexHealth>,
+    /// Read-only, in-memory view of snapshots already published by the Git
+    /// intelligence runtime. MCP must never mine history or reopen graph.db.
+    git_intelligence: Option<GitIntelligenceSnapshotHandle>,
+}
+
+/// Runtime-to-MCP handoff for already-published Git-intelligence snapshots.
+///
+/// The runtime owns publication and freshness transitions. Request handling
+/// only clones a bounded in-memory snapshot, so presenting history evidence
+/// cannot perform repository traversal or database I/O.
+#[derive(Clone, Default)]
+pub(crate) struct GitIntelligenceSnapshotHandle {
+    snapshots: Arc<StdMutex<HashMap<String, McpGitIntelligenceSnapshot>>>,
+}
+
+#[derive(Clone)]
+struct McpGitIntelligenceSnapshot {
+    generation: i64,
+    snapshot: Arc<GitIntelligenceSnapshot>,
+    is_fresh: bool,
+}
+
+#[allow(dead_code)]
+impl GitIntelligenceSnapshotHandle {
+    pub(crate) fn publish(
+        &self,
+        stored: StoredGitIntelligenceSnapshot,
+        is_fresh: bool,
+    ) -> Result<(), String> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| "Git-intelligence snapshot handoff lock was poisoned".to_string())?;
+        snapshots.insert(
+            stored.repository_id,
+            McpGitIntelligenceSnapshot {
+                generation: stored.generation,
+                snapshot: Arc::new(stored.snapshot),
+                is_fresh,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn mark_stale(&self, repository_id: &str) -> Result<(), String> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| "Git-intelligence snapshot handoff lock was poisoned".to_string())?;
+        if let Some(snapshot) = snapshots.get_mut(repository_id) {
+            snapshot.is_fresh = false;
+        }
+        Ok(())
+    }
+
+    fn read(&self, repository_id: &str) -> Result<Option<McpGitIntelligenceSnapshot>, String> {
+        self.snapshots
+            .lock()
+            .map_err(|_| "Git-intelligence snapshot handoff lock was poisoned".to_string())
+            .map(|snapshots| snapshots.get(repository_id).cloned())
+    }
 }
 
 #[derive(Clone)]
@@ -792,6 +858,30 @@ impl McpHandler {
             refresh_running,
             watcher_health,
             index_health,
+            git_intelligence: None,
+        }
+    }
+
+    /// Installs the runtime-owned, in-memory Git-intelligence read handle.
+    /// Construction without this handoff remains valid and presents history as
+    /// unavailable rather than performing request-path recovery or I/O.
+    #[allow(dead_code)]
+    pub(crate) fn with_git_intelligence_snapshot_handle(
+        mut self,
+        handle: GitIntelligenceSnapshotHandle,
+    ) -> Self {
+        self.git_intelligence = Some(handle);
+        self
+    }
+
+    fn git_intelligence_snapshot(&self) -> Option<McpGitIntelligenceSnapshot> {
+        let handle = self.git_intelligence.as_ref()?;
+        match handle.read(&self.memory_workspace_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "Git-intelligence presentation disabled for request");
+                None
+            }
         }
     }
 
@@ -1508,8 +1598,21 @@ impl McpHandler {
         if routed.get("diff").and_then(Value::as_str).is_some() || direction == "diff" {
             return self.tool_impact_from_diff(&routed).await;
         }
+        let mut changed_paths = parse_string_array(&routed, "files");
+        if let Some(file) = routed.get("file").and_then(Value::as_str) {
+            changed_paths.push(file.to_string());
+        }
+        changed_paths.sort();
+        changed_paths.dedup();
+        let git_intelligence = self.git_intelligence_snapshot();
         if direction == "tests" {
-            return self.tool_find_relevant_tests(&routed).await;
+            let mut result = self.tool_find_relevant_tests(&routed).await?;
+            enrich_impact_tool_result_with_git_intelligence(
+                &mut result,
+                git_intelligence.as_ref(),
+                &changed_paths,
+            );
+            return Ok(result);
         }
 
         let impact = if routed["name"].as_str().is_none() && routed["file"].as_str().is_some() {
@@ -1524,15 +1627,21 @@ impl McpHandler {
                 _ => self.tool_blast_radius(&routed).await?,
             }
         };
-        if args["include_tests"].as_bool().unwrap_or(true) {
+        let mut result = if args["include_tests"].as_bool().unwrap_or(true) {
             let tests = self.tool_find_relevant_tests(&routed).await?;
-            Ok(wrap_tool_result(json!({
+            wrap_tool_result(json!({
                 "impact": unwrap_tool_text_json(&impact).unwrap_or(impact),
                 "tests": unwrap_tool_text_json(&tests).unwrap_or(tests)
-            })))
+            }))
         } else {
-            Ok(impact)
-        }
+            impact
+        };
+        enrich_impact_tool_result_with_git_intelligence(
+            &mut result,
+            git_intelligence.as_ref(),
+            &changed_paths,
+        );
+        Ok(result)
     }
 
     async fn tool_file_impact(
@@ -3003,6 +3112,10 @@ impl McpHandler {
             &mut bundle,
         )
         .await;
+        enrich_context_bundle_with_git_intelligence(
+            &mut bundle,
+            self.git_intelligence_snapshot().as_ref(),
+        );
         let mut value = serde_json::to_value(&bundle)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "get_context_capsule");
@@ -3574,6 +3687,7 @@ impl McpHandler {
             return Ok(response);
         }
 
+        let git_intelligence = self.git_intelligence_snapshot();
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
@@ -3599,12 +3713,22 @@ impl McpHandler {
                 entry_symbols: symbols.clone(),
                 render_mode: format!("{:?}", render_choice).to_lowercase(),
             };
-            let bundle = workflow_v2::impact_from_diff::build_bundle(
+            let mut bundle = workflow_v2::impact_from_diff::build_bundle(
                 engine.graph(),
                 &self.workspace_root.to_string_lossy(),
                 &request,
                 &report,
                 render_choice,
+            );
+            let changed_paths = report
+                .changed_files
+                .iter()
+                .map(|changed| changed.file.as_str())
+                .collect::<Vec<_>>();
+            enrich_impact_bundle_with_git_intelligence(
+                &mut bundle,
+                git_intelligence.as_ref(),
+                changed_paths,
             );
 
             (
@@ -7064,15 +7188,11 @@ impl McpHandler {
                     .map(|(d, _)| format!("{}:{}", d.file, d.name))
                     .collect();
 
-                // Hotspot score from edit_count
-                let hotspot = n.edit_count as f64;
-
                 Ok(json!({
                     "name": n.name,
                     "dependentCount": dependents.len(),
                     "crossRepoCount": cross_repo_count,
                     "topCallers": top_callers,
-                    "hotspot": hotspot,
                     "lastModified": n.last_modified.to_string()
                 }))
             }
@@ -7365,6 +7485,123 @@ fn busy_query_workflow_response(tool_name: &str, query: &str) -> Value {
 
 fn workflow_graph_is_empty(graph: &CodeGraph) -> bool {
     graph.stats().node_count == 0
+}
+
+fn git_intelligence_view(snapshot: Option<&McpGitIntelligenceSnapshot>) -> GitIntelligenceView<'_> {
+    snapshot.map_or_else(GitIntelligenceView::unavailable, |published| {
+        GitIntelligenceView::from_snapshot(published.snapshot.as_ref(), published.is_fresh)
+    })
+}
+
+fn enrich_context_bundle_with_git_intelligence(
+    bundle: &mut WorkflowBundle,
+    snapshot: Option<&McpGitIntelligenceSnapshot>,
+) {
+    let view = git_intelligence_view(snapshot);
+    let evidence = bundle
+        .ranked_pivots
+        .iter()
+        .filter_map(|pivot| {
+            let evidence =
+                secondary_ranking_evidence(view, pivot.file.as_deref()?, pivot.symbol.as_deref())?;
+            Some(json!({
+                "file": pivot.file,
+                "symbol": pivot.symbol,
+                "evidence": evidence,
+            }))
+        })
+        .collect::<Vec<_>>();
+    attach_git_intelligence_presentation(
+        &mut bundle.structured_payload,
+        json!({
+            "generation": snapshot.map(|published| published.generation),
+            "metadata": view.metadata(),
+            "secondary_ranking_evidence": evidence,
+        }),
+    );
+}
+
+fn enrich_impact_bundle_with_git_intelligence<I, S>(
+    bundle: &mut WorkflowBundle,
+    snapshot: Option<&McpGitIntelligenceSnapshot>,
+    changed_paths: I,
+) where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let view = git_intelligence_view(snapshot);
+    order_impact_pivots_within_primary_tiers(view, &mut bundle.ranked_pivots);
+    let advisory = missing_cochange_partners(view, changed_paths);
+    attach_git_intelligence_presentation(
+        &mut bundle.structured_payload,
+        json!({
+            "generation": snapshot.map(|published| published.generation),
+            "impact_advisory": advisory,
+        }),
+    );
+}
+
+fn enrich_impact_tool_result_with_git_intelligence(
+    result: &mut Value,
+    snapshot: Option<&McpGitIntelligenceSnapshot>,
+    changed_paths: &[String],
+) {
+    let view = git_intelligence_view(snapshot);
+    let advisory = missing_cochange_partners(view, changed_paths);
+    let mut payload = unwrap_tool_text_json(result).unwrap_or_else(|| result.clone());
+    attach_git_intelligence_presentation(
+        &mut payload,
+        json!({
+            "generation": snapshot.map(|published| published.generation),
+            "impact_advisory": advisory,
+        }),
+    );
+    *result = wrap_tool_result(payload);
+}
+
+fn order_impact_pivots_within_primary_tiers(
+    view: GitIntelligenceView<'_>,
+    pivots: &mut Vec<workflow_v2::Pivot>,
+) {
+    let original = std::mem::take(pivots);
+    let mut ordered = Vec::with_capacity(original.len());
+    let mut start = 0;
+    while start < original.len() {
+        let score = original[start].score.to_bits();
+        let end = original[start..]
+            .iter()
+            .position(|pivot| pivot.score.to_bits() != score)
+            .map_or(original.len(), |offset| start + offset);
+        let mut tier = original[start..end]
+            .iter()
+            .cloned()
+            .map(|pivot| ImpactCandidate {
+                stable_key: format!(
+                    "{}\0{}\0{}",
+                    pivot.file.as_deref().unwrap_or_default(),
+                    pivot.symbol.as_deref().unwrap_or(&pivot.label),
+                    pivot.line.unwrap_or_default()
+                ),
+                file_path: pivot.file.clone(),
+                stable_symbol: pivot.symbol.clone(),
+                candidate: pivot,
+            })
+            .collect::<Vec<_>>();
+        order_impact_within_tier(view, &mut tier);
+        ordered.extend(tier.into_iter().map(|candidate| candidate.candidate));
+        start = end;
+    }
+    *pivots = ordered;
+}
+
+fn attach_git_intelligence_presentation(payload: &mut Value, presentation: Value) {
+    if !payload.is_object() {
+        let original = std::mem::take(payload);
+        *payload = json!({ "result": original });
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("git_intelligence".to_string(), presentation);
+    }
 }
 
 fn apply_lsp_edge_to_graph(
@@ -10374,10 +10611,12 @@ mod tests {
         parse_wrapped_tool_payload, report_memory_highlights, seed_from_plan_edit_bundle,
         seed_from_task_bundle, seed_from_trace_scenario_bundle, stable_refresh_key,
         summarize_workflow_outcome_content, workflow_outcome_identifiers, wrap_tool_result,
-        wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler, SharedMemoryRuntime,
-        WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
+        wrap_workflow_tool_result, GitIntelligenceSnapshotHandle, McpHandler, QueryJobError,
+        RequestHandler, SharedMemoryRuntime, WorkflowRenderMode, WorkflowRunMetadata,
+        FULL_WORKFLOW_TOKEN_CAP,
     };
     use lattice_core::events::{EventStore, EventWriter};
+    use lattice_core::git_intelligence::{CommitSample, GitHistoryMiner, PathChange};
     use lattice_core::graph::CodeGraph;
     use lattice_core::identity::{encode_identity, Identity, MemoryId as GraphMemoryId};
     use lattice_core::indexer::Indexer;
@@ -10393,7 +10632,7 @@ mod tests {
     use lattice_core::memory::{MemoryScope, MemoryStore, MemoryType};
     use lattice_core::query::QueryEngine;
     use lattice_core::query::QueryIntent;
-    use lattice_core::storage::GraphStore;
+    use lattice_core::storage::{GraphStore, StoredGitIntelligenceSnapshot};
     use lattice_core::symbols::SymbolId;
     use lattice_core::symbols::{Language, SymbolKind};
     use serde_json::{json, Value};
@@ -12612,6 +12851,12 @@ export function sendGreeting(): string {
         let workspace_root = unique_test_path("lattice-mcp-context-capsule");
         std::fs::create_dir_all(&workspace_root).expect("failed to create temp workspace");
         let context_cache_path = workspace_root.join("context_handles.json");
+        let git_intelligence = GitIntelligenceSnapshotHandle::default();
+        let mut stored_git_intelligence = git_presentation_snapshot();
+        stored_git_intelligence.repository_id = workspace_root.to_string_lossy().to_string();
+        git_intelligence
+            .publish(stored_git_intelligence, true)
+            .expect("publish Git-intelligence handoff");
 
         let handler = McpHandler::new(
             Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
@@ -12633,7 +12878,8 @@ export function sendGreeting(): string {
             None,
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .with_git_intelligence_snapshot_handle(git_intelligence);
 
         let response = RequestHandler::handle(
             &handler,
@@ -12686,6 +12932,11 @@ export function sendGreeting(): string {
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| !value.is_empty()),
             "expected context handle: {payload:?}"
+        );
+        assert_eq!(
+            payload["structured_payload"]["git_intelligence"]["metadata"]["availability"],
+            "available",
+            "expected context presentation to consume the injected runtime snapshot: {payload:?}"
         );
 
         let _ = std::fs::remove_file(context_cache_path);
@@ -13081,6 +13332,212 @@ def detect_agent_version_drift(agent, rollout):
 
         let _ = std::fs::remove_file(context_cache_path);
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    fn git_presentation_snapshot() -> StoredGitIntelligenceSnapshot {
+        let commit = |id: &str, paths: &[(&str, &[&str])]| CommitSample {
+            id: id.to_string(),
+            author: Some("fixture@example.invalid".to_string()),
+            subject: "change fixture".to_string(),
+            changes: paths
+                .iter()
+                .map(|(path, symbols)| PathChange {
+                    path: (*path).to_string(),
+                    symbols: symbols.iter().map(|symbol| (*symbol).to_string()).collect(),
+                })
+                .collect(),
+        };
+        let snapshot = GitHistoryMiner::new(4).mine(vec![
+            commit(
+                "head",
+                &[("src/hot.rs", &["hot::run"]), ("src/partner.rs", &[])],
+            ),
+            commit(
+                "two",
+                &[("src/hot.rs", &["hot::run"]), ("src/partner.rs", &[])],
+            ),
+            commit(
+                "three",
+                &[("src/hot.rs", &["hot::run"]), ("src/partner.rs", &[])],
+            ),
+            commit("four", &[("src/cold.rs", &["cold::run"])]),
+        ]);
+        StoredGitIntelligenceSnapshot {
+            repository_id: "fixture-repository".to_string(),
+            generation: 7,
+            head_commit_id: Some("head".to_string()),
+            refreshed_at: 1,
+            snapshot,
+        }
+    }
+
+    fn git_presentation_bundle() -> super::WorkflowBundle {
+        use super::workflow_v2::{
+            Pivot, RenderChoice, StableIdentity, WorkflowBundle, WorkflowRecord,
+        };
+        let pivot = |label: &str, file: &str, symbol: &str| Pivot {
+            identity: StableIdentity::LegacyHandle(format!("symbol:{symbol}")),
+            kind: "symbol".to_string(),
+            label: label.to_string(),
+            file: Some(file.to_string()),
+            symbol: Some(symbol.to_string()),
+            line: Some(1),
+            score: 1.0,
+            inclusion_reason: "primary graph rank".to_string(),
+            relevance_summary: None,
+            relevance_breakdown: None,
+            relevance_detail_handle: None,
+            relevance_detail_focus: None,
+        };
+        WorkflowBundle {
+            overview: "fixture".to_string(),
+            ranked_pivots: vec![
+                pivot("cold", "src/cold.rs", "cold::run"),
+                pivot("hot", "src/hot.rs", "hot::run"),
+            ],
+            relevant_context: Vec::new(),
+            memory_highlights: Vec::new(),
+            memory_empty_rationale: None,
+            event_episodes: Vec::new(),
+            suggested_next_expansion: None,
+            stable_handles: Vec::new(),
+            risks: Vec::new(),
+            render_choice: RenderChoice {
+                mode: "compact".to_string(),
+                reason: "fixture".to_string(),
+            },
+            verification_commands: Vec::new(),
+            workflow_record: WorkflowRecord {
+                tool: "fixture".to_string(),
+                input: "fixture".to_string(),
+                resolved_anchors: Vec::new(),
+                selected_candidates: Vec::new(),
+                excluded_high_scoring_candidates: Vec::new(),
+                working_memory_summary: String::new(),
+            },
+            structured_payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn git_intelligence_handoff_is_repository_scoped_and_explicitly_stale() {
+        let handle = GitIntelligenceSnapshotHandle::default();
+        let stored = git_presentation_snapshot();
+        handle
+            .publish(stored.clone(), true)
+            .expect("publish handoff");
+
+        let published = handle
+            .read("fixture-repository")
+            .expect("read handoff")
+            .expect("published snapshot");
+        assert_eq!(published.generation, 7);
+        assert!(published.is_fresh);
+        assert!(handle
+            .read("other-repository")
+            .expect("other read")
+            .is_none());
+
+        handle
+            .mark_stale("fixture-repository")
+            .expect("mark handoff stale");
+        assert!(
+            !handle
+                .read("fixture-repository")
+                .expect("read stale handoff")
+                .expect("stale snapshot")
+                .is_fresh
+        );
+    }
+
+    #[test]
+    fn context_presentation_uses_core_secondary_evidence_without_changing_primary_order() {
+        let stored = git_presentation_snapshot();
+        let published = super::McpGitIntelligenceSnapshot {
+            generation: stored.generation,
+            snapshot: Arc::new(stored.snapshot),
+            is_fresh: true,
+        };
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_context_bundle_with_git_intelligence(&mut bundle, Some(&published));
+
+        assert_eq!(bundle.ranked_pivots[0].label, "cold");
+        assert_eq!(bundle.ranked_pivots[1].label, "hot");
+        let git = &bundle.structured_payload["git_intelligence"];
+        assert_eq!(git["metadata"]["availability"], "available");
+        assert_eq!(git["generation"], 7);
+        assert_eq!(
+            git["secondary_ranking_evidence"]
+                .as_array()
+                .expect("ranking evidence")
+                .len(),
+            2
+        );
+        let rendered = serde_json::to_value(&bundle).expect("serialize context bundle");
+        let summary = super::build_tool_result_summary(&rendered).expect("context summary");
+        assert!(summary.contains("Git history: available across 4 commit(s)"));
+    }
+
+    #[test]
+    fn impact_presentation_orders_only_within_primary_tier_and_surfaces_cochange_advisory() {
+        let stored = git_presentation_snapshot();
+        let published = super::McpGitIntelligenceSnapshot {
+            generation: stored.generation,
+            snapshot: Arc::new(stored.snapshot),
+            is_fresh: true,
+        };
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            Some(&published),
+            ["src/hot.rs"],
+        );
+
+        assert_eq!(bundle.ranked_pivots[0].label, "hot");
+        assert_eq!(bundle.ranked_pivots[1].label, "cold");
+        let advisory = &bundle.structured_payload["git_intelligence"]["impact_advisory"];
+        assert_eq!(advisory["metadata"]["availability"], "available");
+        assert_eq!(
+            advisory["missing_cochange_partners"][0]["partner_path"],
+            "src/partner.rs"
+        );
+    }
+
+    #[test]
+    fn unavailable_and_stale_history_are_explicit_and_never_affect_results() {
+        let mut unavailable = git_presentation_bundle();
+        super::enrich_context_bundle_with_git_intelligence(&mut unavailable, None);
+        let unavailable_git = &unavailable.structured_payload["git_intelligence"];
+        assert_eq!(unavailable_git["metadata"]["availability"], "unavailable");
+        assert!(unavailable_git["secondary_ranking_evidence"]
+            .as_array()
+            .expect("unavailable evidence")
+            .is_empty());
+
+        let stored = git_presentation_snapshot();
+        let stale = super::McpGitIntelligenceSnapshot {
+            generation: stored.generation,
+            snapshot: Arc::new(stored.snapshot),
+            is_fresh: false,
+        };
+        let mut impact = git_presentation_bundle();
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut impact,
+            Some(&stale),
+            ["src/hot.rs"],
+        );
+        assert_eq!(impact.ranked_pivots[0].label, "cold");
+        let advisory = &impact.structured_payload["git_intelligence"]["impact_advisory"];
+        assert_eq!(advisory["metadata"]["availability"], "stale");
+        assert!(advisory["missing_cochange_partners"]
+            .as_array()
+            .expect("stale advisory")
+            .is_empty());
+        let rendered = serde_json::to_value(&impact).expect("serialize impact bundle");
+        let summary = super::build_tool_result_summary(&rendered).expect("impact summary");
+        assert!(summary.contains("Git history: stale; signals suppressed."));
     }
 }
 
@@ -13739,6 +14196,10 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
         lines.push(format!("- Top symbol: `{}`", symbol));
     }
 
+    if let Some(git_summary) = git_intelligence_summary(object) {
+        lines.push(format!("- Git history: {git_summary}"));
+    }
+
     if let Some(contract) =
         object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
     {
@@ -13759,6 +14220,43 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
     } else {
         Some(lines.join("\n"))
     }
+}
+
+fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let git = object.get("git_intelligence").or_else(|| {
+        object
+            .get("structured_payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("git_intelligence"))
+    })?;
+    let metadata = git.get("metadata").or_else(|| {
+        git.get("impact_advisory")
+            .and_then(|advisory| advisory.get("metadata"))
+    })?;
+    let availability = metadata.get("availability")?.as_str()?;
+    if availability != "available" {
+        return Some(format!("{availability}; signals suppressed."));
+    }
+
+    let window = metadata
+        .get("window_commits")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let evidence_count = git
+        .get("secondary_ranking_evidence")
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    let partner_count = git
+        .get("impact_advisory")
+        .and_then(|advisory| advisory.get("missing_cochange_partners"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    let detail = match (evidence_count, partner_count) {
+        (Some(count), _) => format!("{count} ranked pivot evidence item(s)"),
+        (_, Some(count)) => format!("{count} missing co-change partner(s)"),
+        _ => "no applicable presentation evidence".to_string(),
+    };
+    Some(format!("available across {window} commit(s); {detail}."))
 }
 
 fn first_result_file(object: &serde_json::Map<String, Value>) -> Option<String> {
