@@ -25,6 +25,9 @@ pub(crate) enum ClientKind {
     StdioProxy,
     Cli,
     Doctor,
+    /// Private local adapter used by installed hook packages. The daemon
+    /// permits hook-session routes only for this authenticated client kind.
+    HookAdapter,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
