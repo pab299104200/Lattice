@@ -315,7 +315,6 @@ enum WorkflowWireFormat {
 enum WorkflowRenderMode {
     Json,
     Markdown,
-    Hybrid,
 }
 
 #[derive(Debug, Clone)]
@@ -916,7 +915,7 @@ impl McpHandler {
                             "focus": { "type": "string", "description": "Expansion focus for expand mode." },
                             "max_tokens": { "type": "integer" },
                             "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
-                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "render": { "type": "string", "enum": ["json", "markdown"], "default": "markdown" },
                             "wire_format": { "type": "string", "enum": ["standard", "dense"] }
                         }
                     }
@@ -940,7 +939,7 @@ impl McpHandler {
                             "entry_symbols": { "type": "array", "items": { "type": "string" } },
                             "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
                             "max_tokens": { "type": "integer" },
-                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "render": { "type": "string", "enum": ["json", "markdown"], "default": "markdown" },
                             "wire_format": { "type": "string", "enum": ["standard", "dense"] }
                         },
                         "required": ["task"]
@@ -966,7 +965,7 @@ impl McpHandler {
                             "limit": { "type": "integer", "default": AGENT_IMPACT_LIMIT_DEFAULT },
                             "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
                             "max_tokens": { "type": "integer" },
-                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "render": { "type": "string", "enum": ["json", "markdown"], "default": "markdown" },
                             "wire_format": { "type": "string", "enum": ["standard", "dense"] }
                         }
                     }
@@ -986,7 +985,7 @@ impl McpHandler {
                             "budget": { "type": "string", "enum": ["tiny", "compact", "full"] },
                             "mode": { "type": "string", "enum": ["auto", "compact", "full"], "default": "auto" },
                             "max_tokens": { "type": "integer" },
-                            "render": { "type": "string", "enum": ["json", "markdown", "hybrid"], "default": "hybrid" },
+                            "render": { "type": "string", "enum": ["json", "markdown"], "default": "markdown" },
                             "wire_format": { "type": "string", "enum": ["standard", "dense"] }
                         },
                         "required": ["failure_text"]
@@ -1128,7 +1127,12 @@ impl McpHandler {
         if let Ok(ref value) = result {
             self.record_tool_metrics(tool_name, value).await;
         }
-        self.record_adoption_tool_call(tool_name, arguments, started.elapsed())
+        self.record_adoption_tool_call(
+            tool_name,
+            arguments,
+            result.as_ref().ok(),
+            started.elapsed(),
+        )
             .await;
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
             .await;
@@ -1410,9 +1414,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["query"]
@@ -1460,9 +1464,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["query"]
@@ -1510,9 +1514,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["query"]
@@ -1560,9 +1564,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["scenario"]
@@ -1638,9 +1642,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             },
                             "hops": {
                                 "type": "integer",
@@ -1693,9 +1697,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": []
@@ -1743,9 +1747,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["query"]
@@ -1779,9 +1783,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": []
@@ -1927,9 +1931,9 @@ impl McpHandler {
                             },
                             "render": {
                                 "type": "string",
-                                "description": "Workflow result rendering: 'hybrid' (default markdown summary + JSON payload), 'markdown', or 'json'",
-                                "enum": ["json", "markdown", "hybrid"],
-                                "default": "hybrid"
+                                "description": "Workflow result rendering: bounded Markdown summary by default, or structured JSON on request.",
+                                "enum": ["json", "markdown"],
+                                "default": "markdown"
                             }
                         },
                         "required": ["input"]
@@ -2349,7 +2353,12 @@ impl McpHandler {
             }
         }
         if tool_name != "get_session_metrics" {
-            self.record_adoption_tool_call(tool_name, arguments, started.elapsed())
+            self.record_adoption_tool_call(
+                tool_name,
+                arguments,
+                result.as_ref().ok(),
+                started.elapsed(),
+            )
                 .await;
         }
         self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
@@ -2430,7 +2439,7 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         if let Some(response) = self
             .workflow_repo_state_placeholder("get_context_capsule", query, response_options.render)
             .await
@@ -2517,7 +2526,7 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let entry_files = merge_unique_strings(
             merge_unique_strings(
                 parse_string_array(args, "entry_files"),
@@ -2696,7 +2705,7 @@ impl McpHandler {
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let entry_files = merge_unique_strings(
             parse_string_array(args, "entry_files"),
             self.default_focus_files.clone(),
@@ -2875,7 +2884,7 @@ impl McpHandler {
             .or_else(|| args["query"].as_str())
             .ok_or((-32602, "Missing required parameter: scenario".to_string()))?;
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let entry_files = parse_string_array(args, "entry_files");
         let entry_symbols = parse_string_array(args, "entry_symbols");
         if let Some(response) = self
@@ -2969,7 +2978,7 @@ impl McpHandler {
         let diff = args["diff"].as_str();
         let limit = (args["limit"].as_u64().unwrap_or(8) as usize).min(50);
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         if let Some(response) = self
             .workflow_repo_state_placeholder(
                 "find_relevant_tests",
@@ -3047,7 +3056,7 @@ impl McpHandler {
         );
         let symbols = parse_string_array(args, "symbols");
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let hops = (args["hops"].as_u64().unwrap_or(2) as usize).min(5);
         if let Some(response) = self
             .workflow_repo_state_placeholder("impact_from_diff", diff, response_options.render)
@@ -3132,7 +3141,7 @@ impl McpHandler {
         );
         let symbols = parse_string_array(args, "symbols");
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let memory_limit = if matches!(requested_mode, RequestedBundleMode::Full) {
             8
         } else {
@@ -3226,7 +3235,7 @@ impl McpHandler {
         let mut files = parse_string_array(args, "files");
         let mut symbols = parse_string_array(args, "symbols");
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let memory_limit = if matches!(requested_mode, RequestedBundleMode::Full) {
             6
         } else {
@@ -3460,7 +3469,7 @@ impl McpHandler {
 
     async fn tool_get_repo_playbook(&self, args: &Value) -> Result<Value, (i32, String)> {
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         let memory_limit = if matches!(requested_mode, RequestedBundleMode::Full) {
             8
         } else {
@@ -3546,7 +3555,7 @@ impl McpHandler {
         let symbols = parse_string_array(args, "symbols");
         let limit = (args["limit"].as_u64().unwrap_or(6) as usize).clamp(1, 20);
         let render_choice = WorkflowRenderChoice::from_mode_str(args["mode"].as_str());
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         if let Some(response) = self
             .workflow_repo_state_placeholder("get_docs_capsule", query, response_options.render)
             .await
@@ -3651,7 +3660,7 @@ impl McpHandler {
             .ok_or((-32602, "Missing required parameter: input".to_string()))?;
         let kind = args["kind"].as_str();
         let requested_mode = parse_requested_bundle_mode(args);
-        let response_options = parse_workflow_response_options(args);
+        let response_options = parse_workflow_response_options(args)?;
         if let Some(response) = self
             .workflow_repo_state_placeholder("diagnose_failure", input, response_options.render)
             .await
@@ -4459,6 +4468,7 @@ impl McpHandler {
         &self,
         tool_name: &str,
         arguments: &Value,
+        result: Option<&Value>,
         elapsed: Duration,
     ) {
         let default_client = self
@@ -4470,7 +4480,6 @@ impl McpHandler {
         let source = source_from_arguments(arguments, &default_client, "mcp");
         let latency_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         let suggested_files = result
-            .as_ref()
             .map(|value| suggested_files_from_tool_result(tool_name, value))
             .unwrap_or_default();
         if let Err(error) = self.adoption_metrics.record(ToolCallRecord {
@@ -7040,7 +7049,7 @@ fn parse_requested_bundle_mode(args: &Value) -> RequestedBundleMode {
     }
 }
 
-fn parse_workflow_response_options(args: &Value) -> WorkflowResponseOptions {
+fn parse_workflow_response_options(args: &Value) -> Result<WorkflowResponseOptions, (i32, String)> {
     let budget = match args["budget"].as_str() {
         Some("tiny") => WorkflowBudget::Tiny,
         Some("compact") => WorkflowBudget::Compact,
@@ -7054,19 +7063,24 @@ fn parse_workflow_response_options(args: &Value) -> WorkflowResponseOptions {
     };
     let render = match args["render"].as_str() {
         Some("json") => WorkflowRenderMode::Json,
-        Some("markdown") => WorkflowRenderMode::Markdown,
-        _ => WorkflowRenderMode::Hybrid,
+        Some("markdown") | None => WorkflowRenderMode::Markdown,
+        Some(render) => {
+            return Err((
+                -32602,
+                format!("Invalid render value: {render}. Expected 'markdown' or 'json'."),
+            ));
+        }
     };
     let max_tokens = args["max_tokens"]
         .as_u64()
         .map(|value| (value as usize).clamp(80, 4000));
 
-    WorkflowResponseOptions {
+    Ok(WorkflowResponseOptions {
         budget,
         max_tokens,
         wire_format,
         render,
-    }
+    })
 }
 
 fn select_task_bundle_mode(
@@ -8083,62 +8097,44 @@ fn stable_file_focus_value(file: &str) -> String {
     stable_file_handle(normalized)
 }
 
-fn attach_agent_retrieval_guidance(tool_name: &str, value: &mut Value) {
+fn attach_agent_retrieval_guidance(_tool_name: &str, value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
-    if object.contains_key("agent_retrieval_contract") {
-        return;
+    let next_action = workflow_next_action(object);
+    object.remove("agent_retrieval_contract");
+    if let Some(next_action) = next_action {
+        object.insert(
+            "agent_retrieval_contract".to_string(),
+            json!({ "next_action": next_action }),
+        );
     }
+}
 
-    let (best_for, why_not_rg, use_rg_if, next_action) = match tool_name {
-        "get_context_capsule" | "prepare_change" | "plan_edit" | "summarize_subsystem" => (
-            "working_set_discovery",
-            "Ranks files and symbols with graph relationships, symbol names, path conventions, tests, docs links, and memory signals; rg only finds literal text.",
-            "Use rg when you need an exact string, identifier spelling, config key, error text, or exhaustive textual occurrences.",
-            "Expand the suggested handle before opening multiple unfamiliar files.",
-        ),
-        "diagnose_failure" => (
-            "failure_triage",
-            "Maps raw failure text to likely files, symbols, related code, and tests; rg only finds the literal stack-trace terms.",
-            "Use rg when the failure contains a unique literal error string or file path you need to inspect directly.",
-            "Expand the top suspect or run the returned focused test.",
-        ),
-        "find_relevant_tests" => (
-            "test_ownership",
-            "Uses graph links, path conventions, changed files, and symbol overlap to pick tests; rg only finds textual references.",
-            "Use rg when you need every textual reference to a test name or symbol.",
-            "Run the highest-confidence tests first.",
-        ),
-        "impact_from_diff" => (
-            "change_impact",
-            "Uses changed symbols and dependents to find blast radius and tests; rg only finds text in the diff.",
-            "Use rg when reviewing exact changed strings or migration markers.",
-            "Review affected symbols and run the returned tests.",
-        ),
-        "trace_scenario" => (
-            "scenario_path_discovery",
-            "Uses likely entrypoints, call paths, guards, side effects, and failure branches; rg only finds scenario words.",
-            "Use rg when the scenario includes a unique route, error string, flag, or config key.",
-            "Expand the top execution-path or entrypoint handle.",
-        ),
-        _ => (
-            "indexed_context",
-            "Uses indexed code graph and metadata to find a working set; rg is better for exact literal search.",
-            "Use rg for exact string search or exhaustive occurrences.",
-            "Use suggested_expand when present.",
-        ),
-    };
+fn workflow_next_action(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let existing = object
+        .get("agent_retrieval_contract")
+        .and_then(Value::as_object)
+        .and_then(|contract| contract.get("next_action"))
+        .and_then(Value::as_str);
+    let suggested_expand = object
+        .get("suggested_expand")
+        .and_then(Value::as_object)
+        .and_then(|suggestion| suggestion.get("focus"))
+        .and_then(Value::as_str)
+        .map(|focus| format!("Expand `{focus}`."));
+    let next_step = object
+        .get("next_steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| steps.first())
+        .and_then(Value::as_str);
 
-    object.insert(
-        "agent_retrieval_contract".to_string(),
-        json!({
-            "best_for": best_for,
-            "why_not_rg": why_not_rg,
-            "use_rg_if": use_rg_if,
-            "next_action": next_action,
-        }),
-    );
+    existing
+        .or(suggested_expand.as_deref())
+        .or(next_step)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+        .map(|action| truncate_text_value(action, 96))
 }
 
 fn attach_workflow_budget_metadata(
@@ -8285,9 +8281,6 @@ fn dense_key(key: &str) -> &str {
         "semantic_fallback_used" => "se",
         "outcome_memory_reuse_count" => "or",
         "agent_retrieval_contract" => "arc",
-        "best_for" => "bf",
-        "why_not_rg" => "wnr",
-        "use_rg_if" => "uri",
         "next_action" => "na",
         "budget" => "bg",
         "budget_max_tokens" => "bmt",
@@ -9636,24 +9629,10 @@ fn extract_wrapped_tool_metrics(
 fn parse_wrapped_tool_payload(text: &str) -> Option<Value> {
     serde_json::from_str::<Value>(text)
         .ok()
-        .or_else(|| parse_json_fenced_block(text))
-        .or_else(|| parse_markdown_metrics_comment(text))
         .or_else(|| {
             text.split_once("\n\nStructured payload:\n")
                 .and_then(|(_, payload)| serde_json::from_str::<Value>(payload).ok())
         })
-}
-
-fn parse_json_fenced_block(text: &str) -> Option<Value> {
-    let (_, rest) = text.split_once("\n\n### Structured Payload\n```json\n")?;
-    let payload = rest.strip_suffix("\n```")?;
-    serde_json::from_str::<Value>(payload).ok()
-}
-
-fn parse_markdown_metrics_comment(text: &str) -> Option<Value> {
-    let (_, payload) = text.rsplit_once("<!-- lattice-metrics: ")?;
-    let payload = payload.strip_suffix(" -->")?;
-    serde_json::from_str::<Value>(payload).ok()
 }
 
 fn dedupe_memory_values(values: &mut Vec<Value>) {
@@ -9809,7 +9788,7 @@ mod tests {
     use super::{
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
         memory_seed_values, parse_wrapped_tool_payload, report_memory_highlights,
-        parse_shared_memory_config,
+        parse_shared_memory_config, parse_workflow_response_options,
         seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
         stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
         wrap_tool_result, wrap_workflow_tool_result, McpHandler, QueryJobError, RequestHandler,
@@ -10191,7 +10170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_workflow_tool_result_hybrid_prefixes_summary_before_json_payload() {
+    fn test_wrap_workflow_tool_result_markdown_returns_only_summary() {
         let wrapped = wrap_workflow_tool_result(
             json!({
                 "overview": "Likely edit: auth. focus loginUser.",
@@ -10209,7 +10188,7 @@ mod tests {
                     "reason": "top file"
                 }
             }),
-            WorkflowRenderMode::Hybrid,
+            WorkflowRenderMode::Markdown,
         );
 
         let text = wrapped["content"][0]["text"]
@@ -10219,17 +10198,9 @@ mod tests {
         assert!(text.contains("- Overview: Likely edit: auth. focus loginUser."));
         assert!(text.contains("- Top file: `src/auth.ts`"));
         assert!(text.contains("- Top symbol: `loginUser`"));
-        assert!(text.contains("### Structured Payload"));
-        assert!(text.contains("```json"));
-
-        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
-        assert_eq!(handle.as_deref(), Some("ctx-9"));
-        assert_eq!(origin.as_deref(), Some("prepare_change"));
-        assert_eq!(metadata.delivery_mode.as_deref(), Some("compact"));
-        assert_eq!(
-            metadata.suggested_expand_focus.as_deref(),
-            Some("file:src/auth.ts")
-        );
+        assert!(!text.contains("### Structured Payload"));
+        assert!(!text.contains("```json"));
+        assert!(!text.contains("lattice-metrics"));
     }
 
     #[test]
@@ -10267,7 +10238,7 @@ mod tests {
                     "reason": "Expand the lead pivot to inspect nearby code and relationships."
                 }
             }),
-            WorkflowRenderMode::Hybrid,
+            WorkflowRenderMode::Markdown,
         );
 
         let text = wrapped["content"][0]["text"]
@@ -10277,16 +10248,8 @@ mod tests {
         assert!(text.contains("- Query: how does auth login work"));
         assert!(text.contains("- Top file: `src/auth.ts`"));
         assert!(text.contains("- Top symbol: `loginUser`"));
-        assert!(text.contains("- Suggested expand: `symbol:loginUser`"));
-        assert!(text.contains("### Structured Payload"));
-
-        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
-        assert_eq!(handle.as_deref(), Some("ctx-11"));
-        assert_eq!(origin.as_deref(), Some("get_context_capsule"));
-        assert_eq!(
-            metadata.suggested_expand_focus.as_deref(),
-            Some("symbol:loginUser")
-        );
+        assert!(!text.contains("- Suggested expand:"));
+        assert!(!text.contains("### Structured Payload"));
     }
 
     #[test]
@@ -10419,7 +10382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_workflow_tool_result_markdown_keeps_hidden_metrics_comment() {
+    fn test_wrap_workflow_tool_result_markdown_omits_telemetry_comment() {
         let wrapped = wrap_workflow_tool_result(
             json!({
                 "overview": "Likely edit: auth. focus loginUser.",
@@ -10446,16 +10409,34 @@ mod tests {
         assert!(text.contains("### Summary"));
         assert!(text.contains("- Overview: Likely edit: auth. focus loginUser."));
         assert!(!text.contains("### Structured Payload"));
-        assert!(text.contains("<!-- lattice-metrics: "));
+        assert!(!text.contains("<!-- lattice-metrics: "));
+    }
 
-        let (_, _, handle, origin, metadata) = extract_wrapped_tool_metrics(&wrapped);
-        assert_eq!(handle.as_deref(), Some("ctx-10"));
-        assert_eq!(origin.as_deref(), Some("prepare_change"));
-        assert_eq!(metadata.delivery_mode.as_deref(), Some("compact"));
-        assert_eq!(
-            metadata.suggested_expand_focus.as_deref(),
-            Some("file:src/auth.ts")
+    #[test]
+    fn workflow_render_defaults_to_markdown_and_rejects_hybrid() {
+        let defaults = parse_workflow_response_options(&json!({}))
+            .expect("missing render must select markdown");
+        assert_eq!(defaults.render, WorkflowRenderMode::Markdown);
+
+        let error = parse_workflow_response_options(&json!({"render": "hybrid"}))
+            .expect_err("hybrid rendering must be rejected");
+        assert_eq!(error.0, -32602);
+        assert!(error.1.contains("Invalid render value: hybrid"));
+    }
+
+    #[test]
+    fn workflow_json_render_is_exactly_the_structured_payload() {
+        let wrapped = wrap_workflow_tool_result(
+            json!({"overview": "structured", "context_handle": "ctx-json"}),
+            WorkflowRenderMode::Json,
         );
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("JSON render text");
+        let payload: Value = serde_json::from_str(text).expect("valid JSON payload");
+        assert_eq!(payload["context_handle"].as_str(), Some("ctx-json"));
+        assert!(!text.contains("### Summary"));
+        assert!(!text.contains("lattice-metrics"));
     }
 
     #[test]
@@ -11600,17 +11581,17 @@ export function sendGreeting(): string {
                 .is_some_and(|value| !value.is_empty()),
             "expected non-empty context_handle in plan_edit payload: {payload:?}"
         );
-        let contract = payload
+        if let Some(contract) = payload
             .get("agent_retrieval_contract")
             .or_else(|| payload.get("arc"))
-            .expect("expected retrieval contract");
-        assert_eq!(
-            contract
-                .get("best_for")
-                .or_else(|| contract.get("bf"))
-                .and_then(|value| value.as_str()),
-            Some("working_set_discovery")
-        );
+        {
+            assert_eq!(contract.as_object().map(|fields| fields.len()), Some(1));
+            assert!(contract
+                .get("next_action")
+                .or_else(|| contract.get("na"))
+                .and_then(Value::as_str)
+                .is_some_and(|action| !action.is_empty() && action.len() <= 96));
+        }
         assert_eq!(
             payload
                 .get("budget")
@@ -11698,14 +11679,12 @@ export function sendGreeting(): string {
             payload["context_origin"].as_str(),
             Some("get_context_capsule")
         );
-        assert_eq!(
-            payload["agent_retrieval_contract"]["best_for"].as_str(),
-            Some("working_set_discovery")
-        );
-        assert_eq!(
-            payload["agent_retrieval_contract"]["use_rg_if"].as_str(),
-            Some("Use rg when you need an exact string, identifier spelling, config key, error text, or exhaustive textual occurrences.")
-        );
+        if let Some(contract) = payload.get("agent_retrieval_contract") {
+            assert_eq!(contract.as_object().map(|fields| fields.len()), Some(1));
+            assert!(contract["next_action"]
+                .as_str()
+                .is_some_and(|action| !action.is_empty() && action.len() <= 96));
+        }
         let pivots_array = payload["pivots"]
             .as_array()
             .or_else(|| payload["ranked_pivots"].as_array());
@@ -12543,17 +12522,7 @@ fn wrap_workflow_tool_result(value: Value, render: WorkflowRenderMode) -> Value 
 
     match render {
         WorkflowRenderMode::Json => wrap_text_result(serialized),
-        WorkflowRenderMode::Markdown => {
-            let mut text = format!("### Summary\n{}", summary);
-            if let Some(comment) = build_workflow_metrics_comment(&value) {
-                text.push_str("\n\n");
-                text.push_str(&comment);
-            }
-            wrap_text_result(text)
-        }
-        WorkflowRenderMode::Hybrid => wrap_text_result(format!(
-            "### Summary\n{summary}\n\n### Structured Payload\n```json\n{serialized}\n```"
-        )),
+        WorkflowRenderMode::Markdown => wrap_text_result(format!("### Summary\n{summary}")),
     }
 }
 
@@ -12564,123 +12533,6 @@ fn wrap_text_result(text: String) -> Value {
             "text": text
         }]
     })
-}
-
-fn build_workflow_metrics_comment(value: &Value) -> Option<String> {
-    let metadata = build_workflow_metrics_payload(value)?;
-    let serialized = serde_json::to_string(&metadata).ok()?;
-    Some(format!("<!-- lattice-metrics: {} -->", serialized))
-}
-
-fn build_workflow_metrics_payload(value: &Value) -> Option<Value> {
-    let object = value.as_object()?;
-    let mut metadata = serde_json::Map::new();
-
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "context_handle",
-        &["context_handle", "h"],
-    );
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "context_origin",
-        &["context_origin", "o"],
-    );
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "delivery_mode",
-        &["delivery_mode", "dm"],
-    );
-    copy_object_alias_value(object, &mut metadata, "wire_format", &["wire_format", "wf"]);
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "single_anchor_used",
-        &["single_anchor_used", "sa"],
-    );
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "semantic_fallback_used",
-        &["semantic_fallback_used", "se"],
-    );
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "outcome_memory_reuse_count",
-        &["outcome_memory_reuse_count", "or"],
-    );
-    copy_object_alias_value(object, &mut metadata, "budget", &["budget", "bg"]);
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "budget_max_tokens",
-        &["budget_max_tokens", "bmt"],
-    );
-    copy_object_alias_value(
-        object,
-        &mut metadata,
-        "approx_tokens",
-        &["approx_tokens", "apt"],
-    );
-    copy_object_alias_value(object, &mut metadata, "truncated", &["truncated", "tr"]);
-
-    if let Some(suggested_expand) =
-        object_get(object, &["suggested_expand", "x"]).and_then(|item| item.as_object())
-    {
-        let mut suggested = serde_json::Map::new();
-        copy_object_alias_value(suggested_expand, &mut suggested, "focus", &["focus", "fo"]);
-        copy_object_alias_value(suggested_expand, &mut suggested, "reason", &["reason", "r"]);
-        if !suggested.is_empty() {
-            metadata.insert("suggested_expand".to_string(), Value::Object(suggested));
-        }
-    }
-
-    if let Some(contract) =
-        object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
-    {
-        let mut retrieval = serde_json::Map::new();
-        copy_object_alias_value(contract, &mut retrieval, "best_for", &["best_for", "bf"]);
-        copy_object_alias_value(
-            contract,
-            &mut retrieval,
-            "why_not_rg",
-            &["why_not_rg", "wnr"],
-        );
-        copy_object_alias_value(contract, &mut retrieval, "use_rg_if", &["use_rg_if", "uri"]);
-        copy_object_alias_value(
-            contract,
-            &mut retrieval,
-            "next_action",
-            &["next_action", "na"],
-        );
-        if !retrieval.is_empty() {
-            metadata.insert(
-                "agent_retrieval_contract".to_string(),
-                Value::Object(retrieval),
-            );
-        }
-    }
-
-    if metadata.is_empty() {
-        None
-    } else {
-        Some(Value::Object(metadata))
-    }
-}
-
-fn copy_object_alias_value(
-    source: &serde_json::Map<String, Value>,
-    target: &mut serde_json::Map<String, Value>,
-    key: &str,
-    aliases: &[&str],
-) {
-    if let Some(value) = object_get(source, aliases) {
-        target.insert(key.to_string(), value.clone());
-    }
 }
 
 fn object_get<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
@@ -12723,50 +12575,9 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
         lines.push(format!("- Top symbol: `{}`", symbol));
     }
 
-    if let Some(step) = object_get(object, &["next_steps", "nx"])
-        .and_then(|item| item.as_array())
-        .and_then(|items| items.first())
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-    {
-        lines.push(format!("- Next step: {}", step));
-    }
-
-    if let Some(suggested_expand) =
-        object_get(object, &["suggested_expand", "x"]).and_then(|item| item.as_object())
-    {
-        let focus = suggested_expand
-            .get("focus")
-            .or_else(|| suggested_expand.get("fo"))
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty());
-        let reason = suggested_expand
-            .get("reason")
-            .or_else(|| suggested_expand.get("r"))
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty());
-
-        if let Some(focus) = focus {
-            match reason {
-                Some(reason) => lines.push(format!("- Suggested expand: `{}` ({})", focus, reason)),
-                None => lines.push(format!("- Suggested expand: `{}`", focus)),
-            }
-        }
-    }
-
     if let Some(contract) =
         object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
     {
-        if let Some(best_for) = object_get(contract, &["best_for", "bf"])
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
-            lines.push(format!("- Best for: {}", best_for));
-        }
         if let Some(next_action) = object_get(contract, &["next_action", "na"])
             .and_then(|item| item.as_str())
             .map(str::trim)
