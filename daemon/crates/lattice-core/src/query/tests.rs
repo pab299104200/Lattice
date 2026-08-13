@@ -2,11 +2,12 @@ use crate::graph::model::{CodeGraph, EdgeKind};
 use crate::storage::{GraphStore, SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::capsule::QueryIntent;
 use super::engine::{
-    merge_seed_hits, parse_query_filters, query_prefers_markdown_results, QueryAdmission,
-    QueryAdmissionError, QueryEngine,
+    merge_seed_hits, parse_query_filters, query_prefers_markdown_results,
+    set_test_post_scoring_delay, QueryAdmission, QueryAdmissionError, QueryEngine,
 };
 use super::intent::detect_intent;
 
@@ -1176,6 +1177,40 @@ fn test_context_relationship_has_edge_info() {
             ctx.symbol
         );
     }
+}
+
+#[test]
+fn expired_query_deadline_returns_not_evaluated_checkpoint() {
+    let mut engine = QueryEngine::new(build_test_graph(), None, None);
+    let (capsule, progress) = engine.query_with_progress(
+        "How does loginUser work?",
+        None,
+        false,
+        Some(Instant::now() - Duration::from_millis(1)),
+    );
+
+    assert!(progress.deadline_reached);
+    assert!(progress.completed_stages.is_empty());
+    assert!(capsule.pivots.is_empty());
+    assert!(capsule.context.is_empty());
+    assert_eq!(capsule.stats.nodes_evaluated, 0);
+}
+
+#[test]
+fn forced_post_scoring_deadline_returns_ranked_checkpoint() {
+    let mut engine = QueryEngine::new(build_test_graph(), None, None);
+    set_test_post_scoring_delay(Some(Duration::from_millis(10)));
+    let (capsule, progress) = engine.query_with_progress(
+        "How does loginUser work?",
+        None,
+        false,
+        Some(Instant::now() + Duration::from_millis(1)),
+    );
+    set_test_post_scoring_delay(None);
+
+    assert!(progress.deadline_reached);
+    assert!(!progress.completed_stages.is_empty());
+    assert!(!capsule.pivots.is_empty() || !capsule.context.is_empty());
 }
 
 #[path = "benchmark_tests.rs"]

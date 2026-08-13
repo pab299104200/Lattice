@@ -329,3 +329,19 @@ B3 does not make interrupted retrieval resumable, expose caller-selected
 deadlines, weaken repository epoch validation, turn index construction into a
 streaming public graph, or redefine token-budget truncation. Those would each
 require a separate contract and verification surface.
+
+## B3 delivery notes
+
+The daemon now creates one typed retrieval control for each agent-facing tool
+call and does not wrap dispatch in `tokio::time::timeout`. A result therefore
+continues through the ordinary workflow budget, context-handle, JSON, and
+Markdown paths. Workflow payloads always identify completion state; a deadline
+observed by the request control is rendered as `partial_reason: "deadline"`
+with the normal ranked payload, while an absent eligible graph is rendered as
+`partial_reason: "index_unavailable"` and `result_set_state:
+"not_evaluated"`.
+
+During same-checkout indexing, the workflow engine captures the existing query
+engine snapshot rather than copying the mutable indexer graph. Its response
+adds the exact freshness banner in this document. A new publication affects
+only subsequent requests, preserving snapshot isolation for the active one.

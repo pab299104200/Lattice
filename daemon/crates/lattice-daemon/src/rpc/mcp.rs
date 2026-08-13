@@ -41,7 +41,7 @@ use lattice_core::memory_graph::{
     record_access, MemoryAccess, MemoryAccessId,
 };
 use lattice_core::query::engine::{QueryAdmission, QueryAdmissionError};
-use lattice_core::query::{ContextCapsule, QueryEngine};
+use lattice_core::query::{ContextCapsule, QueryEngine, QueryProgress};
 use lattice_core::storage::{GraphStore, SharedVectorIndex, StoredGitIntelligenceSnapshot};
 use lattice_core::symbols::stable_file_handle;
 use lattice_core::verification::ScopeFilter;
@@ -72,6 +72,7 @@ use crate::memory_attribution::{
     RetrievedMemory,
 };
 use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
+use crate::rpc::request_control;
 use crate::runtime_support::{
     background_vector_sync_enabled, build_incremental_index_for_roots, load_incremental_cache,
     max_warm_graph_bytes, max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult,
@@ -1107,17 +1108,17 @@ impl McpHandler {
     }
 
     async fn query_engine_snapshot_for_workflow(&self) -> Result<QueryEngine, QueryJobError> {
-        let mut engine = self
+        let engine = self
             .lock_query_engine_for_workflow()
             .await
             .map_err(|()| QueryJobError::Indexing)?;
-        if self.is_indexing()
-            && workflow_graph_is_empty(engine.graph())
-            && !self.promote_live_graph_for_workflow(&mut engine)
-        {
+        // The live query engine is the published immutable generation. While
+        // an indexer builds privately, retain this snapshot rather than copying
+        // its mutable graph into a request-local engine.
+        if self.is_indexing() && workflow_graph_is_empty(engine.graph()) {
             return Err(QueryJobError::Indexing);
         }
-        Ok(engine.clone())
+        Ok(engine.snapshot())
     }
 
     async fn run_query_job<T, F>(&self, job: F) -> Result<T, QueryJobError>
@@ -1163,35 +1164,6 @@ impl McpHandler {
                 format!("{tool_name} query worker failed: {message}"),
             )),
         }
-    }
-
-    fn promote_live_graph_for_workflow(&self, engine: &mut QueryEngine) -> bool {
-        if engine.graph().stats().node_count > 0 {
-            return true;
-        }
-        if !self.is_indexing() {
-            return false;
-        }
-
-        if let Some(wm) = &self.workspace_manager {
-            if let Ok(wm) = wm.try_lock() {
-                let graph = wm.unified_graph();
-                if graph.stats().node_count > 0 {
-                    engine.update_graph(graph);
-                    return true;
-                }
-            }
-        }
-
-        if let Ok(indexer) = self.indexer.try_lock() {
-            let graph = indexer.graph().clone();
-            if graph.stats().node_count > 0 {
-                engine.update_graph(graph);
-                return true;
-            }
-        }
-
-        false
     }
 
     // ── MCP Protocol Methods ──────────────────────────────────────────
@@ -1369,7 +1341,7 @@ impl McpHandler {
                 },
                 {
                     "name": "search",
-                    "description": "Searches symbols, call paths, and docs links using graph identity — the structural match grep cannot provide. Use rg for exact text.",
+                    "description": "Searches symbols, call paths, and docs links using graph identity; use a literal text search when exact content is required.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1487,7 +1459,8 @@ impl McpHandler {
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
         let started = Instant::now();
 
-        let mut result = match tokio::time::timeout(Duration::from_secs(5), async {
+        let request_control = request_control::RequestControl::retrieval();
+        let mut result = request_control::scope(request_control, async {
             match tool_name {
                 "context" => self.tool_agent_context(arguments).await,
                 "prepare_change" => self.tool_agent_prepare_change(arguments).await,
@@ -1501,16 +1474,7 @@ impl McpHandler {
             }
         })
         .instrument(span)
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Ok(wrap_tool_result(json!({
-                "partial": true,
-                "timeout": true,
-                "tool": tool_name,
-                "message": "server-side 5s cap reached; returning a bounded partial response",
-            }))),
-        };
+        .await;
 
         self.attach_memory_attribution(
             tool_name,
@@ -3068,12 +3032,14 @@ impl McpHandler {
         };
         let query_owned = query.to_string();
         let workspace_root = self.workspace_root.to_string_lossy().to_string();
-        let (mut bundle, seed) = match self
+        let deadline = request_control::current().map(|control| control.deadline());
+        let (mut bundle, seed, progress) = match self
             .run_query_job(move || {
-                let capsule = engine.query(
+                let (capsule, progress) = engine.query_with_progress(
                     &query_owned,
                     None,
                     matches!(render_choice, WorkflowRenderChoice::Focused),
+                    deadline,
                 );
                 let request = workflow_v2::WorkflowRequest {
                     input: query_owned,
@@ -3089,7 +3055,7 @@ impl McpHandler {
                     render_choice,
                 );
                 let seed = workflow_v2::build_expand_seed(&bundle);
-                (bundle, seed)
+                (bundle, seed, progress)
             })
             .await
         {
@@ -3119,6 +3085,7 @@ impl McpHandler {
         let mut value = serde_json::to_value(&bundle)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "get_context_capsule");
+        attach_query_progress_metadata(&mut value, &progress);
 
         let metadata = WorkflowRunMetadata {
             delivery_mode: format!("{:?}", render_choice).to_lowercase(),
@@ -4723,6 +4690,11 @@ impl McpHandler {
         metadata: &WorkflowRunMetadata,
         response_options: &WorkflowResponseOptions,
     ) -> Result<Value, (i32, String)> {
+        attach_retrieval_completion_metadata(&mut value, request_control::current());
+        if self.is_indexing() {
+            let snapshot_id = self.current_repo_epoch().await;
+            attach_indexing_freshness(&mut value, snapshot_id);
+        }
         if let Some(retrieved_count) = workflow_memory_result_count(&value) {
             self.record_memory_retrieval(tool_name, arguments, retrieved_count)
                 .await;
@@ -7428,17 +7400,28 @@ fn status_snapshot_from_graph(graph: &CodeGraph, include_languages: bool) -> Sta
 
 fn indexing_workflow_response(tool_name: &str, query: &str, reason: &str) -> Value {
     let overview = if reason == "branch_switch" {
-        "The workspace branch changed and the graph is being refreshed; retry shortly or use rg for exact literal lookup."
+        "The workspace branch changed and no eligible published graph is available yet; check status and retry after refresh completes."
     } else if reason == "workspace_change" {
-        "The workspace changed substantially and the graph is being refreshed; retry shortly or use rg for exact literal lookup."
+        "The workspace changed substantially and no eligible published graph is available yet; check status and retry after refresh completes."
     } else {
-        "Indexing is still in progress and the graph is temporarily busy; retry shortly or use rg for exact literal lookup."
+        "Indexing is in progress and no eligible published graph is available yet; check status and retry after refresh completes."
     };
     json!({
         "query": query,
         "overview": overview,
         "indexing": true,
         "reason": reason,
+        "partial": true,
+        "partial_reason": "index_unavailable",
+        "result_set_state": "not_evaluated",
+        "completed_stages": [],
+        "last_completed_stage": Value::Null,
+        "omitted_stages": ["anchors", "lexical_structural", "graph_expansion", "semantic", "repository_memory", "shared_memory"],
+        "freshness": {
+            "state": "unavailable",
+            "served_snapshot": false,
+            "reason": reason,
+        },
         "primary_files": [],
         "symbols": [],
         "tests": [],
@@ -7481,6 +7464,150 @@ fn busy_query_workflow_response(tool_name: &str, query: &str) -> Value {
             "reason": "Retry after an active context query completes."
         }
     })
+}
+
+const COMPLETED_RETRIEVAL_STAGES: &[&str] = &[
+    "anchors",
+    "lexical_structural",
+    "graph_expansion",
+    "semantic",
+    "repository_memory",
+    "shared_memory",
+];
+
+fn attach_retrieval_completion_metadata(
+    value: &mut Value,
+    control: Option<request_control::RequestControl>,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("partial") {
+        return;
+    }
+    let deadline_reached = control
+        .as_ref()
+        .is_some_and(request_control::RequestControl::deadline_reached);
+    let has_results = [
+        "pivots",
+        "context",
+        "primary_files",
+        "key_files",
+        "suspects",
+    ]
+    .iter()
+    .any(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    });
+    object.insert("partial".to_string(), Value::Bool(deadline_reached));
+    object.insert(
+        "result_set_state".to_string(),
+        Value::String(
+            if has_results {
+                "complete"
+            } else {
+                "complete_no_matches"
+            }
+            .to_string(),
+        ),
+    );
+    object.insert(
+        "completed_stages".to_string(),
+        Value::Array(
+            COMPLETED_RETRIEVAL_STAGES
+                .iter()
+                .map(|stage| json!(stage))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "last_completed_stage".to_string(),
+        Value::String("shared_memory".to_string()),
+    );
+    object.insert("omitted_stages".to_string(), Value::Array(Vec::new()));
+    if deadline_reached {
+        object.insert(
+            "partial_reason".to_string(),
+            Value::String("deadline".to_string()),
+        );
+        object.insert(
+            "result_set_state".to_string(),
+            Value::String("ranked_so_far".to_string()),
+        );
+    }
+}
+
+fn attach_query_progress_metadata(value: &mut Value, progress: &QueryProgress) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let completed = progress
+        .completed_stages
+        .iter()
+        .map(|stage| Value::String(stage.as_str().to_string()))
+        .collect::<Vec<_>>();
+    let last_completed_stage = completed.last().cloned().unwrap_or(Value::Null);
+    let omitted_stages = COMPLETED_RETRIEVAL_STAGES
+        .iter()
+        .filter(|stage| {
+            !progress
+                .completed_stages
+                .iter()
+                .any(|completed| completed.as_str() == **stage)
+        })
+        .map(|stage| Value::String((*stage).to_string()))
+        .collect::<Vec<_>>();
+    object.insert(
+        "partial".to_string(),
+        Value::Bool(progress.deadline_reached),
+    );
+    object.insert(
+        "result_set_state".to_string(),
+        Value::String(
+            if progress.deadline_reached {
+                if progress.completed_stages.is_empty() {
+                    "not_evaluated"
+                } else {
+                    "ranked_so_far"
+                }
+            } else {
+                "complete"
+            }
+            .to_string(),
+        ),
+    );
+    object.insert("completed_stages".to_string(), Value::Array(completed));
+    object.insert("last_completed_stage".to_string(), last_completed_stage);
+    object.insert("omitted_stages".to_string(), Value::Array(omitted_stages));
+    if progress.deadline_reached {
+        object.insert(
+            "partial_reason".to_string(),
+            Value::String("deadline".to_string()),
+        );
+    }
+}
+
+fn attach_indexing_freshness(value: &mut Value, snapshot_id: u64) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("indexing".to_string(), Value::Bool(true));
+    object.insert(
+        "freshness".to_string(),
+        json!({
+            "state": "refreshing",
+            "served_snapshot": true,
+            "snapshot_id": snapshot_id,
+            "reason": "reindex",
+        }),
+    );
+    object.insert(
+        "freshness_banner".to_string(),
+        Value::String("Index refresh is in progress; results use the last published snapshot and may be stale.".to_string()),
+    );
 }
 
 fn workflow_graph_is_empty(graph: &CodeGraph) -> bool {
@@ -11033,6 +11160,30 @@ mod tests {
     }
 
     #[test]
+    fn deadline_partial_markdown_keeps_the_normal_summary_and_one_warning() {
+        let wrapped = wrap_workflow_tool_result(
+            json!({
+                "partial": true,
+                "partial_reason": "deadline",
+                "last_completed_stage": "graph_expansion",
+                "result_set_state": "ranked_so_far",
+                "context_handle": "ctx-deadline",
+                "overview": "Ranked published snapshot results.",
+                "primary_files": [{ "file": "src/auth.rs" }],
+            }),
+            WorkflowRenderMode::Markdown,
+        );
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("markdown text");
+        let warning = "Partial result: the retrieval deadline was reached after graph_expansion; results below are ranked from completed stages.";
+        assert_eq!(text.matches(warning).count(), 1);
+        assert!(text.contains("### Summary"));
+        assert!(text.contains("Ranked published snapshot results."));
+        assert!(!text.contains("timeout"));
+    }
+
+    #[test]
     fn test_wrap_workflow_tool_result_summarizes_context_capsule_payload() {
         let wrapped = wrap_workflow_tool_result(
             json!({
@@ -11968,6 +12119,36 @@ mod tests {
         assert_eq!(payload["partial"], true);
         assert_eq!(payload["reason"], "query_capacity");
         assert_eq!(payload["primary_files"], json!([]));
+        std::fs::remove_dir_all(workspace_root).expect("remove temp workspace");
+    }
+
+    #[tokio::test]
+    async fn expired_context_request_keeps_handle_and_budget_metadata() {
+        let (handler, _, workspace_root) = build_memory_test_handler("deadline-context-response");
+        let response = crate::rpc::request_control::scope(
+            crate::rpc::request_control::RequestControl::with_budget(Duration::ZERO),
+            handler.tool_agent_context(&json!({
+                "query": "how does login work",
+                "render": "json"
+            })),
+        )
+        .await
+        .expect("deadline partial response");
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("wrapped text");
+        let payload = parse_wrapped_tool_payload(text).expect("structured deadline partial");
+        assert_eq!(payload["partial"], true);
+        assert_eq!(payload["partial_reason"], "deadline");
+        assert_eq!(payload["result_set_state"], "not_evaluated");
+        assert!(payload["completed_stages"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert!(payload["context_handle"]
+            .as_str()
+            .is_some_and(|handle| !handle.is_empty()));
+        assert!(payload["budget"].is_string());
+        assert!(payload["budget_max_tokens"].as_u64().is_some());
         std::fs::remove_dir_all(workspace_root).expect("remove temp workspace");
     }
 
@@ -12995,6 +13176,10 @@ export function sendGreeting(): string {
             .expect("expected wrapped prepare_change response text");
         let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
         assert_eq!(payload["indexing"].as_bool(), Some(true));
+        assert_eq!(payload["partial"].as_bool(), Some(true));
+        assert_eq!(payload["partial_reason"], "index_unavailable");
+        assert_eq!(payload["result_set_state"], "not_evaluated");
+        assert_eq!(payload["freshness"]["served_snapshot"], false);
         assert_eq!(
             payload["primary_files"].as_array().map(Vec::len),
             Some(0),
@@ -13003,8 +13188,12 @@ export function sendGreeting(): string {
         assert!(
             payload["overview"]
                 .as_str()
-                .is_some_and(|overview| overview.contains("Indexing is still in progress")),
+                .is_some_and(|overview| overview.contains("no eligible published graph")),
             "expected explicit indexing overview: {payload:?}"
+        );
+        assert!(
+            !text.contains("use rg"),
+            "B3 must not advertise rg fallback: {text}"
         );
 
         let _ = std::fs::remove_file(context_cache_path);
@@ -13012,7 +13201,7 @@ export function sendGreeting(): string {
     }
 
     #[tokio::test]
-    async fn test_prepare_change_promotes_live_indexer_graph_while_indexing() {
+    async fn test_prepare_change_uses_published_snapshot_while_indexing() {
         let workspace_root = unique_test_path("lattice-mcp-prepare-change-live-indexer-graph");
         std::fs::create_dir_all(&workspace_root).expect("failed to create temp workspace");
         let context_cache_path = workspace_root.join("context_handles.json");
@@ -13027,9 +13216,10 @@ def detect_agent_version_drift(agent, rollout):
 "#,
             )
             .expect("index test file");
+        let published_graph = indexer.graph().clone();
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(published_graph, None, None))),
             Arc::new(Mutex::new(indexer)),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -13068,10 +13258,12 @@ def detect_agent_version_drift(agent, rollout):
             .as_str()
             .expect("expected wrapped prepare_change response text");
         let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
-        assert_ne!(
-            payload["indexing"].as_bool(),
-            Some(true),
-            "live indexer graph should be promoted instead of returning an indexing placeholder: {payload:?}"
+        assert_eq!(payload["indexing"].as_bool(), Some(true));
+        assert_eq!(payload["freshness"]["state"], "refreshing");
+        assert_eq!(payload["freshness"]["served_snapshot"], true);
+        assert_eq!(
+            payload["freshness_banner"],
+            "Index refresh is in progress; results use the last published snapshot and may be stale."
         );
         let primary_files = payload["primary_files"]
             .as_array()
@@ -14048,7 +14240,27 @@ fn wrap_workflow_tool_result(value: Value, render: WorkflowRenderMode) -> Value 
 
     match render {
         WorkflowRenderMode::Json => wrap_text_result(serialized),
-        WorkflowRenderMode::Markdown => wrap_text_result(format!("### Summary\n{summary}")),
+        WorkflowRenderMode::Markdown => {
+            let partial_warning = if value["partial"].as_bool() == Some(true)
+                && value["partial_reason"].as_str() == Some("deadline")
+            {
+                let stage = value["last_completed_stage"]
+                    .as_str()
+                    .unwrap_or("no completed stage");
+                format!(
+                    "Partial result: the retrieval deadline was reached after {stage}; results below are ranked from completed stages.\n\n"
+                )
+            } else {
+                String::new()
+            };
+            let freshness_banner = value["freshness_banner"]
+                .as_str()
+                .map(|banner| format!("{banner}\n\n"))
+                .unwrap_or_default();
+            wrap_text_result(format!(
+                "{partial_warning}{freshness_banner}### Summary\n{summary}"
+            ))
+        }
     }
 }
 

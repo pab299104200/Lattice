@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod memory_v2;
 pub mod metrics_surface;
 pub mod protocol;
+pub mod request_control;
 pub mod server;
 pub mod session_metrics;
 pub mod workflow_v2;

@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -62,6 +68,58 @@ const DOCUMENT_RESULT_QUERY_KEYWORDS: &[&str] = &[
 const FILE_SUMMARY_VECTOR_NAME: &str = "file_summary";
 const FILE_SUMMARY_VECTOR_OFFSET: usize = usize::MAX;
 const MAX_CACHED_MODULE_DIGESTS: usize = 2;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_POST_SCORING_DELAY: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_post_scoring_delay(delay: Option<Duration>) {
+    TEST_POST_SCORING_DELAY.with(|configured| configured.set(delay));
+}
+
+#[cfg(test)]
+fn run_test_post_scoring_delay() {
+    TEST_POST_SCORING_DELAY.with(|configured| {
+        if let Some(delay) = configured.get() {
+            std::thread::sleep(delay);
+        }
+    });
+}
+
+/// Stable ranking checkpoints exposed to the daemon's response contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryStage {
+    Anchors,
+    LexicalStructural,
+    GraphExpansion,
+    Semantic,
+    RepositoryMemory,
+    SharedMemory,
+}
+
+impl QueryStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anchors => "anchors",
+            Self::LexicalStructural => "lexical_structural",
+            Self::GraphExpansion => "graph_expansion",
+            Self::Semantic => "semantic",
+            Self::RepositoryMemory => "repository_memory",
+            Self::SharedMemory => "shared_memory",
+        }
+    }
+}
+
+/// Ranking progress returned with a capsule. The current engine keeps its
+/// deterministic ranking and budget assembly intact; callers can use this to
+/// report whether a request was observed past its cooperative deadline.
+#[derive(Debug, Clone)]
+pub struct QueryProgress {
+    pub completed_stages: Vec<QueryStage>,
+    pub deadline_reached: bool,
+}
 
 /// Typed rejection from the non-queueing query admission gate.
 ///
@@ -277,6 +335,16 @@ impl QueryEngine {
         embedding: Option<&[f32]>,
         focused: bool,
     ) -> ContextCapsule {
+        self.query_internal(query_text, embedding, focused, None).0
+    }
+
+    fn query_internal(
+        &mut self,
+        query_text: &str,
+        embedding: Option<&[f32]>,
+        focused: bool,
+        deadline: Option<Instant>,
+    ) -> (ContextCapsule, QueryProgress) {
         // Record the query for frequency tracking (adaptive budget)
         self.record_query(query_text);
 
@@ -694,7 +762,15 @@ impl QueryEngine {
             .unwrap_or(1)
             .max(1);
 
-        for (id, semantic_sim) in &candidate_ids {
+        let mut ranking_interrupted = false;
+        for (candidate_index, (id, semantic_sim)) in candidate_ids.iter().enumerate() {
+            if candidate_index > 0
+                && candidate_index % 64 == 0
+                && deadline.is_some_and(|limit| Instant::now() >= limit)
+            {
+                ranking_interrupted = true;
+                break;
+            }
             if let Some(node) = self.graph.get_node(id) {
                 // Apply query filters before scoring.
                 if !filter.matches(node) {
@@ -840,6 +916,9 @@ impl QueryEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.node.name.cmp(&b.node.name))
         });
+        #[cfg(test)]
+        run_test_post_scoring_delay();
+        let mut deadline_reached = ranking_interrupted;
 
         // Deduplicate: when multiple candidates share the same name and >80% body
         // overlap (e.g. 5 identical `interface Host` in different .tsx files), keep
@@ -909,7 +988,14 @@ impl QueryEngine {
         let max_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0.0);
         let relative_pivot = (max_candidate_score * 0.55).max(0.12);
 
-        for candidate in &candidates {
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            if candidate_index > 0
+                && candidate_index % 16 == 0
+                && deadline.is_some_and(|limit| Instant::now() >= limit)
+            {
+                deadline_reached = true;
+                break;
+            }
             if tokens_used >= budget {
                 break;
             }
@@ -1023,7 +1109,7 @@ impl QueryEngine {
         //  - Cap at 5 siblings per file
         //  - Rank candidate siblings by keyword overlap with query
         //  - Separate 500-token mini-budget so siblings aren't blocked by main budget
-        if !focused {
+        if !focused && !deadline_reached {
             let sibling_budget = 500usize;
             let mut sibling_tokens_used = 0usize;
             let max_siblings_per_file = 5usize;
@@ -1160,7 +1246,7 @@ impl QueryEngine {
         // dependencies are likely relevant helpers. Context nodes are weaker
         // matches and their deps would amplify noise (e.g. vuln_matcher deps).
         // Uses a separate 300-token mini-budget, capped at 5 total additions.
-        if !focused {
+        if !focused && !deadline_reached {
             let dep_budget = 300usize;
             let mut dep_tokens_used = 0usize;
             let max_dep_additions = 5usize;
@@ -1260,7 +1346,10 @@ impl QueryEngine {
         let nodes_included = pivots.len() + context.len();
 
         // Step 6: Retrieve relevant memories
-        let memories = if let Some(ref ms) = self.memory_store {
+        deadline_reached |= deadline.is_some_and(|limit| Instant::now() >= limit);
+        let memories = if deadline_reached {
+            Vec::new()
+        } else if let Some(ref ms) = self.memory_store {
             match ms.lock() {
                 Ok(store) => store
                     .search_by_keyword(query_text)
@@ -1281,7 +1370,7 @@ impl QueryEngine {
         };
 
         // Step 7: Assemble capsule
-        ContextCapsule {
+        let capsule = ContextCapsule {
             query: query_text.to_string(),
             intent,
             pivots,
@@ -1306,7 +1395,67 @@ impl QueryEngine {
                     })
                     .collect(),
             },
+        };
+        let mut completed_stages = vec![
+            QueryStage::Anchors,
+            QueryStage::LexicalStructural,
+            QueryStage::GraphExpansion,
+        ];
+        if embedding.is_some() {
+            completed_stages.push(QueryStage::Semantic);
         }
+        if !deadline_reached {
+            completed_stages.push(QueryStage::RepositoryMemory);
+        }
+        (
+            capsule,
+            QueryProgress {
+                completed_stages,
+                deadline_reached,
+            },
+        )
+    }
+
+    /// Execute ranking while reporting the durable stage vocabulary used by
+    /// daemon response metadata. `deadline` is checked at the hand-off
+    /// boundary; individual ranking loops retain deterministic ordering and
+    /// are never cancelled by dropping their worker future.
+    ///
+    /// The daemon uses this result only after the blocking worker has returned,
+    /// so a deadline never leaves an orphaned ranking task behind.
+    pub fn query_with_progress(
+        &mut self,
+        query_text: &str,
+        embedding: Option<&[f32]>,
+        focused: bool,
+        deadline: Option<Instant>,
+    ) -> (ContextCapsule, QueryProgress) {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            let (_, clean_query) = parse_query_filters(query_text);
+            return (
+                ContextCapsule {
+                    query: query_text.to_string(),
+                    intent: detect_intent(&clean_query),
+                    pivots: Vec::new(),
+                    context: Vec::new(),
+                    memories: Vec::new(),
+                    stats: CapsuleStats {
+                        tokens_used: 0,
+                        tokens_saved: 0,
+                        nodes_evaluated: 0,
+                        nodes_included: 0,
+                        engine_version: ENGINE_VERSION.to_string(),
+                        seed_count: 0,
+                        seed_symbols: Vec::new(),
+                    },
+                },
+                QueryProgress {
+                    completed_stages: Vec::new(),
+                    deadline_reached: true,
+                },
+            );
+        }
+        self.query_internal(query_text, embedding, focused, deadline)
     }
 
     /// Get the underlying graph for direct operations.
