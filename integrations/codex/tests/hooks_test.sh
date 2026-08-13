@@ -41,7 +41,13 @@ case "$1" in
       printf '%s\n' 'prompt context with enough useful detail to exceed the hook relevance-size guard for this regression test.'
     fi
     ;;
-  impact) printf '%s\n' 'affected dependent one' 'affected dependent two' 'affected dependent three' ;;
+  impact)
+    if [[ "${LATTICE_HOOK_TEST_HOTSPOT:-0}" == "1" ]]; then
+      printf '%s\n' '- Hotspot warning: `src/example.rs` changed in 7/10 sampled commits; head `abc123`.'
+      printf '%s\n' '- Hotspot warning: `src/other.rs` changed in 6/10 sampled commits; head `def456`.'
+    fi
+    printf '%s\n' 'affected dependent one' 'affected dependent two' 'affected dependent three'
+    ;;
   remember) : ;;
   *) exit 1 ;;
 esac
@@ -101,6 +107,25 @@ assert result["additionalContext"].strip()
 PY
 }
 
+assert_git_history_warning() {
+  local client_name="$1"
+  local hooks_dir="$2"
+  local output
+
+  # The warning is independently useful, so it must survive the dependent
+  # threshold. The fake impact output deliberately has only three dependents.
+  output="$(LATTICE_BIN="$fake_lattice" LATTICE_HOOK_COMMAND_LOG="$temp_dir/commands" LATTICE_HOOK_TEST_HOTSPOT=1 LATTICE_HOOK_MIN_DEPENDENTS=4 LATTICE_HOOK_MAX_HOTSPOT_WARNINGS=1 "$hooks_dir/post-tool-use.sh" <<<'{"file_path":"src/example.rs"}')"
+  [[ "$output" == *'## Lattice Git History Warning'* ]]
+  [[ "$(grep -o '## Lattice Git History Warning' <<<"$output" | wc -l | tr -d ' ')" == "1" ]]
+  [[ "$output" == *'`src/example.rs` changed in 7/10 sampled commits'* ]]
+  [[ "$output" != *'`src/other.rs` changed in 6/10 sampled commits'* ]]
+  [[ "$output" != *'## Lattice Edit Impact'* ]]
+
+  if [[ "$client_name" == "claude-code" ]]; then
+    assert_claude_envelope "PostToolUse" "$output"
+  fi
+}
+
 exercise_package() {
   local client_name="$1"
   local hooks_dir="$2"
@@ -134,6 +159,8 @@ exercise_package() {
   if [[ "$client_name" == "claude-code" ]]; then
     assert_claude_envelope "PostToolUse" "$stale_output"
   fi
+
+  assert_git_history_warning "$client_name" "$hooks_dir"
 }
 
 exercise_package codex "$codex_hooks_dir"

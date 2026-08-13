@@ -149,6 +149,37 @@ sys.stdout.write(text[:limit])
 ' "$max_chars"
 }
 
+# The MCP impact renderer owns Git-history collection and emits this stable
+# Markdown marker only for published, fresh hotspot data. Hooks must consume
+# that marker rather than invoke Git themselves.
+lattice_extract_git_history_warnings() {
+  python3 -c '
+import os
+import sys
+
+marker = "- Hotspot warning: "
+try:
+    limit = int(os.environ.get("LATTICE_HOOK_MAX_HOTSPOT_WARNINGS", "5"))
+except ValueError:
+    limit = 5
+limit = max(1, min(limit, 5))
+
+try:
+    char_limit = int(os.environ.get("LATTICE_HOOK_MAX_HOTSPOT_CHARS", "1200"))
+except ValueError:
+    char_limit = 1200
+char_limit = max(1, min(char_limit, 1200))
+
+warnings = [
+    line.strip()
+    for line in sys.stdin
+    if line.strip().startswith(marker)
+]
+if warnings:
+    print("\n".join(warnings[:limit])[:char_limit])
+'
+}
+
 lattice_json_text() {
   python3 -c '
 import json

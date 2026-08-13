@@ -23,13 +23,20 @@ if [[ "$impact" == *"not found"* || "$impact" == *"Missing required parameter"* 
   exit 0
 fi
 
+git_history_warning="$(printf '%s\n' "$impact" | lattice_extract_git_history_warnings)"
+
 summary="$(
   printf '%s\n' "$impact" | python3 -c '
 import os
 import sys
 
 threshold = int(os.environ.get("LATTICE_HOOK_MIN_DEPENDENTS", "3"))
-lines = [line.rstrip() for line in sys.stdin if line.strip()]
+hotspot_marker = "- Hotspot warning: "
+lines = [
+    line.rstrip()
+    for line in sys.stdin
+    if line.strip() and not line.strip().startswith(hotspot_marker)
+]
 dependent_lines = [
     line for line in lines
     if "dependent" in line.lower() or "affected" in line.lower() or "caller" in line.lower()
@@ -41,9 +48,18 @@ for line in lines[:10]:
 '
 )"
 
-if [[ -z "${summary//[[:space:]]/}" ]]; then
+context=""
+if [[ -n "${git_history_warning//[[:space:]]/}" ]]; then
+  context="## Lattice Git History Warning"$'\n\n'"$git_history_warning"
+fi
+if [[ -n "${summary//[[:space:]]/}" ]]; then
+  [[ -n "$context" ]] && context+=$'\n\n'
+  context+="## Lattice Edit Impact"$'\n\n'"$summary"
+fi
+
+if [[ -z "${context//[[:space:]]/}" ]]; then
   exit 0
 fi
 
-lattice_emit_context "PostToolUse" "## Lattice Edit Impact"$'\n\n'"$summary"
+lattice_emit_context "PostToolUse" "$context"
 exit 0

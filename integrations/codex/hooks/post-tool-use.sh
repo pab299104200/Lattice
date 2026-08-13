@@ -23,13 +23,20 @@ if [[ "$impact" == *"not found"* || "$impact" == *"Missing required parameter"* 
   exit 0
 fi
 
+git_history_warning="$(printf '%s\n' "$impact" | lattice_extract_git_history_warnings)"
+
 summary="$(
   printf '%s\n' "$impact" | python3 -c '
 import os
 import sys
 
 threshold = int(os.environ.get("LATTICE_HOOK_MIN_DEPENDENTS", "3"))
-lines = [line.rstrip() for line in sys.stdin if line.strip()]
+hotspot_marker = "- Hotspot warning: "
+lines = [
+    line.rstrip()
+    for line in sys.stdin
+    if line.strip() and not line.strip().startswith(hotspot_marker)
+]
 dependent_lines = [
     line for line in lines
     if "dependent" in line.lower() or "affected" in line.lower() or "caller" in line.lower()
@@ -41,6 +48,9 @@ for line in lines[:10]:
 '
 )"
 
+if [[ -n "${git_history_warning//[[:space:]]/}" ]]; then
+  printf '## Lattice Git History Warning\n\n%s\n' "$git_history_warning"
+fi
 if [[ -n "${summary//[[:space:]]/}" ]]; then
   printf '## Lattice Edit Impact\n\n%s\n' "$summary"
 fi
