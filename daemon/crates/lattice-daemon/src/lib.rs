@@ -2,6 +2,7 @@
 
 #[allow(dead_code)]
 pub(crate) mod adoption_metrics;
+pub mod hook_session_binding;
 pub(crate) mod index_health;
 #[allow(dead_code)]
 pub(crate) mod index_work;
