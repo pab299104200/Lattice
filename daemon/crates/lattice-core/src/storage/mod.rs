@@ -1,3 +1,4 @@
+pub mod git_intelligence_store;
 pub mod graph_store;
 pub mod schema;
 pub mod usearch_index;
@@ -7,6 +8,10 @@ pub mod vector_store;
 #[cfg(test)]
 mod tests;
 
+pub use git_intelligence_store::{
+    GitIntelligenceLoad, GitIntelligenceRecovery, GitIntelligenceStore,
+    StoredGitIntelligenceSnapshot,
+};
 pub use graph_store::{
     FileIndexEntry, GraphStore, GraphStoreRecovery, FILE_INDEX_PARSER_VERSION,
     FILE_INDEX_SCHEMA_VERSION,
