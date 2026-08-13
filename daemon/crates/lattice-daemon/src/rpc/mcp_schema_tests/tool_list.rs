@@ -159,6 +159,56 @@ async fn metadata_and_identifier_fields_are_typed() {
     );
 }
 
+#[tokio::test]
+async fn advertised_properties_are_strictly_typed() {
+    let fixture = SchemaFixture::new("schema-strict");
+    let response = fixture
+        .handler
+        .handle("tools/list", json!({}))
+        .await
+        .expect("tools/list succeeds");
+    let tools = response["tools"].as_array().expect("tools array");
+
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("tool `{name}` should declare properties"));
+        for (property_name, property_schema) in properties {
+            let schema = property_schema
+                .as_object()
+                .unwrap_or_else(|| panic!("{name}.{property_name} schema must be an object"));
+            assert!(
+                schema.contains_key("type") || schema.contains_key("oneOf"),
+                "{name}.{property_name} must declare a type or oneOf schema"
+            );
+            if let Some(default) = schema.get("default") {
+                if let Some(kind) = schema.get("type").and_then(|value| value.as_str()) {
+                    let valid = match kind {
+                        "string" => default.is_string(),
+                        "integer" => default.as_i64().is_some() || default.as_u64().is_some(),
+                        "number" => default.is_number(),
+                        "boolean" => default.is_boolean(),
+                        "array" => default.is_array(),
+                        "object" => default.is_object(),
+                        other => panic!("{name}.{property_name} uses unsupported type {other}"),
+                    };
+                    assert!(
+                        valid,
+                        "default for {name}.{property_name} does not match type {kind}"
+                    );
+                }
+                if let Some(enum_values) = schema.get("enum").and_then(|value| value.as_array()) {
+                    assert!(
+                        enum_values.iter().any(|candidate| candidate == default),
+                        "default for {name}.{property_name} must be one of enum values"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn schema_for_tool(tools: &[serde_json::Value], name: &str) -> serde_json::Value {
     tools
         .iter()
