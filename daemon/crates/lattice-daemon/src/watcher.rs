@@ -1,6 +1,8 @@
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -23,6 +25,11 @@ use crate::watcher_health::WatcherHealth;
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 const WORKSPACE_INVALIDATION_BATCH_THRESHOLD: usize = 20;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Git commonly rewrites HEAD and rebase control files in a short sequence.
+/// One bounded retry captures a settled state without allowing an unavailable
+/// control file to turn into a synthetic workspace invalidation.
+const GIT_HEAD_READ_RETRIES: u64 = 1;
+const GIT_HEAD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// The part of a checkout state that makes source contents potentially differ.
 ///
@@ -80,6 +87,8 @@ pub struct FileWatcher {
     observed_head: Arc<Mutex<Option<ObservedCheckoutHead>>>,
     #[cfg(test)]
     forced_watch_failure: Option<String>,
+    #[cfg(test)]
+    head_read_count: AtomicU64,
 }
 
 impl FileWatcher {
@@ -123,6 +132,8 @@ impl FileWatcher {
             observed_head: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             forced_watch_failure: None,
+            #[cfg(test)]
+            head_read_count: AtomicU64::new(0),
         }
     }
 
@@ -461,23 +472,35 @@ impl FileWatcher {
     }
 
     async fn capture_head_baseline(&self) {
-        let snapshot = read_checkout_head(&self.workspace_root);
+        let snapshot = self.read_current_checkout_head();
         if let Some(snapshot) = snapshot {
+            self.watcher_health.mark_git_state_healthy();
             self.request_git_intelligence_refresh(&snapshot);
             *self.observed_head.lock().await = Some(snapshot);
         }
     }
 
     async fn observe_head_transition(&self) -> bool {
-        let Some(current) = read_checkout_head(&self.workspace_root) else {
-            // Git rewrites HEAD and its ref files in several steps. Retaining
-            // the last good baseline is safer than invalidating on uncertainty;
-            // a later owned event will perform the comparison again.
-            tracing::warn!(
-                workspace = %self.workspace_root.display(),
-                "Watcher could not read a coherent checkout HEAD; retaining last baseline"
-            );
-            return false;
+        let mut retries = 0;
+        let current = loop {
+            if let Some(current) = self.read_current_checkout_head() {
+                break current;
+            }
+            if retries == GIT_HEAD_READ_RETRIES {
+                // Git rewrites HEAD and its ref files in several steps.
+                // Retaining the last good baseline is safer than invalidating
+                // on uncertainty; a later owned event can compare again.
+                let reason = "Watcher could not read a coherent checkout HEAD after bounded retry";
+                tracing::warn!(
+                    workspace = %self.workspace_root.display(),
+                    retries,
+                    "{reason}; retaining last baseline"
+                );
+                self.watcher_health.mark_git_state_unknown(reason, retries);
+                return false;
+            }
+            retries += 1;
+            tokio::time::sleep(GIT_HEAD_RETRY_DELAY).await;
         };
 
         let mut observed = self.observed_head.lock().await;
@@ -488,7 +511,24 @@ impl FileWatcher {
             self.request_git_intelligence_refresh(&current);
         }
         *observed = Some(current);
+        self.watcher_health.mark_git_state_healthy();
         changed
+    }
+
+    fn read_current_checkout_head(&self) -> Option<ObservedCheckoutHead> {
+        #[cfg(test)]
+        self.head_read_count.fetch_add(1, Ordering::AcqRel);
+        read_checkout_head(&self.workspace_root)
+    }
+
+    #[cfg(test)]
+    fn reset_head_read_count_for_test(&self) {
+        self.head_read_count.store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn head_read_count_for_test(&self) -> u64 {
+        self.head_read_count.load(Ordering::Acquire)
     }
 
     fn request_git_intelligence_refresh(&self, head: &ObservedCheckoutHead) {
@@ -889,6 +929,7 @@ fn resolve_packed_ref(git_dir: &Path, ref_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{Repository, Signature, WorktreeAddOptions};
     use lattice_core::graph::CodeGraph;
     use lattice_core::memory::MemoryStore;
 
@@ -1197,6 +1238,324 @@ mod tests {
             .any(|path| path.ends_with(Path::new("common-git/packed-refs"))));
         assert!(paths.iter().all(|path| !path.ends_with("worktrees")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn real_git2_linked_worktree_churn_does_not_invalidate_primary_checkout() {
+        let mut fixture = LinkedWorktreeFixture::new("watch-real-linked-worktree");
+        let (watcher, indexer, _, _, index_work) = test_watcher(fixture.primary_root.clone());
+        watcher.capture_head_baseline().await;
+        let initial_epoch = watcher.repo_state.lock().await.current_epoch();
+
+        // This commit changes both the linked checkout's private HEAD metadata
+        // and its shared branch ref. Neither belongs to the primary checkout.
+        let sibling_commit = fixture.commit_in_sibling("src/sibling.rs", "pub fn sibling() {}\n");
+        watcher
+            .process_changes(vec![
+                fixture.sibling_git_dir().join("HEAD"),
+                fixture.primary_git_dir().join("refs/heads/sibling"),
+            ])
+            .await;
+        fixture
+            .primary
+            .reference(
+                "refs/heads/unrelated",
+                sibling_commit,
+                true,
+                "test unrelated ref",
+            )
+            .expect("create unrelated branch");
+        std::fs::write(
+            fixture.primary_git_dir().join("packed-refs"),
+            "# unchanged current head\n",
+        )
+        .expect("write packed refs fixture");
+        watcher
+            .process_changes(vec![
+                fixture.primary_git_dir().join("refs/heads/unrelated"),
+                fixture.primary_git_dir().join("packed-refs"),
+            ])
+            .await;
+
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 0);
+        assert_eq!(indexer.lock().await.graph_snapshot_id(), 0);
+
+        // `feature` and `main` intentionally begin at the same object. The
+        // ref name still changes the checkout contract and must invalidate once.
+        fixture
+            .primary
+            .set_head("refs/heads/feature")
+            .expect("switch primary branch");
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("HEAD")])
+            .await;
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("HEAD")])
+            .await;
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch + 1
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 1);
+
+        // Moving the active ref is a reset-style transition and must also run
+        // one reindex cycle, even when the move is observed more than once.
+        fixture
+            .primary
+            .reference("refs/heads/feature", sibling_commit, true, "test reset")
+            .expect("move active branch");
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("refs/heads/feature")])
+            .await;
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("refs/heads/feature")])
+            .await;
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch + 2
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 2);
+
+        fixture
+            .primary
+            .set_head_detached(sibling_commit)
+            .expect("detach primary HEAD");
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("HEAD")])
+            .await;
+        watcher
+            .process_changes(vec![fixture.primary_git_dir().join("HEAD")])
+            .await;
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch + 3
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 3);
+        assert_eq!(indexer.lock().await.graph_snapshot_id(), 0);
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn git_head_rebase_retry_is_bounded_and_never_manufactures_an_epoch() {
+        let mut fixture = LinkedWorktreeFixture::new("watch-rebase-retry");
+        let (watcher, _, _, health, index_work) = test_watcher(fixture.primary_root.clone());
+        watcher.capture_head_baseline().await;
+        watcher.reset_head_read_count_for_test();
+        let initial_epoch = watcher.repo_state.lock().await.current_epoch();
+        let settled_target = fixture.commit_in_sibling("src/settled.rs", "pub fn settled() {}\n");
+        let head_path = fixture.primary_git_dir().join("HEAD");
+        let hidden_head = fixture.primary_git_dir().join("HEAD.rebase-fixture");
+        std::fs::rename(&head_path, &hidden_head).expect("hide primary HEAD during rebase");
+        std::fs::create_dir_all(fixture.primary_git_dir().join("rebase-merge"))
+            .expect("create rebase metadata");
+
+        let settling_head = head_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            std::fs::write(settling_head, format!("{settled_target}\n"))
+                .expect("settle detached HEAD");
+        });
+        watcher
+            .process_changes(vec![fixture
+                .primary_git_dir()
+                .join("rebase-merge/head-name")])
+            .await;
+
+        assert_eq!(watcher.head_read_count_for_test(), 2);
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch + 1
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 1);
+        assert_eq!(
+            health.snapshot().git_state,
+            crate::watcher_health::GitStateHealth::Healthy
+        );
+
+        std::fs::remove_file(&head_path).expect("hide permanent unreadable HEAD");
+        watcher.reset_head_read_count_for_test();
+        watcher
+            .process_changes(vec![fixture
+                .primary_git_dir()
+                .join("rebase-merge/head-name")])
+            .await;
+
+        let snapshot = health.snapshot();
+        assert_eq!(watcher.head_read_count_for_test(), 2);
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch + 1
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 1);
+        assert_eq!(
+            snapshot.git_state,
+            crate::watcher_health::GitStateHealth::Unknown
+        );
+        assert_eq!(snapshot.git_state_retry_count, GIT_HEAD_READ_RETRIES);
+        assert!(snapshot.git_state_reason.is_some());
+
+        // The private HEAD was deliberately hidden only for the test. Restore
+        // it before removing the fixture so libgit2 handles remain coherent.
+        std::fs::rename(hidden_head, head_path).expect("restore primary HEAD");
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn mixed_source_and_sibling_worktree_metadata_uses_only_source_threshold() {
+        let fixture = LinkedWorktreeFixture::new("watch-mixed-worktree-batch");
+        let (watcher, indexer, _, _, index_work) = test_watcher(fixture.primary_root.clone());
+        watcher.capture_head_baseline().await;
+        let initial_epoch = watcher.repo_state.lock().await.current_epoch();
+        let source_paths = (0..WORKSPACE_INVALIDATION_BATCH_THRESHOLD - 1)
+            .map(|index| {
+                let path = fixture.primary_root.join(format!("src/file_{index}.ts"));
+                std::fs::create_dir_all(path.parent().expect("source parent"))
+                    .expect("create source directory");
+                std::fs::write(&path, format!("export function f{index}(): void {{}}"))
+                    .expect("write source");
+                path
+            })
+            .collect::<Vec<_>>();
+        let sibling_paths = (0..WORKSPACE_INVALIDATION_BATCH_THRESHOLD + 5)
+            .map(|index| fixture.sibling_git_dir().join(format!("logs/HEAD-{index}")))
+            .collect::<Vec<_>>();
+
+        watcher
+            .process_changes(source_paths.into_iter().chain(sibling_paths).collect())
+            .await;
+
+        assert_eq!(
+            watcher.repo_state.lock().await.current_epoch(),
+            initial_epoch
+        );
+        assert_eq!(index_work.snapshot().completed_jobs, 1);
+        assert_eq!(
+            indexer.lock().await.file_count(),
+            WORKSPACE_INVALIDATION_BATCH_THRESHOLD - 1
+        );
+
+        fixture.cleanup();
+    }
+
+    struct LinkedWorktreeFixture {
+        primary_root: PathBuf,
+        linked_root: PathBuf,
+        primary: Repository,
+        sibling: Repository,
+    }
+
+    impl LinkedWorktreeFixture {
+        fn new(name: &str) -> Self {
+            let primary_root = unique_test_root(name);
+            let linked_root = primary_root.with_extension("linked-worktree");
+            let primary = Repository::init(&primary_root).expect("initialize primary repository");
+            let initial = commit_fixture_file(
+                &primary,
+                &primary_root,
+                "src/lib.rs",
+                "pub fn initial() {}\n",
+                "initial fixture commit",
+            );
+            let initial_commit = primary.find_commit(initial).expect("find initial commit");
+            primary
+                .branch("main", &initial_commit, true)
+                .expect("create main branch");
+            primary
+                .branch("feature", &initial_commit, true)
+                .expect("create same-target feature branch");
+            primary
+                .branch("sibling", &initial_commit, true)
+                .expect("create sibling branch");
+            drop(initial_commit);
+            primary
+                .set_head("refs/heads/main")
+                .expect("set primary branch");
+
+            let sibling_ref = primary
+                .find_reference("refs/heads/sibling")
+                .expect("find sibling branch");
+            let mut options = WorktreeAddOptions::new();
+            options.reference(Some(&sibling_ref));
+            primary
+                .worktree("sibling", &linked_root, Some(&options))
+                .expect("create linked worktree with libgit2");
+            drop(sibling_ref);
+            let sibling = Repository::open(&linked_root).expect("open linked worktree");
+            Self {
+                primary_root,
+                linked_root,
+                primary,
+                sibling,
+            }
+        }
+
+        fn primary_git_dir(&self) -> PathBuf {
+            self.primary.path().to_path_buf()
+        }
+
+        fn sibling_git_dir(&self) -> PathBuf {
+            self.sibling.path().to_path_buf()
+        }
+
+        fn commit_in_sibling(&mut self, relative: &str, contents: &str) -> git2::Oid {
+            commit_fixture_file(
+                &self.sibling,
+                &self.linked_root,
+                relative,
+                contents,
+                "linked worktree fixture commit",
+            )
+        }
+
+        fn cleanup(self) {
+            drop(self.sibling);
+            drop(self.primary);
+            let _ = std::fs::remove_dir_all(&self.linked_root);
+            let _ = std::fs::remove_dir_all(&self.primary_root);
+        }
+    }
+
+    fn commit_fixture_file(
+        repository: &Repository,
+        checkout_root: &Path,
+        relative: &str,
+        contents: &str,
+        message: &str,
+    ) -> git2::Oid {
+        let path = checkout_root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("fixture source parent"))
+            .expect("create fixture source directory");
+        std::fs::write(&path, contents).expect("write fixture source");
+        let mut index = repository.index().expect("open fixture index");
+        index
+            .add_path(Path::new(relative))
+            .expect("stage fixture source through libgit2");
+        index.write().expect("write fixture index");
+        let tree_id = index.write_tree().expect("write fixture tree");
+        let tree = repository.find_tree(tree_id).expect("find fixture tree");
+        let signature = Signature::now("Lattice Fixture", "fixture@lattice.test")
+            .expect("build fixture signature");
+        let parent = repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repository.find_commit(oid).ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("create fixture commit through libgit2")
     }
 
     type TestWatcher = (

@@ -185,3 +185,35 @@ The C2 acceptance result is a real linked-worktree regression test proving a
 sibling commit causes zero full reindexes of the main checkout, alongside the
 unit transition matrix above. C3 may later replace the full graph rebuild
 mechanism; it must preserve this invalidation decision contract.
+
+## C2 acceptance evidence
+
+The daemon-owned watcher tests implement this acceptance surface without
+invoking a shell `git` executable. Their fixture uses `git2` to initialize a
+repository, create same-target `main` and `feature` branches, and add a real
+linked `sibling` worktree. The test then passes the actual private-worktree
+`HEAD` path and shared sibling branch-ref path to the primary watcher.
+
+`real_git2_linked_worktree_churn_does_not_invalidate_primary_checkout`
+asserts all of the following with explicit counters:
+
+- a sibling worktree commit/ref update leaves the primary epoch unchanged,
+  leaves its graph snapshot unchanged, and acquires zero index-work permits;
+- an unrelated local ref event and an unchanged `packed-refs` event remain
+  no-ops;
+- a same-object-id branch switch, an active-ref reset, and a detached-HEAD
+  transition each advance exactly one epoch and complete exactly one index
+  work cycle, even when the corresponding metadata event is delivered twice.
+
+`git_head_rebase_retry_is_bounded_and_never_manufactures_an_epoch` makes the
+primary `HEAD` temporarily unavailable during a synthetic rebase rewrite. It
+settles on the single bounded retry and invalidates once when that settled HEAD
+differs. A permanently unavailable `HEAD` performs exactly that one retry,
+records `git_state=unknown`, its retry count, and an actionable reason in
+watcher health, while leaving both epoch and index-work counts unchanged.
+
+`mixed_source_and_sibling_worktree_metadata_uses_only_source_threshold`
+combines nineteen indexable source files with more than twenty sibling
+worktree metadata paths. It confirms the batch remains an incremental source
+batch: exactly nineteen files are indexed, one ordinary index-work cycle runs,
+and no workspace epoch is advanced.

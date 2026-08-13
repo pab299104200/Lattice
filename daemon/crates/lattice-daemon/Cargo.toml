@@ -24,3 +24,8 @@ notify = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+# Watcher acceptance tests construct linked worktrees through libgit2 so they
+# never depend on a host `git` executable or its configuration.
+git2 = { version = "0.19", default-features = false }
