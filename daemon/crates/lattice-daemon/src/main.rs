@@ -3,9 +3,10 @@
 mod adoption_metrics;
 mod cli;
 mod doctor;
-mod install;
+mod git_intelligence_runtime;
 mod index_health;
 mod index_work;
+mod install;
 mod lifecycle_log;
 mod memory_attribution;
 mod proxy;
@@ -434,6 +435,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&index_readiness_for_watchers),
                     Arc::clone(&watcher_health),
                     Arc::clone(&index_health),
+                    None,
                     watcher_session_id.clone(),
                 );
 
@@ -558,7 +560,7 @@ pub(crate) async fn build_workspace_runtime(
 
     let graph_path = lattice_dir.join("graph.db");
     let (graph_store, graph) = open_graph_store_with_warm_graph(
-        graph_path,
+        graph_path.clone(),
         workspace_root.clone(),
         Arc::clone(&index_work),
     )
@@ -582,6 +584,22 @@ pub(crate) async fn build_workspace_runtime(
         Arc::clone(&compaction_graph),
     );
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    // Validate every Git store before spawning its worker. A failed schema or
+    // active-generation audit must fail workspace construction, not surface
+    // later as a detached background error.
+    let mut git_refresh_handles = HashMap::new();
+    for root in &workspace_roots {
+        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(root)?;
+        let (handle, runtime) = crate::git_intelligence_runtime::GitIntelligenceRuntime::open(
+            root.clone(),
+            &graph_path,
+            identity.repository_id,
+            Arc::clone(&index_work),
+        )?;
+        git_refresh_handles.insert(root.clone(), handle);
+        background_tasks.push(runtime.spawn());
+    }
 
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
     let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
@@ -755,6 +773,7 @@ pub(crate) async fn build_workspace_runtime(
                 Arc::clone(&index_readiness),
                 Arc::clone(&watcher_health),
                 Arc::clone(&index_health),
+                git_refresh_handles.get(&root).cloned(),
                 watcher_session_id.clone(),
             );
             let task = tokio::spawn(async move {

@@ -14,6 +14,7 @@ use lattice_core::storage::{GraphStore, SharedVectorIndex};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
 use crate::adoption_metrics::AdoptionMetricsStore;
+use crate::git_intelligence_runtime::GitIntelligenceRefreshHandle;
 use crate::index_health::IndexHealth;
 use crate::index_work::{IndexReadiness, IndexWorkCoordinator};
 use crate::repo_state::RepoStateTracker;
@@ -70,6 +71,7 @@ pub struct FileWatcher {
     index_readiness: Arc<IndexReadiness>,
     watcher_health: Arc<WatcherHealth>,
     index_health: Arc<IndexHealth>,
+    git_intelligence: Option<GitIntelligenceRefreshHandle>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
     session_id: String,
     /// This baseline is intentionally owned by the watcher rather than the
@@ -96,6 +98,7 @@ impl FileWatcher {
         index_readiness: Arc<IndexReadiness>,
         watcher_health: Arc<WatcherHealth>,
         index_health: Arc<IndexHealth>,
+        git_intelligence: Option<GitIntelligenceRefreshHandle>,
         session_id: String,
     ) -> Self {
         let adoption_metrics = Arc::new(AdoptionMetricsStore::new(&workspace_root));
@@ -114,6 +117,7 @@ impl FileWatcher {
             index_readiness,
             watcher_health,
             index_health,
+            git_intelligence,
             adoption_metrics,
             session_id,
             observed_head: Arc::new(Mutex::new(None)),
@@ -209,6 +213,7 @@ impl FileWatcher {
     }
 
     async fn run_polling(&self, interval: Duration) -> anyhow::Result<()> {
+        self.capture_head_baseline().await;
         let mut previous = self.poll_snapshot();
         self.watcher_health.mark_poll();
         let mut ticker = tokio::time::interval(interval);
@@ -238,6 +243,26 @@ impl FileWatcher {
     fn poll_snapshot(&self) -> HashMap<PathBuf, PollFileState> {
         let mut snapshot = HashMap::new();
         self.collect_poll_snapshot(&self.workspace_root, &mut snapshot);
+        // Native notification setup can fail on remote or constrained file
+        // systems. Preserve HEAD transition behavior in degraded polling mode
+        // by observing the same exact checkout-owned control paths.
+        for path in checkout_git_control_paths(&self.workspace_root) {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let modified_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                snapshot.insert(
+                    path,
+                    PollFileState {
+                        modified_ns,
+                        size_bytes: metadata.len(),
+                    },
+                );
+            }
+        }
         snapshot
     }
 
@@ -438,6 +463,7 @@ impl FileWatcher {
     async fn capture_head_baseline(&self) {
         let snapshot = read_checkout_head(&self.workspace_root);
         if let Some(snapshot) = snapshot {
+            self.request_git_intelligence_refresh(&snapshot);
             *self.observed_head.lock().await = Some(snapshot);
         }
     }
@@ -458,8 +484,22 @@ impl FileWatcher {
         let changed = observed
             .as_ref()
             .is_some_and(|previous| previous != &current);
+        if changed {
+            self.request_git_intelligence_refresh(&current);
+        }
         *observed = Some(current);
         changed
+    }
+
+    fn request_git_intelligence_refresh(&self, head: &ObservedCheckoutHead) {
+        let Some(runtime) = self.git_intelligence.as_ref() else {
+            return;
+        };
+        let target = match &head.target {
+            HeadTarget::Unborn => None,
+            HeadTarget::Resolved(oid) => Some(oid.clone()),
+        };
+        runtime.request(target);
     }
 
     async fn classify_changes(&self, paths: Vec<PathBuf>) -> ClassifiedChanges {
@@ -1051,6 +1091,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_baseline_and_transition_request_git_intelligence_refreshes() {
+        let root = unique_test_root("watch-git-intelligence");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("create git refs");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write head");
+        std::fs::write(root.join(".git/refs/heads/main"), "first-oid\n")
+            .expect("write initial ref");
+        let (mut watcher, _, _, _, _) = test_watcher(root.clone());
+        let refresh = GitIntelligenceRefreshHandle::for_test();
+        watcher.git_intelligence = Some(refresh.clone());
+
+        watcher.capture_head_baseline().await;
+        assert_eq!(
+            refresh.latest_request_for_test(),
+            (1, Some("first-oid".to_string()))
+        );
+
+        std::fs::write(root.join(".git/refs/heads/main"), "second-oid\n").expect("advance ref");
+        assert!(watcher.observe_head_transition().await);
+        assert_eq!(
+            refresh.latest_request_for_test(),
+            (2, Some("second-oid".to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn sibling_worktree_events_and_unchanged_packed_refs_do_no_index_work() {
         let root = unique_test_root("watch-sibling-noop");
         std::fs::create_dir_all(root.join(".git/refs/heads")).expect("create git refs");
@@ -1179,6 +1246,7 @@ mod tests {
             readiness,
             Arc::clone(&health),
             Arc::new(IndexHealth::default()),
+            None,
             "test-session".to_string(),
         );
         (watcher, indexer, indexing, health, index_work)
