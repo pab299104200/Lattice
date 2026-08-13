@@ -307,11 +307,16 @@ fn ratio_per_mille(numerator: u32, denominator: u32) -> u16 {
 /// Detects conventional fix-shaped subjects without retaining commit bodies.
 pub fn looks_like_bug_fix(subject: &str) -> bool {
     let normalized = subject.trim_start().to_ascii_lowercase();
-    normalized.starts_with("fix")
-        || normalized.starts_with("bug")
-        || normalized.starts_with("hotfix")
-        || normalized.starts_with("patch")
-        || normalized.contains("regression")
+    ["fix", "bug", "hotfix", "patch"].into_iter().any(|label| {
+        normalized.strip_prefix(label).is_some_and(|suffix| {
+            suffix
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric())
+        })
+    }) || normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word == "regression")
 }
 
 /// Canonicalizes a repository-relative path or rejects unsafe/ambiguous input.
@@ -439,8 +444,14 @@ mod tests {
     #[test]
     fn recognizes_fix_subjects_without_false_positive_prefixes() {
         assert!(looks_like_bug_fix("fix: parser"));
+        assert!(looks_like_bug_fix("bug(parser): bounds"));
+        assert!(looks_like_bug_fix("hotfix"));
         assert!(looks_like_bug_fix("Regression in indexing"));
         assert!(!looks_like_bug_fix("prefix cleanup"));
+        assert!(!looks_like_bug_fix("fixture cleanup"));
+        assert!(!looks_like_bug_fix("bugbear cleanup"));
+        assert!(!looks_like_bug_fix("patchwork cleanup"));
+        assert!(!looks_like_bug_fix("nonregression cleanup"));
         assert!(!looks_like_bug_fix("feature: repair docs"));
     }
 }
