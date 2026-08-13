@@ -24,8 +24,41 @@ pub(crate) struct McpRegistration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigScanReport {
     pub(crate) registrations: Vec<McpRegistration>,
+    pub(crate) hook_registrations: Vec<HookRegistration>,
     pub(crate) conflicts: Vec<String>,
     pub(crate) stale_paths: Vec<String>,
+    pub(crate) registration_issues: Vec<String>,
+    pub(crate) hook_timeout_violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookRegistration {
+    pub(crate) source: PathBuf,
+    pub(crate) json_path: String,
+    pub(crate) command: String,
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+/// A snapshot of the process table.  Keeping this boundary explicit makes the
+/// doctor check deterministic in tests and prevents fixture tests from ever
+/// inspecting the host process table.
+trait ProcessSnapshot {
+    fn output(&self) -> Result<String>;
+}
+
+struct SystemProcessSnapshot;
+
+impl ProcessSnapshot for SystemProcessSnapshot {
+    fn output(&self) -> Result<String> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .output()
+            .context("failed to inspect process table")?;
+        if !output.status.success() {
+            anyhow::bail!("process inspection exited with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +149,29 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
     }
     for stale in &config_report.stale_paths {
         warnings += 1;
-        println!("WARN stale binary path: {}", stale);
+        println!("WARN stale configured path: {}", stale);
+    }
+    for issue in &config_report.registration_issues {
+        failures += 1;
+        println!("FAIL config registration: {}", issue);
+    }
+    for violation in &config_report.hook_timeout_violations {
+        failures += 1;
+        println!("FAIL hook timeout: {}", violation);
+    }
+
+    match orphan_proxy_count(&SystemProcessSnapshot) {
+        Ok(0) => println!("PASS no orphaned lattice --stdio proxies"),
+        Ok(count) => {
+            warnings += 1;
+            println!(
+                "WARN found {count} orphaned lattice --stdio proxy process(es); stop them with: pkill -f 'lattice --stdio'"
+            );
+        }
+        Err(error) => {
+            warnings += 1;
+            println!("WARN orphan proxy check failed: {}", error);
+        }
     }
 
     match binary_skew_report() {
@@ -377,6 +432,7 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
     }
     if let Some(workspace) = workspace {
         files.push(workspace.join(".mcp.json"));
+        files.push(workspace.join(".codex").join("hooks.json"));
         let claude_dir = workspace.join(".claude");
         files.push(claude_dir.join("settings.json"));
         if let Ok(entries) = fs::read_dir(&claude_dir) {
@@ -393,6 +449,7 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
     }
 
     let mut registrations = Vec::new();
+    let mut hook_registrations = Vec::new();
     for file in files {
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
@@ -400,11 +457,17 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        collect_lattice_registrations(&file, "$", &value, &mut registrations);
+        collect_lattice_registrations(
+            &file,
+            "$",
+            &value,
+            &mut registrations,
+            &mut hook_registrations,
+        );
     }
 
     let conflicts = registration_conflicts(&registrations);
-    let stale_paths = registrations
+    let mut stale_paths = registrations
         .iter()
         .filter_map(|registration| {
             let command = registration.command.as_ref()?;
@@ -418,11 +481,28 @@ pub(crate) fn scan_configs(home: Option<PathBuf>, workspace: Option<PathBuf>) ->
                 None
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    stale_paths.extend(hook_registrations.iter().filter_map(|registration| {
+        (Path::new(&registration.command).is_absolute()
+            && !Path::new(&registration.command).exists())
+        .then(|| {
+            format!(
+                "{} at {} references missing {}",
+                registration.source.display(),
+                registration.json_path,
+                registration.command
+            )
+        })
+    }));
+    let registration_issues = registration_issues(&registrations);
+    let hook_timeout_violations = hook_timeout_violations(&hook_registrations);
     ConfigScanReport {
         registrations,
+        hook_registrations,
         conflicts,
         stale_paths,
+        registration_issues,
+        hook_timeout_violations,
     }
 }
 
@@ -431,6 +511,7 @@ fn collect_lattice_registrations(
     json_path: &str,
     value: &Value,
     registrations: &mut Vec<McpRegistration>,
+    hook_registrations: &mut Vec<HookRegistration>,
 ) {
     match value {
         Value::Object(object) => {
@@ -452,12 +533,16 @@ fn collect_lattice_registrations(
                     });
                 }
             }
+            if let Some(hooks) = object.get("hooks").and_then(Value::as_object) {
+                collect_lattice_hook_registrations(source, json_path, hooks, hook_registrations);
+            }
             for (key, child) in object {
                 collect_lattice_registrations(
                     source,
                     &format!("{json_path}.{key}"),
                     child,
                     registrations,
+                    hook_registrations,
                 );
             }
         }
@@ -468,11 +553,59 @@ fn collect_lattice_registrations(
                     &format!("{json_path}[{index}]"),
                     child,
                     registrations,
+                    hook_registrations,
                 );
             }
         }
         _ => {}
     }
+}
+
+fn collect_lattice_hook_registrations(
+    source: &Path,
+    json_path: &str,
+    hooks: &serde_json::Map<String, Value>,
+    registrations: &mut Vec<HookRegistration>,
+) {
+    for (event, entries) in hooks {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let Some(commands) = entry.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for (command_index, command) in commands.iter().enumerate() {
+                let Some(path) = command.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !is_lattice_hook_path(path) {
+                    continue;
+                }
+                registrations.push(HookRegistration {
+                    source: source.to_path_buf(),
+                    json_path: format!(
+                        "{json_path}.hooks.{event}[{entry_index}].hooks[{command_index}]"
+                    ),
+                    command: path.to_string(),
+                    timeout_secs: command.get("timeout").and_then(Value::as_u64),
+                });
+            }
+        }
+    }
+}
+
+fn is_lattice_hook_path(command: &str) -> bool {
+    let path = Path::new(command);
+    path.components()
+        .any(|component| component.as_os_str() == "integrations")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "hooks")
+        && matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("session-start.sh" | "user-prompt-submit.sh" | "post-tool-use.sh" | "stop.sh")
+        )
 }
 
 fn registration_conflicts(registrations: &[McpRegistration]) -> Vec<String> {
@@ -499,6 +632,92 @@ fn registration_conflicts(registrations: &[McpRegistration]) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(" | ")
     )]
+}
+
+fn registration_issues(registrations: &[McpRegistration]) -> Vec<String> {
+    registrations
+        .iter()
+        .filter_map(|registration| {
+            let source = format!(
+                "{} at {}",
+                registration.source.display(),
+                registration.json_path
+            );
+            let command = registration.command.as_deref()?;
+            if command.trim().is_empty() {
+                return Some(format!("{source} has an empty command"));
+            }
+            if !registration.args.iter().any(|arg| arg == "--stdio") {
+                return Some(format!("{source} is missing required --stdio argument"));
+            }
+            None
+        })
+        .chain(registrations.iter().filter_map(|registration| {
+            registration.command.is_none().then(|| {
+                format!(
+                    "{} at {} is missing a command",
+                    registration.source.display(),
+                    registration.json_path
+                )
+            })
+        }))
+        .collect()
+}
+
+fn hook_timeout_violations(registrations: &[HookRegistration]) -> Vec<String> {
+    registrations
+        .iter()
+        .filter_map(|registration| {
+            let timeout = registration.timeout_secs?;
+            (timeout <= crate::install::MAX_INNER_HOOK_TIMEOUT_SECS).then(|| {
+                format!(
+                    "{} at {} uses {timeout}s, but it must exceed the {}s internal query timeout",
+                    registration.source.display(),
+                    registration.json_path,
+                    crate::install::MAX_INNER_HOOK_TIMEOUT_SECS
+                )
+            })
+        })
+        .chain(registrations.iter().filter_map(|registration| {
+            registration.timeout_secs.is_none().then(|| {
+                format!(
+                    "{} at {} has no numeric outer timeout",
+                    registration.source.display(),
+                    registration.json_path
+                )
+            })
+        }))
+        .collect()
+}
+
+fn orphan_proxy_count(snapshot: &dyn ProcessSnapshot) -> Result<usize> {
+    Ok(orphaned_stdio_proxies(&snapshot.output()?))
+}
+
+fn orphaned_stdio_proxies(processes: &str) -> usize {
+    processes
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let Some(_pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+                return false;
+            };
+            let ppid = fields.next().and_then(|value| value.parse::<u32>().ok());
+            let command = fields.collect::<Vec<_>>().join(" ");
+            ppid == Some(1) && is_lattice_stdio_proxy(&command)
+        })
+        .count()
+}
+
+fn is_lattice_stdio_proxy(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|argument| argument == "--stdio")
+        && command.split_whitespace().any(|argument| {
+            Path::new(argument)
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new("lattice"))
+        })
 }
 
 fn binary_skew_report() -> Result<Vec<String>> {
@@ -607,6 +826,90 @@ mod tests {
 
         assert_eq!(report.registrations.len(), 1);
         assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn config_scan_reports_stale_paths_and_invalid_mcp_registration() {
+        let root = unique_test_dir("doctor-stale-registration");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join(".mcp.json"),
+            r#"{"mcpServers":{"lattice":{"command":"/missing/lattice","args":["--workspace","/repo"]}}}"#,
+        )
+        .unwrap();
+
+        let report = scan_configs(None, Some(workspace));
+
+        assert_eq!(report.stale_paths.len(), 1);
+        assert!(report.stale_paths[0].contains("/missing/lattice"));
+        assert_eq!(report.registration_issues.len(), 1);
+        assert!(report.registration_issues[0].contains("--stdio"));
+    }
+
+    #[test]
+    fn config_scan_rejects_hook_timeouts_that_do_not_exceed_internal_timeout() {
+        let root = unique_test_dir("doctor-hook-timeout");
+        let workspace = root.join("repo");
+        let hook = workspace.join("integrations/codex/hooks/session-start.sh");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(workspace.join(".codex")).unwrap();
+        fs::write(
+            workspace.join(".codex/hooks.json"),
+            format!(
+                r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"command":"{}","timeout":4}}]}}]}}}}"#,
+                hook.display()
+            ),
+        )
+        .unwrap();
+
+        let report = scan_configs(None, Some(workspace));
+
+        assert_eq!(report.hook_registrations.len(), 1);
+        assert!(report.stale_paths.is_empty());
+        assert_eq!(report.hook_timeout_violations.len(), 1);
+        assert!(report.hook_timeout_violations[0].contains("must exceed"));
+    }
+
+    #[test]
+    fn config_scan_reports_missing_lattice_hook_path() {
+        let root = unique_test_dir("doctor-stale-hook");
+        let workspace = root.join("repo");
+        fs::create_dir_all(workspace.join(".codex")).unwrap();
+        fs::write(
+            workspace.join(".codex/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"command":"/missing/integrations/codex/hooks/session-start.sh","timeout":5}]}]}}"#,
+        )
+        .unwrap();
+
+        let report = scan_configs(None, Some(workspace));
+
+        assert_eq!(report.hook_registrations.len(), 1);
+        assert_eq!(report.stale_paths.len(), 1);
+        assert!(report.stale_paths[0].contains("session-start.sh"));
+        assert!(report.hook_timeout_violations.is_empty());
+    }
+
+    #[test]
+    fn orphan_proxy_count_uses_injectable_process_snapshot() {
+        struct FixtureSnapshot(&'static str);
+
+        impl ProcessSnapshot for FixtureSnapshot {
+            fn output(&self) -> Result<String> {
+                Ok(self.0.to_string())
+            }
+        }
+
+        let snapshot = FixtureSnapshot(
+            "  12     1 /opt/lattice --stdio --workspace /repo\n\
+               13     7 /opt/lattice --stdio --workspace /repo\n\
+               14     1 /usr/bin/other --stdio\n\
+               15     1 /opt/lattice doctor\n\
+               16     1 /opt/lattice-helper --stdio\n",
+        );
+
+        assert_eq!(orphan_proxy_count(&snapshot).unwrap(), 1);
     }
 
     #[test]

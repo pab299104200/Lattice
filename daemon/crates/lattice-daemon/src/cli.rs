@@ -7,6 +7,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::adoption_metrics::render_metrics_for_workspace;
+use crate::install::{
+    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, InstallPaths,
+};
 use crate::proxy::{daemon_addr, ProxyHello};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,6 +26,7 @@ pub(crate) struct CliRequest {
 #[derive(Debug)]
 enum CliError {
     DaemonUnavailable,
+    DaemonConnection(std::io::Error),
     Rpc(String),
     Other(anyhow::Error),
 }
@@ -45,6 +49,7 @@ pub(crate) fn is_cli_query_command() -> bool {
             | Some("recall")
             | Some("status")
             | Some("metrics")
+            | Some("install")
     )
 }
 
@@ -71,13 +76,16 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics\n  install <mcp|claude-code|codex>\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("metrics") {
         return run_metrics_command(args);
+    }
+    if args.get(1).map(String::as_str) == Some("install") {
+        return run_install_command(args);
     }
     match parse_args(args) {
         Ok(request) => run_request(request).await,
@@ -86,6 +94,283 @@ pub(crate) async fn run_from_env() -> i32 {
             1
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallTarget {
+    Mcp,
+    ClaudeCode,
+    Codex,
+}
+
+impl InstallTarget {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "mcp" => Ok(Self::Mcp),
+            "claude-code" => Ok(Self::ClaudeCode),
+            "codex" => Ok(Self::Codex),
+            other => Err(anyhow!(
+                "unknown install target `{other}`; expected one of: mcp, claude-code, codex"
+            )),
+        }
+    }
+
+    fn config_path(self, workspace: &Path) -> PathBuf {
+        match self {
+            Self::Mcp => workspace.join(".mcp.json"),
+            Self::ClaudeCode => workspace.join(".claude/settings.json"),
+            Self::Codex => workspace.join(".codex/hooks.json"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallCommand {
+    target: InstallTarget,
+    workspaces: Vec<PathBuf>,
+    verify: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InstallRuntime {
+    executable: PathBuf,
+    asset_root: PathBuf,
+}
+
+fn run_install_command(args: Vec<String>) -> i32 {
+    let result = (|| {
+        let command = parse_install_command(args)?;
+        let runtime = resolve_install_runtime()?;
+        run_install_command_with(command, &runtime)
+    })();
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(error) => {
+            eprintln!("lattice: {error:#}");
+            1
+        }
+    }
+}
+
+fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
+    let target = args
+        .get(2)
+        .ok_or_else(|| anyhow!("install requires a target: mcp, claude-code, or codex"))
+        .and_then(|target| InstallTarget::parse(target))?;
+    let mut workspaces = Vec::new();
+    let mut verify = false;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--verify" => verify = true,
+            "--workspace" | "-w" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--workspace requires a path"))?;
+                workspaces.push(canonical_workspace(Path::new(value))?);
+                index += 1;
+            }
+            argument => return Err(anyhow!("unknown install argument `{argument}`")),
+        }
+        index += 1;
+    }
+    if workspaces.is_empty() {
+        workspaces.push(detect_workspace_root()?);
+    }
+    if target != InstallTarget::Mcp && workspaces.len() != 1 {
+        return Err(anyhow!(
+            "install hooks accepts exactly one --workspace; received {}",
+            workspaces.len()
+        ));
+    }
+    Ok(InstallCommand {
+        target,
+        workspaces,
+        verify,
+    })
+}
+
+/// Resolve all machine-specific installation inputs at the CLI boundary. The
+/// reconciliation domain never consults PATH or a caller's current directory.
+fn resolve_install_runtime() -> Result<InstallRuntime> {
+    let executable = std::env::current_exe()
+        .context("resolve the currently running lattice executable")?
+        .canonicalize()
+        .context("canonicalize the currently running lattice executable")?;
+    let asset_root = stable_asset_root(&executable)?;
+    Ok(InstallRuntime {
+        executable,
+        asset_root,
+    })
+}
+
+fn stable_asset_root(executable: &Path) -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("LATTICE_ASSET_ROOT") {
+        let root = PathBuf::from(root);
+        return root
+            .canonicalize()
+            .with_context(|| format!("canonicalize LATTICE_ASSET_ROOT `{}`", root.display()));
+    }
+
+    // Development builds live under daemon/target/*; installed distributions
+    // may place the binary elsewhere. Search only explicit, stable roots.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for candidate in executable.ancestors().chain(manifest.ancestors()) {
+        if candidate.join("integrations").is_dir() {
+            return candidate
+                .canonicalize()
+                .with_context(|| format!("canonicalize asset root `{}`", candidate.display()));
+        }
+    }
+    Err(anyhow!(
+        "cannot locate installation assets; set LATTICE_ASSET_ROOT to the directory containing integrations/"
+    ))
+}
+
+fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -> Result<String> {
+    let config_workspace = command
+        .workspaces
+        .first()
+        .expect("install parser guarantees a workspace");
+    let config_path = command.target.config_path(config_workspace);
+    let mut config = read_install_config(&config_path)?;
+
+    match command.target {
+        InstallTarget::Mcp => {
+            reconcile_mcp_config(&mut config, &runtime.executable, &command.workspaces)?;
+        }
+        InstallTarget::ClaudeCode | InstallTarget::Codex => {
+            let client = if command.target == InstallTarget::ClaudeCode {
+                HookClient::ClaudeCode
+            } else {
+                HookClient::Codex
+            };
+            let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
+            verify_hook_assets(&paths, client)?;
+            reconcile_hook_config(&mut config, client, &paths)?;
+        }
+    }
+
+    write_install_config(&config_path, &config)?;
+    if command.verify {
+        verify_install_config(&config_path, &command, runtime)?;
+    }
+    Ok(format!(
+        "installed Lattice {} configuration at {}",
+        match command.target {
+            InstallTarget::Mcp => "MCP",
+            InstallTarget::ClaudeCode => "Claude Code hook",
+            InstallTarget::Codex => "Codex hook",
+        },
+        config_path.display()
+    ))
+}
+
+fn read_install_config(path: &Path) -> Result<Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let config: Value = serde_json::from_str(&text).with_context(|| {
+                format!("parse existing installation config `{}`", path.display())
+            })?;
+            if !config.is_object() {
+                return Err(anyhow!(
+                    "installation config `{}` must be a JSON object",
+                    path.display()
+                ));
+            }
+            Ok(config)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(error) => {
+            Err(error).with_context(|| format!("read installation config `{}`", path.display()))
+        }
+    }
+}
+
+fn write_install_config(path: &Path, config: &Value) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("installation config `{}` has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create installation config directory `{}`",
+            parent.display()
+        )
+    })?;
+    let staged = path.with_extension("json.lattice-install-tmp");
+    std::fs::write(&staged, render_config(config)?)
+        .with_context(|| format!("write staged installation config `{}`", staged.display()))?;
+    std::fs::rename(&staged, path).with_context(|| {
+        format!(
+            "replace installation config `{}` with staged file `{}`",
+            path.display(),
+            staged.display()
+        )
+    })
+}
+
+fn verify_hook_assets(paths: &InstallPaths, client: HookClient) -> Result<()> {
+    let directory = match client {
+        HookClient::ClaudeCode => "claude-code",
+        HookClient::Codex => "codex",
+    };
+    for script in [
+        "session-start.sh",
+        "user-prompt-submit.sh",
+        "post-tool-use.sh",
+        "stop.sh",
+    ] {
+        let path = paths
+            .asset_root
+            .join("integrations")
+            .join(directory)
+            .join("hooks")
+            .join(script);
+        if !path.is_file() {
+            return Err(anyhow!(
+                "required {} hook asset is missing: {}",
+                directory,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Re-read from disk after replacement, so verification catches serialization
+/// and target-path mistakes rather than validating only the in-memory value.
+fn verify_install_config(
+    path: &Path,
+    command: &InstallCommand,
+    runtime: &InstallRuntime,
+) -> Result<()> {
+    let mut actual = read_install_config(path)?;
+    let before = render_config(&actual)?;
+    match command.target {
+        InstallTarget::Mcp => {
+            reconcile_mcp_config(&mut actual, &runtime.executable, &command.workspaces)?
+        }
+        InstallTarget::ClaudeCode | InstallTarget::Codex => {
+            let client = if command.target == InstallTarget::ClaudeCode {
+                HookClient::ClaudeCode
+            } else {
+                HookClient::Codex
+            };
+            let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
+            verify_hook_assets(&paths, client)?;
+            reconcile_hook_config(&mut actual, client, &paths)?;
+        }
+    }
+    if before != render_config(&actual)? {
+        return Err(anyhow!(
+            "verification failed: `{}` is not a canonical Lattice installation config",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_request(request: CliRequest) -> i32 {
@@ -102,6 +387,10 @@ async fn run_request(request: CliRequest) -> i32 {
         }
         Ok(Err(CliError::DaemonUnavailable)) => {
             eprintln!("lattice daemon not running — start with: lattice --daemon");
+            2
+        }
+        Ok(Err(CliError::DaemonConnection(error))) => {
+            eprintln!("{}", daemon_connection_message(&error));
             2
         }
         Err(_) => {
@@ -125,7 +414,7 @@ async fn run_request(request: CliRequest) -> i32 {
 async fn call_daemon(request: &CliRequest) -> Result<Value, CliError> {
     let mut stream = TcpStream::connect(daemon_addr())
         .await
-        .map_err(|_| CliError::DaemonUnavailable)?;
+        .map_err(CliError::DaemonConnection)?;
     let hello = ProxyHello {
         workspace_roots: vec![request.workspace.to_string_lossy().to_string()],
         focus_files: Vec::new(),
@@ -172,6 +461,28 @@ async fn call_daemon(request: &CliRequest) -> Result<Value, CliError> {
             .ok_or_else(|| CliError::Rpc("missing JSON-RPC result".to_string()));
     }
     Err(CliError::DaemonUnavailable)
+}
+
+fn daemon_connection_message(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "lattice cannot connect to {} because localhost access was denied: {}",
+            daemon_addr(),
+            error
+        )
+    } else if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        format!(
+            "lattice daemon is not accepting connections at {} — start with: lattice --daemon ({})",
+            daemon_addr(),
+            error
+        )
+    } else {
+        format!(
+            "lattice could not connect to daemon at {}: {}",
+            daemon_addr(),
+            error
+        )
+    }
 }
 
 fn run_metrics_command(args: Vec<String>) -> i32 {
@@ -731,6 +1042,45 @@ fn compact_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn install_fixture() -> (PathBuf, PathBuf, InstallRuntime) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lattice-cli-install-{nonce}"));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        for client in ["claude-code", "codex"] {
+            let hooks = root.join("integrations").join(client).join("hooks");
+            fs::create_dir_all(&hooks).unwrap();
+            for script in [
+                "session-start.sh",
+                "user-prompt-submit.sh",
+                "post-tool-use.sh",
+                "stop.sh",
+            ] {
+                fs::write(hooks.join(script), "#!/bin/sh\nexit 0\n").unwrap();
+            }
+        }
+        let runtime = InstallRuntime {
+            executable: PathBuf::from("/opt/lattice/bin/lattice"),
+            asset_root: root.clone(),
+        };
+        (root, workspace, runtime)
+    }
+
+    #[test]
+    fn permission_denied_connection_error_is_not_reported_as_daemon_absence() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "blocked by sandbox");
+        let message = daemon_connection_message(&error);
+
+        assert!(message.contains("localhost access was denied"));
+        assert!(message.contains("blocked by sandbox"));
+        assert!(!message.contains("daemon not running"));
+    }
 
     #[test]
     fn parses_context_command_with_common_flags() {
@@ -789,5 +1139,94 @@ mod tests {
             }]
         });
         assert_eq!(render_output(&result, false), "### Summary\n- ok");
+    }
+
+    #[test]
+    fn install_mcp_reconciles_config_idempotently_and_verifies_disk_round_trip() {
+        let (root, workspace, runtime) = install_fixture();
+        fs::write(
+            workspace.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"other"},"lattice":{"command":"stale"}}}"#,
+        )
+        .unwrap();
+        let command = InstallCommand {
+            target: InstallTarget::Mcp,
+            workspaces: vec![workspace.clone()],
+            verify: true,
+        };
+
+        run_install_command_with(command.clone(), &runtime).unwrap();
+        let once = fs::read_to_string(workspace.join(".mcp.json")).unwrap();
+        run_install_command_with(command, &runtime).unwrap();
+        let twice = fs::read_to_string(workspace.join(".mcp.json")).unwrap();
+
+        assert_eq!(once, twice);
+        let config: Value = serde_json::from_str(&twice).unwrap();
+        assert_eq!(config["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            config["mcpServers"]["lattice"]["command"],
+            "/opt/lattice/bin/lattice"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_hook_targets_preserve_foreign_entries_and_write_stable_assets() {
+        let (root, workspace, runtime) = install_fixture();
+        fs::create_dir_all(workspace.join(".codex")).unwrap();
+        fs::write(
+            workspace.join(".codex/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"custom-hook"}]}]}}"#,
+        )
+        .unwrap();
+        let command = InstallCommand {
+            target: InstallTarget::Codex,
+            workspaces: vec![workspace.clone()],
+            verify: true,
+        };
+
+        run_install_command_with(command.clone(), &runtime).unwrap();
+        let once = fs::read_to_string(workspace.join(".codex/hooks.json")).unwrap();
+        run_install_command_with(command, &runtime).unwrap();
+        let twice = fs::read_to_string(workspace.join(".codex/hooks.json")).unwrap();
+
+        assert_eq!(once, twice);
+        let config: Value = serde_json::from_str(&twice).unwrap();
+        let stop_hooks = config["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop_hooks.iter().any(|entry| {
+            entry["hooks"]
+                .as_array()
+                .is_some_and(|hooks| hooks.iter().any(|hook| hook["command"] == "custom-hook"))
+        }));
+        assert!(twice.contains(
+            &root
+                .join("integrations/codex/hooks/stop.sh")
+                .display()
+                .to_string()
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_parser_rejects_unknown_targets_and_multiple_hook_workspaces() {
+        let error = InstallTarget::parse("wrong").unwrap_err().to_string();
+        assert!(error.contains("unknown install target"));
+
+        let (root, workspace, _) = install_fixture();
+        let second = root.join("second");
+        fs::create_dir_all(second.join(".git")).unwrap();
+        let error = parse_install_command(vec![
+            "lattice".into(),
+            "install".into(),
+            "codex".into(),
+            "--workspace".into(),
+            workspace.display().to_string(),
+            "--workspace".into(),
+            second.display().to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exactly one --workspace"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
