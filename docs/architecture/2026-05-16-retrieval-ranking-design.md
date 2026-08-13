@@ -37,6 +37,24 @@ Source retrieval must be bounded before ranking. Broad textual search remains ap
 
 Known-extension root files are first-class path anchors. Change-preparation routes resolve existing file tokens against the canonical workspace root, reject references outside that root, cap the inferred entry set, and promote those files ahead of generic lexical matches. Structural `search` normalizes punctuation and can require all query terms across a node name and file path, allowing document headings and root instruction files to be found without weakening exact-name ordering.
 
+### Deterministic module digests
+
+The indexer builds one deterministic module digest per indexed source file from graph
+facts. Inputs are sorted, limits are fixed, and ties are
+resolved by stable paths, lines, and symbol names. Digests are generated and persisted
+with the committed graph/index epoch; query handling only selects from the immutable
+cache and never generates or refreshes digest prose on the query hot path. Digest
+prose carries exact `file:line` citations for its claims.
+
+Warm graph loads hydrate the digest cache only when its epoch, generator/version
+metadata, fingerprints, hashes, canonical payloads, and graph facts all validate. A
+pre-digest or epoch-zero store may still serve graph-backed retrieval while indexing
+rebuilds the cache. A cache with missing rows, malformed data, stale metadata, or facts
+inconsistent with its graph is rejected with an actionable storage error rather than
+partially hydrated or silently served. If no cached digest overlaps the requested subsystem,
+the response falls back to structured prose from the already-ranked files and symbols,
+with the same citation requirement; it does not synthesize a digest at query time.
+
 ## Ranking signals
 
 The required ranking signals from [## Retrieval Engine](../plans/2026-05-16-cognitive-workspace-fork-plan.md#retrieval-engine) are:

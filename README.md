@@ -123,6 +123,18 @@ At runtime Lattice keeps assistant state under the workspace-local `.lattice/` d
 
 On startup, Lattice warm-loads the persisted graph immediately, computes current file fingerprints in the background, and reparses only new, changed, deleted, or parser/schema-version-stale files. The first run after this cache format is introduced populates cached parsed files; later restarts reuse unchanged parsed files and update the loaded graph from deltas.
 
+Subsystem retrieval also uses deterministic, persisted module digests. The indexer
+generates one digest per indexed source file from sorted
+graph facts, fixed limits, and stable tie-breakers, then commits the digest rows with
+the graph's index epoch. Query-time retrieval selects only from the immutable hydrated
+cache; it never generates or refreshes digest prose. Digest claims include exact
+`file:line` citations. If a legacy/pre-digest store has no cache, graph-backed
+retrieval remains available while reindexing populates it. If a cache row fails epoch,
+fingerprint, hash, canonical-payload, or graph validation, warm loading fails with an
+actionable storage error rather than serving a partial cache. When no cached digest
+matches a subsystem, the response falls back to structured prose from the ranked files
+and symbols, still with citations.
+
 Because `graph.db` is derived current-workspace state, Lattice validates it with SQLite `quick_check` on open. Confirmed corruption replaces only `graph.db` plus its WAL/SHM sidecars and triggers a clean source rebuild; memory, vector, event, and snapshot stores are untouched. Permission and other non-corruption failures fail visibly instead of silently falling back to an empty in-memory graph.
 
 If `memories.db` cannot be opened cleanly, the daemon first quarantines `memories.db`, `memories.db-wal`, and `memories.db-shm` under `.lattice/recovered-memory/`, rebuilds a fresh persistent store, and only falls back to in-memory session memory if that recovery path also fails.
@@ -323,6 +335,11 @@ The retrieval core combines keyword matching with graph scoring. Important behav
 - negative keyword signal for wrong-subsystem suppression
 - word-boundary matching
 - intent detection for Explore / FixBug / Refactor / AddFeature queries
+
+Module digests are an index-time summary layer over this core. They are deterministic,
+cache-backed, and citation-bearing; digest generation never runs during a query.
+Missing cache data uses the graph-backed structured fallback until indexing rebuilds
+the cache.
 
 The newer workflow tools layer task reasoning and response shaping on top of that retrieval core.
 
