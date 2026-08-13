@@ -6,6 +6,7 @@
 //! transcript, command, or tool payload.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -22,6 +23,113 @@ use crate::{DateTime, Utc};
 pub const SESSION_CAPTURE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SESSION_CAPTURE_EVENT_BYTES: usize = 4 * 1024;
 pub const MAX_SESSION_CAPTURE_CLOSE_BYTES: usize = 4 * 1024;
+pub const MAX_SESSION_CAPTURE_SELECTOR_BYTES: usize = 512;
+
+/// Repository-local lifecycle bounds for the sanitized capture journal.
+///
+/// Both bounds are mandatory. A delivery is eligible for pruning when it is
+/// older than `max_age` or falls outside the newest `max_captures` deliveries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCaptureRetentionPolicy {
+    max_age: Duration,
+    max_captures: usize,
+}
+
+impl SessionCaptureRetentionPolicy {
+    pub fn new(max_age: Duration, max_captures: usize) -> Result<Self, SessionCaptureError> {
+        if max_age.is_zero() || max_captures == 0 {
+            return Err(SessionCaptureError::InvalidRetentionPolicy);
+        }
+        Ok(Self {
+            max_age,
+            max_captures,
+        })
+    }
+
+    pub(crate) fn max_age(self) -> Duration {
+        self.max_age
+    }
+
+    pub(crate) fn max_captures(self) -> usize {
+        self.max_captures
+    }
+}
+
+/// An authority-qualified opaque selector for operator deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCaptureSelector {
+    repository_id: String,
+    opaque_id: String,
+    kind: SessionCaptureSelectorKind,
+}
+
+impl SessionCaptureSelector {
+    pub fn session(
+        repository_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Result<Self, SessionCaptureError> {
+        Self::new(
+            repository_id.into(),
+            session_id.into(),
+            SessionCaptureSelectorKind::Session,
+        )
+    }
+
+    pub fn capture(
+        repository_id: impl Into<String>,
+        capture_id: impl Into<String>,
+    ) -> Result<Self, SessionCaptureError> {
+        Self::new(
+            repository_id.into(),
+            capture_id.into(),
+            SessionCaptureSelectorKind::Capture,
+        )
+    }
+
+    fn new(
+        repository_id: String,
+        opaque_id: String,
+        kind: SessionCaptureSelectorKind,
+    ) -> Result<Self, SessionCaptureError> {
+        if !valid_opaque_selector_component(&repository_id)
+            || !valid_opaque_selector_component(&opaque_id)
+        {
+            return Err(SessionCaptureError::InvalidLifecycleSelector);
+        }
+        Ok(Self {
+            repository_id,
+            opaque_id,
+            kind,
+        })
+    }
+
+    pub(crate) fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub(crate) fn opaque_id(&self) -> &str {
+        &self.opaque_id
+    }
+
+    pub(crate) fn kind(&self) -> SessionCaptureSelectorKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionCaptureSelectorKind {
+    Session,
+    Capture,
+}
+
+/// Content-free outcome of retention or operator deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionCaptureDeletionResult {
+    pub deleted_capture_ids: Vec<String>,
+    pub deleted_memory_count: usize,
+    pub retained_derived_memory_count: usize,
+    pub retained_proposal_count: usize,
+}
 
 /// A normalized fact admitted from one authenticated hook event.
 ///
@@ -92,6 +200,10 @@ pub enum SessionCaptureError {
     SegmentOrder,
     #[error("invalid daemon-owned session capture authority")]
     InvalidAuthority,
+    #[error("invalid session capture retention policy")]
+    InvalidRetentionPolicy,
+    #[error("invalid session capture lifecycle selector")]
+    InvalidLifecycleSelector,
 }
 
 /// Parse one narrow event envelope.
@@ -406,6 +518,12 @@ fn ensure_same_session(
 
 fn map_digest_authority_error(_: SessionDigestError) -> SessionCaptureError {
     SessionCaptureError::InvalidAuthority
+}
+
+fn valid_opaque_selector_component(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_SESSION_CAPTURE_SELECTOR_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]

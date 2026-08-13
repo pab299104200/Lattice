@@ -7,6 +7,9 @@
 //! returned identifier.
 
 use super::model::MemoryProvenance;
+use super::session_capture::{
+    SessionCaptureDeletionResult, SessionCaptureRetentionPolicy, SessionCaptureSelector,
+};
 use super::session_digest::{
     extract_default_session_digest_candidates, SessionDigest, SessionDigestCandidate,
     SESSION_DIGEST_EXTRACTOR_VERSION,
@@ -337,6 +340,43 @@ impl<'a> MemoryStoreRouter<'a> {
             dropped_observation_count: persisted.dropped_observation_count,
             replayed: persisted.replayed,
         })
+    }
+
+    /// Apply repository-local age-and-count retention to automatic captures.
+    pub fn prune_session_captures(
+        &self,
+        policy: SessionCaptureRetentionPolicy,
+        now: crate::DateTime<crate::Utc>,
+    ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        self.repository_store.prune_session_captures(
+            &self.authority.repository_id,
+            policy,
+            now.unix_seconds(),
+        )
+    }
+
+    /// Delete automatic captures selected by an opaque session or capture ID.
+    /// The repository qualifier is a strict lease and cannot be supplied from
+    /// another repository authority.
+    pub fn delete_session_captures(
+        &self,
+        selector: &SessionCaptureSelector,
+        deleted_at: crate::DateTime<crate::Utc>,
+    ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        if selector.repository_id() != self.authority.repository_id {
+            self.audit_denial(
+                "delete session captures",
+                "capture selector repository does not match the repository router",
+            )?;
+            return Err(LatticeError::Storage(
+                "session capture selector does not match repository authority".to_string(),
+            ));
+        }
+        self.repository_store.delete_session_captures(
+            &self.authority.repository_id,
+            selector,
+            deleted_at.unix_seconds(),
+        )
     }
 
     /// Merged, bounded recall. Each store is searched independently before
@@ -682,15 +722,18 @@ fn ensure_role_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::session_capture::{SessionCaptureRetentionPolicy, SessionCaptureSelector};
     use crate::memory::store::{
-        MEMORY_FTS_STATE_TABLE, SESSION_DIGEST_CAPTURE_COMMITS_TABLE,
+        MEMORY_FTS_STATE_TABLE, SESSION_CAPTURE_TOMBSTONES_TABLE,
+        SESSION_CAPTURE_TOMBSTONE_PROVENANCE_TABLE, SESSION_DIGEST_CAPTURE_COMMITS_TABLE,
         SESSION_DIGEST_DELIVERIES_TABLE,
     };
     use crate::memory::{
-        bind_session_digest_authority, parse_session_digest, MemoryClass, MemoryType,
-        SessionDigestAuthority,
+        bind_session_digest_authority, parse_session_digest, MemoryClass, MemoryLinkRecord,
+        MemoryType, SessionDigestAuthority,
     };
     use crate::DateTime;
+    use std::time::Duration;
 
     fn authority(repository: &str, organization: Option<&str>) -> MemoryQueryAuthority {
         MemoryQueryAuthority::new(
@@ -769,6 +812,47 @@ mod tests {
                 branch: branch.map(str::to_string),
                 revision: "0123456789abcdef".to_string(),
                 segment: 7,
+            },
+        )
+        .unwrap()
+    }
+
+    fn capture_authority_for_session(session_id: &str, checkout: &str) -> MemoryQueryAuthority {
+        MemoryQueryAuthority::new(
+            "repo-capture",
+            checkout,
+            Some("main".to_string()),
+            session_id,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn capture_digest_at(
+        session_id: &str,
+        checkout: &str,
+        segment: u64,
+        received_at: i64,
+    ) -> SessionDigest {
+        let content = parse_session_digest(
+            r#"{
+                "schema_version":1,
+                "ended_at":"2023-11-14T22:13:20Z",
+                "edited_paths":["src/capture.rs"],
+                "observations":[]
+            }"#,
+            DateTime::from_unix_seconds(received_at),
+        )
+        .unwrap();
+        bind_session_digest_authority(
+            content,
+            &SessionDigestAuthority {
+                session_id: session_id.to_string(),
+                repository_id: "repo-capture".to_string(),
+                checkout_id: Some(checkout.to_string()),
+                branch: Some("main".to_string()),
+                revision: format!("revision-{segment}"),
+                segment,
             },
         )
         .unwrap()
@@ -1227,5 +1311,215 @@ mod tests {
         assert_eq!(table_count(&repository, "memories"), 0);
         assert_eq!(table_count(&shared, "memories"), 0);
         assert_eq!(table_count(&shared, SESSION_DIGEST_DELIVERIES_TABLE), 0);
+    }
+
+    #[test]
+    fn capture_retention_applies_repository_local_age_and_count_bounds() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let mut capture_ids = Vec::new();
+        for (segment, received_at) in [(1, 100), (2, 200), (3, 300)] {
+            let digest = capture_digest_at("retention-session", "checkout-a", segment, received_at);
+            let candidates = extract_default_session_digest_candidates(&digest);
+            let result = MemoryStoreRouter::new(
+                &repository,
+                None,
+                capture_authority_for_session("retention-session", "checkout-a"),
+            )
+            .unwrap()
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+            capture_ids.push(result.delivery_key);
+        }
+
+        let router = MemoryStoreRouter::new(
+            &repository,
+            None,
+            capture_authority_for_session("retention-session", "checkout-a"),
+        )
+        .unwrap();
+        let result = router
+            .prune_session_captures(
+                SessionCaptureRetentionPolicy::new(Duration::from_secs(150), 1).unwrap(),
+                DateTime::from_unix_seconds(350),
+            )
+            .unwrap();
+
+        assert_eq!(result.deleted_capture_ids, capture_ids[..2]);
+        assert_eq!(result.deleted_memory_count, 2);
+        assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
+        assert_eq!(table_count(&repository, "memories"), 1);
+        assert_eq!(
+            table_count(&repository, SESSION_CAPTURE_TOMBSTONES_TABLE),
+            2
+        );
+        assert_eq!(
+            router
+                .prune_session_captures(
+                    SessionCaptureRetentionPolicy::new(Duration::from_secs(150), 1).unwrap(),
+                    DateTime::from_unix_seconds(350),
+                )
+                .unwrap(),
+            SessionCaptureDeletionResult::default()
+        );
+    }
+
+    #[test]
+    fn operator_deletion_prunes_dependencies_and_retains_derived_records_as_tombstones() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let authority = capture_authority_for_session("delete-session", "checkout-a");
+        let digest = capture_digest_at("delete-session", "checkout-a", 1, 500);
+        let candidates = extract_default_session_digest_candidates(&digest);
+        let router = MemoryStoreRouter::new(&repository, None, authority).unwrap();
+        let captured = router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+        let source_memory_id = captured.memory_ids[0].local_id.clone();
+
+        let mut derived = memory(MemoryScope::Repo, None, "durable derived decision");
+        derived.workspace_id = Some("repo-capture".to_string());
+        derived.session_id = "later-session".to_string();
+        let derived_id = repository.store(derived).unwrap();
+        let mut derived_fields = fields();
+        derived_fields.linked_memories = vec![source_memory_id.clone()];
+        repository
+            .update_structured_fields(&derived_id, &derived_fields)
+            .unwrap();
+        repository
+            .insert_memory_link(&MemoryLinkRecord {
+                link_id: "derived-capture-link".to_string(),
+                source_memory_id: derived_id.clone(),
+                target_memory_id: source_memory_id.clone(),
+                link_type: "derived_from".to_string(),
+                reason: "test provenance".to_string(),
+                created_at: 501,
+                verification_status: "unverified".to_string(),
+            })
+            .unwrap();
+        repository
+            .enqueue_verification_job("repo-capture", &source_memory_id)
+            .unwrap();
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO consolidation_jobs
+                            (job_id, workspace_id, kind, mode, status, enqueued_at)
+                         VALUES ('capture-job', 'repo-capture', 'session_digest',
+                                 'manual_review', 'proposed', 501)",
+                        [],
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                connection
+                    .execute(
+                        "INSERT INTO consolidation_proposals
+                            (proposal_id, job_id, target_memory_id, proposal_kind,
+                             prior_state, proposed_state, evidence, decision)
+                         VALUES ('capture-proposal', 'capture-job', ?1, 'update_memory',
+                                 ?2, '{}', ?3, 'pending')",
+                        params![
+                            source_memory_id,
+                            serde_json::json!({
+                                "memory": {"id": source_memory_id, "content": "deleted claim"}
+                            })
+                            .to_string(),
+                            serde_json::json!({"source_memory_ids": [source_memory_id]})
+                                .to_string(),
+                        ],
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let selector = SessionCaptureSelector::session("repo-capture", "delete-session").unwrap();
+        let result = router
+            .delete_session_captures(&selector, DateTime::from_unix_seconds(600))
+            .unwrap();
+        assert_eq!(
+            result.deleted_capture_ids,
+            vec![captured.delivery_key.clone()]
+        );
+        assert_eq!(result.deleted_memory_count, 1);
+        assert_eq!(result.retained_derived_memory_count, 1);
+        assert_eq!(result.retained_proposal_count, 1);
+        assert!(repository.get_by_id(&source_memory_id).unwrap().is_none());
+        assert!(repository.get_by_id(&derived_id).unwrap().is_some());
+        assert_eq!(table_count(&repository, "memory_links"), 0);
+        assert_eq!(table_count(&repository, "verification_jobs"), 0);
+        assert_eq!(table_count(&repository, "consolidation_jobs"), 1);
+        assert_eq!(table_count(&repository, "consolidation_proposals"), 1);
+        assert_eq!(
+            table_count(&repository, SESSION_CAPTURE_TOMBSTONE_PROVENANCE_TABLE),
+            2
+        );
+
+        repository
+            .with_connection(|connection| {
+                let provenance_json: String = connection
+                    .query_row(
+                        "SELECT provenance_json FROM memories WHERE id = ?1",
+                        params![derived_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                let provenance: Vec<MemoryProvenance> =
+                    serde_json::from_str(&provenance_json).unwrap();
+                assert!(provenance.iter().any(|entry| {
+                    entry.source == "lattice.deleted_session_capture.v1"
+                        && entry.reference.as_deref() == Some(captured.delivery_key.as_str())
+                        && entry.captured_at == Some(600)
+                }));
+                let (target, prior): (Option<String>, String) = connection
+                    .query_row(
+                        "SELECT target_memory_id, prior_state
+                         FROM consolidation_proposals WHERE proposal_id = 'capture-proposal'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                assert!(target.is_none());
+                assert!(!prior.contains("deleted claim"));
+                assert!(prior.contains("deleted_session_capture"));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            router
+                .delete_session_captures(&selector, DateTime::from_unix_seconds(700))
+                .unwrap(),
+            SessionCaptureDeletionResult::default()
+        );
+        assert_eq!(
+            table_count(&repository, SESSION_CAPTURE_TOMBSTONES_TABLE),
+            1
+        );
+
+        let replay_error = router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap_err();
+        assert!(replay_error.to_string().contains("cannot be replayed"));
+        assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 0);
+        assert!(repository.get_by_id(&source_memory_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn operator_deletion_refuses_cross_repository_selector() {
+        let repository = MemoryStore::open_in_memory().unwrap();
+        let authority = capture_authority_for_session("delete-session", "checkout-a");
+        let digest = capture_digest_at("delete-session", "checkout-a", 1, 500);
+        let candidates = extract_default_session_digest_candidates(&digest);
+        let router = MemoryStoreRouter::new(&repository, None, authority).unwrap();
+        router
+            .capture_session_digest_candidate_batch(&digest, &candidates)
+            .unwrap();
+
+        let selector = SessionCaptureSelector::session("repo-other", "delete-session").unwrap();
+        let error = router
+            .delete_session_captures(&selector, DateTime::from_unix_seconds(600))
+            .unwrap_err();
+        assert!(error.to_string().contains("repository authority"));
+        assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
+        assert_eq!(table_count(&repository, "memories"), 1);
     }
 }

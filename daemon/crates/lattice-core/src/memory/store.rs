@@ -3,6 +3,10 @@ use super::model::{
     MemoryFreshnessPolicy, MemoryLinkRecord, MemoryProvenance, MemoryScope, MemoryScoreKind,
     MemoryScoreRecord, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
 };
+use super::session_capture::{
+    SessionCaptureDeletionResult, SessionCaptureRetentionPolicy, SessionCaptureSelector,
+    SessionCaptureSelectorKind,
+};
 use super::session_digest::{SessionDigest, SessionDigestCandidate};
 use crate::error::LatticeError;
 use crate::verification::{
@@ -18,7 +22,7 @@ use rusqlite::{
     params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +35,9 @@ const MEMORIES_FTS_TABLE: &str = "memories_fts";
 pub(crate) const MEMORY_FTS_STATE_TABLE: &str = "memory_fts_state";
 pub(crate) const SESSION_DIGEST_DELIVERIES_TABLE: &str = "session_digest_deliveries";
 pub(crate) const SESSION_DIGEST_CAPTURE_COMMITS_TABLE: &str = "session_digest_capture_commits";
+pub(crate) const SESSION_CAPTURE_TOMBSTONES_TABLE: &str = "session_capture_tombstones";
+pub(crate) const SESSION_CAPTURE_TOMBSTONE_PROVENANCE_TABLE: &str =
+    "session_capture_tombstone_provenance";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedSessionDigestBatch {
@@ -334,6 +341,24 @@ impl MemoryStore {
                     memory_id TEXT NOT NULL UNIQUE
                         REFERENCES memories(id) ON DELETE RESTRICT,
                     PRIMARY KEY (delivery_key, candidate_ordinal)
+                );
+
+                CREATE TABLE IF NOT EXISTS session_capture_tombstones (
+                    delivery_key TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    deletion_reason TEXT NOT NULL CHECK (
+                        deletion_reason IN ('retention', 'operator')
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS session_capture_tombstone_provenance (
+                    delivery_key TEXT NOT NULL
+                        REFERENCES session_capture_tombstones(delivery_key) ON DELETE RESTRICT,
+                    derived_kind TEXT NOT NULL CHECK (derived_kind IN ('memory', 'proposal')),
+                    derived_id TEXT NOT NULL,
+                    source_memory_id TEXT NOT NULL,
+                    PRIMARY KEY (delivery_key, derived_kind, derived_id, source_memory_id)
                 );",
             )
             .map_err(|e| {
@@ -376,7 +401,11 @@ impl MemoryStore {
                  CREATE INDEX IF NOT EXISTS idx_session_digest_deliveries_session
                     ON session_digest_deliveries(repository_id, checkout_id, session_id, segment);
                  CREATE INDEX IF NOT EXISTS idx_session_digest_capture_memory
-                    ON session_digest_capture_commits(memory_id);",
+                    ON session_digest_capture_commits(memory_id);
+                 CREATE INDEX IF NOT EXISTS idx_session_capture_tombstones_repository_time
+                    ON session_capture_tombstones(repository_id, deleted_at, delivery_key);
+                 CREATE INDEX IF NOT EXISTS idx_session_capture_tombstone_derived
+                    ON session_capture_tombstone_provenance(derived_kind, derived_id);",
             )
             .map_err(|e| {
                 LatticeError::Storage(format!("Failed to initialize memory indexes: {}", e))
@@ -577,6 +606,28 @@ impl MemoryStore {
             },
         )?;
 
+        let was_deleted = tx
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM {SESSION_CAPTURE_TOMBSTONES_TABLE}
+                     WHERE delivery_key = ?1 AND repository_id = ?2"
+                ),
+                params![delivery_key, digest.repository_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to inspect automatic capture deletion tombstone: {error}"
+                ))
+            })?
+            .is_some();
+        if was_deleted {
+            return Err(LatticeError::Storage(
+                "automatic session capture delivery was deleted and cannot be replayed".to_string(),
+            ));
+        }
+
         if let Some(existing) = load_session_digest_delivery(&tx, &delivery_key)? {
             if existing.normalized_fingerprint != normalized_fingerprint
                 || existing.candidate_count != candidates.len()
@@ -748,6 +799,296 @@ impl MemoryStore {
             committed_count: candidates.len(),
             dropped_observation_count: digest.dropped_observation_count,
             replayed: false,
+        })
+    }
+
+    pub(crate) fn prune_session_captures(
+        &self,
+        repository_id: &str,
+        policy: SessionCaptureRetentionPolicy,
+        now: i64,
+    ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        let max_age_secs = policy.max_age().as_secs().min(i64::MAX as u64) as i64;
+        let cutoff = now.saturating_sub(max_age_secs);
+        let max_captures = i64::try_from(policy.max_captures()).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT delivery_key
+                 FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                 WHERE repository_id = ?1
+                   AND (
+                       created_at < ?2
+                       OR delivery_key NOT IN (
+                           SELECT delivery_key
+                           FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                           WHERE repository_id = ?1
+                           ORDER BY created_at DESC, delivery_key DESC
+                           LIMIT ?3
+                       )
+                   )
+                 ORDER BY created_at ASC, delivery_key ASC"
+            ))
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to prepare automatic capture retention query: {error}"
+                ))
+            })?;
+        let delivery_keys = statement
+            .query_map(params![repository_id, cutoff, max_captures], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to query automatic capture retention candidates: {error}"
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to decode automatic capture retention candidate: {error}"
+                ))
+            })?;
+        drop(statement);
+        self.delete_session_capture_deliveries(repository_id, &delivery_keys, now, "retention")
+    }
+
+    pub(crate) fn delete_session_captures(
+        &self,
+        repository_id: &str,
+        selector: &SessionCaptureSelector,
+        deleted_at: i64,
+    ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        let (predicate, selector_value) = match selector.kind() {
+            SessionCaptureSelectorKind::Session => ("session_id", selector.opaque_id()),
+            SessionCaptureSelectorKind::Capture => ("delivery_key", selector.opaque_id()),
+        };
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT delivery_key
+                 FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                 WHERE repository_id = ?1 AND {predicate} = ?2
+                 ORDER BY created_at ASC, delivery_key ASC"
+            ))
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to prepare automatic capture deletion query: {error}"
+                ))
+            })?;
+        let delivery_keys = statement
+            .query_map(params![repository_id, selector_value], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to query automatic capture deletion candidates: {error}"
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to decode automatic capture deletion candidate: {error}"
+                ))
+            })?;
+        drop(statement);
+        self.delete_session_capture_deliveries(
+            repository_id,
+            &delivery_keys,
+            deleted_at,
+            "operator",
+        )
+    }
+
+    fn delete_session_capture_deliveries(
+        &self,
+        repository_id: &str,
+        delivery_keys: &[String],
+        deleted_at: i64,
+        deletion_reason: &str,
+    ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        if delivery_keys.is_empty() {
+            return Ok(SessionCaptureDeletionResult::default());
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(
+            |error| {
+                LatticeError::Storage(format!(
+                    "Failed to begin automatic capture deletion transaction: {error}"
+                ))
+            },
+        )?;
+
+        let mut source_delivery_by_memory = HashMap::<String, String>::new();
+        for delivery_key in delivery_keys {
+            let owning_repository = tx
+                .query_row(
+                    &format!(
+                        "SELECT repository_id FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                         WHERE delivery_key = ?1"
+                    ),
+                    params![delivery_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to verify automatic capture deletion authority: {error}"
+                    ))
+                })?;
+            if owning_repository.as_deref() != Some(repository_id) {
+                return Err(LatticeError::Storage(
+                    "automatic capture deletion crossed repository-store authority".to_string(),
+                ));
+            }
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {SESSION_CAPTURE_TOMBSTONES_TABLE}
+                        (delivery_key, repository_id, deleted_at, deletion_reason)
+                     VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![delivery_key, repository_id, deleted_at, deletion_reason],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to retain automatic capture tombstone: {error}"
+                ))
+            })?;
+            let mut commits = tx
+                .prepare(&format!(
+                    "SELECT memory_id FROM {SESSION_DIGEST_CAPTURE_COMMITS_TABLE}
+                     WHERE delivery_key = ?1 ORDER BY candidate_ordinal ASC"
+                ))
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to prepare automatic capture dependency query: {error}"
+                    ))
+                })?;
+            let memory_ids = commits
+                .query_map(params![delivery_key], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to query automatic capture dependencies: {error}"
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to decode automatic capture dependency: {error}"
+                    ))
+                })?;
+            for memory_id in memory_ids {
+                source_delivery_by_memory.insert(memory_id, delivery_key.clone());
+            }
+        }
+
+        let source_memory_ids = source_delivery_by_memory
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let retained_derived_memory_count = retain_derived_memory_provenance(
+            &tx,
+            &source_delivery_by_memory,
+            &source_memory_ids,
+            deleted_at,
+        )?;
+        let retained_proposal_count = retain_proposal_tombstone_provenance(
+            &tx,
+            &source_delivery_by_memory,
+            &source_memory_ids,
+        )?;
+
+        tx.execute(
+            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 1 WHERE singleton = 1"),
+            [],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to enter automatic capture deletion FTS recovery state: {error}"
+            ))
+        })?;
+        for memory_id in source_delivery_by_memory.keys() {
+            tx.execute(
+                "DELETE FROM verification_jobs WHERE target_memory_id = ?1",
+                params![memory_id],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to delete automatic capture verification jobs: {error}"
+                ))
+            })?;
+            tx.execute(
+                "DELETE FROM memory_links
+                 WHERE source_memory_id = ?1 OR target_memory_id = ?1",
+                params![memory_id],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to delete automatic capture memory links: {error}"
+                ))
+            })?;
+            tx.execute(
+                &format!("DELETE FROM {MEMORIES_FTS_TABLE} WHERE memory_id = ?1"),
+                params![memory_id],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to delete automatic capture FTS document: {error}"
+                ))
+            })?;
+        }
+        for delivery_key in delivery_keys {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {SESSION_DIGEST_CAPTURE_COMMITS_TABLE} WHERE delivery_key = ?1"
+                ),
+                params![delivery_key],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to delete automatic capture commit journal: {error}"
+                ))
+            })?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                     WHERE delivery_key = ?1 AND repository_id = ?2"
+                ),
+                params![delivery_key, repository_id],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to delete automatic capture delivery journal: {error}"
+                ))
+            })?;
+        }
+        for memory_id in source_delivery_by_memory.keys() {
+            tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to delete automatic capture memory: {error}"
+                    ))
+                })?;
+        }
+        tx.execute(
+            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 0 WHERE singleton = 1"),
+            [],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to finalize automatic capture deletion FTS state: {error}"
+            ))
+        })?;
+        tx.commit().map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to commit automatic capture deletion transaction: {error}"
+            ))
+        })?;
+
+        Ok(SessionCaptureDeletionResult {
+            deleted_capture_ids: delivery_keys.to_vec(),
+            deleted_memory_count: source_delivery_by_memory.len(),
+            retained_derived_memory_count,
+            retained_proposal_count,
         })
     }
 
@@ -3072,6 +3413,330 @@ impl MemoryStore {
             None => true,
             Some(required) => checkout_id.is_some_and(|actual| actual == required),
         })
+    }
+}
+
+fn retain_derived_memory_provenance(
+    tx: &Transaction<'_>,
+    source_delivery_by_memory: &HashMap<String, String>,
+    source_memory_ids: &HashSet<String>,
+    deleted_at: i64,
+) -> Result<usize, LatticeError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id, provenance_json, evidence_json, linked_memories_json,
+                    supersedes_memory_id, superseded_by_memory_id,
+                    contradicts_memory_ids, contradicted_by_memory_ids
+             FROM memories ORDER BY id ASC",
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to prepare derived-memory provenance query: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to query derived-memory provenance: {error}"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to decode derived-memory provenance: {error}"
+            ))
+        })?;
+    drop(statement);
+
+    let mut retained = 0;
+    for (
+        memory_id,
+        provenance_json,
+        evidence_json,
+        linked_memories_json,
+        supersedes_memory_id,
+        superseded_by_memory_id,
+        contradicts_memory_ids,
+        contradicted_by_memory_ids,
+    ) in rows
+    {
+        if source_memory_ids.contains(&memory_id) {
+            continue;
+        }
+        let mut referenced = HashSet::new();
+        for encoded in [
+            &provenance_json,
+            &evidence_json,
+            &linked_memories_json,
+            &contradicts_memory_ids,
+            &contradicted_by_memory_ids,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(encoded).map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to decode derived-memory references: {error}"
+                ))
+            })?;
+            collect_capture_references(&value, source_memory_ids, &mut referenced);
+        }
+        for reference in [supersedes_memory_id, superseded_by_memory_id]
+            .into_iter()
+            .flatten()
+        {
+            if source_memory_ids.contains(&reference) {
+                referenced.insert(reference);
+            }
+        }
+        if referenced.is_empty() {
+            continue;
+        }
+
+        let mut provenance: Vec<MemoryProvenance> = serde_json::from_str(&provenance_json)
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to decode derived-memory provenance JSON: {error}"
+                ))
+            })?;
+        let mut ordered_references = referenced.into_iter().collect::<Vec<_>>();
+        ordered_references.sort();
+        for source_memory_id in ordered_references {
+            let delivery_key = &source_delivery_by_memory[&source_memory_id];
+            let tombstone_source = "lattice.deleted_session_capture.v1";
+            if !provenance.iter().any(|entry| {
+                entry.source == tombstone_source
+                    && entry.reference.as_deref() == Some(delivery_key.as_str())
+            }) {
+                provenance.push(MemoryProvenance {
+                    source: tombstone_source.to_string(),
+                    reference: Some(delivery_key.clone()),
+                    captured_at: Some(deleted_at.max(0) as u64),
+                    note: None,
+                });
+            }
+            insert_capture_tombstone_provenance(
+                tx,
+                delivery_key,
+                "memory",
+                &memory_id,
+                &source_memory_id,
+            )?;
+        }
+        let encoded = serde_json::to_string(&provenance).map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to encode derived-memory tombstone provenance: {error}"
+            ))
+        })?;
+        tx.execute(
+            "UPDATE memories SET provenance_json = ?1 WHERE id = ?2",
+            params![encoded, memory_id],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to retain derived-memory tombstone provenance: {error}"
+            ))
+        })?;
+        retained += 1;
+    }
+    Ok(retained)
+}
+
+fn retain_proposal_tombstone_provenance(
+    tx: &Transaction<'_>,
+    source_delivery_by_memory: &HashMap<String, String>,
+    source_memory_ids: &HashSet<String>,
+) -> Result<usize, LatticeError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT proposal_id, target_memory_id, prior_state, proposed_state, evidence
+             FROM consolidation_proposals ORDER BY proposal_id ASC",
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to prepare capture-derived proposal query: {error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to query capture-derived proposals: {error}"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to decode capture-derived proposal: {error}"
+            ))
+        })?;
+    drop(statement);
+
+    let mut retained = 0;
+    for (proposal_id, target_memory_id, prior_state, proposed_state, evidence) in rows {
+        let mut prior: serde_json::Value = serde_json::from_str(&prior_state).map_err(|error| {
+            LatticeError::Storage(format!("Failed to decode proposal prior state: {error}"))
+        })?;
+        let mut proposed: serde_json::Value =
+            serde_json::from_str(&proposed_state).map_err(|error| {
+                LatticeError::Storage(format!("Failed to decode proposal proposed state: {error}"))
+            })?;
+        let evidence_value: serde_json::Value =
+            serde_json::from_str(&evidence).map_err(|error| {
+                LatticeError::Storage(format!("Failed to decode proposal evidence: {error}"))
+            })?;
+        let mut referenced = HashSet::new();
+        collect_capture_references(&prior, source_memory_ids, &mut referenced);
+        collect_capture_references(&proposed, source_memory_ids, &mut referenced);
+        collect_capture_references(&evidence_value, source_memory_ids, &mut referenced);
+        if target_memory_id
+            .as_ref()
+            .is_some_and(|id| source_memory_ids.contains(id))
+        {
+            referenced.insert(target_memory_id.clone().expect("checked as some"));
+        }
+        if referenced.is_empty() {
+            continue;
+        }
+
+        scrub_capture_memory_snapshots(&mut prior, source_memory_ids);
+        scrub_capture_memory_snapshots(&mut proposed, source_memory_ids);
+        let mut ordered_references = referenced.into_iter().collect::<Vec<_>>();
+        ordered_references.sort();
+        for source_memory_id in ordered_references {
+            insert_capture_tombstone_provenance(
+                tx,
+                &source_delivery_by_memory[&source_memory_id],
+                "proposal",
+                &proposal_id,
+                &source_memory_id,
+            )?;
+        }
+        tx.execute(
+            "UPDATE consolidation_proposals
+             SET target_memory_id = CASE
+                     WHEN target_memory_id IN (
+                         SELECT source_memory_id
+                         FROM session_capture_tombstone_provenance
+                         WHERE derived_kind = 'proposal' AND derived_id = ?1
+                     ) THEN NULL
+                     ELSE target_memory_id
+                 END,
+                 prior_state = ?2,
+                 proposed_state = ?3
+             WHERE proposal_id = ?1",
+            params![
+                proposal_id,
+                serde_json::to_string(&prior).map_err(|error| LatticeError::Storage(format!(
+                    "Failed to encode scrubbed proposal prior state: {error}"
+                )))?,
+                serde_json::to_string(&proposed).map_err(|error| LatticeError::Storage(
+                    format!("Failed to encode scrubbed proposal proposed state: {error}")
+                ))?,
+            ],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to retain capture-derived proposal: {error}"
+            ))
+        })?;
+        retained += 1;
+    }
+    Ok(retained)
+}
+
+fn insert_capture_tombstone_provenance(
+    tx: &Transaction<'_>,
+    delivery_key: &str,
+    derived_kind: &str,
+    derived_id: &str,
+    source_memory_id: &str,
+) -> Result<(), LatticeError> {
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {SESSION_CAPTURE_TOMBSTONE_PROVENANCE_TABLE}
+                (delivery_key, derived_kind, derived_id, source_memory_id)
+             VALUES (?1, ?2, ?3, ?4)"
+        ),
+        params![delivery_key, derived_kind, derived_id, source_memory_id],
+    )
+    .map_err(|error| {
+        LatticeError::Storage(format!(
+            "Failed to persist content-free capture tombstone provenance: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn collect_capture_references(
+    value: &serde_json::Value,
+    source_memory_ids: &HashSet<String>,
+    found: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(value) if source_memory_ids.contains(value) => {
+            found.insert(value.clone());
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_capture_references(value, source_memory_ids, found);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_capture_references(value, source_memory_ids, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scrub_capture_memory_snapshots(
+    value: &mut serde_json::Value,
+    source_memory_ids: &HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let captured_id = object
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| source_memory_ids.contains(*id))
+                .map(str::to_string);
+            if let Some(source_memory_id) = captured_id {
+                *value = serde_json::json!({
+                    "deleted_session_capture": {
+                        "source_memory_id": source_memory_id
+                    }
+                });
+                return;
+            }
+            for value in object.values_mut() {
+                scrub_capture_memory_snapshots(value, source_memory_ids);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                scrub_capture_memory_snapshots(value, source_memory_ids);
+            }
+        }
+        _ => {}
     }
 }
 
