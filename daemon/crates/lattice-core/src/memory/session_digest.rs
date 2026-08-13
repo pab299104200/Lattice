@@ -17,6 +17,11 @@ pub const SESSION_DIGEST_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_DIGEST_EXTRACTOR_VERSION: &str = "session-digest-v1";
 pub const MAX_SESSION_DIGEST_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
+/// Canonical repository and checkout identities are daemon-owned filesystem
+/// identities. They can legitimately be absolute paths, unlike opaque client
+/// session IDs, so validate them separately and never apply the opaque-token
+/// alphabet to them.
+pub const MAX_DAEMON_IDENTITY_BYTES: usize = 4 * 1024;
 pub const MAX_EDITED_PATHS: usize = 128;
 pub const MAX_EDITED_PATH_BYTES: usize = 512;
 pub const MAX_OBSERVATIONS: usize = 64;
@@ -309,11 +314,11 @@ pub fn bind_session_digest_authority(
     if !is_safe_opaque_id(&authority.session_id, MAX_SESSION_ID_BYTES) {
         return Err(SessionDigestError::InvalidSessionId);
     }
-    if !is_safe_opaque_id(&authority.repository_id, MAX_SESSION_ID_BYTES) {
+    if !is_safe_daemon_identity(&authority.repository_id) {
         return Err(SessionDigestError::InvalidRepositoryId);
     }
     let checkout_id = match authority.checkout_id.as_deref() {
-        Some(value) if is_safe_opaque_id(value, MAX_SESSION_ID_BYTES) => Some(value.to_owned()),
+        Some(value) if is_safe_daemon_identity(value) => Some(value.to_owned()),
         Some(_) => return Err(SessionDigestError::InvalidCheckoutId),
         None => None,
     };
@@ -694,6 +699,17 @@ fn is_safe_opaque_id(value: &str, max_bytes: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
+/// Repository and checkout identities come only from daemon-side canonical
+/// resolution. They are not transport input, but must remain bounded and
+/// incapable of carrying control characters into persistent records/logs.
+fn is_safe_daemon_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_DAEMON_IDENTITY_BYTES
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\0')
+}
+
 fn is_safe_branch(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -1067,6 +1083,41 @@ mod tests {
         );
         let serialized_content = serde_json::to_string(&content).unwrap();
         assert!(!serialized_content.contains("unsafe/session"));
+    }
+
+    #[test]
+    fn binds_canonical_daemon_repository_and_checkout_identities() {
+        let content = parse_content(r#"{"schema_version":1,"ended_at":"2026-05-17T14:30:00Z"}"#);
+        let authority = SessionDigestAuthority {
+            session_id: "session-1".to_owned(),
+            repository_id: "/Users/pete/Cadres/lattice/.git".to_owned(),
+            checkout_id: Some("/Users/pete/Cadres/lattice".to_owned()),
+            branch: Some("main".to_owned()),
+            revision: "0123456789abcdef".to_owned(),
+            segment: 1,
+        };
+
+        let digest = bind_session_digest_authority(content, &authority)
+            .expect("canonical daemon identities should bind");
+        assert_eq!(digest.repository_id, authority.repository_id);
+        assert_eq!(digest.checkout_id, authority.checkout_id);
+    }
+
+    #[test]
+    fn rejects_control_characters_in_daemon_identities() {
+        let content = parse_content(r#"{"schema_version":1,"ended_at":"2026-05-17T14:30:00Z"}"#);
+        let authority = SessionDigestAuthority {
+            session_id: "session-1".to_owned(),
+            repository_id: "/safe\nidentity".to_owned(),
+            checkout_id: None,
+            branch: None,
+            revision: "0123456789abcdef".to_owned(),
+            segment: 1,
+        };
+        assert_eq!(
+            bind_session_digest_authority(content, &authority),
+            Err(SessionDigestError::InvalidRepositoryId)
+        );
     }
 
     #[test]
