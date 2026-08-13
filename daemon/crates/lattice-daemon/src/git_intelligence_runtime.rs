@@ -11,11 +11,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use lattice_core::git_intelligence::{mine_repository, GitMiningLimits};
-use lattice_core::storage::GitIntelligenceStore;
+use lattice_core::storage::{GitIntelligenceStore, StoredGitIntelligenceSnapshot};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::index_work::IndexWorkCoordinator;
+use crate::rpc::mcp::GitIntelligenceSnapshotHandle;
+
+trait GitIntelligenceSnapshotPublisher: Send + Sync {
+    fn publish(
+        &self,
+        snapshot: StoredGitIntelligenceSnapshot,
+        is_fresh: bool,
+    ) -> Result<(), String>;
+
+    fn mark_stale(&self, repository_id: &str) -> Result<(), String>;
+}
+
+impl GitIntelligenceSnapshotPublisher for GitIntelligenceSnapshotHandle {
+    fn publish(
+        &self,
+        snapshot: StoredGitIntelligenceSnapshot,
+        is_fresh: bool,
+    ) -> Result<(), String> {
+        GitIntelligenceSnapshotHandle::publish(self, snapshot, is_fresh)
+    }
+
+    fn mark_stale(&self, repository_id: &str) -> Result<(), String> {
+        GitIntelligenceSnapshotHandle::mark_stale(self, repository_id)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RefreshRequest {
@@ -28,11 +53,20 @@ struct RefreshRequest {
 pub(crate) struct GitIntelligenceRefreshHandle {
     sender: watch::Sender<RefreshRequest>,
     next_sequence: Arc<AtomicU64>,
+    repository_id: String,
+    snapshots: Arc<dyn GitIntelligenceSnapshotPublisher>,
 }
 
 impl GitIntelligenceRefreshHandle {
     /// Replaces any queued request with the newest observed HEAD.
     pub(crate) fn request(&self, expected_head: Option<String>) {
+        if let Err(error) = self.snapshots.mark_stale(&self.repository_id) {
+            tracing::warn!(
+                repository_id = self.repository_id.as_str(),
+                %error,
+                "Failed to mark Git-intelligence snapshot stale"
+            );
+        }
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.sender.send_replace(RefreshRequest {
             sequence,
@@ -49,6 +83,8 @@ impl GitIntelligenceRefreshHandle {
         Self {
             sender,
             next_sequence: Arc::new(AtomicU64::new(1)),
+            repository_id: "test-repository".to_string(),
+            snapshots: Arc::new(GitIntelligenceSnapshotHandle::default()),
         }
     }
 
@@ -66,6 +102,7 @@ pub(crate) struct GitIntelligenceRuntime {
     store: Arc<StdMutex<GitIntelligenceStore>>,
     requests: watch::Receiver<RefreshRequest>,
     index_work: Arc<IndexWorkCoordinator>,
+    snapshots: Arc<dyn GitIntelligenceSnapshotPublisher>,
 }
 
 impl GitIntelligenceRuntime {
@@ -76,6 +113,23 @@ impl GitIntelligenceRuntime {
         graph_path: &Path,
         repository_id: String,
         index_work: Arc<IndexWorkCoordinator>,
+        snapshots: GitIntelligenceSnapshotHandle,
+    ) -> Result<(GitIntelligenceRefreshHandle, Self)> {
+        Self::open_with_snapshot_publisher(
+            repository_path,
+            graph_path,
+            repository_id,
+            index_work,
+            Arc::new(snapshots),
+        )
+    }
+
+    fn open_with_snapshot_publisher(
+        repository_path: PathBuf,
+        graph_path: &Path,
+        repository_id: String,
+        index_work: Arc<IndexWorkCoordinator>,
+        snapshots: Arc<dyn GitIntelligenceSnapshotPublisher>,
     ) -> Result<(GitIntelligenceRefreshHandle, Self)> {
         let store = GitIntelligenceStore::open(graph_path).with_context(|| {
             format!(
@@ -86,9 +140,15 @@ impl GitIntelligenceRuntime {
         // Audit the active pointer while construction can still fail cleanly.
         // Recovery is intentionally not automatic here: an unreadable prior
         // generation must be retained for diagnosis rather than erased.
-        store.load_active(&repository_id).with_context(|| {
+        let active = store.load_active(&repository_id).with_context(|| {
             format!("failed to validate Git intelligence for repository `{repository_id}`")
         })?;
+        if let Some(active) = active {
+            snapshots
+                .publish(active, false)
+                .map_err(anyhow::Error::msg)
+                .context("failed to hydrate the Git-intelligence snapshot handoff")?;
+        }
 
         let initial = RefreshRequest {
             sequence: 0,
@@ -98,6 +158,8 @@ impl GitIntelligenceRuntime {
         let handle = GitIntelligenceRefreshHandle {
             sender,
             next_sequence: Arc::new(AtomicU64::new(1)),
+            repository_id: repository_id.clone(),
+            snapshots: snapshots.clone(),
         };
         Ok((
             handle,
@@ -107,6 +169,7 @@ impl GitIntelligenceRuntime {
                 store: Arc::new(StdMutex::new(store)),
                 requests,
                 index_work,
+                snapshots,
             },
         ))
     }
@@ -130,7 +193,7 @@ impl GitIntelligenceRuntime {
     }
 
     async fn refresh(&self, request: RefreshRequest) -> Result<()> {
-        let active_head = {
+        let active = {
             let store = self
                 .store
                 .lock()
@@ -138,9 +201,10 @@ impl GitIntelligenceRuntime {
             store
                 .load_active(&self.repository_id)
                 .context("failed to read the active Git-intelligence generation")?
-                .map(|active| active.head_commit_id)
         };
-        if active_head == Some(request.expected_head.clone()) {
+        if let Some(active) = active.filter(|active| active.head_commit_id == request.expected_head)
+        {
+            self.publish_snapshot(active, true)?;
             tracing::debug!(
                 workspace = %self.repository_path.display(),
                 head = ?request.expected_head,
@@ -159,7 +223,7 @@ impl GitIntelligenceRuntime {
             .context("index work coordinator closed before Git mining")?;
 
         // A queued request can become redundant while waiting behind indexing.
-        let active_head = {
+        let active = {
             let store = self
                 .store
                 .lock()
@@ -167,9 +231,10 @@ impl GitIntelligenceRuntime {
             store
                 .load_active(&self.repository_id)
                 .context("failed to re-read the active Git-intelligence generation")?
-                .map(|active| active.head_commit_id)
         };
-        if active_head == Some(request.expected_head.clone()) {
+        if let Some(active) = active.filter(|active| active.head_commit_id == request.expected_head)
+        {
+            self.publish_snapshot(active, true)?;
             return Ok(());
         }
 
@@ -199,17 +264,19 @@ impl GitIntelligenceRuntime {
         let store = Arc::clone(&self.store);
         let repository_id = self.repository_id.clone();
         let sampled_commits = mined.report.sampled_commits;
-        let generation = tokio::task::spawn_blocking(move || -> Result<i64> {
+        let published = tokio::task::spawn_blocking(move || -> Result<_> {
             let store = store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Git-intelligence store lock was poisoned"))?;
             let published = store
                 .publish(&repository_id, unix_timestamp()?, &mined.snapshot)
                 .context("atomic Git-intelligence publication failed")?;
-            Ok(published.generation)
+            Ok(published)
         })
         .await
         .context("Git-intelligence publication worker panicked")??;
+        let generation = published.generation;
+        self.publish_snapshot(published, true)?;
 
         tracing::info!(
             workspace = %self.repository_path.display(),
@@ -220,6 +287,17 @@ impl GitIntelligenceRuntime {
             "Published Git-intelligence generation"
         );
         Ok(())
+    }
+
+    fn publish_snapshot(
+        &self,
+        snapshot: StoredGitIntelligenceSnapshot,
+        is_fresh: bool,
+    ) -> Result<()> {
+        self.snapshots
+            .publish(snapshot, is_fresh)
+            .map_err(anyhow::Error::msg)
+            .context("failed to publish the Git-intelligence snapshot handoff")
     }
 }
 
@@ -236,6 +314,34 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingSnapshotPublisher {
+        publications: StdMutex<Vec<(String, i64, bool)>>,
+        stale_repositories: StdMutex<Vec<String>>,
+    }
+
+    impl GitIntelligenceSnapshotPublisher for RecordingSnapshotPublisher {
+        fn publish(
+            &self,
+            snapshot: StoredGitIntelligenceSnapshot,
+            is_fresh: bool,
+        ) -> Result<(), String> {
+            self.publications
+                .lock()
+                .expect("publication recorder lock")
+                .push((snapshot.repository_id, snapshot.generation, is_fresh));
+            Ok(())
+        }
+
+        fn mark_stale(&self, repository_id: &str) -> Result<(), String> {
+            self.stale_repositories
+                .lock()
+                .expect("stale recorder lock")
+                .push(repository_id.to_string());
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn refresh_handle_coalesces_queued_heads_to_the_latest_generation() {
@@ -267,6 +373,7 @@ mod tests {
             &graph_path,
             repository_id.clone(),
             Arc::clone(&coordinator),
+            GitIntelligenceSnapshotHandle::default(),
         )
         .expect("open runtime");
         let task = runtime.spawn();
@@ -302,11 +409,13 @@ mod tests {
         let graph_path = root.join("graph.db");
         let repository_id = "fixture-repository".to_string();
         let coordinator = IndexWorkCoordinator::new(1);
-        let (_handle, runtime) = GitIntelligenceRuntime::open(
+        let snapshots = Arc::new(RecordingSnapshotPublisher::default());
+        let (handle, runtime) = GitIntelligenceRuntime::open_with_snapshot_publisher(
             root.clone(),
             &graph_path,
             repository_id.clone(),
             Arc::clone(&coordinator),
+            snapshots.clone(),
         )
         .expect("open runtime");
         let head = git_output(&root, &["rev-parse", "HEAD"]);
@@ -327,7 +436,16 @@ mod tests {
             .expect("active generation");
         assert_eq!(first.head_commit_id.as_deref(), Some(head.as_str()));
         assert_eq!(coordinator.snapshot().completed_jobs, 1);
+        assert_eq!(
+            snapshots
+                .publications
+                .lock()
+                .expect("publication recorder lock")
+                .as_slice(),
+            [(repository_id.clone(), first.generation, true)]
+        );
 
+        handle.request(Some(head.clone()));
         runtime
             .refresh(RefreshRequest {
                 sequence: 2,
@@ -336,9 +454,29 @@ mod tests {
             .await
             .expect("skip stable head");
         assert_eq!(coordinator.snapshot().completed_jobs, 1);
+        assert_eq!(
+            snapshots
+                .publications
+                .lock()
+                .expect("publication recorder lock")
+                .as_slice(),
+            [
+                (repository_id.clone(), first.generation, true),
+                (repository_id.clone(), first.generation, true),
+            ]
+        );
+        assert_eq!(
+            snapshots
+                .stale_repositories
+                .lock()
+                .expect("stale recorder lock")
+                .as_slice(),
+            [repository_id.clone()]
+        );
 
         std::fs::rename(root.join(".git"), root.join("git-disabled"))
             .expect("make repository unreadable");
+        handle.request(Some("new-head".to_string()));
         let error = runtime
             .refresh(RefreshRequest {
                 sequence: 3,
@@ -358,6 +496,23 @@ mod tests {
             .expect("retained generation");
         assert_eq!(retained.generation, first.generation);
         assert_eq!(retained.snapshot, first.snapshot);
+        assert_eq!(
+            snapshots
+                .publications
+                .lock()
+                .expect("publication recorder lock")
+                .len(),
+            2,
+            "failed refresh must not republish the retained generation as fresh"
+        );
+        assert_eq!(
+            snapshots
+                .stale_repositories
+                .lock()
+                .expect("stale recorder lock")
+                .as_slice(),
+            [repository_id.clone(), repository_id]
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
