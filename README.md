@@ -81,17 +81,32 @@ daemon/target/release/lattice
 
 For MCP clients, `lattice --stdio --workspace <path>` is a lightweight proxy. The proxy keeps client stdio dedicated to MCP, connects to the long-lived local Lattice daemon, and starts that daemon if it is not already running. The daemon is one process per user environment and can host multiple workspace shards at the same time; each proxy connection is bound to the workspace path supplied by that MCP client.
 
+The built-in installer reconciles client configuration without deleting unrelated entries:
+
+```bash
+lattice install mcp --workspace /path/to/your/project --verify
+lattice install claude-code --workspace /path/to/your/project --verify
+lattice install codex --workspace /path/to/your/project --verify
+lattice doctor --workspace /path/to/your/project
+```
+
+`install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. `--verify` performs a disk round-trip check. The standalone packages under `integrations/` remain available for package-level installation and testing.
+
 The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. Proxy processes use a cross-process startup lock, so concurrent hooks and MCP clients recheck and reuse one daemon instead of racing to spawn several. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.
 
 A proxy exits immediately when its client closes stdin, and otherwise exits after five minutes without traffic. Set `LATTICE_PROXY_IDLE_TIMEOUT_SECS` to a positive number of seconds to tune that limit. Idle exit never interrupts an in-flight JSON-RPC request.
 
-Multi-root proxy requests are represented as logical views over canonical per-root shards instead of as graph-owning combined runtimes. The daemon preserves the existing MCP method and tool schemas, warms the primary requested shard before accepting tool traffic, and prewarms the remaining view shards sequentially in the background so clients do not pay a seven-repo startup latency spike. Graph-backed workflow and dependency-analysis tools fan out across selected shards and return a bounded merged payload with per-shard summaries, source-workspace annotations, `failed_shards`, `incomplete_shards`, and context-handle routing back to the shard that created the handle. The architecture favors per-root shard ownership, session-level composed views, and compact structural graphs instead of permanently materialized multi-root mega-runtimes.
+Multi-root proxy requests are represented as logical views over canonical per-root shards instead of as graph-owning combined runtimes. The daemon preserves the existing MCP method and tool schemas, warms the primary requested shard before accepting tool traffic, and loads secondary shards when a routed or fan-out request needs them. Secondary shards are leased for the active request rather than pinned for the proxy's full lifetime; persisted context handles route correctly after an evicted shard reloads. Graph-backed workflow and dependency-analysis tools fan out across selected shards and return a bounded merged payload with per-shard summaries, source-workspace annotations, `failed_shards`, `incomplete_shards`, and context-handle routing back to the shard that created the handle. The architecture favors per-root shard ownership, session-level composed views, and compact structural graphs instead of permanently materialized multi-root mega-runtimes.
 
-The long-lived daemon bounds shard residency instead of keeping every graph forever. Loaded workspace shards are capped by `LATTICE_MAX_LOADED_SHARDS` (default `8`; falls back to the legacy `LATTICE_MAX_LOADED_WORKSPACES` value when set) and idle shards are evicted after `LATTICE_WORKSPACE_IDLE_TTL_SECS` (default `1800`). Multi-root view prewarming is enabled by default and can be disabled with `LATTICE_PREWARM_VIEW_SHARDS=0`; it is bounded by the same loaded-shard cap and stops at the first shard-load failure. Eviction stops that shard's indexing, watcher, memory-maintenance, and compaction tasks before dropping its graph and index handles. Full-graph semantic vector sync is disabled by default because it can be CPU-expensive on large repos; set `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1` to run it during background indexing.
+The long-lived daemon bounds shard residency instead of keeping every graph forever. Loaded workspace shards are capped by `LATTICE_MAX_LOADED_SHARDS` (default `3`; falls back to the legacy `LATTICE_MAX_LOADED_WORKSPACES` value when set). At capacity, the least-recently-used inactive, non-indexing shard is shut down before another shard loads; ordinary idle eviction still runs after `LATTICE_WORKSPACE_IDLE_TTL_SECS` (default `1800`). Multi-root view prewarming is disabled by default and can be enabled with `LATTICE_PREWARM_VIEW_SHARDS=1`; prewarmed shards remain evictable. Full-graph semantic vector sync is disabled by default because it can be CPU-expensive on large repos; set `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1` to run it during background indexing.
 
-`index_status` includes warm-load diagnostics for each shard entry in a logical view: `warm_load_skipped`, `warm_load_skip_reason`, `persisted_files`, `limit`, `env_var`, `persisted_bytes`, `byte_limit`, `byte_env_var`, and `effective_files`. This distinguishes a first-run cache miss from a persisted graph that was intentionally skipped because it exceeded `LATTICE_MAX_WARM_GRAPH_FILES` or `LATTICE_MAX_WARM_GRAPH_BYTES`.
+`index_status` includes warm-load diagnostics for each shard entry in a logical view: `graph_storage_state`, `warm_load_skipped`, `warm_load_skip_reason`, `persisted_files`, `limit`, `env_var`, `persisted_bytes`, `byte_limit`, `byte_env_var`, and `effective_files`. `graph_storage_state` distinguishes an ordinary healthy open from automatic replacement of a corrupt derived graph; `busy` means a snapshot is being published, and `graph_storage_diagnostic` explains that transient state. Status does not wait behind graph-store publication. The remaining fields distinguish a first-run cache miss from a persisted graph intentionally skipped because it exceeded `LATTICE_MAX_WARM_GRAPH_FILES` or `LATTICE_MAX_WARM_GRAPH_BYTES`.
 
-Within a loaded workspace, the query engine and indexer share immutable graph snapshots instead of retaining separate graph copies. Reindexing and watcher updates publish a new shared snapshot only when the graph changes, while cached parsed files remain in the indexer for incremental rebuilds.
+Within a loaded workspace, the query engine and indexer share immutable graph snapshots instead of retaining separate graph copies. Reindexing and watcher updates publish a new shared snapshot only when the graph changes, while cached parsed files remain in the indexer for incremental rebuilds. File-watcher storms are collapsed into one parse/apply batch and one graph rebuild per debounce window. Graph construction borrows the parsed cache instead of cloning it, and publication moves the cache into the live indexer.
+
+All shards share a bounded index-work scheduler. Startup, watcher, branch/workspace refresh, and explicit reindex jobs use `LATTICE_MAX_CONCURRENT_INDEX_JOBS` slots (default `1`) so full replacement graphs are not built concurrently by default. Repeated explicit reindex requests coalesce while a refresh is running or queued. `index_status.index_work` reports `state`, `capacity`, `active_jobs`, `queued_jobs`, `completed_jobs`, and the controlling `env_var`.
+
+Context, preparation, plan, and subsystem workflows also execute against cloned immutable snapshots outside the live engine lock. Two bounded CPU query slots prevent timed-out work from creating unbounded background load. When both are occupied, another graph workflow returns a partial response with `reason: query_capacity`; `status` remains responsive and can be used to distinguish query backpressure from daemon or transport failure.
 
 Graph-backed workflow tools also validate lightweight repo and workspace state at request time. If the current workspace branch, detached `HEAD`, Git index, or other substantial workspace state no longer matches the graph snapshot that was last published, those tools return the existing bounded indexing-style response with `"reason": "branch_switch"` or `"reason": "workspace_change"` instead of serving stale graph results. The daemon stamps context handles with a repo epoch and rejects handles created before a later workspace epoch publishes.
 
@@ -107,6 +122,8 @@ At runtime Lattice keeps assistant state under the workspace-local `.lattice/` d
 - `vectors.usearch` stores the persisted ANN index used on the semantic-search hot path
 
 On startup, Lattice warm-loads the persisted graph immediately, computes current file fingerprints in the background, and reparses only new, changed, deleted, or parser/schema-version-stale files. The first run after this cache format is introduced populates cached parsed files; later restarts reuse unchanged parsed files and update the loaded graph from deltas.
+
+Because `graph.db` is derived current-workspace state, Lattice validates it with SQLite `quick_check` on open. Confirmed corruption replaces only `graph.db` plus its WAL/SHM sidecars and triggers a clean source rebuild; memory, vector, event, and snapshot stores are untouched. Permission and other non-corruption failures fail visibly instead of silently falling back to an empty in-memory graph.
 
 If `memories.db` cannot be opened cleanly, the daemon first quarantines `memories.db`, `memories.db-wal`, and `memories.db-shm` under `.lattice/recovered-memory/`, rebuilds a fresh persistent store, and only falls back to in-memory session memory if that recovery path also fails.
 
@@ -147,7 +164,7 @@ Add Lattice to your project's `.mcp.json` for Claude Code, Codex CLI, or any oth
 
 The configured command should stay `lattice --stdio --workspace ...`. Do not point MCP clients at `lattice --daemon`; that mode is the long-lived internal server that proxies start or reuse automatically.
 
-For the full agent setup path, including Claude Code hooks, Codex `config.toml`, CLI usage, duplicate-registration rules, and `lattice doctor` verification, see `docs/operator-guide/agent-integration.md`.
+For the full agent setup path, including Claude Code hooks, Codex hooks, Codex `config.toml`, CLI usage, duplicate-registration rules, and `lattice doctor` verification, see `docs/operator-guide/agent-integration.md`.
 
 ## CLI Query Interface
 
@@ -165,7 +182,7 @@ lattice status --scope index
 lattice metrics
 ```
 
-Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. `lattice metrics` reads the workspace-local adoption ledger and supports `--days <n>` plus `--json`; hook calls are tagged as `claude-code` / `hook`, direct CLI calls as `lattice-cli` / `cli`, and MCP calls as the initialized client name or `mcp` / `mcp`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. The daemon-down message is intentionally one actionable line: `lattice daemon not running — start with: lattice --daemon`.
+Default output is compact Markdown on stdout; pass `--json` for the raw MCP result. Shared flags are `--workspace <path>`, `--timeout <seconds>`, and `--json`. `lattice metrics` reads the workspace-local adoption ledger and supports `--days <n>` plus `--json`; hook calls are tagged as `claude-code` or `codex` / `hook`, direct CLI calls as `lattice-cli` / `cli`, and MCP calls as the initialized client name or `mcp` / `mcp`. Exit codes are stable: `0` for results, `1` for no result or usage/RPC errors, `2` when the daemon is unreachable, and `3` on timeout. Connection-refused errors suggest starting the daemon; permission-denied errors identify blocked localhost access instead of falsely reporting that the daemon is absent. Runtime modes are explicit: use `--stdio` for the MCP proxy or `--daemon` for the long-lived server; a bare invocation does not silently select either mode.
 
 ## MCP Tools
 
@@ -218,10 +235,10 @@ Memory trust diagnostics are deliberately response-level and current-checkout-aw
 - Workflow bundles propagate memory trust fields, evidence links, recheck commands, and artifact-conflict risks so prior memory is treated as a hypothesis until current code, docs, and tests confirm it.
 
 - `recall` with `mode=task` reads task-scoped working memory plus relevant durable memory. The daemon seeds missing task state from the task statement or hint, records automatic checkpoints, and returns trust diagnostics so unverified, evidence-free, high-risk, different-HEAD, or docs-drifted claims are not mistaken for proof.
-- `recall` with `mode=search` searches stored memory across sessions within the active workspace. In multi-root logical views, the daemon fans out to every shard and merges results by exact-match score plus cross-shard context coverage so a wrong primary shard or same-ID collision cannot hide the correct workspace memory.
+- `recall` with `mode=search` searches stored memory across sessions within the active workspace. In multi-root logical views, the daemon fans out to every shard and merges results by exact-match score plus cross-shard context coverage so a wrong primary shard or same-ID collision cannot hide the correct workspace memory. Configure organization memory in user-controlled `~/.lattice/config.toml` with `[memory] organization_id` and optional absolute `shared_store_path`, or override either with `LATTICE_ORGANIZATION_ID` and `LATTICE_SHARED_MEMORY_PATH`; the default shared path is `~/.lattice/shared/memories.db`. Organization records retain `organization:<id>:<record-id>` identities; a result originating in another repository is explicitly `cross_repo`, `unverified`, and `advisory` until verified locally.
 - `recall` with `mode=verify` verifies or explains a memory before callers rely on it.
 - `remember` with `kind=quick` captures lightweight memory using active task state, focus paths, and recent failure context. In a multi-root logical view, path-bearing memory arguments route the write to the uniquely matching shard; ambiguous relative paths fail instead of falling back to the primary shard.
-- `remember` with `kind=durable` creates durable memory with explicit evidence, validity conditions, and invalidation triggers.
+- `remember` with `kind=durable` creates durable memory with explicit evidence, validity conditions, and invalidation triggers. A durable request with `scope: "organization"` writes only to the configured shared store; a request-supplied organization ID cannot widen daemon authority.
 - `remember` with `kind=outcome` persists successful workflow outcomes so future sessions can reuse real solutions. Verified workflow outcomes are treated as stronger recall when later bundles summarize durable memory.
 - `status` with `scope=memory` or `scope=conflicts` finds stale memories and contradiction/supersession conflicts.
 
@@ -244,7 +261,7 @@ The public verbs support assistant-oriented response shaping where documented:
 - `wire_format`
   `standard` or `dense`
 - `render`
-  `hybrid` (default markdown summary + JSON payload), `markdown`, or `json`
+  `markdown` (default) or `json`; `hybrid` is rejected
 
 What this means in practice:
 
