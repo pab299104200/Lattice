@@ -436,3 +436,31 @@ fn indexing_priority(rel_path: &str) -> (u8, u8) {
         (2, 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_start_skips_unparsed_c_family_files() {
+        let root = std::env::temp_dir().join(format!(
+            "lattice-runtime-support-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        std::fs::write(root.join("native.c"), "int main(void) { return 0; }\n")
+            .expect("write C fixture");
+        std::fs::write(root.join("native.hpp"), "int value;\n").expect("write header fixture");
+        std::fs::write(root.join("src.ts"), "export const value = 1;\n")
+            .expect("write supported fixture");
+
+        let result = build_incremental_index_for_roots(&[root.clone()], None, HashMap::new());
+
+        assert_eq!(result.file_index.len(), 1);
+        assert_eq!(result.file_index[0].file, "src.ts");
+        assert!(result.index_report.failures.is_empty());
+        assert_eq!(result.index_report.requested_count, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

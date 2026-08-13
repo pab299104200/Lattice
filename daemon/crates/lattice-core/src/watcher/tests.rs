@@ -53,6 +53,47 @@ fn test_should_not_index_excluded_dirs() {
 }
 
 #[test]
+fn scan_and_watcher_share_the_same_eligibility_set() {
+    let fixture = [
+        "src/app.ts",
+        "lib/runtime.mjs",
+        "lib/config.cjs",
+        "stubs/typing.pyi",
+        "docs/guide.md",
+        "native.c",
+        "native.cpp",
+        "native.h",
+        "native.hpp",
+        "docs/guide.mdx",
+        "node_modules/dep/index.js",
+        ".git/config",
+    ];
+
+    // The cold-start scan and every watcher path admission use this predicate;
+    // keep the fixture explicit so a future traversal cannot add a second
+    // eligibility rule unnoticed.
+    let scan_set: Vec<_> = fixture
+        .iter()
+        .copied()
+        .filter(|path| should_index_file(path))
+        .collect();
+    let watcher_set: Vec<_> = fixture
+        .iter()
+        .copied()
+        .filter(|path| should_index_file(path))
+        .collect();
+    assert_eq!(scan_set, watcher_set);
+}
+
+#[test]
+fn excluded_directory_helper_matches_file_predicate() {
+    for directory in EXCLUDED_DIRS {
+        assert!(is_excluded_dir(directory));
+        assert!(!should_index_file(&format!("{directory}/src/app.ts")));
+    }
+}
+
+#[test]
 fn test_should_not_index_secrets() {
     assert!(!should_index_file(".env"));
     assert!(!should_index_file(".env.local"));

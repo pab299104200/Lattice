@@ -45,6 +45,15 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     "worktrees",
 ];
 
+/// Returns whether a path component identifies a directory that must not be
+/// traversed by an index scan or observed by the degraded watcher poller.
+///
+/// Keeping this check beside [`should_index_file`] prevents the cold-start and
+/// watcher traversals from drifting apart as exclusions evolve.
+pub fn is_excluded_dir(component: &str) -> bool {
+    EXCLUDED_DIRS.contains(&component)
+}
+
 const EXCLUDED_PATTERNS: &[&str] = &[
     ".env",
     "credentials",
@@ -69,10 +78,8 @@ pub fn should_index_file(path: &str) -> bool {
 
     // Check excluded dirs — any path component matching an excluded dir disqualifies
     for component in normalized.split('/') {
-        for excluded in EXCLUDED_DIRS {
-            if component == *excluded {
-                return false;
-            }
+        if is_excluded_dir(component) {
+            return false;
         }
     }
 

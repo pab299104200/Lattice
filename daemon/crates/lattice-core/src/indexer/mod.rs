@@ -517,7 +517,7 @@ impl Indexer {
             let path = entry.path();
             if path.is_dir() {
                 let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !crate::watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                if !crate::watcher::is_excluded_dir(dir_name) {
                     self.scan_files(base, &path, files)?;
                 }
             } else if path.is_file() {

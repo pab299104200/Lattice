@@ -286,7 +286,7 @@ impl FileWatcher {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
-                    if lattice_core::watcher::EXCLUDED_DIRS.contains(&dir_name) {
+                    if lattice_core::watcher::is_excluded_dir(dir_name) {
                         continue;
                     }
                 }
