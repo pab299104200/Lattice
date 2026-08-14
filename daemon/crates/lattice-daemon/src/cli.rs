@@ -16,6 +16,10 @@ use crate::install::{
 use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
 use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelInstallStatus};
+use lattice_core::health::backtest::replay::{
+    repository_name, replay_repository_streaming, ReplayLimits,
+};
+use lattice_core::health::backtest::report::ReportBuilder;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -65,6 +69,7 @@ pub(crate) fn is_cli_query_command() -> bool {
             | Some("recall")
             | Some("status")
             | Some("metrics")
+            | Some("health-backtest")
             | Some("install")
     )
 }
@@ -92,13 +97,16 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  health-backtest [--json] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("metrics") {
         return run_metrics_command(args);
+    }
+    if args.get(1).map(String::as_str) == Some("health-backtest") {
+        return run_health_backtest_command(args);
     }
     if args.get(1).map(String::as_str) == Some("install") {
         return run_install_command(args);
@@ -1103,6 +1111,162 @@ fn daemon_connection_message(error: &std::io::Error) -> String {
     }
 }
 
+/// Options for the `health-backtest` operational report.
+struct HealthBacktestArgs {
+    /// Repositories to replay, in the order given.
+    repositories: Vec<PathBuf>,
+    /// Emit JSON instead of markdown.
+    json: bool,
+    /// Write the report to this file instead of standard output.
+    output: Option<PathBuf>,
+    /// Bounds passed through to the replay engine.
+    limits: ReplayLimits,
+}
+
+/// `lattice health-backtest` — Phase H1 of the health engine plan.
+///
+/// An operational report like `metrics`, deliberately *not* an MCP verb: it
+/// replays history offline and produces a document, so it has no place in the
+/// eight-verb retrieval surface (spec design decision 5).
+fn run_health_backtest_command(args: Vec<String>) -> i32 {
+    match parse_health_backtest_args(args).and_then(run_health_backtest) {
+        Ok(output) => {
+            if let Some(output) = output {
+                println!("{}", output.trim_end());
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("lattice: {error:#}");
+            1
+        }
+    }
+}
+
+/// Replay every requested repository and render the report.
+fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
+    let mut builder = ReportBuilder::new();
+    for repository in &args.repositories {
+        // A repository that cannot be replayed fails the run rather than being
+        // quietly dropped: a pooled report that silently lost a repository
+        // would misstate the evidence it rests on.
+        // Cut points are folded in and dropped one at a time. A single cut
+        // point of a large repository carries hundreds of megabytes of fact
+        // snapshots, so collecting even one repository's worth was measured
+        // above four gigabytes; streaming keeps peak memory at one cut point.
+        builder.start_repository(&repository_name(repository));
+        let mut cut_points = 0usize;
+        let summary = replay_repository_streaming(repository, args.limits, |cut_point| {
+            cut_points += 1;
+            builder.push_cut_point(&cut_point);
+        })
+        .with_context(|| format!("could not replay repository `{}`", repository.display()))?;
+        eprintln!(
+            "lattice: replayed {} — {} cut points over {} first-parent commits",
+            summary.name, cut_points, summary.report.spine_length
+        );
+        builder.finish_repository(&summary);
+    }
+
+    let report = builder.finish();
+    let rendered = if args.json {
+        report
+            .render_json()
+            .context("could not render the backtest report as JSON")?
+    } else {
+        report.render_markdown()
+    };
+
+    match args.output {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("could not create directory `{}`", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(&path, &rendered)
+                .with_context(|| format!("could not write `{}`", path.display()))?;
+            eprintln!("lattice: wrote {}", path.display());
+            Ok(None)
+        }
+        None => Ok(Some(rendered)),
+    }
+}
+
+fn parse_health_backtest_args(args: Vec<String>) -> Result<HealthBacktestArgs> {
+    let mut repositories: Vec<PathBuf> = Vec::new();
+    let mut json = false;
+    let mut output = None;
+    let mut limits = ReplayLimits::default();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--repo" | "-r" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--repo requires a path"))?;
+                repositories.push(canonical_workspace(Path::new(value))?);
+                i += 1;
+            }
+            "--output" | "-o" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--output requires a path"))?;
+                output = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "--cut-points" => {
+                limits.cut_points = parse_positive(&args, i, "--cut-points")?;
+                i += 1;
+            }
+            "--horizon-days" => {
+                limits.horizon.max_days = parse_positive::<u32>(&args, i, "--horizon-days")?;
+                i += 1;
+            }
+            "--horizon-commits" => {
+                limits.horizon.max_commits = parse_positive(&args, i, "--horizon-commits")?;
+                i += 1;
+            }
+            "--window" => {
+                limits.git.history_limit = parse_positive(&args, i, "--window")?;
+                i += 1;
+            }
+            other => return Err(anyhow!("unknown health-backtest argument `{}`", other)),
+        }
+        i += 1;
+    }
+    if repositories.is_empty() {
+        repositories.push(detect_workspace_root()?);
+    }
+    Ok(HealthBacktestArgs {
+        repositories,
+        json,
+        output,
+        limits,
+    })
+}
+
+/// Parse a positive integer flag value.
+fn parse_positive<T>(args: &[String], index: usize, flag: &str) -> Result<T>
+where
+    T: std::str::FromStr + PartialOrd + From<u8>,
+    T::Err: std::fmt::Display,
+{
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| anyhow!("{flag} requires a positive integer"))?;
+    let parsed: T = value
+        .parse()
+        .map_err(|error| anyhow!("invalid {flag} `{value}`: {error}"))?;
+    if parsed <= T::from(0u8) {
+        return Err(anyhow!("{flag} must be positive"));
+    }
+    Ok(parsed)
+}
+
 fn run_metrics_command(args: Vec<String>) -> i32 {
     match parse_metrics_args(args).and_then(|(workspace, days, json, memory)| {
         if memory {
@@ -1826,6 +1990,92 @@ mod tests {
         assert!(message.contains("localhost access was denied"));
         assert!(message.contains("blocked by sandbox"));
         assert!(!message.contains("daemon not running"));
+    }
+
+    #[test]
+    fn health_backtest_defaults_to_the_detected_workspace_and_markdown() {
+        let parsed =
+            parse_health_backtest_args(vec!["lattice".into(), "health-backtest".into()]).unwrap();
+        assert_eq!(parsed.repositories.len(), 1);
+        assert!(!parsed.json);
+        assert!(parsed.output.is_none());
+        assert_eq!(parsed.limits.cut_points, ReplayLimits::default().cut_points);
+    }
+
+    #[test]
+    fn health_backtest_accepts_several_repositories_in_the_order_given() {
+        let workspace = std::env::current_dir().unwrap();
+        let parsed = parse_health_backtest_args(vec![
+            "lattice".into(),
+            "health-backtest".into(),
+            "--repo".into(),
+            workspace.to_string_lossy().into_owned(),
+            "--repo".into(),
+            workspace.to_string_lossy().into_owned(),
+            "--json".into(),
+            "--output".into(),
+            "report.json".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.repositories.len(), 2);
+        assert!(parsed.json);
+        assert_eq!(parsed.output, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn health_backtest_bounds_are_configurable() {
+        let parsed = parse_health_backtest_args(vec![
+            "lattice".into(),
+            "health-backtest".into(),
+            "--cut-points".into(),
+            "3".into(),
+            "--horizon-days".into(),
+            "30".into(),
+            "--horizon-commits".into(),
+            "50".into(),
+            "--window".into(),
+            "200".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.limits.cut_points, 3);
+        assert_eq!(parsed.limits.horizon.max_days, 30);
+        assert_eq!(parsed.limits.horizon.max_commits, 50);
+        assert_eq!(parsed.limits.git.history_limit, 200);
+    }
+
+    #[test]
+    fn health_backtest_rejects_unusable_arguments_rather_than_guessing() {
+        for bad in [
+            vec!["lattice".into(), "health-backtest".into(), "--nope".into()],
+            vec!["lattice".into(), "health-backtest".into(), "--repo".into()],
+            vec!["lattice".into(), "health-backtest".into(), "--output".into()],
+            vec![
+                "lattice".into(),
+                "health-backtest".into(),
+                "--cut-points".into(),
+                "0".into(),
+            ],
+            vec![
+                "lattice".into(),
+                "health-backtest".into(),
+                "--horizon-days".into(),
+                "not-a-number".into(),
+            ],
+        ] {
+            let bad: Vec<String> = bad;
+            assert!(
+                parse_health_backtest_args(bad.clone()).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_backtest_is_dispatched_as_a_local_command_not_an_mcp_verb() {
+        // The eight-verb surface is fixed (spec design decision 5); this
+        // subcommand is an operational report like `metrics`.
+        assert!(usage().contains("health-backtest"));
+        assert_eq!(EXPECTED_MCP_TOOL_COUNT, 8);
     }
 
     #[test]
