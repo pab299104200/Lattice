@@ -717,7 +717,12 @@ fn is_lattice_hook_path(command: &str) -> bool {
             .any(|component| component.as_os_str() == "hooks")
         && matches!(
             path.file_name().and_then(|name| name.to_str()),
-            Some("session-start.sh" | "user-prompt-submit.sh" | "post-tool-use.sh" | "stop.sh")
+            Some(
+                "session-start.sh"
+                    | "user-prompt-submit.sh"
+                    | "post-tool-use.sh"
+                    | "session-end.sh"
+            )
         )
 }
 
@@ -782,12 +787,12 @@ fn hook_timeout_violations(registrations: &[HookRegistration]) -> Vec<String> {
         .iter()
         .filter_map(|registration| {
             let timeout = registration.timeout_secs?;
-            (timeout <= crate::install::MAX_INNER_HOOK_TIMEOUT_SECS).then(|| {
+            (!hook_timeout_is_valid(registration, timeout)).then(|| {
                 format!(
-                    "{} at {} uses {timeout}s, but it must exceed the {}s internal query timeout",
+                    "{} at {} uses an invalid {timeout}s outer timeout for {}",
                     registration.source.display(),
                     registration.json_path,
-                    crate::install::MAX_INNER_HOOK_TIMEOUT_SECS
+                    registration.event,
                 )
             })
         })
@@ -803,6 +808,14 @@ fn hook_timeout_violations(registrations: &[HookRegistration]) -> Vec<String> {
         .collect()
 }
 
+fn hook_timeout_is_valid(registration: &HookRegistration, timeout_secs: u64) -> bool {
+    if registration.event == "SessionEnd" && path_has_component(&registration.source, ".codex") {
+        timeout_secs > 2
+    } else {
+        timeout_secs > crate::install::MAX_INNER_HOOK_TIMEOUT_SECS
+    }
+}
+
 /// Execute an installed hook with a synthetic, allowlisted host envelope.
 /// This is a doctor-only wiring check: protected state is disposable and the
 /// loopback address is intentionally unreachable, so no binding or delivery
@@ -815,10 +828,10 @@ fn run_hook_fixture(
     let timeout_secs = registration
         .timeout_secs
         .ok_or_else(|| anyhow::anyhow!("configured hook has no numeric outer timeout"))?;
-    if timeout_secs <= crate::install::MAX_INNER_HOOK_TIMEOUT_SECS {
+    if !hook_timeout_is_valid(registration, timeout_secs) {
         anyhow::bail!(
-            "configured outer timeout ({timeout_secs}s) must exceed the {}s internal query timeout",
-            crate::install::MAX_INNER_HOOK_TIMEOUT_SECS
+            "configured outer timeout ({timeout_secs}s) is invalid for {}",
+            registration.event
         );
     }
     let command = hook_command_path(registration, workspace);
@@ -866,7 +879,7 @@ fn hook_command_path(registration: &HookRegistration, workspace: &Path) -> PathB
 fn hook_fixture_is_eligible(registration: &HookRegistration, workspace: &Path) -> bool {
     registration
         .timeout_secs
-        .is_some_and(|timeout| timeout > crate::install::MAX_INNER_HOOK_TIMEOUT_SECS)
+        .is_some_and(|timeout| hook_timeout_is_valid(registration, timeout))
         && hook_command_path(registration, workspace).is_file()
 }
 
@@ -1085,7 +1098,9 @@ fn hook_fixture_payload(event: &str) -> &'static str {
         "PostToolUse" => {
             r#"{"session_id":"doctor-hook-fixture","tool_name":"apply_patch","file_path":"README.md"}"#
         }
-        "Stop" => r#"{"session_id":"doctor-hook-fixture"}"#,
+        "SessionEnd" => {
+            r#"{"session_id":"doctor-hook-fixture","transcript_path":"/tmp/private","reason":"private","cwd":"/private","final_summary":"private"}"#
+        }
         _ => "{}",
     }
 }
@@ -1314,8 +1329,34 @@ mod tests {
         assert_eq!(report.hook_registrations.len(), 1);
         assert!(report.stale_paths.is_empty());
         assert_eq!(report.hook_timeout_violations.len(), 1);
-        assert!(report.hook_timeout_violations[0].contains("must exceed"));
+        assert!(report.hook_timeout_violations[0].contains("invalid 4s"));
         assert!(!hook_fixture_is_eligible(
+            &report.hook_registrations[0],
+            &workspace
+        ));
+    }
+
+    #[test]
+    fn config_scan_accepts_codex_session_end_three_second_timeout() {
+        let root = unique_test_dir("doctor-session-end-timeout");
+        let workspace = root.join("repo");
+        let hook = workspace.join("integrations/codex/hooks/session-end.sh");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(workspace.join(".codex")).unwrap();
+        fs::write(
+            workspace.join(".codex/hooks.json"),
+            format!(
+                r#"{{"hooks":{{"SessionEnd":[{{"hooks":[{{"command":"{}","timeout":3}}]}}]}}}}"#,
+                hook.display()
+            ),
+        )
+        .unwrap();
+
+        let report = scan_configs(None, Some(workspace.clone()));
+
+        assert!(report.hook_timeout_violations.is_empty());
+        assert!(hook_fixture_is_eligible(
             &report.hook_registrations[0],
             &workspace
         ));

@@ -15,7 +15,7 @@ versioned hello/ack, and connection metadata are live. The hook-session
 capability state machine, protected client capability-file lifecycle, and the
 SQLite binding/receipt/outbox are implemented and tested as payload-free
 primitives. Installed Codex and Claude Code adapters now open/resume a binding
-and queue sanitized edit facts or a Stop close marker with bounded retry state.
+and queue sanitized edit facts or a `SessionEnd` close marker with bounded retry state.
 The daemon hook routes reduce these facts into deterministic repository-store
 session-digest memories on an authenticated close. No installed hook creates
 an organization or cross-checkout memory.
@@ -186,7 +186,9 @@ The directory and file receive the same ownership, non-symlink, and
 descriptor-relative, no-follow operations where available. The adapter refuses
 an unsafe record instead of repairing or trusting it. Capability records are
 deleted after a successful seal and a short retry grace, or when conclusively
-expired/revoked.
+expired/revoked. An explicit later `SessionStart` may retire the locally held
+generation before that grace elapses only after its close was acknowledged and
+no delivery remains pending; an unacknowledged close stays retryable.
 
 ### Presenting authority
 
@@ -240,7 +242,7 @@ branch-scoped memory.
 
 Moving or recreating a worktree changes checkout identity and invalidates the
 old binding. A later authenticated `SessionStart` creates a new generation; a
-`Stop` event alone cannot silently rebind.
+`SessionEnd` event alone cannot silently rebind. Per-turn `Stop` is not a terminal event and is not registered by Lattice.
 
 ## No-transcript data path
 
@@ -255,8 +257,8 @@ bounded extraction before RPC:
 - structured error/resolution hooks extract a redacted category, stable local
   fingerprint, status, and optional bounded safe symptom only when the host
   supplies enough typed data; and
-- `Stop` carries the close marker plus a final summary only when the host
-  supplies a dedicated summary field. Absence is normal.
+- `SessionEnd` carries only a content-free close marker. Host transcript,
+  reason, cwd, and summary fields are not admitted.
 
 Transcript mining is not a fallback. The adapter does not derive tests,
 failures, resolutions, or a final summary from conversation text. When a host
@@ -396,7 +398,7 @@ daemon boundaries:
   from the hook-adapter client kind and are routed before ordinary MCP tools;
 - capability files, pending deliveries, registry receipts, and the capture
   journal are protected, bounded, replay-safe, and payload-limited;
-- the Stop flow seals only on an authenticated close and writes deterministic
+- the SessionEnd flow seals only on an authenticated close and writes deterministic
   repository-local candidates through `MemoryStoreRouter`; it has no shared or
   organization-store fallback; and
 - explicit `remember` records are independent of automatic capture and are not
@@ -439,7 +441,7 @@ and real-package tests prove:
 - crash points before receipt, after receipt, during memory commit, and after
   close converge to one deterministic result on retry; and
 - the installed Codex and Claude Code packages complete a scripted
-  SessionStart/structured-edit/Stop session, produce task-recallable bounded
+  SessionStart/structured-edit/SessionEnd session, produce task-recallable bounded
   memories, remain successful when capture is unavailable, and make no LLM
   call by default.
 

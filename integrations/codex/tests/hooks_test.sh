@@ -49,7 +49,7 @@ exercise_package() {
     'session-start.sh:session-start'
     'user-prompt-submit.sh:user-prompt-submit'
     'post-tool-use.sh:post-tool-use'
-    'stop.sh:stop'
+    'session-end.sh:session-end'
   )
 
   for item in "${cases[@]}"; do
@@ -85,7 +85,7 @@ if rg -n 'remember|recall|context|impact|status' \
   exit 1
 fi
 
-# Host shutdown must remain successful and silent when capture is unavailable.
+# Host session termination must remain successful and silent when capture is unavailable.
 unavailable="$temp_dir/unavailable"
 python3 - "$unavailable" <<'PY'
 from pathlib import Path
@@ -94,7 +94,7 @@ Path(sys.argv[1]).write_text('#!/usr/bin/env bash\nexit 23\n', encoding='utf-8')
 PY
 chmod 755 "$unavailable"
 for hooks_dir in "$codex_hooks_dir" "$claude_hooks_dir"; do
-  output="$(LATTICE_BIN="$unavailable" "$hooks_dir/stop.sh" <<<'{"session_id":"unavailable"}')"
+  output="$(LATTICE_BIN="$unavailable" "$hooks_dir/session-end.sh" <<<'{"session_id":"unavailable"}')"
   [[ -z "$output" ]]
 done
 
@@ -194,8 +194,11 @@ PY
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
         <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"sentinel-$client\"}}" \
         >"$e2e_root/$client-post-tool.out"
-      env "${common_env[@]}" "$hooks_dir/stop.sh" \
-        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"files\":[\"forged-$client\"]}"
+      env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
+        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"second-sentinel-$client\"}}" \
+        >"$e2e_root/$client-post-tool-second.out"
+      env "${common_env[@]}" "$hooks_dir/session-end.sh" \
+        <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"reason\":\"private-$client\",\"cwd\":\"/forged\",\"final_summary\":\"private summary\"}"
     )
     rg -q 'constraint-fixture' "$e2e_root/$client-session-start.out"
     rg -q 'constraint-fixture' "$e2e_root/$client-user-prompt.out"

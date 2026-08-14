@@ -99,13 +99,15 @@ const HOOKS: [HookDefinition; 4] = [
         status_message: "Checking Lattice edit impact",
     },
     HookDefinition {
-        event: "Stop",
-        script: "stop.sh",
+        event: "SessionEnd",
+        script: "session-end.sh",
         matcher: None,
-        timeout_secs: 5,
+        timeout_secs: 3,
         status_message: "Finalizing protected Lattice session capture",
     },
 ];
+
+const STALE_LATTICE_HOOKS: [(&str, &str); 1] = [("Stop", "stop.sh")];
 
 /// Reconcile Lattice's hook entries while preserving unrelated client hooks.
 ///
@@ -117,8 +119,9 @@ pub(crate) fn reconcile_hook_config(
     client: HookClient,
     paths: &InstallPaths,
 ) -> Result<()> {
+    remove_stale_lattice_hooks(config)?;
     for definition in HOOKS {
-        validate_outer_timeout(definition.timeout_secs)?;
+        validate_outer_timeout(client, definition)?;
         reconcile_hook(config, client, paths, definition)?;
     }
     Ok(())
@@ -170,14 +173,74 @@ pub(crate) fn render_config(config: &Value) -> Result<String> {
         .map(|text| format!("{text}\n"))
 }
 
-fn validate_outer_timeout(outer_timeout_secs: u64) -> Result<()> {
-    if outer_timeout_secs <= MAX_INNER_HOOK_TIMEOUT_SECS {
+fn hook_timeout_secs(client: HookClient, definition: HookDefinition) -> u64 {
+    if client == HookClient::ClaudeCode && definition.event == "SessionEnd" {
+        5
+    } else {
+        definition.timeout_secs
+    }
+}
+
+fn validate_outer_timeout(client: HookClient, definition: HookDefinition) -> Result<()> {
+    let outer_timeout_secs = hook_timeout_secs(client, definition);
+    let terminal_adapter_only = client == HookClient::Codex && definition.event == "SessionEnd";
+    if (!terminal_adapter_only && outer_timeout_secs <= MAX_INNER_HOOK_TIMEOUT_SECS)
+        || (terminal_adapter_only && outer_timeout_secs <= 2)
+    {
         bail!(
-            "hook timeout invariant violated: outer timeout ({outer_timeout_secs}s) must exceed internal query timeout ({}s)",
-            MAX_INNER_HOOK_TIMEOUT_SECS
+            "hook timeout invariant violated for {}: outer timeout ({}s) is too short",
+            definition.event,
+            outer_timeout_secs,
         );
     }
     Ok(())
+}
+
+fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
+    let root = object_mut(config, "hook configuration")?;
+    let hooks = object_field_mut(root, "hooks", "hook configuration")?;
+    for (event, script) in STALE_LATTICE_HOOKS {
+        let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries.iter_mut() {
+            let Some(commands) = entry
+                .as_object_mut()
+                .and_then(|entry| entry.get_mut("hooks"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            commands.retain(|hook| !is_stale_lattice_hook(hook, script));
+        }
+        entries.retain(|entry| {
+            entry
+                .as_object()
+                .and_then(|entry| entry.get("hooks"))
+                .and_then(Value::as_array)
+                .is_none_or(|commands| !commands.is_empty())
+        });
+    }
+    Ok(())
+}
+
+fn is_stale_lattice_hook(hook: &Value, script: &str) -> bool {
+    let Some(command) = hook
+        .as_object()
+        .and_then(|hook| hook.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let path = Path::new(command);
+    path.file_name().and_then(|name| name.to_str()) == Some(script)
+        && path
+            .components()
+            .any(|part| part.as_os_str() == "integrations")
+        && path.components().any(|part| part.as_os_str() == "hooks")
+        && path
+            .components()
+            .any(|part| matches!(part.as_os_str().to_str(), Some("codex" | "claude-code")))
 }
 
 fn reconcile_hook(
@@ -187,10 +250,11 @@ fn reconcile_hook(
     definition: HookDefinition,
 ) -> Result<()> {
     let command = paths.hook_path(client, definition.script);
+    let timeout_secs = hook_timeout_secs(client, definition);
     let desired_hook = json!({
         "type": "command",
         "command": command.to_string_lossy(),
-        "timeout": definition.timeout_secs,
+        "timeout": timeout_secs,
         "statusMessage": definition.status_message,
     });
     let root = object_mut(config, "hook configuration")?;
@@ -324,6 +388,12 @@ mod tests {
                     ]},
                     {"hooks": [{"type": "command", "command": "/another/user-prompt-submit.sh"}]}
                 ],
+                "Stop": [
+                    {"hooks": [
+                        {"type": "command", "command": "/old/integrations/codex/hooks/stop.sh"},
+                        {"type": "command", "command": "foreign-stop.sh"}
+                    ]}
+                ],
                 "Custom": [{"hooks": [{"command": "custom-hook"}]}]
             }
         });
@@ -350,10 +420,22 @@ mod tests {
             "custom-hook"
         );
         assert_eq!(config["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5);
+        assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        assert_eq!(
+            config["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "foreign-stop.sh"
+        );
         assert_eq!(
             config["hooks"]["Custom"][0]["hooks"][0]["command"],
             "custom-hook"
         );
+    }
+
+    #[test]
+    fn claude_session_end_retains_query_safe_outer_timeout() {
+        let mut config = json!({});
+        reconcile_hook_config(&mut config, HookClient::ClaudeCode, &paths()).unwrap();
+        assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 5);
     }
 
     #[test]
@@ -397,10 +479,12 @@ mod tests {
             .to_string();
         assert!(error.contains("hook configuration.hooks must be a JSON object"));
 
-        let error = validate_outer_timeout(MAX_INNER_HOOK_TIMEOUT_SECS)
+        let mut invalid_timeout = HOOKS[0];
+        invalid_timeout.timeout_secs = MAX_INNER_HOOK_TIMEOUT_SECS;
+        let error = validate_outer_timeout(HookClient::Codex, invalid_timeout)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must exceed internal query timeout"));
+        assert!(error.contains("outer timeout (4s) is too short"));
     }
 
     #[test]

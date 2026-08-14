@@ -25,7 +25,7 @@ const INSTALLED_HOOKS: [(&str, &str); 4] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PostToolUse", "post-tool-use.sh"),
-    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
 ];
 
 #[derive(Debug, Clone)]
@@ -369,7 +369,7 @@ fn verify_hook_assets(paths: &InstallPaths, client: HookClient) -> Result<()> {
         "session-start.sh",
         "user-prompt-submit.sh",
         "post-tool-use.sh",
-        "stop.sh",
+        "session-end.sh",
     ] {
         let path = paths
             .asset_root
@@ -841,8 +841,8 @@ fn hook_fixture_payload(event: &str) -> &'static str {
         "PostToolUse" => {
             r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md","tool_input":"lattice-install-verification-tool-input","tool_response":"lattice-install-verification-tool-output","transcript_path":"/tmp/lattice-install-verification-transcript"}"#
         }
-        "Stop" => {
-            r#"{"session_id":"install-verification","transcript_path":"/tmp/lattice-install-verification-transcript","final_summary":"lattice-install-verification-prompt"}"#
+        "SessionEnd" => {
+            r#"{"session_id":"install-verification","transcript_path":"/tmp/lattice-install-verification-transcript","reason":"private","cwd":"/private","final_summary":"lattice-install-verification-prompt"}"#
         }
         _ => "{}",
     }
@@ -1945,7 +1945,7 @@ mod tests {
         fs::create_dir_all(workspace.join(".codex")).unwrap();
         fs::write(
             workspace.join(".codex/hooks.json"),
-            r#"{"hooks":{"Stop":[{"hooks":[{"command":"custom-hook"}]}]}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"custom-hook"},{"command":"/old/integrations/codex/hooks/stop.sh"}]}]}}"#,
         )
         .unwrap();
         let command = InstallCommand {
@@ -1968,12 +1968,14 @@ mod tests {
                 .as_array()
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook["command"] == "custom-hook"))
         }));
+        assert!(!twice.contains("/old/integrations/codex/hooks/stop.sh"));
         assert!(twice.contains(
             &root
-                .join("integrations/codex/hooks/stop.sh")
+                .join("integrations/codex/hooks/session-end.sh")
                 .display()
                 .to_string()
         ));
+        assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         fs::remove_dir_all(root).unwrap();
     }
 

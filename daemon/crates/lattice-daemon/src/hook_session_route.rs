@@ -1992,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn event_reordering_is_journaled_reduced_and_close_seals_idempotently() {
+    fn session_start_two_edits_and_session_end_preserve_order_and_seal_idempotently() {
         let directory = test_directory("capture-state");
         let checkout = committed_repository("capture-checkout");
         let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
@@ -2030,9 +2030,8 @@ mod tests {
                     "22222222222222222222222222222222",
                     serde_json::json!({
                         "schema_version": 1,
-                        "kind": "check",
-                        "label": "daemon tests",
-                        "outcome": "passed",
+                        "kind": "edited_path",
+                        "path": "fixture.txt",
                     }),
                 ),
             )
@@ -2107,16 +2106,44 @@ mod tests {
             Err(HookSessionRouteError::AuthorityRejected)
         ));
 
+        let next_generation = route
+            .handle_open(
+                &hello,
+                serde_json::json!({
+                    "integration": "codex/v1",
+                    "host_session_id": "capture-host-session",
+                }),
+            )
+            .unwrap();
+        assert_eq!(next_generation["generation"], 2);
+        assert_ne!(next_generation["binding_id"], opened["binding_id"]);
+        let next_event = serde_json::json!({
+            "binding_id": next_generation["binding_id"],
+            "capability": next_generation["capability"],
+            "integration": "codex/v1",
+            "delivery_id": "55555555555555555555555555555555",
+            "sequence": 1,
+            "event": {
+                "schema_version": 1,
+                "kind": "edited_path",
+                "path": "fixture.txt",
+            },
+        });
+        assert_eq!(
+            route.handle_event(&hello, next_event).unwrap()["status"],
+            "reduced"
+        );
+
         let capture_health =
             crate::adoption_metrics::capture_health_for_workspace(&identity.repository_root)
                 .expect("read capture counters");
-        assert_eq!(capture_health.total_attempts, 4);
+        assert_eq!(capture_health.total_attempts, 5);
         assert_eq!(capture_health.outcomes.get("queued"), Some(&1));
-        assert_eq!(capture_health.outcomes.get("captured"), Some(&2));
+        assert_eq!(capture_health.outcomes.get("captured"), Some(&3));
         assert_eq!(capture_health.outcomes.get("rejected"), Some(&1));
         // The close replay is a transport retry of the same admitted delivery;
         // it must not create a second capture metric.
-        assert_eq!(capture_health.outcomes.values().sum::<u64>(), 4);
+        assert_eq!(capture_health.outcomes.values().sum::<u64>(), 5);
 
         let metrics = std::fs::read_to_string(
             identity

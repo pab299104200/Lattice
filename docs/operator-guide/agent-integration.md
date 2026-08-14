@@ -46,7 +46,7 @@ The installed hooks are:
 - `SessionStart`: injects task memory and repo rules from `lattice recall --mode task --json`.
 - `UserPromptSubmit`: injects `lattice context "<prompt>" --mode auto` only when the relevance threshold is met.
 - `PostToolUse` on `Edit|Write`: injects a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
-- `Stop`: makes a best-effort protected close-marker attempt for the current
+- `SessionEnd`: makes a best-effort protected close-marker attempt for the current
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
 
@@ -69,29 +69,29 @@ The installed hooks are:
 - `SessionStart`: runs task-memory recall and repo-rule context concurrently, then prints their bounded results.
 - `UserPromptSubmit`: prints `lattice context "<prompt>" --mode auto` only when the relevance threshold is met and hook stdout is supported.
 - `PostToolUse` on `apply_patch|Edit|Write`: prints a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
-- `Stop`: makes a best-effort protected close-marker attempt for the current
+- `SessionEnd`: makes a best-effort protected close-marker attempt for the current
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
 
-All hooks exit `0` without output if the binary is missing, the daemon is down, or the bounded adapter call cannot complete. The adapter has a two-second invocation deadline and performs no separate health check. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Installed outer timeouts are five seconds for all four hooks, leaving process and serialization overhead around the bounded adapter call.
+All hooks exit `0` without output if the binary is missing, the daemon is down, or the bounded adapter call cannot complete. The adapter has a two-second invocation deadline and performs no separate health check. The sole recovery exception is an already authenticated `SessionStart` whose adapter later cannot reach or validate the daemon: it emits `lattice: daemon unreachable — run 'lattice doctor'` once for that host session. Hook failures must never block a coding session. A no-injection result is therefore not proof that hook wiring is missing; after the session is responsive, run `lattice status --timeout 2` to distinguish an unavailable or overloaded daemon from a configuration issue. Query-bearing hooks retain five-second outer timeouts; Codex `SessionEnd` uses three seconds around the two-second adapter deadline.
 
 ### D3a session boundary
 
 The installed adapters accept only bounded structured host fields. `SessionStart`
 uses the opaque host session identifier; an edit event uses the allowlisted
-tool kind and dedicated file path; `Stop` carries only a close marker because
-the supported hosts do not currently provide an admitted final-summary field.
-The adapter ignores `cwd`, repository/checkout/scope claims, prompts,
+tool kind and dedicated file path; `SessionEnd` carries only a close marker.
+The adapter ignores `cwd`, reason, final summary, repository/checkout/scope claims, prompts,
 transcripts, tool input/output, commands, terminal output, and environment
-values. It never opens a host `transcript_path`.
+values. It never opens a host `transcript_path`. Lattice deliberately removes
+its former per-turn `Stop` registration during reconciliation.
 
 D3a state is repository-local and bound to the exact canonical checkout by a
 daemon-minted capability. The short-lived adapter stores only protected
 capability metadata and sanitized pending deliveries under the user's private
 state directory; delivery IDs make retries idempotent, and bounded pending
 state is pruned after acknowledgement, expiry, or the retry grace period. A
-verified Stop close is reduced into deterministic repository-local session
-memories and is available to task-scoped recall; a failed or unavailable Stop
+verified `SessionEnd` close is reduced into deterministic repository-local session
+memories and is available to task-scoped recall; a failed or unavailable `SessionEnd`
 is not reported as a successful capture. No LLM call is made by default; the
 separate consolidation workflow is explicit, repository-scoped, and
 proposal-only.

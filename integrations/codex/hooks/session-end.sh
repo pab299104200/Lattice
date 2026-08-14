@@ -3,5 +3,5 @@ set -u
 
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
-lattice_hook_adapter codex stop
+lattice_hook_adapter codex session-end
 exit 0

@@ -95,14 +95,14 @@ lattice doctor --workspace /path/to/your/project
 
 Installed hook adapters implement the D3a boundary, not a transcript recorder.
 They accept an opaque host session ID, allowlisted edit metadata, and a
-best-effort `Stop` close marker. They do not read `transcript_path` or retain
+best-effort `SessionEnd` close marker. They do not read `transcript_path` or retain
 prompts, raw tool input/output, commands, terminal output, environment values,
 or caller-supplied repository, checkout, branch, or organization scope. The
 protected capability record and bounded retry queue are repository-local and
 exact-checkout-bound; retries reuse delivery IDs, and expired/acknowledged
 state is pruned. The transport/state primitives are implemented, while
-verified `Stop` close is reduced into deterministic repository-local session
-memories for task-scoped recall; a failed or unavailable `Stop` is never
+verified `SessionEnd` close is reduced into deterministic repository-local session
+memories for task-scoped recall; a failed or unavailable `SessionEnd` is never
 reported as a successful capture. Capture is best-effort and never blocks
 agent shutdown. Deterministic capture has no LLM dependency; the separate
 consolidation workflow is explicit opt-in, repository-scoped, and

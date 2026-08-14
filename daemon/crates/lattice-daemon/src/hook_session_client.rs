@@ -549,6 +549,32 @@ impl HookSessionClient {
         })
     }
 
+    /// Retires a fully acknowledged terminal generation when the host emits
+    /// an explicit new SessionStart for the same tuple. Pending close delivery
+    /// is never discarded; without a successful acknowledgement the old
+    /// generation remains authoritative and retryable.
+    pub fn retire_acknowledged_close(
+        &self,
+        key: &HookClientBindingKey,
+    ) -> Result<bool, HookSessionClientError> {
+        self.with_lock(|| {
+            let fingerprint = key.fingerprint(&self.cryptography)?;
+            let record = match self.load_record_by_fingerprint(&fingerprint) {
+                Ok(record) => record,
+                Err(HookSessionClientError::BindingMissing) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if record.close_retire_after_ms.is_none() {
+                return Ok(false);
+            }
+            if !self.pending_records(&fingerprint, &record)?.is_empty() {
+                return Err(HookSessionClientError::MalformedState);
+            }
+            remove_private_file(&self.binding_path(&fingerprint))?;
+            Ok(true)
+        })
+    }
+
     fn with_lock<T>(
         &self,
         operation: impl FnOnce() -> Result<T, HookSessionClientError>,
@@ -1316,6 +1342,44 @@ mod tests {
             client.pending(&key),
             Err(HookSessionClientError::BindingMissing)
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_session_start_retires_only_an_acknowledged_close_generation() {
+        let (client, root) = client("new-generation");
+        let key = key();
+        client.store_binding(&key, &binding()).unwrap();
+        let closing = client.enqueue(&key, close(), 1).unwrap().delivery;
+        assert!(!client.retire_acknowledged_close(&key).unwrap());
+        assert_eq!(client.pending(&key).unwrap(), vec![closing.clone()]);
+
+        client.acknowledge(&key, &closing.delivery_id, 2).unwrap();
+        assert!(client.retire_acknowledged_close(&key).unwrap());
+        assert!(matches!(
+            client.load_binding(&key, 2),
+            Err(HookSessionClientError::BindingMissing)
+        ));
+
+        let next = HookClientBinding::new(
+            HookClientOpaqueId::new("binding-next-generation").unwrap(),
+            HookClientOpaqueId::new("capability-next-generation").unwrap(),
+            "codex-1",
+            "repo-private",
+            "/work/private",
+            10_000,
+            20_000,
+        )
+        .unwrap();
+        client.store_binding(&key, &next).unwrap();
+        assert_eq!(
+            client
+                .enqueue(&key, event("src/new.rs"), 3)
+                .unwrap()
+                .delivery
+                .sequence,
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

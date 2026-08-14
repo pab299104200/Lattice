@@ -35,14 +35,14 @@ desired = {
     "SessionStart": [
         {
             "hooks": [
-                {"type": "command", "command": str(hook_dir / "session-start.sh")},
+                {"type": "command", "command": str(hook_dir / "session-start.sh"), "timeout": 5},
             ],
         },
     ],
     "UserPromptSubmit": [
         {
             "hooks": [
-                {"type": "command", "command": str(hook_dir / "user-prompt-submit.sh")},
+                {"type": "command", "command": str(hook_dir / "user-prompt-submit.sh"), "timeout": 5},
             ],
         },
     ],
@@ -50,37 +50,63 @@ desired = {
         {
             "matcher": "Edit|Write",
             "hooks": [
-                {"type": "command", "command": str(hook_dir / "post-tool-use.sh")},
+                {"type": "command", "command": str(hook_dir / "post-tool-use.sh"), "timeout": 5},
             ],
         },
     ],
-    "Stop": [
+    "SessionEnd": [
         {
             "hooks": [
-                {"type": "command", "command": str(hook_dir / "stop.sh")},
+                {"type": "command", "command": str(hook_dir / "session-end.sh"), "timeout": 5},
             ],
         },
     ],
 }
 
+# Remove superseded Lattice Stop hooks without disturbing foreign Stop hooks.
+for entry in hooks.get("Stop", []):
+    if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+        entry["hooks"] = [
+            hook for hook in entry["hooks"]
+            if not (
+                isinstance(hook, dict)
+                and isinstance(hook.get("command"), str)
+                and Path(hook["command"]).name == "stop.sh"
+                and "integrations" in Path(hook["command"]).parts
+                and "hooks" in Path(hook["command"]).parts
+                and any(part in {"codex", "claude-code"} for part in Path(hook["command"]).parts)
+            )
+        ]
+hooks["Stop"] = [
+    entry for entry in hooks.get("Stop", [])
+    if not isinstance(entry, dict) or entry.get("hooks")
+]
+if not hooks.get("Stop"):
+    hooks.pop("Stop", None)
+
 for event, entries in desired.items():
     current = hooks.setdefault(event, [])
     if not isinstance(current, list):
         hooks[event] = current = []
-    existing_commands = {
-        hook.get("command")
-        for entry in current
-        if isinstance(entry, dict)
-        for hook in entry.get("hooks", [])
-        if isinstance(hook, dict)
-    }
     for entry in entries:
-        commands = [
-            hook["command"]
-            for hook in entry.get("hooks", [])
-            if isinstance(hook, dict) and "command" in hook
-        ]
-        if not any(command in existing_commands for command in commands):
+        desired_hook = entry["hooks"][0]
+        desired_name = Path(desired_hook["command"]).name
+        matched = False
+        for existing_entry in current:
+            if not isinstance(existing_entry, dict):
+                continue
+            for existing_hook in existing_entry.get("hooks", []):
+                if not isinstance(existing_hook, dict):
+                    continue
+                command = existing_hook.get("command")
+                if isinstance(command, str) and Path(command).name == desired_name:
+                    existing_hook.update(desired_hook)
+                    if "matcher" in entry:
+                        existing_entry["matcher"] = entry["matcher"]
+                    else:
+                        existing_entry.pop("matcher", None)
+                    matched = True
+        if not matched:
             current.append(entry)
 
 settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")

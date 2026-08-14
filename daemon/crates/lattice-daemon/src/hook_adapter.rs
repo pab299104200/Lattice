@@ -66,7 +66,7 @@ enum HookKind {
     SessionStart,
     UserPromptSubmit,
     PostToolUse,
-    Stop,
+    SessionEnd,
 }
 
 impl HookKind {
@@ -75,7 +75,7 @@ impl HookKind {
             "session-start" => Some(Self::SessionStart),
             "user-prompt-submit" => Some(Self::UserPromptSubmit),
             "post-tool-use" => Some(Self::PostToolUse),
-            "stop" => Some(Self::Stop),
+            "session-end" => Some(Self::SessionEnd),
             _ => None,
         }
     }
@@ -158,6 +158,10 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
     let client = HookSessionClient::open_default()?;
     let now_ms = unix_time_ms()?;
 
+    if invocation.kind == HookKind::SessionStart {
+        client.retire_acknowledged_close(&key)?;
+    }
+
     match invocation.kind {
         HookKind::SessionStart | HookKind::UserPromptSubmit => {
             let presentation = match open_or_resume(
@@ -221,7 +225,7 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
                 render_host_presentation(invocation.integration, invocation.kind, result)
             }))
         }
-        HookKind::Stop => {
+        HookKind::SessionEnd => {
             let Some(payload) = fact.payload else {
                 return Ok(None);
             };
@@ -621,7 +625,7 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
     let payload = match kind {
         HookKind::SessionStart | HookKind::UserPromptSubmit => None,
         HookKind::PostToolUse => extract_edit_event(object)?,
-        HookKind::Stop => Some(HookClientCapturePayload::Close(
+        HookKind::SessionEnd => Some(HookClientCapturePayload::Close(
             parse_session_capture_close(
                 &json!({"schema_version": SESSION_CAPTURE_SCHEMA_VERSION}).to_string(),
                 DateTime::<Utc>::from_unix_seconds(unix_time_ms()? / 1_000),
@@ -660,7 +664,7 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
             path: Some(path.to_string()),
             acted_on_injection_id,
         }),
-        HookKind::Stop => None,
+        HookKind::SessionEnd => None,
     };
     Ok(HostFact {
         host_session_id,
@@ -732,7 +736,7 @@ fn presentation_params(request: &HostPresentationRequest) -> Value {
         HookKind::SessionStart => "session-start",
         HookKind::UserPromptSubmit => "user-prompt-submit",
         HookKind::PostToolUse => "post-tool-use",
-        HookKind::Stop => unreachable!("stop has no presentation request"),
+        HookKind::SessionEnd => unreachable!("session end has no presentation request"),
     };
     let mut value = json!({
         "kind": kind,
@@ -764,7 +768,7 @@ fn render_host_presentation(
                     HookKind::SessionStart => "SessionStart",
                     HookKind::UserPromptSubmit => "UserPromptSubmit",
                     HookKind::PostToolUse => "PostToolUse",
-                    HookKind::Stop => "Stop",
+                    HookKind::SessionEnd => "SessionEnd",
                 },
                 "additionalContext": result.context,
             }
@@ -925,14 +929,16 @@ mod tests {
     }
 
     #[test]
-    fn close_has_no_host_summary_or_envelope_fields() {
+    fn session_end_close_has_no_host_summary_or_envelope_fields() {
         let input = br#"{
             "session_id":"opaque-session",
             "transcript_path":"/tmp/private",
+            "reason":"private shutdown reason",
+            "cwd":"/forged/root",
             "final_summary":"host text is not an admitted dedicated field yet",
             "files":["src/private.rs"]
         }"#;
-        let extracted = extract_host_fact(HookKind::Stop, input).unwrap();
+        let extracted = extract_host_fact(HookKind::SessionEnd, input).unwrap();
         let HookClientCapturePayload::Close(close) = extracted.payload.unwrap() else {
             panic!("expected a close marker");
         };
@@ -1067,5 +1073,11 @@ mod tests {
         assert!(!session_start_notice_eligible(&anyhow::Error::new(
             HookSessionClientError::BindingMissing
         )));
+    }
+
+    #[test]
+    fn per_turn_stop_is_not_a_supported_lifecycle_hook() {
+        assert_eq!(HookKind::parse("stop"), None);
+        assert_eq!(HookKind::parse("session-end"), Some(HookKind::SessionEnd));
     }
 }

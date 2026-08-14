@@ -46,7 +46,7 @@ It does not archive agent conversations, act as telemetry, infer secrets, promot
 
 ## Payload boundary
 
-The bundled Stop hook invokes the private `__hook-adapter` entry point. This is
+The bundled `SessionEnd` hook invokes the private `__hook-adapter` entry point. This is
 an implemented best-effort transport adapter, not a user-facing memory-write
 command: it opens/resumes a capability binding, queues a sanitized close
 marker, and the authenticated daemon route reduces the complete bound journal
@@ -63,7 +63,7 @@ integration must not inspect, open, hash, or forward a transcript path to make
 the envelope; hosts that do not expose safe structured facts omit them.
 
 The future digest schema has this logical shape; it is not the payload emitted
-by today's Stop hook and exact public field names require a versioned adapter
+by today's `SessionEnd` hook and exact public field names require a versioned adapter
 change:
 
 ```json
@@ -98,9 +98,10 @@ The live adapters have a narrower contract than the future digest shape above:
   `tool_input.file_path` fallback). It emits only a normalized repository-
   relative `edited_path` fact; command arguments, tool input/output, and
   terminal text are discarded.
-- `Stop` admits the host `session_id` and emits only a close marker. The
+- `SessionEnd` admits the host `session_id` and emits only a close marker. The
   installed adapters do not admit `edited_files`, a prompt, a transcript path,
-  or a final summary from the host envelope.
+  reason, cwd, or a final summary from the host envelope. Lattice does not
+  register per-turn `Stop` as a lifecycle boundary.
 
 Every adapter requires bounded JSON, drops unknown keys before transport, and
 never opens a path named by the envelope. Repository, checkout, branch, and
@@ -176,7 +177,7 @@ Absent opt-in, provider/key, or queue capacity means no LLM call. The daemon rec
 
 ## Failure handling, retention, and observability
 
-The Stop hook has a short deadline and exits zero after best-effort diagnostics
+The `SessionEnd` hook has a short deadline and exits zero after best-effort diagnostics
 without printing payload content. Today, a missing daemon, missing binding, or
 unavailable registry prevents delivery; it is not reported as a successful
 memory write. Capture admission is transactional, and internal outcomes must
@@ -205,7 +206,7 @@ organization store or another checkout.
 
 ## Required verification
 
-The implementation and bundled Stop-hook package must prove all of the following through direct daemon/CLI tests:
+The implementation and bundled `SessionEnd` hook package must prove all of the following through direct daemon/CLI tests:
 
 - a scripted fixture session yields task-recallable `WorkflowOutcome` and `FailurePattern` records with typed evidence;
 - delivery retry is idempotent and output ordering is deterministic;
@@ -214,7 +215,7 @@ The implementation and bundled Stop-hook package must prove all of the following
 - prose cannot assert a passing test or resolution without typed corroboration;
 - resolved errors require a matching same-session resolution marker;
 - captured session/branch data cannot reach another repository or the shared store, including through handles and consolidation;
-- daemon/store failure leaves the Stop hook successful but reports a truthful observable capture failure;
+- daemon/store failure leaves the `SessionEnd` hook successful but reports a truthful observable capture failure;
 - no LLM request occurs without explicit enabled configuration and a usable key; enabled jobs create review proposals only; and
 - retention/deletion cleans capture dependencies without deleting derived durable memory or required audit history.
 
