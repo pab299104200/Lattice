@@ -17,6 +17,7 @@
 //! misleading timings.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -27,10 +28,14 @@ use lattice_core::graph::{CodeGraph, EdgeKind};
 use lattice_core::health::churn_facts::line_churn_fact;
 use lattice_core::health::complexity_facts::compute_file_complexity_facts;
 use lattice_core::health::complexity_facts::FileComplexityFacts;
-use lattice_core::health::dead_symbol_facts::{DeadSymbolExclusionInputs, DeadSymbolFactProducer};
-use lattice_core::health::graph_facts::GraphFactProducer;
+use lattice_core::health::dead_symbol_facts::{
+    DeadSymbolExclusionInputs, DeadSymbolFactProducer, DeadSymbolFactsSnapshot,
+};
+use lattice_core::health::graph_facts::{GraphFactProducer, GraphFactsSnapshot};
 use lattice_core::health::scoring::HealthFactIndex;
-use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
+use lattice_core::health::test_proximity_facts::{
+    TestProximityFactProducer, TestProximitySnapshot,
+};
 use std::collections::BTreeMap;
 use lattice_core::symbols::{Language, ParsedFile, Symbol, SymbolId, SymbolKind};
 
@@ -337,6 +342,114 @@ fn corpus_complexity(file_count: usize) -> BTreeMap<String, FileComplexityFacts>
         .collect()
 }
 
+/// The read path as it behaved before published generations were served: every
+/// graph-derived family recomputed in process, per request.
+///
+/// This is exactly what `rpc::mcp::health_fact_index` did for every `impact`,
+/// `context`, `prepare_change`, `diagnose` and `status` call, and it is the
+/// number the store-backed path has to beat.
+fn build_index_from_live_graph(
+    graph: &CodeGraph,
+    git: &GitIntelligenceSnapshot,
+) -> HealthFactIndex {
+    HealthFactIndex::builder()
+        .with_graph_facts(GraphFactProducer::default().produce(graph, true))
+        .with_git_intelligence(git.clone())
+        .with_test_proximity_facts(TestProximityFactProducer::default().produce(graph, true))
+        .with_dead_symbol_facts(DeadSymbolFactProducer::default().produce(
+            graph,
+            &DeadSymbolExclusionInputs::default(),
+            true,
+        ))
+        .build()
+}
+
+/// The read path once a generation has been published: no whole-graph pass at
+/// all, only `Arc` clones and the ranking join.
+///
+/// Complexity facts appear here and cannot appear above, because producing
+/// them means re-parsing file contents, which request handling must not do.
+/// The store-backed path is therefore both cheaper *and* strictly better
+/// evidenced (`docs/architecture/2026-08-13-health-engine.md`).
+fn build_index_from_published(
+    published: &PublishedFixture,
+    git: &GitIntelligenceSnapshot,
+) -> HealthFactIndex {
+    HealthFactIndex::builder()
+        .with_shared_graph_facts(Arc::clone(&published.graph))
+        .with_git_intelligence(git.clone())
+        .with_shared_complexity_facts(Arc::clone(&published.complexity))
+        .with_shared_test_proximity_facts(Arc::clone(&published.test_proximity))
+        .with_shared_dead_symbol_facts(Arc::clone(&published.dead_symbols))
+        .build()
+}
+
+struct PublishedFixture {
+    graph: Arc<GraphFactsSnapshot>,
+    complexity: Arc<BTreeMap<String, FileComplexityFacts>>,
+    test_proximity: Arc<TestProximitySnapshot>,
+    dead_symbols: Arc<DeadSymbolFactsSnapshot>,
+}
+
+/// What one verb request pays to obtain a fact index.
+///
+/// H5 measured *publication*, which this change does not make cheaper: the
+/// three graph-derived families are still whole-graph passes, now coalesced to
+/// the watcher's settling window instead of running per request. What changed
+/// is the read path, so that is what this measures — the live-graph
+/// recomputation every request used to perform against the `Arc`-clone the
+/// published handoff serves instead.
+fn bench_health_index_read_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("health_index_read_path");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(4));
+    group.sample_size(20);
+
+    for file_count in [REPO_FILE_COUNT, LARGE_FILE_COUNT] {
+        let fixture = Fixture::new(file_count);
+        let git = GitIntelligenceSnapshot::empty();
+        let graph = fixture.baseline.clone();
+
+        let published = PublishedFixture {
+            graph: Arc::new(GraphFactProducer::default().produce(&graph, true)),
+            complexity: Arc::new(corpus_complexity(file_count)),
+            test_proximity: Arc::new(TestProximityFactProducer::default().produce(&graph, true)),
+            dead_symbols: Arc::new(DeadSymbolFactProducer::default().produce(
+                &graph,
+                &DeadSymbolExclusionInputs::default(),
+                true,
+            )),
+        };
+
+        // Both paths must cover the same population, or the comparison would
+        // be measuring two different amounts of work rather than two ways of
+        // obtaining the same answer.
+        assert_eq!(
+            build_index_from_live_graph(&graph, &git).file_count(),
+            build_index_from_published(&published, &git).file_count(),
+            "both read paths must score the same file population"
+        );
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new("live_graph_recomputation", file_count),
+            &(&graph, &git),
+            |bencher, (graph, git)| {
+                bencher.iter(|| black_box(build_index_from_live_graph(graph, git)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("published_generation", file_count),
+            &(&published, &git),
+            |bencher, (published, git)| {
+                bencher.iter(|| black_box(build_index_from_published(published, git)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_health_facts_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("health_facts_publish");
     group.warm_up_time(Duration::from_secs(1));
@@ -456,6 +569,7 @@ fn bench_incremental_graph_maintenance(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_incremental_graph_maintenance,
-    bench_health_facts_publish
+    bench_health_facts_publish,
+    bench_health_index_read_path
 );
 criterion_main!(benches);
