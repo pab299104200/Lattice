@@ -712,7 +712,10 @@ impl BacktestReport {
             "The ground truth above rests entirely on `looks_like_bug_fix`, a\nsubject-prefix heuristic. It is audited here against an independent signal:\ncommits whose diff touches both an existing test file and a production file.\n\n",
         );
         out.push_str(
-            "**These two signals do not measure the same thing.** Real fixes often ship\nwithout touching a test, and features often touch both. Raw agreement and\nCohen's kappa are therefore expected to be low even when the classifier works\ncorrectly, and a low kappa here is *not* evidence against the vocabulary. The\nfigure that carries evidence is enrichment: whether commits the classifier\ncalls fixes co-modify tests and production more often than commits in general.\nEnrichment of 1.000 means fix-shaped commits are indistinguishable from any\nother commit, which would mean the classifier tracks nothing.\n\n",
+            "**These two signals do not measure the same thing.** Real fixes often ship\nwithout touching a test, and features often ship with one. Raw agreement and\nCohen's kappa are therefore expected to be low even when the classifier works\ncorrectly, and a low kappa here is *not* evidence against the vocabulary. The\nfigure that carries the most evidence is enrichment: whether commits the\nclassifier calls fixes co-modify tests and production more often than commits\nin general.\n\n",
+        );
+        out.push_str(
+            "Enrichment below 1.000 is genuinely ambiguous. It can mean the vocabulary\nadmits commits that are not fixes — or it can mean the proxy is\n*anti-correlated* with fix-ness in this corpus, which is what happens wherever\nfeature work ships with tests while bug fixes are one-line repairs. Only the\nspot-review sample below separates those two readings, which is why the spec\nrequires one. Read them together.\n\n",
         );
         out.push_str("| Measure | Value |\n| --- | ---: |\n");
         out.push_str(&format!(
@@ -749,8 +752,31 @@ impl BacktestReport {
             "| Cohen's kappa | {} |\n",
             signed_decimal(audit.cohen_kappa_per_mille)
         ));
-        out.push_str(&format!("| **Verdict** | **{}** |\n", audit.verdict.as_str()));
+        out.push_str(&format!(
+            "| **Verdict (independent signal)** | **{}** |\n",
+            audit.verdict.as_str()
+        ));
         out.push('\n');
+        out.push_str("### Recall: the fixes the classifier does not see\n\n");
+        out.push_str(
+            "Precision is not the only way a labeler fails. `looks_like_bug_fix` inspects\nonly the *prefix* of a subject, so a commit that announces repair work\nanywhere else goes unlabeled and its files are recorded as clean. The count\nbelow is every rejected commit whose subject names repair work as a whole word\n(`fix`, `bug`, `hotfix`, `regression`, `revert`, …), which is a lower bound on\nwhat the prefix rule gives up.\n\n",
+        );
+        out.push_str("| Measure | Value |\n| --- | ---: |\n");
+        out.push_str(&format!(
+            "| Recognised as fixes | {} |\n",
+            audit.classified_fix
+        ));
+        out.push_str(&format!(
+            "| Rejected but naming repair work | {} |\n",
+            audit.unclassified_with_fix_vocabulary
+        ));
+        out.push_str(&format!(
+            "| **Recall gap** | **{}** |\n",
+            percentage(audit.recall_gap_per_mille)
+        ));
+        out.push_str(
+            "\nA large recall gap means the reported prevalence understates the true defect\nrate and that files repaired by unrecognised commits are counted as clean.\nThat depresses measured precision — it does not inflate it — so the accuracy\nfigures in this report are conservative with respect to this failure mode.\n\n",
+        );
         out.push_str("2x2 table: fix-shaped and co-modifying ");
         out.push_str(&format!(
             "{}; fix-shaped only {}; co-modifying only {}; neither {}.\n\n",
@@ -872,8 +898,9 @@ impl BacktestReport {
 
         out.push_str("Limits on what this evidence supports:\n\n");
         out.push_str(&format!(
-            "- Ground truth is a subject-line heuristic, audited above and judged **{}**. Every accuracy figure inherits that classifier's error.\n",
-            self.audit.verdict.as_str()
+            "- Ground truth is a subject-line heuristic. The independent signal judged it **{}**, and it leaves a **{} recall gap** — subjects naming repair work that its prefix-only matching rejects. Every accuracy figure inherits that classifier's error.\n",
+            self.audit.verdict.as_str(),
+            percentage(self.audit.recall_gap_per_mille)
         ));
         out.push_str(
             "- A defect that was never fixed inside the horizon, or fixed with a subject the classifier does not recognise, is labeled clean. Recall is measured against detected fixes, not against defects.\n",

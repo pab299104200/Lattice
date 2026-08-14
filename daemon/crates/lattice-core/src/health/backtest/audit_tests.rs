@@ -56,11 +56,11 @@ fn a_perfectly_enriched_classifier_is_corroborated() {
     assert_eq!(audit.co_modification_given_fix_per_mille, 1000);
     assert_eq!(audit.enrichment_per_mille, 2000);
     assert_eq!(audit.verdict, AuditVerdict::Corroborated);
-    assert!(!audit.verdict.warrants_tightening());
+    assert!(audit.verdict.corroborates());
 }
 
 #[test]
-fn a_classifier_that_tracks_nothing_is_uncorroborated_and_warrants_tightening() {
+fn a_classifier_that_tracks_nothing_is_uncorroborated() {
     // Co-modification is spread identically across both classes, so knowing a
     // commit is fix-shaped tells you nothing about it.
     let mut commits = Vec::new();
@@ -80,7 +80,7 @@ fn a_classifier_that_tracks_nothing_is_uncorroborated_and_warrants_tightening() 
     assert_eq!(audit.co_modification_given_non_fix_per_mille, 500);
     assert_eq!(audit.enrichment_per_mille, 1000);
     assert_eq!(audit.verdict, AuditVerdict::Uncorroborated);
-    assert!(audit.verdict.warrants_tightening());
+    assert!(!audit.verdict.corroborates());
     // Kappa is zero because the signals are independent — and note this is a
     // *different* fact from the enrichment being 1000.
     assert_eq!(audit.cohen_kappa_per_mille, 0);
@@ -116,7 +116,9 @@ fn slight_enrichment_is_reported_as_weak_rather_than_rounded_to_a_verdict() {
     assert_eq!(audit.co_modification_given_fix_per_mille, 600);
     assert_eq!(audit.enrichment_per_mille, 1091);
     assert_eq!(audit.verdict, AuditVerdict::Weak);
-    assert!(!audit.verdict.warrants_tightening());
+    // Weak still counts as corroboration: the signals point the same way, just
+    // not far.
+    assert!(audit.verdict.corroborates());
 }
 
 #[test]
@@ -273,4 +275,46 @@ fn commit_ids_are_abbreviated_for_report_text() {
     ];
     let audit = audit_labels(&commits, 2);
     assert_eq!(audit.sample[0].commit, "0123456789");
+}
+
+#[test]
+fn fix_vocabulary_matches_whole_words_only() {
+    assert!(mentions_fix_vocabulary("v24: fix seed stage"));
+    assert!(mentions_fix_vocabulary("Repair the BUG in parsing"));
+    assert!(mentions_fix_vocabulary("chore: revert the change"));
+    // The same traps the production classifier's boundary check avoids.
+    assert!(!mentions_fix_vocabulary("add a prefix to the key"));
+    assert!(!mentions_fix_vocabulary("extend the fixture helpers"));
+    assert!(!mentions_fix_vocabulary("feat: add a new endpoint"));
+}
+
+#[test]
+fn the_recall_gap_counts_repair_subjects_the_prefix_rule_rejects() {
+    let commits = vec![
+        // Recognised: the repair word sits at the prefix.
+        commit("aaa", "fix: recognised", &["src/lib.rs"]),
+        // Missed: repair work announced somewhere other than the prefix.
+        commit("bbb", "v24: fix the seed stage", &["src/lib.rs"]),
+        commit("ccc", "core: revert the bad change", &["src/lib.rs"]),
+        // Genuinely not repair work; the `prefix` trap must not fire.
+        commit("ddd", "feat: add an endpoint", &["src/lib.rs"]),
+        commit("eee", "docs: describe the prefix rule", &["src/lib.rs"]),
+    ];
+    let audit = audit_labels(&commits, 50);
+
+    assert_eq!(audit.classified_fix, 1);
+    assert_eq!(audit.unclassified_with_fix_vocabulary, 2);
+    // Two of the three repair-shaped subjects go unlabeled.
+    assert_eq!(audit.recall_gap_per_mille, 667);
+}
+
+#[test]
+fn a_classifier_that_misses_nothing_reports_no_recall_gap() {
+    let commits = vec![
+        commit("aaa", "fix: one", &["src/lib.rs"]),
+        commit("bbb", "feat: two", &["src/lib.rs"]),
+    ];
+    let audit = audit_labels(&commits, 50);
+    assert_eq!(audit.unclassified_with_fix_vocabulary, 0);
+    assert_eq!(audit.recall_gap_per_mille, 0);
 }

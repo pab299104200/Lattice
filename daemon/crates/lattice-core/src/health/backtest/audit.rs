@@ -21,17 +21,33 @@
 //! are therefore expected to be low even when the classifier is working, and
 //! **a low kappa here is not by itself evidence that the vocabulary is bad**.
 //!
-//! The figure that does carry evidence is *enrichment*: whether commits the
-//! classifier calls fixes are more likely to co-modify tests and production
-//! code than commits in general. If fix-shaped commits are no more likely than
-//! any other commit to look like repair work by this independent measure, the
-//! classifier is not tracking anything real and the vocabulary needs
-//! tightening. If they are meaningfully enriched, two unrelated signals are
-//! pointing the same way, which is what corroboration means.
+//! The figure that carries the most evidence is *enrichment*: whether commits
+//! the classifier calls fixes are more likely to co-modify tests and
+//! production code than commits in general. If they are meaningfully enriched,
+//! two unrelated signals are pointing the same way, which is what
+//! corroboration means.
 //!
-//! [`AuditVerdict`] encodes exactly that bar, and all of raw agreement, kappa,
-//! and enrichment are reported so a reader can disagree with the bar and
-//! recompute their own.
+//! Enrichment below 1.0 is genuinely ambiguous, and this module refuses to
+//! resolve the ambiguity automatically. It can mean the vocabulary admits
+//! commits that are not fixes — or it can mean the proxy is anti-correlated
+//! with fix-ness in this corpus, which is exactly what happens where feature
+//! work ships with tests while bug fixes are one-line repairs. Only the
+//! spot-review sample separates those, which is why the spec requires one and
+//! why [`AuditVerdict::corroborates`] reports what was measured rather than
+//! prescribing a change.
+//!
+//! # The other failure mode: recall
+//!
+//! A classifier can be perfectly precise and still be a poor labeler by
+//! missing most of the fixes. [`LabelAudit::unclassified_with_fix_vocabulary`]
+//! measures that directly: commits the classifier rejected whose subject names
+//! repair work somewhere other than the prefix it inspects. It is a
+//! measurement only — it is deliberately not wired into labeling, because
+//! changing the ground-truth definition would change every number in the report
+//! that measures it.
+//!
+//! All of raw agreement, kappa, enrichment, and the recall gap are reported so
+//! a reader can disagree with every bar drawn here and recompute their own.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +102,9 @@ pub enum AuditVerdict {
     /// Enriched, but only slightly. The classifier is tracking something, but
     /// the corroboration is thin enough that the report says so.
     Weak,
-    /// No enrichment at all: fix-shaped commits look no different from any
-    /// other commit by the independent measure. The vocabulary needs work.
+    /// No enrichment: fix-shaped commits look no different from any other
+    /// commit by the independent measure. Ambiguous on its own — read it with
+    /// the spot-review sample, per [`AuditVerdict::corroborates`].
     Uncorroborated,
     /// The audit could not run — too few commits, or no commit of one class.
     Unavailable,
@@ -104,10 +121,22 @@ impl AuditVerdict {
         }
     }
 
-    /// Whether the measurement authorizes tightening the classifier's
-    /// vocabulary in this change (spec H1.2).
-    pub fn warrants_tightening(&self) -> bool {
-        matches!(self, Self::Uncorroborated)
+    /// Whether the independent signal corroborated the classifier.
+    ///
+    /// A verdict of [`AuditVerdict::Uncorroborated`] means the independent
+    /// signal did not agree — it does **not** on its own mean the vocabulary
+    /// admits commits that are not fixes. The proxy can be anti-correlated
+    /// with fix-ness by construction: in a codebase where feature work ships
+    /// with tests and bug fixes are one-line repairs, fix commits co-modify
+    /// tests *less* often than everything else, and this measure will read
+    /// below 1.0 for a classifier whose every positive is correct.
+    ///
+    /// Distinguishing "the vocabulary is loose" from "the proxy is
+    /// anti-correlated" needs the spot-review sample, which is why the spec
+    /// requires one. Nothing in this module can make that call automatically,
+    /// so nothing in this module claims to.
+    pub fn corroborates(&self) -> bool {
+        matches!(self, Self::Corroborated | Self::Weak)
     }
 }
 
@@ -145,7 +174,15 @@ pub struct LabelAudit {
     /// means fix-shaped commits are indistinguishable from any other commit by
     /// the independent signal.
     pub enrichment_per_mille: u32,
-    /// The verdict, and with it whether tightening is warranted.
+    /// Commits the classifier rejected whose subject names repair work
+    /// somewhere other than the prefix it inspects — a direct measure of the
+    /// recall its prefix-only matching gives up.
+    pub unclassified_with_fix_vocabulary: u32,
+    /// `unclassified_with_fix_vocabulary / (classified_fix +
+    /// unclassified_with_fix_vocabulary)`, per-mille: the share of
+    /// repair-shaped subjects the classifier does not recognise.
+    pub recall_gap_per_mille: u32,
+    /// What the independent signal concluded.
     pub verdict: AuditVerdict,
     /// Subjects for human spot-review.
     pub sample: Vec<AuditSample>,
@@ -165,6 +202,29 @@ fn per_mille(numerator: u64, denominator: u64) -> u32 {
         return 0;
     }
     round_div(u128::from(numerator) * 1000, u128::from(denominator)) as u32
+}
+
+/// Words that name repair work, matched anywhere in a subject as whole words.
+///
+/// Used only to *measure* the recall gap the production classifier's
+/// prefix-only matching leaves behind. It is deliberately not wired into
+/// labeling: changing the ground-truth definition would change every number in
+/// the report that measures it.
+const FIX_VOCABULARY: [&str; 9] = [
+    "fix", "fixes", "fixed", "bugfix", "hotfix", "bug", "regression", "revert", "reverts",
+];
+
+/// Whether a subject mentions repair work anywhere, as a whole word.
+///
+/// Whole-word matching is what keeps this from firing on `prefix` or
+/// `fixture`, the same trap the production classifier's boundary check avoids.
+pub fn mentions_fix_vocabulary(subject: &str) -> bool {
+    subject
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| {
+            let word = word.to_ascii_lowercase();
+            FIX_VOCABULARY.contains(&word.as_str())
+        })
 }
 
 /// Whether a commit touched both an existing test file and a production file.
@@ -229,6 +289,10 @@ pub fn audit_labels(commits: &[AuditInput], sample_size: usize) -> LabelAudit {
 
     let classified_fix = both + fix_only;
     let co_modifying = both + signal_only;
+    let unclassified_with_fix_vocabulary = classified
+        .iter()
+        .filter(|(commit, is_fix, _)| !*is_fix && mentions_fix_vocabulary(&commit.subject))
+        .count() as u64;
     let non_fix = total - classified_fix;
 
     let co_modification_rate_per_mille = per_mille(co_modifying, total);
@@ -263,6 +327,11 @@ pub fn audit_labels(commits: &[AuditInput], sample_size: usize) -> LabelAudit {
         co_modification_given_fix_per_mille,
         co_modification_given_non_fix_per_mille: per_mille(signal_only, non_fix),
         enrichment_per_mille,
+        unclassified_with_fix_vocabulary: unclassified_with_fix_vocabulary as u32,
+        recall_gap_per_mille: per_mille(
+            unclassified_with_fix_vocabulary,
+            classified_fix + unclassified_with_fix_vocabulary,
+        ),
         verdict,
         sample: build_sample(&classified, sample_size),
     }
