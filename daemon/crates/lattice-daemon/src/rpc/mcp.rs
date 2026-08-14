@@ -3149,9 +3149,14 @@ impl McpHandler {
             &mut bundle,
         )
         .await;
+        let git_intelligence = self.git_intelligence_snapshot();
+        let health = self
+            .health_fact_index_for_request(git_intelligence.as_ref())
+            .await;
         enrich_context_bundle_with_git_intelligence(
             &mut bundle,
-            self.git_intelligence_snapshot().as_ref(),
+            git_intelligence.as_ref(),
+            Some(&health),
         );
         let mut value = serde_json::to_value(&bundle)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
@@ -3274,13 +3279,14 @@ impl McpHandler {
         let entry_files_for_bundle = entry_files.clone();
         let entry_symbols_for_bundle = entry_symbols.clone();
         let capsule_for_bundle = capsule.clone();
-        let (bundle, delivery_mode, mode_reason) = match self
+        let git_intelligence = self.git_intelligence_snapshot();
+        let (bundle, delivery_mode, mode_reason, health_presentation) = match self
             .run_query_job(move || {
-                // Built once per request rather than once per bundle mode.
-                // H4 replaces this with the published fact generations, which
-                // add the git, complexity, and test-linkage families this
-                // graph-derived index necessarily lacks.
-                let health = HealthFactIndex::from_graph(engine.graph(), false);
+                // Built once per request rather than once per bundle mode: a
+                // score walks every input weight and the index ranks the whole
+                // file population.
+                let health =
+                    health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
                 let compact_bundle = prepare_change(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3305,7 +3311,13 @@ impl McpHandler {
                 } else {
                     compact_bundle
                 };
-                (bundle, delivery_mode, mode_reason)
+                // Scored inside the job: the index borrows the graph snapshot
+                // this closure owns, and only the rendered section escapes.
+                let health_presentation = change_set_health_presentation(
+                    Some(&health),
+                    task_bundle_change_set(&bundle),
+                );
+                (bundle, delivery_mode, mode_reason, health_presentation)
             })
             .await
         {
@@ -3351,6 +3363,7 @@ impl McpHandler {
             &mut workflow_bundle,
         )
         .await;
+        attach_health_presentation(&mut workflow_bundle.structured_payload, health_presentation);
 
         self.serialize_workflow_with_context_handle(
             "prepare_change",
@@ -3459,11 +3472,12 @@ impl McpHandler {
         let entry_files_for_bundle = entry_files.clone();
         let entry_symbols_for_bundle = entry_symbols.clone();
         let capsule_for_bundle = capsule.clone();
-        let (bundle, delivery_mode, mode_reason) = match self
+        let git_intelligence = self.git_intelligence_snapshot();
+        let (bundle, delivery_mode, mode_reason, health_presentation) = match self
             .run_query_job(move || {
-                // See `tool_prepare_change`: one graph-derived index per
-                // request until H4 supplies the published fact generations.
-                let health = HealthFactIndex::from_graph(engine.graph(), false);
+                // See `tool_prepare_change`: one index per request.
+                let health =
+                    health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
                 let compact_bundle = plan_edit(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3489,7 +3503,13 @@ impl McpHandler {
                     compact_bundle
                 };
 
-                (bundle, delivery_mode, mode_reason)
+                // `edit_files` is the literal change set this plan proposes,
+                // which is exactly the scope spec H4.3 bounds health to.
+                let health_presentation = change_set_health_presentation(
+                    Some(&health),
+                    bundle.edit_files.iter().map(|file| file.file.as_str()),
+                );
+                (bundle, delivery_mode, mode_reason, health_presentation)
             })
             .await
         {
@@ -3535,6 +3555,7 @@ impl McpHandler {
             &mut workflow_bundle,
         )
         .await;
+        attach_health_presentation(&mut workflow_bundle.structured_payload, health_presentation);
 
         self.serialize_workflow_with_context_handle(
             "plan_edit",
@@ -4792,6 +4813,14 @@ impl McpHandler {
         }
         let pruning_profile = self.session_pruning_profile().await;
         let mut metadata = metadata.clone();
+        // Health is evidence *about* the answer, so it must not be what decides
+        // how much of the answer is delivered. It is lifted out for the budget
+        // decision and reinstated afterwards, then pruned to the budget that
+        // was chosen and counted against the hard token cap like everything
+        // else (`docs/architecture/2026-08-13-render-response-contract.md`,
+        // § "Target contract -> Rendering": bounded summary behaviour and
+        // budget metadata are preserved in every mode).
+        let detached_health = detach_health_section(&mut value);
         let mut budget = select_workflow_budget(
             tool_name,
             &value,
@@ -4799,6 +4828,7 @@ impl McpHandler {
             response_options,
             pruning_profile,
         );
+        reattach_health_section(&mut value, detached_health);
         apply_workflow_budget(
             tool_name,
             &mut value,
@@ -4811,6 +4841,17 @@ impl McpHandler {
         let effective_token_cap = response_options
             .max_tokens
             .unwrap_or_else(|| default_workflow_token_cap(budget));
+        // Health yields before the answer does. It is evidence *about* the
+        // response, so an over-cap payload sheds its health citations first and
+        // only downgrades the whole delivery mode if that was not enough --
+        // otherwise an annotation would decide how much of the answer a caller
+        // receives. The section keeps its availability and counts, so a trimmed
+        // section still cannot be mistaken for a clean one.
+        if approx_value_tokens(&value) > effective_token_cap {
+            if let Some(object) = value.as_object_mut() {
+                prune_health_section(object, 0);
+            }
+        }
         let mut truncated = approx_value_tokens(&value) > effective_token_cap;
         if truncated {
             if !matches!(budget, WorkflowBudget::Tiny) {
@@ -7758,6 +7799,7 @@ fn health_fact_index(
 fn enrich_context_bundle_with_git_intelligence(
     bundle: &mut WorkflowBundle,
     snapshot: Option<&McpGitIntelligenceSnapshot>,
+    health: Option<&HealthFactIndex>,
 ) {
     let view = git_intelligence_view(snapshot);
     let evidence = bundle
@@ -7781,6 +7823,17 @@ fn enrich_context_bundle_with_git_intelligence(
             "secondary_ranking_evidence": evidence,
         }),
     );
+    // The subsystem this response describes is the files it ranked, so that is
+    // the scope health covers. Ordering is untouched: `context` ranks by
+    // retrieval relevance and the git contract's tie-break-only rule still
+    // governs retrieval ranking.
+    let change_set: Vec<String> = bundle
+        .ranked_pivots
+        .iter()
+        .filter_map(|pivot| pivot.file.clone())
+        .collect();
+    let presentation = change_set_health_presentation(health, change_set);
+    attach_health_presentation(&mut bundle.structured_payload, presentation);
 }
 
 fn enrich_impact_bundle_with_git_intelligence<I, S>(
@@ -7827,6 +7880,36 @@ fn attach_impact_health_presentation(
         object.insert("untested_changes".to_string(), json!(untested));
     }
     attach_health_presentation(payload, presentation);
+}
+
+/// The bounded `health` section for `context` and `prepare_change` (spec
+/// H4.3), as a payload value.
+///
+/// `change_set` is the files the response itself proposes to change or
+/// describes as the subsystem — never every file the response happens to
+/// mention. Capped at [`MAX_HEALTH_SECTION_FILES`]; when facts are unavailable
+/// the section is still emitted, carrying its availability metadata, so an
+/// agent can tell an unmeasured file from a low-risk one.
+fn change_set_health_presentation<I, S>(health: Option<&HealthFactIndex>, change_set: I) -> Value
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let section = health_section(health, change_set, MAX_HEALTH_SECTION_FILES);
+    serde_json::to_value(&section).unwrap_or_else(|_| json!({}))
+}
+
+/// The change set a `prepare_change` or `context` bundle proposes.
+///
+/// The primary files are the response's own answer to "what does this task
+/// touch", so scoping health to them is what keeps the section from spreading
+/// to unrelated files.
+fn task_bundle_change_set(bundle: &lattice_core::intelligence::TaskBundle) -> Vec<String> {
+    bundle
+        .primary_files
+        .iter()
+        .map(|file| file.file.clone())
+        .collect()
 }
 
 /// Inserts the `health` section into a structured payload.
@@ -8812,6 +8895,12 @@ fn apply_workflow_budget(
     pruning_profile: SessionPruningProfile,
     metadata: &mut WorkflowRunMetadata,
 ) {
+    // Bounded before the budget's own pruning runs, so that every
+    // size-and-confidence decision below sees the section a reader will
+    // actually receive rather than the unbounded one.
+    if let Some(object) = value.as_object_mut() {
+        prune_health_section(object, health_section_files_for_budget(budget));
+    }
     match budget {
         WorkflowBudget::Full => {}
         WorkflowBudget::Compact => {
@@ -8830,6 +8919,20 @@ fn apply_workflow_budget(
             metadata.single_anchor_used |= used_single_anchor;
         }
         WorkflowBudget::Auto => {}
+    }
+}
+
+/// Files the `health` section may cite under each workflow budget.
+///
+/// Health annotates the answer, so it shrinks ahead of the answer. A tiny
+/// budget keeps the section's availability and counts but cites no file: an
+/// agent still learns that health was measured and how many files it covered,
+/// which is what stops "trimmed" from reading as "clean".
+fn health_section_files_for_budget(budget: WorkflowBudget) -> usize {
+    match budget {
+        WorkflowBudget::Full | WorkflowBudget::Auto => MAX_HEALTH_SECTION_FILES,
+        WorkflowBudget::Compact => COMPACT_HEALTH_SECTION_FILES,
+        WorkflowBudget::Tiny => 0,
     }
 }
 
@@ -8867,6 +8970,85 @@ fn apply_compact_workflow_pruning(value: &mut Value, pruning_profile: SessionPru
     strip_array_object_field(object, "pivots", "source");
     shorten_array_object_string_field(object, "pivots", "reason", 96);
     shorten_array_object_string_field(object, "context", "relationship", 96);
+}
+
+/// Lifts the `health` section out of a payload, remembering where it was.
+///
+/// Returned as `(host_is_structured_payload, section)`.
+fn detach_health_section(value: &mut Value) -> Option<(bool, Value)> {
+    let object = value.as_object_mut()?;
+    if let Some(section) = object.remove("health") {
+        return Some((false, section));
+    }
+    let payload = object
+        .get_mut("structured_payload")
+        .and_then(Value::as_object_mut)?;
+    payload.remove("health").map(|section| (true, section))
+}
+
+/// Puts a detached `health` section back exactly where it came from.
+fn reattach_health_section(value: &mut Value, detached: Option<(bool, Value)>) {
+    let Some((nested, section)) = detached else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if nested {
+        if let Some(payload) = object
+            .get_mut("structured_payload")
+            .and_then(Value::as_object_mut)
+        {
+            payload.insert("health".to_string(), section);
+            return;
+        }
+    }
+    object.insert("health".to_string(), section);
+}
+
+/// Files the `health` section keeps under the compact budget.
+const COMPACT_HEALTH_SECTION_FILES: usize = 3;
+
+/// Bounds the `health` section under a workflow budget.
+///
+/// Health is evidence *about* the change set, not the change set itself, so it
+/// yields first: a smaller budget cites fewer files, and a `file_limit` of zero
+/// drops the section entirely rather than letting evidence crowd out the answer
+/// it annotates. The section keeps its availability metadata and its
+/// `considered`/`truncated` counts either way, so a reader can still tell a
+/// budget-trimmed section from an unmeasured one.
+///
+/// Runs before `densify_workflow_value`, so the long key names are the ones on
+/// the wire here.
+fn prune_health_section(object: &mut serde_json::Map<String, Value>, file_limit: usize) {
+    let mut prune = |host: &mut serde_json::Map<String, Value>| {
+        let Some(health) = host.get_mut("health").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if let Some(files) = health.get_mut("files").and_then(Value::as_array_mut) {
+            let dropped = files.len().saturating_sub(file_limit);
+            if dropped > 0 {
+                files.truncate(file_limit);
+                let truncated = health
+                    .get("truncated")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                health.insert(
+                    "truncated".to_string(),
+                    json!(truncated + dropped as u64),
+                );
+            }
+        }
+        truncate_array_field(health, "untested_changes", file_limit);
+    };
+
+    prune(object);
+    if let Some(payload) = object
+        .get_mut("structured_payload")
+        .and_then(Value::as_object_mut)
+    {
+        prune(payload);
+    }
 }
 
 fn apply_tiny_workflow_pruning(
@@ -13892,7 +14074,7 @@ def detect_agent_version_drift(agent, rollout):
         };
         let mut bundle = git_presentation_bundle();
 
-        super::enrich_context_bundle_with_git_intelligence(&mut bundle, Some(&published));
+        super::enrich_context_bundle_with_git_intelligence(&mut bundle, Some(&published), None);
 
         assert_eq!(bundle.ranked_pivots[0].label, "cold");
         assert_eq!(bundle.ranked_pivots[1].label, "hot");
@@ -14277,6 +14459,123 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
     }
 
     #[test]
+    fn context_health_section_covers_the_ranked_subsystem_and_nothing_else() {
+        let health = health_presentation_index();
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_context_bundle_with_git_intelligence(&mut bundle, None, Some(&health));
+
+        // The bundle ranks `src/cold.rs` and `src/hot.rs`; `src/partner.rs` and
+        // `src/caller.rs` are in the index but not in this response, so they
+        // must not appear.
+        let section = &bundle.structured_payload["health"];
+        assert_eq!(section["considered"], 2);
+        let paths: Vec<&str> = section["files"]
+            .as_array()
+            .expect("health files")
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"src/hot.rs"));
+        assert!(paths.contains(&"src/cold.rs"));
+        assert!(!paths.contains(&"src/partner.rs"), "{paths:?}");
+        assert!(!paths.contains(&"src/caller.rs"), "{paths:?}");
+    }
+
+    #[test]
+    fn context_health_section_does_not_reorder_retrieval_ranking() {
+        let health = health_presentation_index();
+        let mut bundle = git_presentation_bundle();
+        let before: Vec<String> = bundle
+            .ranked_pivots
+            .iter()
+            .map(|pivot| pivot.label.clone())
+            .collect();
+
+        super::enrich_context_bundle_with_git_intelligence(&mut bundle, None, Some(&health));
+
+        let after: Vec<String> = bundle
+            .ranked_pivots
+            .iter()
+            .map(|pivot| pivot.label.clone())
+            .collect();
+        assert_eq!(
+            before, after,
+            "the git contract's tie-break-only rule still governs retrieval ranking"
+        );
+    }
+
+    #[test]
+    fn the_health_section_is_bounded_by_the_workflow_budget() {
+        let health = health_presentation_index();
+        let section = super::change_set_health_presentation(
+            Some(&health),
+            ["src/hot.rs", "src/cold.rs", "src/partner.rs", "src/caller.rs"],
+        );
+        let mut value = json!({ "health": section });
+        let full = value["health"]["files"]
+            .as_array()
+            .expect("files")
+            .len();
+        assert!(full >= 4, "the fixture must exercise the cap: {full}");
+
+        let object = value.as_object_mut().expect("payload object");
+        super::prune_health_section(object, super::COMPACT_HEALTH_SECTION_FILES);
+        assert_eq!(
+            value["health"]["files"].as_array().expect("files").len(),
+            super::COMPACT_HEALTH_SECTION_FILES
+        );
+        // What was dropped is counted, so a trimmed section cannot read as a
+        // clean one.
+        assert_eq!(
+            value["health"]["truncated"]
+                .as_u64()
+                .expect("truncated count"),
+            (full - super::COMPACT_HEALTH_SECTION_FILES) as u64
+        );
+
+        let object = value.as_object_mut().expect("payload object");
+        super::prune_health_section(object, 0);
+        assert!(value["health"]["files"]
+            .as_array()
+            .expect("files")
+            .is_empty());
+        assert_eq!(value["health"]["considered"], 4);
+        assert_eq!(value["health"]["availability"], "available");
+        assert_eq!(value["health"]["truncated"].as_u64(), Some(4));
+    }
+
+    #[test]
+    fn the_health_section_is_lifted_out_of_the_budget_decision_and_put_back() {
+        for nested in [false, true] {
+            let mut value = if nested {
+                json!({ "structured_payload": { "health": { "considered": 3 }, "other": 1 } })
+            } else {
+                json!({ "health": { "considered": 3 }, "other": 1 })
+            };
+
+            let detached = super::detach_health_section(&mut value);
+            assert!(detached.is_some(), "nested={nested}");
+            assert!(
+                serde_json::to_string(&value)
+                    .expect("serialize")
+                    .find("considered")
+                    .is_none(),
+                "the budget decision must not see health: {value}"
+            );
+
+            super::reattach_health_section(&mut value, detached);
+            let restored = if nested {
+                &value["structured_payload"]["health"]
+            } else {
+                &value["health"]
+            };
+            assert_eq!(restored["considered"], 3, "nested={nested}");
+        }
+    }
+
+    #[test]
     fn rendered_health_text_states_facts_and_never_predicts() {
         // The daemon-side mirror of `lattice_core::health_consumers`'s guard:
         // the backtest is correlational, so no rendered response may claim a
@@ -14441,7 +14740,7 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
     #[test]
     fn unavailable_and_stale_history_are_explicit_and_never_affect_results() {
         let mut unavailable = git_presentation_bundle();
-        super::enrich_context_bundle_with_git_intelligence(&mut unavailable, None);
+        super::enrich_context_bundle_with_git_intelligence(&mut unavailable, None, None);
         let unavailable_git = &unavailable.structured_payload["git_intelligence"];
         assert_eq!(unavailable_git["metadata"]["availability"], "unavailable");
         assert!(unavailable_git["secondary_ranking_evidence"]
