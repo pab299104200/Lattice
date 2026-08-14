@@ -67,7 +67,7 @@ use super::workflow_v2::{
     self, VecEventSink, WorkflowBundle, WorkflowRenderChoice, WorkflowRequest,
 };
 use super::working_memory_tool;
-use crate::adoption_metrics::{
+use crate::adoption_metrics::{HealthEvidenceRecord, 
     source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore,
     MemoryRetrievalRecord, MemoryUseRecord, ToolCallRecord,
 };
@@ -5292,15 +5292,32 @@ impl McpHandler {
         let suggested_files = result
             .map(|value| suggested_files_from_tool_result(tool_name, value))
             .unwrap_or_default();
+        let cited_files = result
+            .map(health_cited_files_from_tool_result)
+            .unwrap_or_default();
         if let Err(error) = self.adoption_metrics.record(ToolCallRecord {
             session_id: self.session_id.clone(),
-            client: source.client,
-            channel: source.channel,
+            client: source.client.clone(),
+            channel: source.channel.clone(),
             tool: tool_name.to_string(),
             latency_ms,
             suggested_files,
         }) {
             tracing::warn!(%error, tool = tool_name, "failed to record adoption metrics");
+        }
+        // Spec H4.5: whether injected health evidence was followed. Recorded
+        // through the same ledger and the same edit-follow-through join the
+        // other rows use, so there is one attribution pipeline and not two.
+        if !cited_files.is_empty() {
+            if let Err(error) = self.adoption_metrics.record_health_evidence(HealthEvidenceRecord {
+                session_id: self.session_id.clone(),
+                client: source.client,
+                channel: source.channel,
+                tool: tool_name.to_string(),
+                cited_files,
+            }) {
+                tracing::warn!(%error, tool = tool_name, "failed to record health evidence metrics");
+            }
         }
     }
 
@@ -8051,6 +8068,38 @@ fn order_impact_pivots_within_primary_tiers(
         start = end;
     }
     *pivots = ordered;
+}
+
+/// The files a response's `health` section actually named.
+///
+/// Only paths the reader was shown count: the section's ranked files, its
+/// untested-change entries and its edit warnings. A file the response merely
+/// mentioned elsewhere was not health evidence and must not be credited as
+/// though it were.
+fn health_cited_files_from_tool_result(result: &Value) -> Vec<String> {
+    let payload = unwrap_tool_text_json(result).unwrap_or_else(|| result.clone());
+    let Some(object) = payload.as_object() else {
+        return Vec::new();
+    };
+    let Some(health) = health_presentation(object).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<String> = Vec::new();
+    let mut push = |value: Option<&Value>| {
+        for entry in value.and_then(Value::as_array).unwrap_or(&Vec::new()) {
+            if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                let path = path.trim();
+                if !path.is_empty() && !files.iter().any(|seen| seen == path) {
+                    files.push(path.to_string());
+                }
+            }
+        }
+    };
+    push(object_get(health, &["files", "fs"]));
+    push(health.get("untested_changes"));
+    push(health.get("warnings"));
+    files
 }
 
 fn attach_git_intelligence_presentation(payload: &mut Value, presentation: Value) {
