@@ -83,7 +83,39 @@ impl GitHistoryAdapter {
             return Ok(Vec::new());
         }
         walk.push_head().map_err(GitHistoryAdapterError::Walk)?;
+        self.collect_walk(repository, walk)
+    }
 
+    /// Returns newest-first samples for the history ending at `start`.
+    ///
+    /// This is the same extraction [`GitHistoryAdapter::collect`] performs,
+    /// pushed at an arbitrary commit instead of `HEAD`, which is what the H1
+    /// backtest harness needs to mine the window before a cut point
+    /// (`health::backtest::replay`). A revwalk pushed at `start` visits only
+    /// `start` and its ancestors, so the harness's zero-leakage property is a
+    /// structural consequence of this walk rather than a filter that could be
+    /// written incorrectly.
+    ///
+    /// Sharing one extraction path with production is deliberate: a replay that
+    /// diffed commits differently would measure a signal the runtime never
+    /// produces.
+    pub(crate) fn collect_from(
+        &self,
+        repository: &Repository,
+        start: git2::Oid,
+    ) -> Result<Vec<CommitSample>, GitHistoryAdapterError> {
+        let mut walk = repository.revwalk().map_err(GitHistoryAdapterError::Walk)?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+            .map_err(GitHistoryAdapterError::Walk)?;
+        walk.push(start).map_err(GitHistoryAdapterError::Walk)?;
+        self.collect_walk(repository, walk)
+    }
+
+    fn collect_walk(
+        &self,
+        repository: &Repository,
+        walk: git2::Revwalk<'_>,
+    ) -> Result<Vec<CommitSample>, GitHistoryAdapterError> {
         let mut samples = Vec::with_capacity(self.limits.history_limit);
         for oid in walk.take(self.limits.history_limit) {
             let oid = oid.map_err(GitHistoryAdapterError::Walk)?;
@@ -107,7 +139,7 @@ impl GitHistoryAdapter {
     }
 }
 
-fn author_identity(commit: &git2::Commit<'_>) -> Option<String> {
+pub(crate) fn author_identity(commit: &git2::Commit<'_>) -> Option<String> {
     let signature = commit.author();
     match (signature.name(), signature.email()) {
         (Some(name), Some(email)) if !name.trim().is_empty() && !email.trim().is_empty() => {
@@ -119,7 +151,11 @@ fn author_identity(commit: &git2::Commit<'_>) -> Option<String> {
     }
 }
 
-fn commit_changes(
+/// First-parent path changes and line stats for one commit.
+///
+/// Exposed to the crate so the H1 backtest harness can read a horizon commit's
+/// touched paths through the identical diff policy production mines with.
+pub(crate) fn commit_changes(
     repository: &Repository,
     commit: &git2::Commit<'_>,
     commit_id: &str,

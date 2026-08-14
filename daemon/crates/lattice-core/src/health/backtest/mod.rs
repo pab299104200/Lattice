@@ -43,6 +43,7 @@
 pub mod features;
 pub mod labels;
 pub mod metrics;
+pub mod replay;
 
 /// Version of the backtest harness itself.
 ///
