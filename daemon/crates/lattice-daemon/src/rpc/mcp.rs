@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -20,10 +20,15 @@ use lattice_core::git_intelligence_consumers::{
     missing_cochange_partners, secondary_ranking_evidence, GitIntelligenceView,
 };
 use lattice_core::graph::model::CodeGraph;
-use lattice_core::health::dead_symbol_facts::{DeadSymbolExclusionInputs, DeadSymbolFactProducer};
-use lattice_core::health::graph_facts::GraphFactProducer;
+use lattice_core::health::complexity_facts::FileComplexityFacts;
+use lattice_core::health::dead_symbol_facts::{
+    DeadSymbolExclusionInputs, DeadSymbolFactProducer, DeadSymbolFactsSnapshot,
+};
+use lattice_core::health::graph_facts::{GraphFactProducer, GraphFactsSnapshot};
 use lattice_core::health::scoring::HealthFactIndex;
-use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
+use lattice_core::health::test_proximity_facts::{
+    TestProximityFactProducer, TestProximitySnapshot,
+};
 use lattice_core::health_consumers::{
     health_section, health_status, order_impact_within_tier_by_defect_risk, select_health_warnings,
     untested_changes, HealthImpactCandidate, HealthStatusInputs, MAX_HEALTH_SECTION_FILES,
@@ -141,6 +146,10 @@ pub struct McpHandler {
     /// Read-only, in-memory view of snapshots already published by the Git
     /// intelligence runtime. MCP must never mine history or reopen graph.db.
     git_intelligence: Option<GitIntelligenceSnapshotHandle>,
+    /// Read-only, in-memory view of health fact generations already published
+    /// by the health facts runtime. MCP must never reopen graph.db to read
+    /// them; a family absent here is derived from the live graph instead.
+    health_facts: Option<HealthFactsSnapshotHandle>,
 }
 
 /// Runtime-to-MCP handoff for already-published Git-intelligence snapshots.
@@ -198,6 +207,78 @@ impl GitIntelligenceSnapshotHandle {
             .lock()
             .map_err(|_| "Git-intelligence snapshot handoff lock was poisoned".to_string())
             .map(|snapshots| snapshots.get(repository_id).cloned())
+    }
+}
+
+/// Runtime-to-MCP handoff for already-published health fact generations.
+///
+/// The health facts runtime owns publication; request handling only clones a
+/// bounded set of `Arc`s. This exists for the same reason
+/// [`GitIntelligenceSnapshotHandle`] does: `rpc::mcp` must never reopen
+/// `graph.db` mid-request, so a store-backed generation can only reach a
+/// request through an in-memory handoff the runtime filled in advance.
+///
+/// Each family is independently optional. A family with no active generation
+/// is simply absent, and the read path falls back to deriving it from the live
+/// graph exactly as it did before this handoff existed — so a cold start never
+/// loses availability, it only loses speed
+/// (`docs/architecture/2026-08-13-health-engine.md`).
+#[derive(Clone, Default)]
+pub(crate) struct HealthFactsSnapshotHandle {
+    published: Arc<StdMutex<HashMap<String, PublishedHealthFacts>>>,
+}
+
+/// One repository's published fact families, as the read path consumes them.
+///
+/// Complexity has no live fallback anywhere: producing it means re-parsing file
+/// contents, which request handling must not do. Before this handoff existed it
+/// was therefore permanently absent and reported through `inputs_missing` on
+/// every score. A published generation here is the only way it ever becomes
+/// available at runtime.
+#[derive(Clone, Default)]
+pub(crate) struct PublishedHealthFacts {
+    pub(crate) graph: Option<Arc<GraphFactsSnapshot>>,
+    pub(crate) complexity: Option<Arc<BTreeMap<String, FileComplexityFacts>>>,
+    pub(crate) test_proximity: Option<Arc<TestProximitySnapshot>>,
+    pub(crate) dead_symbols: Option<Arc<DeadSymbolFactsSnapshot>>,
+}
+
+impl PublishedHealthFacts {
+    /// Whether any family at all has an active generation.
+    fn is_empty(&self) -> bool {
+        self.graph.is_none()
+            && self.complexity.is_none()
+            && self.test_proximity.is_none()
+            && self.dead_symbols.is_none()
+    }
+}
+
+#[allow(dead_code)]
+impl HealthFactsSnapshotHandle {
+    /// Replaces the published families for one repository.
+    pub(crate) fn publish(
+        &self,
+        repository_id: &str,
+        facts: PublishedHealthFacts,
+    ) -> Result<(), String> {
+        let mut published = self
+            .published
+            .lock()
+            .map_err(|_| "health fact snapshot handoff lock was poisoned".to_string())?;
+        published.insert(repository_id.to_string(), facts);
+        Ok(())
+    }
+
+    fn read(&self, repository_id: &str) -> Result<Option<PublishedHealthFacts>, String> {
+        self.published
+            .lock()
+            .map_err(|_| "health fact snapshot handoff lock was poisoned".to_string())
+            .map(|published| {
+                published
+                    .get(repository_id)
+                    .filter(|facts| !facts.is_empty())
+                    .cloned()
+            })
     }
 }
 
@@ -872,6 +953,7 @@ impl McpHandler {
             watcher_health,
             index_health,
             git_intelligence: None,
+            health_facts: None,
         }
     }
 
@@ -884,6 +966,14 @@ impl McpHandler {
         handle: GitIntelligenceSnapshotHandle,
     ) -> Self {
         self.git_intelligence = Some(handle);
+        self
+    }
+
+    pub(crate) fn with_health_facts_snapshot_handle(
+        mut self,
+        handle: HealthFactsSnapshotHandle,
+    ) -> Self {
+        self.health_facts = Some(handle);
         self
     }
 
@@ -918,8 +1008,29 @@ impl McpHandler {
         &self,
         git: Option<&McpGitIntelligenceSnapshot>,
     ) -> HealthFactIndex {
+        let published = self.published_health_facts();
         let engine = self.engine.lock().await;
-        health_fact_index(engine.graph(), git, false)
+        health_fact_index(engine.graph(), git, published.as_ref(), false)
+    }
+
+    /// The health fact generations the runtime has already published, if any.
+    ///
+    /// Read before the engine lock is taken: this touches only an in-memory
+    /// map, and holding the engine lock across it would serialize requests
+    /// behind work that does not need the graph at all.
+    fn published_health_facts(&self) -> Option<PublishedHealthFacts> {
+        let handle = self.health_facts.as_ref()?;
+        match handle.read(&self.memory_workspace_id) {
+            Ok(published) => published,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Published health facts unavailable for request; \
+                     falling back to deriving them from the live graph"
+                );
+                None
+            }
+        }
     }
 
     /// `status{scope:"health"}` (spec H4.5).
@@ -3331,13 +3442,19 @@ impl McpHandler {
         let entry_symbols_for_bundle = entry_symbols.clone();
         let capsule_for_bundle = capsule.clone();
         let git_intelligence = self.git_intelligence_snapshot();
+        let published_health = self.published_health_facts();
         let (bundle, delivery_mode, mode_reason, health_presentation) = match self
             .run_query_job(move || {
                 // Built once per request rather than once per bundle mode: a
                 // score walks every input weight and the index ranks the whole
                 // file population.
                 let health =
-                    health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
+                    health_fact_index(
+                    engine.graph(),
+                    git_intelligence.as_ref(),
+                    published_health.as_ref(),
+                    false,
+                );
                 let compact_bundle = prepare_change(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3524,11 +3641,17 @@ impl McpHandler {
         let entry_symbols_for_bundle = entry_symbols.clone();
         let capsule_for_bundle = capsule.clone();
         let git_intelligence = self.git_intelligence_snapshot();
+        let published_health = self.published_health_facts();
         let (bundle, delivery_mode, mode_reason, health_presentation) = match self
             .run_query_job(move || {
                 // See `tool_prepare_change`: one index per request.
                 let health =
-                    health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
+                    health_fact_index(
+                    engine.graph(),
+                    git_intelligence.as_ref(),
+                    published_health.as_ref(),
+                    false,
+                );
                 let compact_bundle = plan_edit(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3810,10 +3933,16 @@ impl McpHandler {
         }
 
         let git_intelligence = self.git_intelligence_snapshot();
+        let published_health = self.published_health_facts();
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            let health = health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
+            let health = health_fact_index(
+                    engine.graph(),
+                    git_intelligence.as_ref(),
+                    published_health.as_ref(),
+                    false,
+                );
             let report = impact_from_diff(
                 engine.graph(),
                 diff,
@@ -4442,11 +4571,17 @@ impl McpHandler {
         }
 
         let git_intelligence = self.git_intelligence_snapshot();
+        let published_health = self.published_health_facts();
         let (mut report, metadata_mode_reason) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
             // See `tool_prepare_change`: one index per request.
-            let health = health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
+            let health = health_fact_index(
+                    engine.graph(),
+                    git_intelligence.as_ref(),
+                    published_health.as_ref(),
+                    false,
+                );
             let compact_report = diagnose_failure(
                 engine.graph(),
                 input,
@@ -7830,34 +7965,64 @@ fn git_intelligence_view(snapshot: Option<&McpGitIntelligenceSnapshot>) -> GitIn
     })
 }
 
-/// Builds the richest health fact index a request may compute in process.
+/// Builds the richest health fact index a request may obtain in process.
+///
+/// # Published generations first
+///
+/// Every family the health facts runtime has already published is taken from
+/// the in-memory handoff, which costs one `Arc` clone. A family with no active
+/// generation — a cold start, or a store whose publication has not completed —
+/// falls back to deriving it from the live graph, which is a whole-graph pass
+/// and exactly what every request did before the handoff existed. The fallback
+/// is per family, so a partial publication degrades to "slower for that one
+/// family", never to "unavailable".
 ///
 /// Graph, test-proximity and dead-symbol facts are pure functions of the graph
-/// the engine already holds, so a request may derive them without touching the
-/// filesystem. Git facts come from the snapshot the runtime already published,
-/// and only when that snapshot is usable — a stale window must not rank files.
+/// the engine already holds, so the fallback can derive them without touching
+/// the filesystem. Git facts come from the git runtime's own snapshot, and only
+/// when that snapshot is usable — a stale window must not rank files.
 ///
-/// Complexity facts are deliberately absent. Producing them means re-parsing
-/// file contents, and loading the published generation instead would mean
-/// reopening `graph.db`, which request handling must never do (see the
-/// `git_intelligence` field on `McpHandler`). They are reported through
-/// `inputs_missing` on every score, which widens the band rather than letting a
-/// file read as simple because nobody measured it.
+/// Complexity facts have no fallback and never will: producing them means
+/// re-parsing file contents, and request handling must not do that (see the
+/// `git_intelligence` field on `McpHandler`). Until a generation is published
+/// they stay absent and are reported through `inputs_missing` on every score,
+/// which widens the band rather than letting a file read as simple because
+/// nobody measured it. A published generation is the only way they become
+/// available at runtime (`docs/architecture/2026-08-13-health-engine.md`).
 fn health_fact_index(
     graph: &CodeGraph,
     git: Option<&McpGitIntelligenceSnapshot>,
+    published: Option<&PublishedHealthFacts>,
     index_complete: bool,
 ) -> HealthFactIndex {
-    let mut builder = HealthFactIndex::builder()
-        .with_graph_facts(GraphFactProducer::default().produce(graph, index_complete))
-        .with_test_proximity_facts(
+    let mut builder = HealthFactIndex::builder();
+
+    builder = match published.and_then(|facts| facts.graph.clone()) {
+        Some(snapshot) => builder.with_shared_graph_facts(snapshot),
+        None => builder
+            .with_graph_facts(GraphFactProducer::default().produce(graph, index_complete)),
+    };
+
+    builder = match published.and_then(|facts| facts.test_proximity.clone()) {
+        Some(snapshot) => builder.with_shared_test_proximity_facts(snapshot),
+        None => builder.with_test_proximity_facts(
             TestProximityFactProducer::default().produce(graph, index_complete),
-        )
-        .with_dead_symbol_facts(DeadSymbolFactProducer::default().produce(
+        ),
+    };
+
+    builder = match published.and_then(|facts| facts.dead_symbols.clone()) {
+        Some(snapshot) => builder.with_shared_dead_symbol_facts(snapshot),
+        None => builder.with_dead_symbol_facts(DeadSymbolFactProducer::default().produce(
             graph,
             &DeadSymbolExclusionInputs::default(),
             index_complete,
-        ));
+        )),
+    };
+
+    if let Some(facts) = published.and_then(|facts| facts.complexity.clone()) {
+        builder = builder.with_shared_complexity_facts(facts);
+    }
+
     if let Some(snapshot) = git_intelligence_view(git).usable_snapshot() {
         builder = builder.with_git_intelligence(snapshot.clone());
     }
@@ -11219,10 +11384,12 @@ mod tests {
         parse_wrapped_tool_payload, report_memory_highlights, seed_from_plan_edit_bundle,
         seed_from_task_bundle, seed_from_trace_scenario_bundle, stable_refresh_key,
         summarize_workflow_outcome_content, workflow_outcome_identifiers, wrap_tool_result,
-        wrap_workflow_tool_result, GitIntelligenceSnapshotHandle, McpHandler, QueryJobError,
-        RequestHandler, SharedMemoryRuntime, WorkflowRenderMode, WorkflowRunMetadata,
-        FULL_WORKFLOW_TOKEN_CAP,
+        wrap_workflow_tool_result, GitIntelligenceSnapshotHandle, HealthFactsSnapshotHandle,
+        McpHandler, PublishedHealthFacts, QueryJobError, RequestHandler, SharedMemoryRuntime,
+        WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
     };
+    use lattice_core::health::graph_facts::GraphFactProducer;
+    use std::collections::BTreeMap;
     use lattice_core::events::{EventStore, EventWriter};
     use lattice_core::git_intelligence::{CommitSample, GitHistoryMiner, PathChange};
     use lattice_core::graph::CodeGraph;
@@ -14139,7 +14306,185 @@ def detect_agent_version_drift(agent, rollout):
         graph.add_edge(&hot, &partner, EdgeKind::Calls);
         graph.add_edge(&caller, &hot, EdgeKind::Calls);
         graph.add_edge(&cold, &hot, EdgeKind::Calls);
-        super::health_fact_index(&graph, None, true)
+        super::health_fact_index(&graph, None, None, true)
+    }
+
+    /// A graph holding exactly one file, used to prove which source the read
+    /// path drew a family from.
+    fn single_file_graph(path: &str) -> CodeGraph {
+        use lattice_core::symbols::{Language, SymbolId, SymbolKind};
+
+        let mut graph = CodeGraph::new();
+        let symbol = SymbolId {
+            file: path.to_string(),
+            name: "only::run".to_string(),
+            byte_offset: 0,
+        };
+        graph.add_node(
+            symbol.clone(),
+            SymbolKind::Function,
+            symbol.name.clone(),
+            format!("fn {}()", symbol.name),
+            "",
+            symbol.file.clone(),
+            1,
+            5,
+            true,
+            Language::Rust,
+        );
+        graph
+    }
+
+    /// Once a generation is published, the read path must serve it rather than
+    /// deriving the family from the live graph.
+    ///
+    /// Proved structurally rather than by instrumentation: the published
+    /// snapshot describes a file the graph does not contain, and the graph
+    /// contains a file the snapshot does not. A live recomputation can only
+    /// ever report the graph's file, so observing the published file — and only
+    /// the published file — is proof the whole-graph pass did not run.
+    #[test]
+    fn published_graph_facts_are_preferred_over_live_recomputation() {
+        use lattice_core::health::dead_symbol_facts::{
+            DeadSymbolExclusionInputs, DeadSymbolFactProducer,
+        };
+        use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
+
+        let graph = single_file_graph("src/from_graph.rs");
+        let stored = single_file_graph("src/from_store.rs");
+
+        // Every family that has a live fallback is published, so any appearance
+        // of the live graph's file would have to come from a fallback that
+        // should not have run.
+        let published = PublishedHealthFacts {
+            graph: Some(Arc::new(GraphFactProducer::default().produce(&stored, true))),
+            test_proximity: Some(Arc::new(
+                TestProximityFactProducer::default().produce(&stored, true),
+            )),
+            dead_symbols: Some(Arc::new(DeadSymbolFactProducer::default().produce(
+                &stored,
+                &DeadSymbolExclusionInputs::default(),
+                true,
+            ))),
+            ..Default::default()
+        };
+
+        let index = super::health_fact_index(&graph, None, Some(&published), true);
+        let paths: Vec<&str> = index.paths().collect();
+
+        assert!(
+            paths.contains(&"src/from_store.rs"),
+            "the published generation must reach the index, got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"src/from_graph.rs"),
+            "published generations must suppress every whole-graph pass, got {paths:?}"
+        );
+    }
+
+    /// Complexity facts have no live fallback at all, so a published
+    /// generation is the only way they ever become available to a request.
+    #[test]
+    fn published_complexity_facts_become_available_to_a_request() {
+        use lattice_core::health::complexity_facts::compute_file_complexity_facts;
+        use lattice_core::health::scoring::{FactAvailability, FactKind};
+
+        let graph = single_file_graph("src/only.rs");
+
+        let cold = super::health_fact_index(&graph, None, None, true);
+        assert!(
+            cold.facts("src/only.rs")
+                .and_then(|facts| facts.get(FactKind::MaxCyclomaticComplexity))
+                .is_none(),
+            "without a published generation complexity must stay absent, never zero"
+        );
+
+        let mut complexity = BTreeMap::new();
+        complexity.insert(
+            "src/only.rs".to_string(),
+            compute_file_complexity_facts(
+                "src/only.rs",
+                "fn only_run(flag: bool) -> u8 { if flag { 1 } else { 2 } }\n",
+            ),
+        );
+        let published = PublishedHealthFacts {
+            complexity: Some(Arc::new(complexity)),
+            ..Default::default()
+        };
+
+        let warm = super::health_fact_index(&graph, None, Some(&published), true);
+        let fact = warm
+            .facts("src/only.rs")
+            .and_then(|facts| facts.get(FactKind::MaxCyclomaticComplexity))
+            .expect("published complexity must reach the index");
+        assert_ne!(
+            fact.availability,
+            FactAvailability::Unavailable,
+            "a published complexity fact must not report as unavailable"
+        );
+    }
+
+    /// A cold start, and a partially-published one, must still answer.
+    ///
+    /// The fallback is per family: publishing only complexity must leave the
+    /// three graph-derived families deriving from the live graph, so the index
+    /// still covers the graph's files rather than losing them.
+    #[test]
+    fn cold_start_falls_back_to_live_recomputation_per_family() {
+        use lattice_core::health::scoring::FactAvailability;
+
+        let graph = single_file_graph("src/only.rs");
+
+        let cold = super::health_fact_index(&graph, None, None, true);
+        assert!(
+            cold.paths().any(|path| path == "src/only.rs"),
+            "with no published generation the live graph must still be scored"
+        );
+        assert_ne!(
+            cold.availability(),
+            FactAvailability::Unavailable,
+            "a cold start must degrade honestly, not vanish"
+        );
+
+        // An empty handoff is treated as no handoff at all, so a repository
+        // whose runtime has not published yet cannot lose its graph families.
+        let handle = HealthFactsSnapshotHandle::default();
+        handle
+            .publish("repo", PublishedHealthFacts::default())
+            .expect("publish empty");
+        assert!(
+            handle.read("repo").expect("read").is_none(),
+            "a handoff holding no family at all must read as absent"
+        );
+
+        let partial = PublishedHealthFacts {
+            complexity: Some(Arc::new(BTreeMap::new())),
+            ..Default::default()
+        };
+        let mixed = super::health_fact_index(&graph, None, Some(&partial), true);
+        assert!(
+            mixed.paths().any(|path| path == "src/only.rs"),
+            "an unpublished family must still fall back to the live graph"
+        );
+    }
+
+    /// The handoff is per repository, exactly as the Git-intelligence one is.
+    #[test]
+    fn health_facts_handoff_is_repository_scoped() {
+        let handle = HealthFactsSnapshotHandle::default();
+        let published = PublishedHealthFacts {
+            graph: Some(Arc::new(
+                GraphFactProducer::default().produce(&single_file_graph("src/a.rs"), true),
+            )),
+            ..Default::default()
+        };
+        handle.publish("repo-a", published).expect("publish");
+
+        assert!(handle.read("repo-a").expect("read a").is_some());
+        assert!(
+            handle.read("repo-b").expect("read b").is_none(),
+            "one repository must not observe another's generation"
+        );
     }
 
     #[test]
@@ -14367,7 +14712,7 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
  }
 ";
 
-        let health = super::health_fact_index(&graph, None, true);
+        let health = super::health_fact_index(&graph, None, None, true);
         let report = impact_from_diff(
             &graph,
             diff,
@@ -14794,7 +15139,7 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
                 graph.add_edge(&ids[source], &ids[target], EdgeKind::Calls);
             }
         }
-        super::health_fact_index(&graph, None, true)
+        super::health_fact_index(&graph, None, None, true)
     }
 
     /// Spec H4.6: the PostToolUse warning cites the `defect_risk` band and its
