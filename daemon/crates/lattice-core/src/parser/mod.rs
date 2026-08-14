@@ -37,6 +37,9 @@ pub fn complexity_profile_for(language: Language) -> Option<&'static LanguageCom
         Language::Python => Some(python::complexity_profile()),
         Language::Go => Some(go_lang::complexity_profile()),
         Language::Java => Some(java::complexity_profile()),
+        Language::TypeScript | Language::JavaScript => {
+            Some(typescript::complexity_profile(language))
+        }
         _ => None,
     }
 }

@@ -574,6 +574,140 @@ fn java_facts_are_deterministic_and_join_to_symbols() {
 }
 
 // ---------------------------------------------------------------------------
+// TypeScript / JavaScript
+// ---------------------------------------------------------------------------
+
+const TYPESCRIPT_SAMPLE: &str = r#"export function straightLine(a: number): number {
+  return a + 1;
+}
+
+export function threeIfs(a: number, b: number, c: number): number {
+  if (a > 0) { return 1; }
+  if (b > 0) { return 2; }
+  if (c > 0) { return 3; }
+  return 0;
+}
+
+export function branches(a: number, b: string): number {
+  if (a > 0 && b !== "") {
+    for (const item of b) {
+      while (a > 2) { return a; }
+    }
+  } else if (a < 0) {
+    return -1;
+  } else {
+    return 0;
+  }
+  return 1;
+}
+
+export function handler(a: number): number {
+  try {
+    return a;
+  } catch (e) {
+    return 1;
+  } finally {
+    a = 0;
+  }
+}
+
+export function switching(a: number): number {
+  switch (a) {
+    case 1: return 1;
+    case 2: return 2;
+    default: return 0;
+  }
+}
+
+export function nullish(a: number | null): number {
+  return a ?? 1;
+}
+
+export function withCallback(values: number[]): number[] {
+  return values.map((v) => (v > 0 ? v : 0));
+}
+
+export const arrow = (p: number): number => (p > 0 ? 1 : 2);
+
+export class Service {
+  handle(a: number, b?: string): number {
+    return a;
+  }
+}
+"#;
+
+const JAVASCRIPT_SAMPLE: &str = r#"export function jsFunction(a, b = 1, ...rest) {
+  return a && b ? 1 : 2;
+}
+"#;
+
+#[test]
+fn typescript_straight_line_function_scores_one() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_eq!(facts.language, Language::TypeScript);
+    assert_eq!(facts.availability, FactAvailability::Available);
+    assert_unit(&facts, "straightLine", 1, 0, Some(1));
+}
+
+#[test]
+fn typescript_three_independent_ifs_score_four() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_unit(&facts, "threeIfs", 4, 1, Some(3));
+}
+
+#[test]
+fn typescript_counts_short_circuits_loops_and_else_if() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    // if + && + for-of + while + the `else if` conditional = 5 decision points.
+    assert_unit(&facts, "branches", 6, 3, Some(2));
+}
+
+#[test]
+fn typescript_counts_catch_switch_cases_and_nullish_coalescing() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_unit(&facts, "handler", 2, 1, Some(1));
+    assert_unit(&facts, "switching", 3, 1, Some(1));
+    assert_unit(&facts, "nullish", 2, 0, Some(1));
+}
+
+#[test]
+fn typescript_inline_callback_is_attributed_to_the_enclosing_function() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_unit(&facts, "withCallback", 2, 0, Some(1));
+}
+
+#[test]
+fn typescript_named_arrow_is_its_own_unit_keyed_like_the_symbol() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_unit(&facts, "arrow", 2, 0, Some(1));
+}
+
+#[test]
+fn typescript_methods_are_qualified_and_count_optional_parameters() {
+    let facts = compute_file_complexity_facts("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_unit(&facts, "Service.handle", 1, 0, Some(2));
+}
+
+#[test]
+fn typescript_facts_are_deterministic_and_join_to_symbols() {
+    assert_deterministic("src/service.ts", TYPESCRIPT_SAMPLE);
+    assert_joins_to_symbols(
+        "src/service.ts",
+        TYPESCRIPT_SAMPLE,
+        &["threeIfs", "arrow", "Service.handle"],
+    );
+}
+
+#[test]
+fn javascript_parameter_patterns_are_counted() {
+    let facts = compute_file_complexity_facts("src/service.js", JAVASCRIPT_SAMPLE);
+    assert_eq!(facts.language, Language::JavaScript);
+    // `&&` plus the ternary are two decision points.
+    assert_unit(&facts, "jsFunction", 3, 0, Some(3));
+    assert_deterministic("src/service.js", JAVASCRIPT_SAMPLE);
+}
+
+// ---------------------------------------------------------------------------
 // Availability
 // ---------------------------------------------------------------------------
 
