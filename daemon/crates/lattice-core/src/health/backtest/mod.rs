@@ -40,6 +40,7 @@
 //! synthetic repository in which leakage would flip a label, and asserting the
 //! facts at `T` equal the facts of a repository truncated at `T`.
 
+pub mod audit;
 pub mod features;
 pub mod labels;
 pub mod metrics;

@@ -2799,7 +2799,12 @@ fn file_summary_query_signal(node: &GraphNode, query_terms: &[String]) -> f64 {
 /// Detect if a file path is a test file based on common naming conventions.
 /// Covers Python (test_*, *_test.py, conftest.py), JS/TS (*.test.*, *.spec.*),
 /// Go (*_test.go), and common test directories (tests/, __tests__/, test/).
-fn is_test_file(file_path: &str) -> bool {
+///
+/// Shared with the H1 backtest harness's label audit
+/// (`health::backtest::audit`), which needs a test-file predicate to build its
+/// independent corroborating signal. Reused rather than copied: a third
+/// path-shape heuristic in this crate would be one more thing to keep in sync.
+pub(crate) fn is_test_file(file_path: &str) -> bool {
     let lower = file_path.to_lowercase();
     let filename = std::path::Path::new(&lower)
         .file_name()
