@@ -724,6 +724,62 @@ fn unsupported_language_is_unavailable_not_zero() {
 }
 
 #[test]
+fn markdown_is_exempt_with_a_stated_reason() {
+    let facts = compute_file_complexity_facts(
+        "docs/guide.md",
+        "# Title\n\nSome prose with a [link](other.md).\n",
+    );
+    assert_eq!(facts.language, Language::Markdown);
+    assert_eq!(facts.availability, FactAvailability::Unavailable);
+    assert_eq!(
+        facts.unavailable_reason,
+        Some(ComplexityUnavailableReason::NoExecutableControlFlow)
+    );
+    assert!(
+        facts
+            .exemption_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no functions or executable control flow"),
+        "the exemption must state why, not merely that facts are missing"
+    );
+    assert!(facts.rollup.is_none(), "no rollup may be fabricated");
+    assert!(facts.symbols.is_empty());
+}
+
+#[test]
+fn every_parsed_language_contributes_a_profile() {
+    use crate::parser::complexity_profile_for;
+
+    for language in [
+        Language::Rust,
+        Language::Python,
+        Language::Go,
+        Language::Java,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Markdown,
+    ] {
+        let profile = complexity_profile_for(language)
+            .unwrap_or_else(|| panic!("{language:?} must contribute a complexity profile"));
+        assert_eq!(profile.language, language);
+        if profile.is_supported() {
+            assert!(
+                !profile.function_kinds.is_empty() && !profile.branch_kinds.is_empty(),
+                "{language:?} must declare function and branch kinds"
+            );
+            assert!(profile.not_applicable_reason().is_none());
+        } else {
+            assert!(
+                profile.not_applicable_reason().is_some(),
+                "{language:?} must document why it is exempt"
+            );
+        }
+    }
+    assert!(complexity_profile_for(Language::Unknown).is_none());
+}
+
+#[test]
 fn broken_source_degrades_rather_than_reporting_clean_facts() {
     let source = "pub fn broken(a: u32) -> u32 {\n    if a > 0 { return 1;\n";
     let facts = compute_file_complexity_facts("src/broken.rs", source);

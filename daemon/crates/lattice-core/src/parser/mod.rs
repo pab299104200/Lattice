@@ -40,7 +40,8 @@ pub fn complexity_profile_for(language: Language) -> Option<&'static LanguageCom
         Language::TypeScript | Language::JavaScript => {
             Some(typescript::complexity_profile(language))
         }
-        _ => None,
+        Language::Markdown => Some(markdown::complexity_profile()),
+        Language::Unknown => None,
     }
 }
 
