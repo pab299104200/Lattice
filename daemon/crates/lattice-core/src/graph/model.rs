@@ -34,6 +34,22 @@ impl EdgeKind {
             EdgeKind::CoChanges => "X",
         }
     }
+
+    /// Inverse of [`EdgeKind::short_code`], for persisted edge references.
+    pub fn from_short_code(code: &str) -> Option<Self> {
+        match code {
+            "C" => Some(EdgeKind::Calls),
+            "I" => Some(EdgeKind::Imports),
+            "M" => Some(EdgeKind::Implements),
+            "E" => Some(EdgeKind::Extends),
+            "T" => Some(EdgeKind::TypeRef),
+            "N" => Some(EdgeKind::Contains),
+            "L" => Some(EdgeKind::LinksTo),
+            "R" => Some(EdgeKind::Mentions),
+            "X" => Some(EdgeKind::CoChanges),
+            _ => None,
+        }
+    }
 }
 
 /// A node in the code dependency graph.
