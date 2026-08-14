@@ -285,6 +285,7 @@ fn prepare_report(
         &task_anchor_symbols(task),
         &runtime.rules,
         BundleMode::Compact,
+        None,
     )
 }
 
@@ -308,6 +309,7 @@ fn impact_report(runtime: &FixtureRuntime, task: &GoldenTask) -> DiffImpactRepor
         &runtime.rules,
         BundleMode::Compact,
         2,
+        None,
     )
 }
 
@@ -318,6 +320,7 @@ fn diagnosis_report(runtime: &FixtureRuntime, task: &GoldenTask) -> FailureDiagn
         Some("test"),
         &runtime.rules,
         BundleMode::Compact,
+        None,
     )
 }
 

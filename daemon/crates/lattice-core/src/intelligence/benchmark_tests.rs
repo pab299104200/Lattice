@@ -838,6 +838,7 @@ fn plan_edit_case(
         &entry_symbols_vec,
         &rules,
         BundleMode::Compact,
+        None,
     );
     let payload = build_plan_edit_payload(case, &bundle);
     let payload_bytes = serde_json::to_vec(&payload).unwrap().len();
@@ -962,6 +963,7 @@ fn bench_prepare_change(graph: &CodeGraph) -> WorkflowResult {
         &["search_across_sessions".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     WorkflowResult {
@@ -997,6 +999,7 @@ fn bench_impact_from_diff(graph: &CodeGraph) -> WorkflowResult {
         &rules,
         BundleMode::Compact,
         2,
+        None,
     );
 
     WorkflowResult {
@@ -1063,6 +1066,7 @@ fn bench_diagnose_failure(graph: &CodeGraph) -> WorkflowResult {
         Some("runtime"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     WorkflowResult {
@@ -1177,6 +1181,7 @@ fn bench_prepare_change_certificate_assistant(graph: &CodeGraph) -> WorkflowResu
         ],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     WorkflowResult {
@@ -1246,6 +1251,7 @@ fn bench_diagnose_failure_certificate_assistant(graph: &CodeGraph) -> WorkflowRe
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     WorkflowResult {
@@ -1405,6 +1411,7 @@ fn bench_trace_scenario_login_refresh_case() -> (usize, bool, bool, bool, bool, 
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
     let guard_hit = strong_path
         .as_ref()
@@ -1599,6 +1606,7 @@ fn workflow_guardrail_certificate_noise_case() {
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
     assert_eq!(
         diagnosis.suspects.first().map(|item| item.file.as_str()),
@@ -1715,6 +1723,7 @@ fn workflow_guardrail_certificate_noise_case() {
         &["_verify_org_access".to_string(), "upsert_renewal_policy".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
     assert_eq!(
         bundle.primary_files.first().map(|item| item.file.as_str()),
@@ -1803,6 +1812,7 @@ fn workflow_guardrail_structured_memory_trust_case() {
         &["_verify_org_access".to_string(), "upsert_renewal_policy".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert_eq!(

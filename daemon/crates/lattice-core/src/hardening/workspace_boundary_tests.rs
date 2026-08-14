@@ -281,6 +281,7 @@ fn test_ignored_files_never_appear_in_query_or_workflow_tool_results() {
         &[],
         &rules,
         BundleMode::Compact,
+        None,
     );
     let expanded = expand_context(&graph, &tool_seed(&bundle), "file:src/auth.ts", 800);
     let diff = impact_from_diff(
@@ -291,6 +292,7 @@ fn test_ignored_files_never_appear_in_query_or_workflow_tool_results() {
         &rules,
         BundleMode::Compact,
         2,
+        None,
     );
     let tests = find_relevant_tests(
         &graph,
@@ -363,7 +365,7 @@ fn test_unresolved_queries_do_not_fall_back_to_broad_workspace_dump() {
     let (_dir, graph) = fixture_graph();
     let mut engine = QueryEngine::new(graph.clone(), None, None);
     let capsule = engine.query("completely absent anchor token", None, false);
-    let bundle = prepare_change(&graph, &capsule, &[], &[], &[], BundleMode::Compact);
+    let bundle = prepare_change(&graph, &capsule, &[], &[], &[], BundleMode::Compact, None);
 
     assert!(
         capsule.pivots.is_empty(),

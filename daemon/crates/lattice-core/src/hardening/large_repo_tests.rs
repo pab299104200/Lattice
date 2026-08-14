@@ -245,6 +245,7 @@ fn measure_workflow_tools(runtime: &FixtureRuntime) -> Vec<ToolLatency> {
                 &anchor_symbols(),
                 &runtime.rules,
                 BundleMode::Compact,
+                None,
             )
         }),
         measure_tool("get_context_capsule", |_| {
@@ -262,6 +263,7 @@ fn measure_workflow_tools(runtime: &FixtureRuntime) -> Vec<ToolLatency> {
                 &runtime.rules,
                 BundleMode::Compact,
                 2,
+                None,
             )
         }),
         measure_tool("diagnose_failure", |_| {
@@ -271,6 +273,7 @@ fn measure_workflow_tools(runtime: &FixtureRuntime) -> Vec<ToolLatency> {
                 Some("test"),
                 &runtime.rules,
                 BundleMode::Compact,
+                None,
             )
         }),
         measure_tool("search_symbols", |index| {

@@ -126,6 +126,7 @@ impl Fixture {
             &rules,
             BundleMode::Compact,
             1,
+            None,
         );
         Self {
             graph,

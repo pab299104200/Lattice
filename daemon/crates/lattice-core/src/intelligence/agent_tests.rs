@@ -680,6 +680,7 @@ fn test_prepare_change_prioritizes_primary_files_and_tests() {
         &["loginUser".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert!(
@@ -831,7 +832,7 @@ fn test_prepare_change_uses_repo_name_query_as_scope_hint() {
         "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js".to_string(),
     ]);
 
-    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact);
+    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact, None);
 
     assert_eq!(
         bundle.primary_files.first().map(|item| item.file.as_str()),
@@ -943,7 +944,7 @@ fn test_prepare_change_promotes_specific_file_stem_over_broad_path_match() {
         "backend/tests/test_agent_version_drift.py".to_string(),
     ]);
 
-    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact);
+    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact, None);
 
     assert_eq!(
         bundle.primary_files.first().map(|item| item.file.as_str()),
@@ -1146,6 +1147,7 @@ fn test_prepare_change_suggested_expand_uses_stable_handle_for_duplicate_symbols
         &["_verify_org_access".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
     let second_bundle = prepare_change(
         &graph,
@@ -1154,6 +1156,7 @@ fn test_prepare_change_suggested_expand_uses_stable_handle_for_duplicate_symbols
         &["_verify_org_access".to_string()],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     let first_suggested = first_bundle
@@ -1800,6 +1803,7 @@ fn test_diagnose_failure_maps_files_symbols_and_tests() {
         None,
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert_eq!(report.kind, "compiler");
@@ -1862,6 +1866,7 @@ fn test_diagnose_failure_prefers_most_specific_line_match() {
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert_eq!(
@@ -1910,6 +1915,7 @@ fn test_diagnose_failure_prefers_matching_file_for_duplicate_symbol_names() {
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert_eq!(
@@ -1952,6 +1958,7 @@ fn test_diagnose_failure_keeps_multiple_line_refs_for_same_file() {
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert!(
@@ -2020,6 +2027,7 @@ fn test_diagnose_failure_downgrades_graph_only_related_symbols() {
         Some("test"),
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     let organization = report
@@ -2067,6 +2075,7 @@ fn test_prepare_change_promotes_entry_file_over_duplicate_symbol_helpers() {
         ],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert_eq!(
@@ -2131,6 +2140,7 @@ fn test_prepare_change_test_selection_stays_anchored_to_entry_files() {
         ],
         &rules,
         BundleMode::Compact,
+        None,
     );
 
     assert!(
@@ -2304,6 +2314,7 @@ fn test_impact_from_diff_maps_changed_symbols_and_dependents() {
         &rules,
         BundleMode::Compact,
         2,
+        None,
     );
 
     assert!(

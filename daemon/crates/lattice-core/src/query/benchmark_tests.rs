@@ -231,7 +231,7 @@ fn lattice_working_set(graph: &CodeGraph, query: &str) -> (Vec<String>, Vec<Stri
     capsule_files.truncate(5);
 
     let rules = RulesDetector::new().detect_rules(&graph_files_for_rules(graph));
-    let bundle = prepare_change(graph, &capsule, &[], &[], &rules, BundleMode::Compact);
+    let bundle = prepare_change(graph, &capsule, &[], &[], &rules, BundleMode::Compact, None);
     let mut files = bundle
         .primary_files
         .iter()

@@ -10,6 +10,9 @@ mod benchmark_tests;
 #[cfg(test)]
 mod docs_tests;
 
+#[cfg(test)]
+mod risk_scoring_tests;
+
 use std::collections::HashMap;
 
 pub use agent::{

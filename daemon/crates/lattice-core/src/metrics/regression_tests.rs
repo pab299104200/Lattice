@@ -186,6 +186,7 @@ impl MetricsTestHarness {
             &symbols,
             rules,
             BundleMode::Compact,
+            None,
         );
         let tests = find_relevant_tests(graph, &files, &symbols, None, rules, 8);
         let report = TaskReport {

@@ -65,6 +65,7 @@ fn prepare_bundle(
         &[],
         &rules,
         BundleMode::Compact,
+        None,
     )
 }
 
@@ -342,6 +343,7 @@ async fn test_partial_batch_report_keeps_cold_start_queries_bounded_and_explicit
         &[],
         BundleMode::Compact,
         2,
+        None,
     );
 
     assert_eq!(partial_result_status(&report), ToolResultStatus::Partial);

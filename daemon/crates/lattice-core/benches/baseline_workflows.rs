@@ -269,6 +269,7 @@ fn prepare_change_report(fixture: &BenchmarkFixture) -> TaskBundle {
         &[],
         &fixture.rules,
         BundleMode::Compact,
+        None,
     )
 }
 
@@ -293,6 +294,7 @@ fn impact_from_diff_report(
         &fixture.rules,
         BundleMode::Compact,
         2,
+        None,
     )
 }
 
@@ -303,6 +305,7 @@ fn diagnose_failure_report(fixture: &BenchmarkFixture) -> FailureDiagnosis {
         Some("test"),
         &fixture.rules,
         BundleMode::Compact,
+        None,
     )
 }
 

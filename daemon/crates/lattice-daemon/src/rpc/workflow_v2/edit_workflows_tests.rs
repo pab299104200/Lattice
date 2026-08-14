@@ -190,6 +190,7 @@ impl Fixture {
             &request.entry_symbols,
             &rules,
             BundleMode::Compact,
+            None,
         );
         let plan = intelligence::plan_edit(
             &graph,
@@ -198,6 +199,7 @@ impl Fixture {
             &request.entry_symbols,
             &rules,
             BundleMode::Compact,
+            None,
         );
         let trace = intelligence::trace_scenario(
             &graph,
@@ -213,6 +215,7 @@ impl Fixture {
             Some("test"),
             &rules,
             BundleMode::Compact,
+            None,
         );
         Self {
             capsule,

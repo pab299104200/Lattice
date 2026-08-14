@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
+use crate::health::scoring::{Axis, AxisScore, Band, FactAvailability, HealthFactIndex};
 use crate::query::{detect_intent, ContextCapsule, QueryIntent};
 use crate::symbols::{parse_stable_file_handle, stable_file_handle, SymbolId};
 
@@ -250,6 +251,13 @@ pub struct TestRecommendation {
     pub reasons: Vec<String>,
 }
 
+/// A change risk, carrying the evidence that established it.
+///
+/// `level` is the `defect_risk` band from `health::scoring` — `low`,
+/// `moderate`, `high`, `critical`, a hyphenated range such as
+/// `moderate-critical` when inputs were missing, or `unknown` when the health
+/// engine had no facts for the file. `defect_risk` is the full bundle behind
+/// it, so a consumer can show why without asking a second question.
 #[derive(Debug, Clone, Serialize)]
 pub struct RiskRecommendation {
     pub level: String,
@@ -257,6 +265,9 @@ pub struct RiskRecommendation {
     pub file: String,
     pub reason: String,
     pub impact_count: usize,
+    /// The scored evidence: contributing facts, ranks, band range, missing
+    /// inputs, and the weights version they were computed under.
+    pub defect_risk: AxisScore,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -919,6 +930,12 @@ impl ExpansionTarget {
     }
 }
 
+/// Plan a change, ranking its risks by the health engine's `defect_risk`
+/// bundle.
+///
+/// `health` carries published fact generations when the caller has them; when
+/// it is `None` the risks are scored on graph facts derived from `graph`, and
+/// every bundle says which families it lacked.
 pub fn prepare_change(
     graph: &CodeGraph,
     capsule: &ContextCapsule,
@@ -926,7 +943,9 @@ pub fn prepare_change(
     entry_symbols: &[String],
     rules: &[ProjectRule],
     mode: BundleMode,
+    health: Option<&HealthFactIndex>,
 ) -> TaskBundle {
+    let health = health_index_or_graph_facts(graph, health);
     let mut file_scores: HashMap<String, FileAccumulator> = HashMap::new();
     let mut symbol_scores: HashMap<(String, String), SymbolAccumulator> = HashMap::new();
     let mut seed_nodes: Vec<&GraphNode> = Vec::new();
@@ -1099,7 +1118,7 @@ pub fn prepare_change(
             continue;
         }
 
-        if let Some(risk) = risk_for_node(graph, node, 2, "candidate change") {
+        if let Some(risk) = risk_for_node(graph, &health, node, 2, "candidate change") {
             risks.push(risk);
         }
     }
@@ -1172,13 +1191,7 @@ pub fn prepare_change(
                 || file_matches_entry_scope(&risk.file, entry_files)
         });
     }
-    risks.sort_by(|a, b| {
-        severity_rank(&a.level)
-            .cmp(&severity_rank(&b.level))
-            .then_with(|| b.impact_count.cmp(&a.impact_count))
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+    risks.sort_by(compare_risk_severity);
     risks.truncate(6);
 
     let mut primary_files = primary_files;
@@ -1263,8 +1276,17 @@ pub fn plan_edit(
     entry_symbols: &[String],
     rules: &[ProjectRule],
     mode: BundleMode,
+    health: Option<&HealthFactIndex>,
 ) -> PlanEditBundle {
-    let task_bundle = prepare_change(graph, capsule, entry_files, entry_symbols, rules, mode);
+    let task_bundle = prepare_change(
+        graph,
+        capsule,
+        entry_files,
+        entry_symbols,
+        rules,
+        mode,
+        health,
+    );
     let mut edit_files = task_bundle.primary_files.clone();
     let mut supporting_files = task_bundle.secondary_files.clone();
     let symbols = task_bundle.symbols.clone();
@@ -3883,13 +3905,19 @@ pub fn expand_context(
     )
 }
 
+/// Diagnose a failure, describing candidate faults with their health evidence.
+///
+/// `health` carries published fact generations when the caller has them; when
+/// it is `None` the evidence is graph facts derived from `graph`.
 pub fn diagnose_failure(
     graph: &CodeGraph,
     input: &str,
     kind: Option<&str>,
     rules: &[ProjectRule],
     mode: BundleMode,
+    health: Option<&HealthFactIndex>,
 ) -> FailureDiagnosis {
+    let health = health_index_or_graph_facts(graph, health);
     let all_nodes = graph.all_nodes();
     let failure_kind = kind
         .map(|value| value.to_string())
@@ -4109,7 +4137,7 @@ pub fn diagnose_failure(
                 );
             }
 
-            if let Some(risk) = risk_for_node(graph, node, 2, "failure signal") {
+            if let Some(risk) = risk_for_node(graph, &health, node, 2, "failure signal") {
                 likely_causes.push(risk.reason);
             }
         }
@@ -4250,6 +4278,10 @@ pub fn diagnose_failure(
     }
 }
 
+/// Report the impact of a diff, ranking changed symbols by `defect_risk`.
+///
+/// `health` carries published fact generations when the caller has them; when
+/// it is `None` the risks are scored on graph facts derived from `graph`.
 pub fn impact_from_diff(
     graph: &CodeGraph,
     diff: &str,
@@ -4258,7 +4290,9 @@ pub fn impact_from_diff(
     rules: &[ProjectRule],
     mode: BundleMode,
     hops: usize,
+    health: Option<&HealthFactIndex>,
 ) -> DiffImpactReport {
+    let health = health_index_or_graph_facts(graph, health);
     let parsed_files = parse_unified_diff(diff);
     let mut changed_files = Vec::new();
     let mut changed_symbols = Vec::new();
@@ -4290,7 +4324,7 @@ pub fn impact_from_diff(
             changed_symbol_names.push(node.name.clone());
             push_seed_node(&mut seed_nodes, &mut seen_seeds, node);
             if let Some(risk) =
-                risk_for_node(graph, node, hops, &format!("{} symbol", parsed.status))
+                risk_for_node(graph, &health, node, hops, &format!("{} symbol", parsed.status))
             {
                 risks.push(risk);
             }
@@ -4351,13 +4385,7 @@ pub fn impact_from_diff(
         mode.test_limit(),
     );
 
-    risks.sort_by(|a, b| {
-        severity_rank(&a.level)
-            .cmp(&severity_rank(&b.level))
-            .then_with(|| b.impact_count.cmp(&a.impact_count))
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+    risks.sort_by(compare_risk_severity);
     risks.truncate(mode.symbol_limit());
 
     changed_symbols.sort_by(|a, b| {
@@ -7070,7 +7098,7 @@ fn build_task_bundle_overview(
             .find(|node| node.file == risk.file && node.name == risk.symbol)
         {
             sentences.push(format!(
-                "Review `{}` at {} because the graph marks it as a {}-risk change with {} affected symbol{}.",
+                "Review `{}` at {} because its defect-risk band is {} with {} affected symbol{}.",
                 risk.symbol,
                 source_citation(&risk.file, node.line),
                 risk.level,
@@ -7338,7 +7366,7 @@ fn build_review_checklist(
 
     if risks
         .iter()
-        .any(|risk| risk.level == "high" || risk.level == "medium")
+        .any(|risk| risk.defect_risk.band_range.ceiling >= Band::Moderate)
     {
         items.push(ReviewChecklistItem {
             level: "medium".to_string(),
@@ -7471,8 +7499,38 @@ fn downstream_impact_count(graph: &CodeGraph, node: &GraphNode, hops: usize) -> 
         .max(graph.get_dependents(&node.id).len())
 }
 
+/// The health facts a verb scores against.
+///
+/// A caller that has published fact generations passes them in. A caller that
+/// has only the graph gets a graph-facts-only index derived from it, built once
+/// per request rather than once per symbol. That fallback declares itself
+/// incomplete: it was derived on the fly from one graph rather than read from a
+/// published fact generation, so nothing it produces may claim to be whole.
+fn health_index_or_graph_facts(
+    graph: &CodeGraph,
+    supplied: Option<&HealthFactIndex>,
+) -> HealthFactIndex {
+    match supplied {
+        Some(index) => index.clone(),
+        None => HealthFactIndex::from_graph(graph, false),
+    }
+}
+
+/// The change risk for one symbol, banded by its file's `defect_risk` score.
+///
+/// The structural gate is unchanged: a symbol nothing depends on and nothing
+/// exports is not a change risk whatever its file's history looks like. What it
+/// gates *on* has changed completely — the old `>= 6` / `>= 3` downstream-count
+/// thresholds are gone, with no alias and no fallback, replaced by the
+/// calibrated bands of `health::scoring` (H3.3 of
+/// `docs/plans/2026-08-13-health-engine.md`).
+///
+/// A risk is reported when the file could still be above the lowest band once
+/// every unknown input is accounted for: the band *ceiling*, not the point
+/// estimate, so a file scored on partial facts is never quietly dismissed.
 fn risk_for_node(
     graph: &CodeGraph,
+    health: &HealthFactIndex,
     node: &GraphNode,
     hops: usize,
     change_context: &str,
@@ -7482,41 +7540,43 @@ fn risk_for_node(
         return None;
     }
 
-    if impact_count >= 3 || (node.is_exported && impact_count > 0) {
-        let level = if impact_count >= 6 {
-            "high"
-        } else if impact_count >= 3 {
-            "medium"
-        } else {
-            "low"
-        };
-        let reason = if node.is_exported && impact_count > 0 {
-            format!(
-                "{} touches exported symbol {} with {} downstream dependents",
-                change_context, node.name, impact_count
-            )
-        } else if node.is_exported {
-            format!(
-                "{} touches exported symbol {} and may affect public callers",
-                change_context, node.name
-            )
-        } else {
-            format!(
-                "{} touches {} which fans out to {} downstream symbol(s)",
-                change_context, node.name, impact_count
-            )
-        };
-
-        return Some(RiskRecommendation {
-            level: level.to_string(),
-            symbol: node.name.clone(),
-            file: node.file.clone(),
-            reason,
-            impact_count,
-        });
+    let defect_risk = health.score(&node.file, Axis::DefectRisk);
+    let scored = defect_risk.availability != FactAvailability::Unavailable;
+    if scored && defect_risk.band_range.ceiling == Band::Low {
+        return None;
     }
 
-    None
+    let exposure = if node.is_exported && impact_count > 0 {
+        format!(
+            "{} touches exported symbol {} with {} downstream dependents",
+            change_context, node.name, impact_count
+        )
+    } else if node.is_exported {
+        format!(
+            "{} touches exported symbol {} and may affect public callers",
+            change_context, node.name
+        )
+    } else {
+        format!(
+            "{} touches {} which fans out to {} downstream symbol(s)",
+            change_context, node.name, impact_count
+        )
+    };
+
+    let reason = if scored {
+        format!("{exposure}; {}", defect_risk.summary(3))
+    } else {
+        format!("{exposure}; no health facts available for {}", node.file)
+    };
+
+    Some(RiskRecommendation {
+        level: defect_risk.band_label(),
+        symbol: node.name.clone(),
+        file: node.file.clone(),
+        reason,
+        impact_count,
+        defect_risk,
+    })
 }
 
 fn parse_unified_diff(diff: &str) -> Vec<ParsedDiffFile> {
@@ -8507,10 +8567,25 @@ fn round_score(score: f64) -> f64 {
     (score * 100.0).round() / 100.0
 }
 
-fn severity_rank(level: &str) -> usize {
-    match level {
-        "high" => 0,
-        "medium" => 1,
-        _ => 2,
-    }
+/// Order risks by the evidence behind them, worst first.
+///
+/// The band *ceiling* leads, so a file whose facts were incomplete is ranked by
+/// what it could still be rather than by the part that happened to be
+/// measurable — "unknown is never zero" applied to ordering as well as to
+/// scoring. The point score breaks ties within a band, and downstream reach
+/// breaks ties within a score, so two equally scored symbols still order by how
+/// much of the graph they carry.
+fn compare_risk_severity(a: &RiskRecommendation, b: &RiskRecommendation) -> Ordering {
+    b.defect_risk
+        .band_range
+        .ceiling
+        .cmp(&a.defect_risk.band_range.ceiling)
+        .then_with(|| {
+            b.defect_risk
+                .score_per_mille
+                .cmp(&a.defect_risk.score_per_mille)
+        })
+        .then_with(|| b.impact_count.cmp(&a.impact_count))
+        .then_with(|| a.file.cmp(&b.file))
+        .then_with(|| a.symbol.cmp(&b.symbol))
 }

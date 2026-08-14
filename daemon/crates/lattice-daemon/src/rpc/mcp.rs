@@ -21,6 +21,7 @@ use lattice_core::git_intelligence_consumers::{
     select_hotspot_warnings, GitIntelligenceView, ImpactCandidate,
 };
 use lattice_core::graph::model::CodeGraph;
+use lattice_core::health::scoring::HealthFactIndex;
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::{
@@ -3249,6 +3250,11 @@ impl McpHandler {
         let capsule_for_bundle = capsule.clone();
         let (bundle, delivery_mode, mode_reason) = match self
             .run_query_job(move || {
+                // Built once per request rather than once per bundle mode.
+                // H4 replaces this with the published fact generations, which
+                // add the git, complexity, and test-linkage families this
+                // graph-derived index necessarily lacks.
+                let health = HealthFactIndex::from_graph(engine.graph(), false);
                 let compact_bundle = prepare_change(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3256,6 +3262,7 @@ impl McpHandler {
                     &entry_symbols_for_bundle,
                     &project_rules,
                     BundleMode::Compact,
+                    Some(&health),
                 );
                 let (delivery_mode, mode_reason) =
                     select_task_bundle_mode(requested_mode, &compact_bundle);
@@ -3267,6 +3274,7 @@ impl McpHandler {
                         &entry_symbols_for_bundle,
                         &project_rules,
                         BundleMode::Full,
+                        Some(&health),
                     )
                 } else {
                     compact_bundle
@@ -3427,6 +3435,9 @@ impl McpHandler {
         let capsule_for_bundle = capsule.clone();
         let (bundle, delivery_mode, mode_reason) = match self
             .run_query_job(move || {
+                // See `tool_prepare_change`: one graph-derived index per
+                // request until H4 supplies the published fact generations.
+                let health = HealthFactIndex::from_graph(engine.graph(), false);
                 let compact_bundle = plan_edit(
                     engine.graph(),
                     &capsule_for_bundle,
@@ -3434,6 +3445,7 @@ impl McpHandler {
                     &entry_symbols_for_bundle,
                     &project_rules,
                     BundleMode::Compact,
+                    Some(&health),
                 );
                 let (delivery_mode, mode_reason) =
                     select_plan_edit_mode(requested_mode, &compact_bundle);
@@ -3445,6 +3457,7 @@ impl McpHandler {
                         &entry_symbols_for_bundle,
                         &project_rules,
                         BundleMode::Full,
+                        Some(&health),
                     )
                 } else {
                     compact_bundle
@@ -3702,6 +3715,9 @@ impl McpHandler {
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
+            // See `tool_prepare_change`: one graph-derived index per request
+            // until H4 supplies the published fact generations.
+            let health = HealthFactIndex::from_graph(engine.graph(), false);
             let report = impact_from_diff(
                 engine.graph(),
                 diff,
@@ -3717,6 +3733,7 @@ impl McpHandler {
                     BundleMode::Compact
                 },
                 hops,
+                Some(&health),
             );
             let request = workflow_v2::WorkflowRequest {
                 input: diff.to_string(),
@@ -4330,12 +4347,16 @@ impl McpHandler {
         let (mut report, metadata_mode_reason) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
+            // See `tool_prepare_change`: one graph-derived index per request
+            // until H4 supplies the published fact generations.
+            let health = HealthFactIndex::from_graph(engine.graph(), false);
             let compact_report = diagnose_failure(
                 engine.graph(),
                 input,
                 kind,
                 &project_rules,
                 BundleMode::Compact,
+                Some(&health),
             );
             let (delivery_mode, mode_reason) =
                 select_failure_diagnosis_mode(requested_mode, &compact_report);
@@ -4346,6 +4367,7 @@ impl McpHandler {
                     kind,
                     &project_rules,
                     BundleMode::Full,
+                    Some(&health),
                 )
             } else {
                 compact_report
