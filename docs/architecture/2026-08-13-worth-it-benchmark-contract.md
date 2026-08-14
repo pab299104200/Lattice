@@ -10,18 +10,30 @@ records agent-reported token usage and tool calls, and independently checks
 whether the answer cites the required repository files.
 
 The executable contract is
-`tools/lattice-worth-it-benchmark.sh`. It emits a versioned JSON report and does
+`tools/lattice-worth-it-benchmark.sh`, and `tools/tests/worth-it-benchmark_test.sh`
+exercises it end to end against stub runners. It emits a versioned JSON report and does
 not update a checked-in baseline. A reviewer intentionally captures a clean-run
 report when accepting new baseline numbers.
 
 ## Fixed Task Set
 
-The v1 task order is stable:
+The v2 task order is stable:
 
 1. `find-implementation`: locate explicit CLI runtime-mode selection.
 2. `blast-radius`: find the MCP response-rendering contract and its schema test.
 3. `diagnose-failure`: explain corrupt derived-graph recovery and error typing.
 4. `recall-decision`: recover the shared-memory authority and isolation decision.
+5. `diff-risk`: name the riskiest file in a described change set, with evidence.
+
+`diff-risk` is the health task required by
+`docs/plans/2026-08-13-health-engine.md` § "Phase H5 — Prove it stays honest".
+It describes a change set functionally rather than by path, so the agent must
+resolve the files before it can rank them, and it asks which single file
+carries the most defect risk *and why*. The ground truth is
+`daemon/crates/lattice-daemon/src/rpc/mcp.rs`: it is an order of magnitude
+larger than the other files in the set and has many times their commit count,
+so it dominates any defensible risk ordering and the answer key does not drift
+with routine development.
 
 Each task has an exact set of required repository-relative citations. Those
 citations remain in the harness scorer and are not included in runner requests.
@@ -29,6 +41,18 @@ A run passes citation scoring only when every required file is present;
 additional citations do not improve the score. This deliberately measures file
 discovery, not whether an agent can repeat an answer key, prose similarity, or a
 subjective grader preference.
+
+A task may additionally declare `required_fact_vocabulary` and
+`required_fact_count`. The scorer then also checks that the answer names at
+least that many distinct terms from the fixed vocabulary, matched
+case-insensitively as substrings. This is a closed-list keyword check and not
+prose grading: it exists because the health engine's contract in
+`docs/architecture/2026-08-13-health-engine.md` requires that a risk judgement
+always ships the facts behind it, so an answer that ranks the right file while
+reporting only a band or a number has not done the task. Like the citations,
+the vocabulary stays in the scorer and never appears in a runner request.
+Tasks that declare no vocabulary are vacuously evidenced, so the aggregate
+remains comparable across task kinds.
 
 The task definitions live in the harness rather than in generated fixtures so
 task drift is visible in code review. Changing a prompt, citation, arm policy, or
@@ -45,8 +69,8 @@ requirement.
   provides no Lattice verbs. A response reporting a `lattice ...` tool call is
   rejected.
 - `lattice` permits ordinary read-only tools plus the task's fixed public-verb
-  subset: `context`/`search`, `impact`/`context`, `diagnose`/`context`, or
-  `recall`/`context`, respectively. It must report at least one permitted
+  subset: `context`/`search`, `impact`/`context`, `diagnose`/`context`,
+  `recall`/`context`, and `impact`/`context` respectively. It must report at least one permitted
   Lattice call. Calls using any other Lattice verb are rejected.
 
 The runner adapter is responsible for enforcing the sandbox and for clearing
@@ -122,10 +146,16 @@ arms, their signed delta, and the full per-task evidence. Per task it records:
 
 - answer and citations
 - missing required citations and `cites_right_files`
+- `required_fact_count`, the `named_facts` actually found, and
+  `names_required_facts`
+- `cites_evidence`, true only when the run both cites every required file and
+  names enough required facts
 - input, output, and total tokens
 - tool-call count and the complete tool trace
 
-The aggregate citation accuracy is passing tasks divided by four. Token and
+The aggregate citation accuracy is passing tasks divided by five, and evidence
+accuracy is `cites_evidence` passes divided by five. Both are reported per arm
+with a signed delta. Token and
 tool-call deltas are `lattice - baseline`, so negative values mean Lattice used
 less. Citation delta is also `lattice - baseline`, so positive values mean
 Lattice found required files more reliably.
@@ -143,12 +173,15 @@ The following commands do not invoke an agent:
 bash -n tools/lattice-worth-it-benchmark.sh
 tools/lattice-worth-it-benchmark.sh --help
 tools/lattice-worth-it-benchmark.sh --list-tasks
-tools/lattice-worth-it-benchmark.sh --dry-run | jq -e '.requests | length == 8'
+tools/lattice-worth-it-benchmark.sh --dry-run | jq -e '.requests | length == 10'
+bash tools/tests/worth-it-benchmark_test.sh
 ```
 
-`--list-tasks` exposes the scoring fixtures. `--dry-run` emits all eight runner
-requests in their execution order: four baseline requests followed by four
-Lattice requests. Neither command starts Lattice, mutates the checkout, calls a
+`--list-tasks` exposes the scoring fixtures. `--dry-run` emits all ten runner
+requests in their execution order: five baseline requests followed by five
+Lattice requests. `worth-it-benchmark_test.sh` runs the harness against stub
+runners and asserts, among other things, that neither the required citations
+nor the fact vocabulary ever reach a runner. Neither command starts Lattice, mutates the checkout, calls a
 network service, or writes a baseline.
 
 ## Baseline Review Rule

@@ -5,7 +5,7 @@ set -euo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly SCHEMA_VERSION="lattice-worth-it/v1"
+readonly SCHEMA_VERSION="lattice-worth-it/v2"
 readonly DEFAULT_TIMEOUT_SECONDS=180
 
 usage() {
@@ -16,7 +16,7 @@ Usage:
   tools/lattice-worth-it-benchmark.sh --dry-run [--workspace <path>]
 
 Options:
-  --runner <path>       Agent runner implementing the v1 request/response contract.
+  --runner <path>       Agent runner implementing the v2 request/response contract.
   --workspace <path>    Lattice checkout to benchmark (default: git top level).
   --output <path>       Write the JSON report to a new file instead of stdout.
   --timeout <seconds>   Per-task runner timeout (default: 180).
@@ -84,6 +84,22 @@ tasks_json() {
           "daemon/crates/lattice-core/src/memory/router.rs"
         ],
         suggested_lattice_verbs: ["recall", "context"]
+      },
+      {
+        id: "diff-risk",
+        category: "health-risk",
+        prompt: "A change threads a new argument through three parts of this repository: the MCP request-handling surface, the git-intelligence history miner, and the health score engine. Which single file in that change set carries the most defect risk, and what specific evidence supports that judgement? Name the concrete facts about the file, not just a ranking or a score.",
+        required_citations: ["daemon/crates/lattice-daemon/src/rpc/mcp.rs"],
+        required_fact_vocabulary: [
+          "fan-in", "fan_in", "fan in", "dependents",
+          "cycle", "scc", "instability",
+          "complexity", "nesting", "function length",
+          "churn", "hotspot", "bug-fix", "bug fix", "defect",
+          "untested", "test coverage", "linked test",
+          "dead symbol", "bus factor", "top-author", "co-change"
+        ],
+        required_fact_count: 2,
+        suggested_lattice_verbs: ["impact", "context"]
       }
     ]'
 }
@@ -193,6 +209,21 @@ score_response() {
     --slurpfile response "$response" \
     '($response[0]) as $r |
      ($task.required_citations - $r.citations) as $missing |
+     # Evidence-naming dimension (v2, added for the health task). A task may
+     # require that its answer names concrete facts rather than only asserting
+     # a ranking. This is a fixed-vocabulary, case-insensitive substring count
+     # over a small closed list, not prose grading: the check is whether the
+     # answer says *why*, which is the health engine contract in
+     # docs/architecture/2026-08-13-health-engine.md -- a consumer must never
+     # be handed a bare number. Tasks without a vocabulary are vacuously true,
+     # so the aggregate stays comparable across task kinds.
+     ($task.required_fact_vocabulary // []) as $vocabulary |
+     ($task.required_fact_count // 0) as $needed |
+     ($r.answer | ascii_downcase) as $answer |
+     # The term must be bound before the pipe: inside `contains(...)` the
+     # input `.` is already $answer, so an unbound `.` would compare the
+     # answer against itself and match unconditionally.
+     ([$vocabulary[] | ascii_downcase | . as $term | select($answer | contains($term))]) as $named |
      {
        arm: $arm,
        task_id: $task.id,
@@ -202,6 +233,10 @@ score_response() {
        required_citations: $task.required_citations,
        missing_citations: $missing,
        cites_right_files: ($missing | length == 0),
+       required_fact_count: $needed,
+       named_facts: $named,
+       names_required_facts: (($named | length) >= $needed),
+       cites_evidence: (($missing | length == 0) and (($named | length) >= $needed)),
        input_tokens: $r.input_tokens,
        output_tokens: $r.output_tokens,
        total_tokens: ($r.input_tokens + $r.output_tokens),
@@ -377,6 +412,8 @@ jq -s \
         task_count: ($rows | length),
         citation_pass_count: ([$rows[] | select(.cites_right_files)] | length),
         citation_accuracy: (([$rows[] | select(.cites_right_files)] | length) / ($rows | length)),
+        evidence_pass_count: ([$rows[] | select(.cites_evidence)] | length),
+        evidence_accuracy: (([$rows[] | select(.cites_evidence)] | length) / ($rows | length)),
         total_tokens: ([$rows[].total_tokens] | add),
         total_tool_calls: ([$rows[].tool_call_count] | add)
       };
@@ -397,7 +434,8 @@ jq -s \
         delta: {
           tokens: ($lattice.total_tokens - $baseline.total_tokens),
           tool_calls: ($lattice.total_tool_calls - $baseline.total_tool_calls),
-          citation_accuracy: ($lattice.citation_accuracy - $baseline.citation_accuracy)
+          citation_accuracy: ($lattice.citation_accuracy - $baseline.citation_accuracy),
+          evidence_accuracy: ($lattice.evidence_accuracy - $baseline.evidence_accuracy)
         }
       },
       runs: ($runs | map(del(.runtime)))
