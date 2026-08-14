@@ -34,6 +34,7 @@ pub fn tree_sitter_language(language: Language) -> Option<tree_sitter::Language>
 pub fn complexity_profile_for(language: Language) -> Option<&'static LanguageComplexityProfile> {
     match language {
         Language::Rust => Some(rust_lang::complexity_profile()),
+        Language::Python => Some(python::complexity_profile()),
         _ => None,
     }
 }

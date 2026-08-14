@@ -240,6 +240,131 @@ fn rust_facts_join_to_extracted_symbols() {
 }
 
 // ---------------------------------------------------------------------------
+// Python
+// ---------------------------------------------------------------------------
+
+const PYTHON_SAMPLE: &str = r#"def straight_line(a):
+    return a + 1
+
+
+def three_ifs(a, b, c):
+    if a:
+        return 1
+    if b:
+        return 2
+    if c:
+        return 3
+    return 0
+
+
+def branches(a, b):
+    if a and b:
+        for i in range(a):
+            while i > b:
+                return i
+    elif a or b:
+        return b
+    else:
+        return 0
+    return -1
+
+
+def handler(a):
+    try:
+        return a
+    except ValueError:
+        return 1
+    except Exception:
+        return 2
+    finally:
+        pass
+
+
+def comprehension(items):
+    return [x for x in items if x]
+
+
+def ternary(a):
+    return 1 if a else 2
+
+
+def matcher(a):
+    match a:
+        case 1:
+            return 1
+        case _:
+            return 0
+
+
+class Service:
+    def method(self, a, b=1):
+        return a + b
+
+    @staticmethod
+    def helper(a, *args, **kwargs):
+        return a
+"#;
+
+#[test]
+fn python_straight_line_function_scores_one() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_eq!(facts.language, Language::Python);
+    assert_eq!(facts.availability, FactAvailability::Available);
+    assert_unit(&facts, "straight_line", 1, 0, Some(1));
+    assert_eq!(unit(&facts, "straight_line").function_length, 2);
+}
+
+#[test]
+fn python_three_independent_ifs_score_four() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_unit(&facts, "three_ifs", 4, 1, Some(3));
+}
+
+#[test]
+fn python_counts_elif_loops_and_boolean_operators() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    // if + `and` + for + while + elif + `or` = 6 decision points; `else` is free.
+    assert_unit(&facts, "branches", 7, 3, Some(2));
+}
+
+#[test]
+fn python_counts_each_except_handler_but_not_finally() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_unit(&facts, "handler", 3, 1, Some(1));
+}
+
+#[test]
+fn python_counts_comprehension_guards_and_ternaries() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_unit(&facts, "comprehension", 2, 0, Some(1));
+    assert_unit(&facts, "ternary", 2, 0, Some(1));
+}
+
+#[test]
+fn python_match_counts_cases_but_not_the_wildcard() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_unit(&facts, "matcher", 2, 1, Some(1));
+}
+
+#[test]
+fn python_methods_are_qualified_and_exclude_the_receiver() {
+    let facts = compute_file_complexity_facts("service.py", PYTHON_SAMPLE);
+    assert_unit(&facts, "Service.method", 1, 0, Some(2));
+    // A static method declares no receiver, so every parameter counts.
+    assert_unit(&facts, "Service.helper", 1, 0, Some(3));
+}
+
+#[test]
+fn python_facts_are_deterministic_and_join_to_symbols() {
+    assert_deterministic("service.py", PYTHON_SAMPLE);
+    assert_joins_to_symbols(
+        "service.py",
+        PYTHON_SAMPLE,
+        &["three_ifs", "matcher", "Service.method", "Service.helper"],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Availability
 // ---------------------------------------------------------------------------
 
