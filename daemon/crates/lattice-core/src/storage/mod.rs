@@ -2,6 +2,7 @@ pub mod git_intelligence_store;
 pub mod graph_store;
 pub mod health_complexity_facts_store;
 pub mod health_graph_facts_store;
+pub mod health_test_proximity_facts_store;
 pub mod parsed_file_cache;
 pub mod schema;
 pub mod usearch_index;
@@ -28,6 +29,10 @@ pub use parsed_file_cache::{
 };
 pub use health_complexity_facts_store::{
     validate_canonical_path, GenerationStatus, HealthComplexityFactsStore,
+};
+pub use health_test_proximity_facts_store::{
+    HealthTestProximityFactsStore, StoredTestProximityFacts, TestProximityFactsLoad,
+    TestProximityFactsRecovery,
 };
 pub use usearch_index::UsearchVectorIndex;
 pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};
