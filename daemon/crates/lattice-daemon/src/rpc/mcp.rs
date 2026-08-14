@@ -14003,6 +14003,163 @@ def detect_agent_version_drift(agent, rollout):
         assert_eq!(untested[0]["linked_test_count"], 0);
     }
 
+    /// The whole `impact` path on a real unified diff: parse the diff against a
+    /// graph, build the workflow bundle, enrich it, and render the markdown an
+    /// agent actually reads.
+    ///
+    /// Spec H4 acceptance: "`impact` on a diff in this repo shows risk-ordered
+    /// files with readable evidence", and success criterion 2 — "every ranked
+    /// entry is explainable from its printed facts alone".
+    #[test]
+    fn impact_on_a_unified_diff_ranks_by_risk_and_prints_the_evidence_end_to_end() {
+        use lattice_core::graph::model::EdgeKind;
+        use lattice_core::intelligence::{impact_from_diff, BundleMode};
+        use lattice_core::symbols::{Language, SymbolId, SymbolKind};
+
+        // A graph in the shape this repository has: a central orchestrator many
+        // files call and which sits in a cycle, and an isolated helper.
+        let id = |file: &str, name: &str| SymbolId {
+            file: file.to_string(),
+            name: name.to_string(),
+            byte_offset: 0,
+        };
+        let mut graph = CodeGraph::new();
+        let orchestrator = id("daemon/src/orchestrator.rs", "run");
+        let partner = id("daemon/src/partner.rs", "partner");
+        let helper = id("daemon/src/helper.rs", "helper");
+        let caller_one = id("daemon/src/one.rs", "one");
+        let caller_two = id("daemon/src/two.rs", "two");
+        for symbol in [
+            &orchestrator,
+            &partner,
+            &helper,
+            &caller_one,
+            &caller_two,
+        ] {
+            graph.add_node(
+                symbol.clone(),
+                SymbolKind::Function,
+                symbol.name.clone(),
+                format!("fn {}()", symbol.name),
+                "",
+                symbol.file.clone(),
+                1,
+                40,
+                true,
+                Language::Rust,
+            );
+        }
+        graph.add_edge(&caller_one, &orchestrator, EdgeKind::Calls);
+        graph.add_edge(&caller_two, &orchestrator, EdgeKind::Calls);
+        graph.add_edge(&partner, &orchestrator, EdgeKind::Calls);
+        graph.add_edge(&orchestrator, &partner, EdgeKind::Calls);
+
+        // A real unified diff touching both changed files.
+        let diff = "\
+diff --git a/daemon/src/helper.rs b/daemon/src/helper.rs
+--- a/daemon/src/helper.rs
++++ b/daemon/src/helper.rs
+@@ -1,4 +1,5 @@
+ fn helper() {
+-    old();
++    new();
++    extra();
+ }
+diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
+--- a/daemon/src/orchestrator.rs
++++ b/daemon/src/orchestrator.rs
+@@ -1,4 +1,5 @@
+ fn run() {
+-    step();
++    step_one();
++    step_two();
+ }
+";
+
+        let health = super::health_fact_index(&graph, None, true);
+        let report = impact_from_diff(
+            &graph,
+            diff,
+            &[],
+            &[],
+            &[],
+            BundleMode::Full,
+            2,
+            Some(&health),
+        );
+        assert_eq!(report.changed_files.len(), 2, "{:?}", report.changed_files);
+
+        let request = super::workflow_v2::WorkflowRequest {
+            input: diff.to_string(),
+            entry_files: Vec::new(),
+            entry_symbols: Vec::new(),
+            render_mode: "full".to_string(),
+        };
+        let mut bundle = super::workflow_v2::impact_from_diff::build_bundle(
+            &graph,
+            "fixture-workspace",
+            &request,
+            &report,
+            super::WorkflowRenderChoice::Full,
+        );
+        let changed: Vec<&str> = report
+            .changed_files
+            .iter()
+            .map(|changed| changed.file.as_str())
+            .collect();
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            None,
+            Some(&health),
+            changed,
+        );
+
+        // The riskier changed file leads the health section on graph evidence,
+        // even though `helper.rs` sorts first alphabetically.
+        let files = bundle.structured_payload["health"]["files"]
+            .as_array()
+            .expect("health files");
+        assert_eq!(files[0]["path"], "daemon/src/orchestrator.rs");
+        assert!(
+            files[0]["defect_risk"]["score_per_mille"]
+                .as_u64()
+                .expect("score")
+                > files
+                    .iter()
+                    .find(|file| file["path"] == "daemon/src/helper.rs")
+                    .expect("helper is scored")["defect_risk"]["score_per_mille"]
+                    .as_u64()
+                    .expect("score")
+        );
+
+        // What an agent reads: every ranked entry explainable from its own text.
+        let rendered = serde_json::to_value(&bundle).expect("serialize bundle");
+        let wrapped =
+            super::wrap_workflow_tool_result(rendered, super::WorkflowRenderMode::Markdown);
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("markdown render");
+
+        assert!(
+            text.contains("- Health: `daemon/src/orchestrator.rs` — defect risk "),
+            "{text}"
+        );
+        assert!(text.contains("fan-in 3"), "{text}");
+        assert!(text.contains("2-file dependency cycle"), "{text}");
+        assert!(
+            text.contains("- Untested change: no edge-linked tests for"),
+            "{text}"
+        );
+        // The orchestrator's line names its band before its evidence.
+        let health_line = text
+            .lines()
+            .find(|line| line.contains("`daemon/src/orchestrator.rs`"))
+            .expect("orchestrator health line");
+        let band_position = health_line.find("defect risk ").expect("band");
+        let fact_position = health_line.find("fan-in 3").expect("fact");
+        assert!(band_position < fact_position, "{health_line}");
+    }
+
     /// A structured payload carrying a `health` section, as `impact` builds it.
     fn health_rendered_payload() -> Value {
         let health = health_presentation_index();
@@ -14117,6 +14274,55 @@ def detect_agent_version_drift(agent, rollout):
         assert!(!text.contains("### Structured Payload"));
         assert!(!text.contains("```json"));
         assert!(!text.contains("lattice-metrics"));
+    }
+
+    #[test]
+    fn rendered_health_text_states_facts_and_never_predicts() {
+        // The daemon-side mirror of `lattice_core::health_consumers`'s guard:
+        // the backtest is correlational, so no rendered response may claim a
+        // specific future failure (spec design decision 6).
+        const PREDICTIVE_VOCABULARY: &[&str] = &[
+            "likely defect",
+            "likely bug",
+            "likely to fail",
+            "will fail",
+            "will break",
+            "will regress",
+            "expected to fail",
+            "predict",
+            "prediction",
+            "predictive",
+            "forecast",
+            "probability of",
+            "risk of failure",
+            "bug-prone",
+            "defect-prone",
+            "is buggy",
+            "unsafe to change",
+        ];
+
+        let mut corpus = Vec::new();
+        corpus.push(
+            super::build_tool_result_summary(&health_rendered_payload()).expect("scored summary"),
+        );
+        let mut bare = git_presentation_bundle();
+        super::enrich_impact_bundle_with_git_intelligence(&mut bare, None, None, ["src/hot.rs"]);
+        corpus.push(
+            super::build_tool_result_summary(&bare.structured_payload).expect("bare summary"),
+        );
+        corpus.push(
+            serde_json::to_string(&health_rendered_payload()["health"]).expect("serialize section"),
+        );
+
+        for text in corpus {
+            let lowered = text.to_lowercase();
+            for phrase in PREDICTIVE_VOCABULARY {
+                assert!(
+                    !lowered.contains(phrase),
+                    "rendered health text uses predictive language {phrase:?}: {text}"
+                );
+            }
+        }
     }
 
     #[test]

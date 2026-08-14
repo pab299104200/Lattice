@@ -402,3 +402,147 @@ fn diagnose_ranking_only_permutes_the_candidates_the_trace_selected() {
     assert_eq!(paths.len(), 2);
     assert!(!paths.contains(&"src/core.rs"));
 }
+
+/// Vocabulary that would turn measured evidence into a claim about the future.
+///
+/// The backtest is correlational, its ground truth is a subject-line heuristic
+/// with a measured 15.9% recall gap, and 30 cut points across 5 repositories is
+/// a small sample (`docs/reports/health-backtest/2026-08-14.md`, § "What H3 may
+/// and may not conclude"). Spec design decision 6 therefore forbids a response
+/// from saying a file *will* do anything. This list is the enforcement.
+const PREDICTIVE_VOCABULARY: &[&str] = &[
+    "likely defect",
+    "likely bug",
+    "likely to fail",
+    "likely to break",
+    "will fail",
+    "will break",
+    "will regress",
+    "going to fail",
+    "expect a defect",
+    "expected to fail",
+    "predict",
+    "prediction",
+    "predictive",
+    "forecast",
+    "probability of",
+    "chance of failure",
+    "risk of failure",
+    "bug-prone",
+    "defect-prone",
+    "is buggy",
+    "unsafe to change",
+    "should be rewritten",
+];
+
+fn assert_descriptive(text: &str, origin: &str) {
+    let lowered = text.to_lowercase();
+    for phrase in PREDICTIVE_VOCABULARY {
+        assert!(
+            !lowered.contains(phrase),
+            "{origin} uses predictive language {phrase:?}: {text}"
+        );
+    }
+}
+
+/// Every string the health surface can emit, from a fixture that exercises
+/// every fact kind, both axes, both value polarities, and the unknown case.
+fn every_emitted_string() -> Vec<(String, String)> {
+    use crate::health::scoring::{ALL_AXES, ALL_FACT_KINDS};
+
+    let index = full_index();
+    let mut strings: Vec<(String, String)> = Vec::new();
+
+    // Raw fact renderings across each fact's range: a boolean fact reads
+    // differently at 0 and 1, and both forms reach a response.
+    for kind in ALL_FACT_KINDS {
+        for value in [0_u64, 1, 12, 4_200] {
+            strings.push((
+                format!("FactKind::{}::describe_value({value})", kind.as_str()),
+                kind.describe_value(value),
+            ));
+        }
+    }
+
+    // Whole bundles, per axis, for a scored file, an unscored file, and a
+    // graph-only index whose bands are widened by missing inputs.
+    let graph_only = HealthFactIndex::from_graph(&fixture_graph(), true);
+    for axis in ALL_AXES {
+        for (label, source) in [("full", &index), ("graph-only", &graph_only)] {
+            for path in ["src/core.rs", "src/leaf.rs", "src/never-indexed.rs"] {
+                let score = source.score(path, axis);
+                strings.push((
+                    format!("{label} {} {path} summary", axis.as_str()),
+                    score.summary(HEALTH_EVIDENCE_FACT_LIMIT),
+                ));
+                strings.push((
+                    format!("{label} {} {path} band", axis.as_str()),
+                    score.band_label(),
+                ));
+                for fact in score.top_facts(HEALTH_EVIDENCE_FACT_LIMIT) {
+                    strings.push((
+                        format!("{label} {} {path} fact", axis.as_str()),
+                        fact.describe(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // The consumer surfaces themselves, serialized exactly as a response
+    // carries them.
+    strings.push((
+        "health_section".to_string(),
+        serde_json::to_string(&health_section(
+            Some(&index),
+            ["src/core.rs", "src/leaf.rs", "src/never-indexed.rs"],
+            MAX_HEALTH_SECTION_FILES,
+        ))
+        .expect("serialize section"),
+    ));
+    strings.push((
+        "empty health_section".to_string(),
+        serde_json::to_string(&health_section(
+            None,
+            ["src/core.rs"],
+            MAX_HEALTH_SECTION_FILES,
+        ))
+        .expect("serialize empty section"),
+    ));
+    strings.push((
+        "untested_changes".to_string(),
+        serde_json::to_string(&untested_changes(
+            Some(&index),
+            ["src/core.rs", "src/leaf.rs"],
+        ))
+        .expect("serialize untested"),
+    ));
+
+    strings
+}
+
+#[test]
+fn no_health_response_text_uses_predictive_language() {
+    let emitted = every_emitted_string();
+    assert!(
+        emitted.len() > 100,
+        "the corpus must actually exercise the surface, got {}",
+        emitted.len()
+    );
+    for (origin, text) in emitted {
+        assert_descriptive(&text, &origin);
+    }
+}
+
+#[test]
+fn the_predictive_vocabulary_guard_would_catch_a_regression() {
+    // A guard nothing can fail is not a guard. This pins that the check itself
+    // rejects the phrasing the spec forbids.
+    let result = std::panic::catch_unwind(|| {
+        assert_descriptive(
+            "high defect risk: this file will fail next release",
+            "fixture",
+        )
+    });
+    assert!(result.is_err(), "the guard must reject predictive phrasing");
+}
