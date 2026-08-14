@@ -117,12 +117,20 @@ pub struct CommitSample {
 }
 
 /// A file changed in a commit and the symbols the caller could resolve in it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PathChange {
     /// Repository-relative, slash-separated path. Invalid paths are ignored.
     pub path: String,
     /// Stable symbol keys, if a historical blob could be parsed. Empty is valid.
     pub symbols: Vec<String>,
+    /// Added lines for this path in this commit's diff (diff stats only; see
+    /// H2.5 in docs/plans/2026-08-13-health-engine.md — no blob content, no
+    /// blame, no rename similarity is ever retained past this count).
+    #[serde(default)]
+    pub lines_added: u32,
+    /// Deleted lines for this path in this commit's diff. Same bound as above.
+    #[serde(default)]
+    pub lines_deleted: u32,
 }
 
 /// Stable history-derived signals consumed by ranking and impact presentation.
@@ -311,6 +319,14 @@ pub struct FileHistorySignal {
     pub top_author_share_per_mille: Option<u16>,
     /// A low number means history has little redundancy; it is not a personnel claim.
     pub bus_factor: Option<u32>,
+    /// Added lines summed across the window's included commits (H2.5). Raw
+    /// count, matching `hotspot_score`'s convention over a normalized ratio.
+    pub lines_added: u64,
+    /// Deleted lines summed across the window's included commits (H2.5).
+    pub lines_deleted: u64,
+    /// `lines_added + lines_deleted`, saturating. Persisted for convenience so
+    /// consumers do not need to re-derive the same sum from two columns.
+    pub line_churn: u64,
 }
 
 /// History-derived signal for a stable symbol key.
@@ -485,7 +501,7 @@ impl GitHistoryMiner {
             processed_commits.push(commit_id.to_owned());
             report.sampled_commits = report.sampled_commits.saturating_add(1);
             let is_bug_fix = looks_like_bug_fix(&commit.subject);
-            let mut commit_paths = BTreeSet::new();
+            let mut commit_paths: BTreeMap<String, (u32, u32)> = BTreeMap::new();
             let mut commit_symbols = BTreeSet::new();
             let mut path_overflow = false;
             let mut symbol_overflow = false;
@@ -495,7 +511,9 @@ impl GitHistoryMiner {
                     report.invalid_path_entries = report.invalid_path_entries.saturating_add(1);
                     continue;
                 };
-                commit_paths.insert(path);
+                let entry = commit_paths.entry(path).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(change.lines_added);
+                entry.1 = entry.1.saturating_add(change.lines_deleted);
                 if commit_paths.len() > self.limits.paths_per_commit {
                     path_overflow = true;
                     break;
@@ -521,11 +539,13 @@ impl GitHistoryMiner {
             }
             report.included_commits = report.included_commits.saturating_add(1);
 
-            for path in &commit_paths {
-                files
-                    .entry(path.clone())
-                    .or_default()
-                    .record(commit.author.as_deref(), is_bug_fix);
+            for (path, (lines_added, lines_deleted)) in &commit_paths {
+                files.entry(path.clone()).or_default().record(
+                    commit.author.as_deref(),
+                    is_bug_fix,
+                    *lines_added,
+                    *lines_deleted,
+                );
             }
             for symbol in &commit_symbols {
                 symbols
@@ -533,7 +553,7 @@ impl GitHistoryMiner {
                     .or_default()
                     .record(commit.author.as_deref(), is_bug_fix);
             }
-            let paths: Vec<_> = commit_paths.into_iter().collect();
+            let paths: Vec<_> = commit_paths.into_keys().collect();
             if paths.len() > self.limits.co_change_width {
                 report.co_change_width_exclusions =
                     report.co_change_width_exclusions.saturating_add(1);
@@ -590,10 +610,12 @@ struct FileAccumulator {
     bug_fix_commits: u32,
     known_authors: BTreeMap<String, u32>,
     unknown_author_commits: u32,
+    lines_added: u64,
+    lines_deleted: u64,
 }
 
 impl FileAccumulator {
-    fn record(&mut self, author: Option<&str>, is_bug_fix: bool) {
+    fn record(&mut self, author: Option<&str>, is_bug_fix: bool, lines_added: u32, lines_deleted: u32) {
         self.commits = self.commits.saturating_add(1);
         if is_bug_fix {
             self.bug_fix_commits = self.bug_fix_commits.saturating_add(1);
@@ -604,6 +626,8 @@ impl FileAccumulator {
         } else {
             self.unknown_author_commits = self.unknown_author_commits.saturating_add(1);
         }
+        self.lines_added = self.lines_added.saturating_add(u64::from(lines_added));
+        self.lines_deleted = self.lines_deleted.saturating_add(u64::from(lines_deleted));
     }
 
     fn into_signal(self, path: String) -> FileHistorySignal {
@@ -620,6 +644,9 @@ impl FileAccumulator {
                 .then(|| ratio_per_mille(top_author_commits, known_author_commits)),
             bus_factor: (author_count > 0 && self.unknown_author_commits == 0)
                 .then(|| estimated_bus_factor(&self.known_authors)),
+            lines_added: self.lines_added,
+            lines_deleted: self.lines_deleted,
+            line_churn: self.lines_added.saturating_add(self.lines_deleted),
         }
     }
 }
@@ -770,6 +797,16 @@ mod tests {
         PathChange {
             path: path.to_owned(),
             symbols: symbols.iter().map(|symbol| (*symbol).to_owned()).collect(),
+            ..PathChange::default()
+        }
+    }
+
+    fn change_with_lines(path: &str, lines_added: u32, lines_deleted: u32) -> PathChange {
+        PathChange {
+            path: path.to_owned(),
+            symbols: Vec::new(),
+            lines_added,
+            lines_deleted,
         }
     }
 
@@ -1104,6 +1141,89 @@ mod tests {
         assert_eq!(snapshot.report.invalid_commit_ids, 1);
         assert_eq!(snapshot.report.invalid_path_entries, 3);
         assert!(snapshot.top_decile_hotspot_cutoff().is_none());
+    }
+
+    #[test]
+    fn aggregates_line_churn_across_commits_deterministically() {
+        let commits = vec![
+            commit(
+                "c2",
+                Some("A"),
+                "fix: parser",
+                vec![change_with_lines("src/a.rs", 10, 3)],
+            ),
+            commit(
+                "c1",
+                Some("B"),
+                "feature",
+                vec![change_with_lines("src/a.rs", 5, 1)],
+            ),
+        ];
+        let miner = GitHistoryMiner::default();
+        let snapshot = miner.mine(commits.clone());
+        let replay = miner.mine(commits);
+
+        let file = &snapshot.files[0];
+        assert_eq!(file.path, "src/a.rs");
+        assert_eq!(file.lines_added, 15);
+        assert_eq!(file.lines_deleted, 4);
+        assert_eq!(file.line_churn, 19);
+        assert_eq!(snapshot, replay, "identical input must mine identically");
+    }
+
+    #[test]
+    fn sums_multiple_line_change_entries_for_the_same_path_in_one_commit() {
+        let snapshot = GitHistoryMiner::default().mine(vec![commit(
+            "c1",
+            Some("A"),
+            "feature",
+            vec![
+                change_with_lines("src/a.rs", 4, 1),
+                change_with_lines("src/a.rs", 2, 2),
+            ],
+        )]);
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].lines_added, 6);
+        assert_eq!(snapshot.files[0].lines_deleted, 3);
+        assert_eq!(snapshot.files[0].line_churn, 9);
+    }
+
+    #[test]
+    fn excludes_line_churn_from_an_overwide_commit_without_partial_data() {
+        let miner = GitHistoryMiner::with_limits(GitMiningLimits {
+            paths_per_commit: 1,
+            ..GitMiningLimits::default()
+        });
+        let snapshot = miner.mine(vec![commit(
+            "wide",
+            Some("A"),
+            "fix",
+            vec![
+                change_with_lines("src/a.rs", 100, 100),
+                change_with_lines("src/b.rs", 5, 5),
+            ],
+        )]);
+
+        // The over-wide commit contributes no file signal at all: line churn
+        // must not leak in partially, matching the existing hotspot exclusion.
+        assert!(snapshot.files.is_empty());
+        assert_eq!(snapshot.report.path_overflow_commits, 1);
+        assert!(snapshot.report.is_degraded());
+    }
+
+    #[test]
+    fn line_churn_defaults_to_zero_for_symbol_only_history() {
+        let snapshot = GitHistoryMiner::default().mine(vec![commit(
+            "c1",
+            Some("A"),
+            "feature",
+            vec![change("src/a.rs", &["a"])],
+        )]);
+
+        assert_eq!(snapshot.files[0].lines_added, 0);
+        assert_eq!(snapshot.files[0].lines_deleted, 0);
+        assert_eq!(snapshot.files[0].line_churn, 0);
     }
 
     #[test]

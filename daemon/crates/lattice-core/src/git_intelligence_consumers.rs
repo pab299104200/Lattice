@@ -438,6 +438,9 @@ mod tests {
             author_count: 0,
             top_author_share_per_mille: None,
             bus_factor: None,
+            lines_added: 0,
+            lines_deleted: 0,
+            line_churn: 0,
         }
     }
 

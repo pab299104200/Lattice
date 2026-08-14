@@ -13604,6 +13604,7 @@ def detect_agent_version_drift(agent, rollout):
                 .map(|(path, symbols)| PathChange {
                     path: (*path).to_string(),
                     symbols: symbols.iter().map(|symbol| (*symbol).to_string()).collect(),
+                    ..PathChange::default()
                 })
                 .collect(),
         };

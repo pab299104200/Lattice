@@ -5,10 +5,10 @@
 //! values for `GitHistoryMiner`. Keeping git IO here lets the miner remain a
 //! pure, replayable component and gives the runtime one narrow integration seam.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use git2::{Delta, DiffOptions, Repository, Sort};
+use git2::{Delta, Diff, DiffOptions, Patch, Repository, Sort};
 
 use crate::git_intelligence::{CommitSample, GitMiningLimits, PathChange};
 
@@ -156,32 +156,68 @@ fn commit_changes(
             source,
         })?;
 
-    let mut paths = BTreeSet::new();
+    let mut paths: BTreeMap<String, LineStats> = BTreeMap::new();
     // Keep one extra valid path so the pure miner can mark this commit as an
     // overflow instead of silently publishing a partial signal.
     let maximum_observations = limits.paths_per_commit.saturating_add(1);
-    for delta in diff.deltas() {
+    'deltas: for (index, delta) in diff.deltas().enumerate() {
+        // Diff stats only (H2.5, docs/plans/2026-08-13-health-engine.md): this
+        // reads added/deleted line counts from the already-computed diff. No
+        // blob content, blame, or rename similarity is retained beyond the
+        // counts below — the same narrow boundary as the path extraction
+        // above, deliberately widened by exactly one signal.
+        let line_stats = delta_line_stats(&diff, index);
         for path in delta_paths(delta.status(), &delta) {
             let Some(path) = path else {
                 continue;
             };
-            paths.insert(path.to_owned());
+            let entry = paths.entry(path.to_owned()).or_insert(LineStats::default());
+            entry.added = entry.added.saturating_add(line_stats.added);
+            entry.deleted = entry.deleted.saturating_add(line_stats.deleted);
             if paths.len() >= maximum_observations {
-                break;
+                break 'deltas;
             }
-        }
-        if paths.len() >= maximum_observations {
-            break;
         }
     }
 
     Ok(paths
         .into_iter()
-        .map(|path| PathChange {
+        .map(|(path, stats)| PathChange {
             path,
             symbols: Vec::new(),
+            lines_added: stats.added,
+            lines_deleted: stats.deleted,
         })
         .collect())
+}
+
+/// Added/deleted line counts for one diff delta, diff stats only.
+#[derive(Debug, Clone, Copy, Default)]
+struct LineStats {
+    added: u32,
+    deleted: u32,
+}
+
+/// Reads per-delta line counts from an already-computed diff.
+///
+/// A patch is required to obtain per-file counts (`Diff::stats` is
+/// diff-wide only), but only the resulting counts are kept; the patch value
+/// itself is dropped at the end of this call. Binary deltas and any delta
+/// libgit2 cannot turn into a patch (rare, e.g. degenerate typechanges)
+/// contribute zero rather than failing the whole commit: a missing line-count
+/// for one file must not discard that commit's hotspot signal for every file.
+fn delta_line_stats(diff: &Diff<'_>, index: usize) -> LineStats {
+    let patch = match Patch::from_diff(diff, index) {
+        Ok(Some(patch)) => patch,
+        Ok(None) | Err(_) => return LineStats::default(),
+    };
+    match patch.line_stats() {
+        Ok((_context, insertions, deletions)) => LineStats {
+            added: u32::try_from(insertions).unwrap_or(u32::MAX),
+            deleted: u32::try_from(deletions).unwrap_or(u32::MAX),
+        },
+        Err(_) => LineStats::default(),
+    }
 }
 
 fn delta_paths<'a>(status: Delta, delta: &'a git2::DiffDelta<'a>) -> [Option<&'a str>; 2] {
@@ -322,5 +358,66 @@ mod tests {
         .mine(samples);
         assert_eq!(snapshot.report.path_overflow_commits, 1);
         assert!(snapshot.files.is_empty());
+    }
+
+    #[test]
+    fn records_added_and_deleted_line_counts_from_diff_stats() {
+        let (directory, repository) = fixture_repository();
+        commit_file(&repository, "src/a.rs", "a\nb\nc\n", "Initial implementation");
+        commit_file(&repository, "src/a.rs", "a\nx\nc\nd\n", "Fix line churn");
+
+        let samples = GitHistoryAdapter::new(GitMiningLimits::default())
+            .collect(directory.path())
+            .expect("collect fixture history");
+
+        // Newest first: the second commit replaces `b` with `x` (one deletion,
+        // one insertion) and appends `d` (one insertion).
+        assert_eq!(samples[0].subject, "Fix line churn");
+        assert_eq!(samples[0].changes.len(), 1);
+        assert_eq!(samples[0].changes[0].path, "src/a.rs");
+        assert_eq!(samples[0].changes[0].lines_added, 2);
+        assert_eq!(samples[0].changes[0].lines_deleted, 1);
+
+        // The initial commit has no parent tree: every line is an addition.
+        assert_eq!(samples[1].changes[0].lines_added, 3);
+        assert_eq!(samples[1].changes[0].lines_deleted, 0);
+    }
+
+    #[test]
+    fn line_stats_do_not_block_hotspot_accounting_for_a_binary_file() {
+        let (directory, repository) = fixture_repository();
+        let workdir = repository.workdir().expect("non-bare fixture");
+        // Bytes that are not valid UTF-8 and contain a NUL: libgit2 treats this
+        // as a binary blob, so the diff cannot yield meaningful line stats.
+        std::fs::write(workdir.join("blob.bin"), [0u8, 159, 146, 150]).expect("write binary file");
+        let mut index = repository.index().expect("fixture index");
+        index
+            .add_all(["blob.bin"], IndexAddOption::DEFAULT, None)
+            .expect("stage binary file");
+        index.write().expect("write fixture index");
+        let tree_id = index.write_tree().expect("write fixture tree");
+        let tree = repository.find_tree(tree_id).expect("read fixture tree");
+        let signature = Signature::now("Fixture Author", "fixture@example.test").expect("sig");
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Add binary asset",
+                &tree,
+                &[],
+            )
+            .expect("create fixture commit");
+
+        let samples = GitHistoryAdapter::new(GitMiningLimits::default())
+            .collect(directory.path())
+            .expect("collect fixture history");
+
+        assert_eq!(samples[0].changes.len(), 1);
+        assert_eq!(samples[0].changes[0].path, "blob.bin");
+        // Diff stats are unavailable for a binary blob; the file is still
+        // observed for hotspot purposes with zero (not fabricated) churn.
+        assert_eq!(samples[0].changes[0].lines_added, 0);
+        assert_eq!(samples[0].changes[0].lines_deleted, 0);
     }
 }

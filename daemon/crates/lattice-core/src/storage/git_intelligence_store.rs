@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS git_intelligence_files (
     top_author_share_per_mille INTEGER
         CHECK (top_author_share_per_mille BETWEEN 0 AND 1000),
     bus_factor INTEGER CHECK (bus_factor >= 0),
+    -- H2.5: per-file line churn (diff stats only), aggregated over the same
+    -- window/generation as hotspot_score. See docs/plans/2026-08-13-health-engine.md.
+    lines_added INTEGER NOT NULL DEFAULT 0 CHECK (lines_added >= 0),
+    lines_deleted INTEGER NOT NULL DEFAULT 0 CHECK (lines_deleted >= 0),
+    line_churn INTEGER NOT NULL DEFAULT 0 CHECK (line_churn >= 0),
     PRIMARY KEY (repository_id, generation, path),
     FOREIGN KEY (repository_id, generation)
         REFERENCES git_intelligence_generations(repository_id, generation) ON DELETE CASCADE
@@ -443,8 +448,9 @@ fn insert_snapshot_rows(
             .prepare(
                 "INSERT INTO git_intelligence_files \
                  (repository_id, generation, path, hotspot_score, bug_fix_commits, \
-                  bug_fix_density_per_mille, author_count, top_author_share_per_mille, bus_factor) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  bug_fix_density_per_mille, author_count, top_author_share_per_mille, bus_factor, \
+                  lines_added, lines_deleted, line_churn) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .map_err(|error| storage_error("prepare Git file signal insert", error))?;
         for file in &snapshot.files {
@@ -459,6 +465,15 @@ fn insert_snapshot_rows(
                     i64::from(file.author_count),
                     file.top_author_share_per_mille.map(i64::from),
                     file.bus_factor.map(i64::from),
+                    i64::try_from(file.lines_added).map_err(|_| {
+                        LatticeError::Storage("Git lines_added exceeded SQLite range".to_owned())
+                    })?,
+                    i64::try_from(file.lines_deleted).map_err(|_| {
+                        LatticeError::Storage("Git lines_deleted exceeded SQLite range".to_owned())
+                    })?,
+                    i64::try_from(file.line_churn).map_err(|_| {
+                        LatticeError::Storage("Git line_churn exceeded SQLite range".to_owned())
+                    })?,
                 ])
                 .map_err(|error| storage_error("insert Git file signal", error))?;
         }
@@ -614,13 +629,17 @@ fn load_files(
     let mut stmt = tx
         .prepare(
             "SELECT path, hotspot_score, bug_fix_commits, bug_fix_density_per_mille, \
-             author_count, top_author_share_per_mille, bus_factor \
+             author_count, top_author_share_per_mille, bus_factor, \
+             lines_added, lines_deleted, line_churn \
              FROM git_intelligence_files WHERE repository_id = ?1 AND generation = ?2 \
              ORDER BY path",
         )
         .map_err(|error| corrupt_rows(storage_path, repository_id, generation, error))?;
     let rows = stmt
         .query_map(params![repository_id, generation], |row| {
+            let lines_added: i64 = row.get(7)?;
+            let lines_deleted: i64 = row.get(8)?;
+            let line_churn: i64 = row.get(9)?;
             Ok(FileHistorySignal {
                 path: row.get(0)?,
                 hotspot_score: row.get(1)?,
@@ -629,6 +648,12 @@ fn load_files(
                 author_count: row.get(4)?,
                 top_author_share_per_mille: row.get(5)?,
                 bus_factor: row.get(6)?,
+                lines_added: u64::try_from(lines_added)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, lines_added))?,
+                lines_deleted: u64::try_from(lines_deleted)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, lines_deleted))?,
+                line_churn: u64::try_from(line_churn)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, line_churn))?,
             })
         })
         .map_err(|error| corrupt_rows(storage_path, repository_id, generation, error))?;
@@ -766,6 +791,13 @@ fn validate_snapshot(snapshot: &GitIntelligenceSnapshot) -> Result<(), LatticeEr
             || file
                 .bus_factor
                 .is_some_and(|value| value > file.author_count)
+            || file.line_churn != file.lines_added.saturating_add(file.lines_deleted)
+            // Each included commit contributes at most `u32::MAX` per line
+            // direction (the adapter's per-commit, per-path bound); a churn
+            // total exceeding that ceiling times the file's commit count is
+            // not reachable by the miner and can only be corrupt storage.
+            || file.lines_added > u64::from(u32::MAX).saturating_mul(u64::from(file.hotspot_score))
+            || file.lines_deleted > u64::from(u32::MAX).saturating_mul(u64::from(file.hotspot_score))
         {
             return Err(LatticeError::Storage(format!(
                 "Git file signal {} has impossible aggregate values",
@@ -929,10 +961,14 @@ mod tests {
                     PathChange {
                         path: "src/a.rs".to_owned(),
                         symbols: vec!["rust::src/a.rs::parse".to_owned()],
+                        lines_added: 4,
+                        lines_deleted: 1,
                     },
                     PathChange {
                         path: "src/b.rs".to_owned(),
                         symbols: Vec::new(),
+                        lines_added: 2,
+                        lines_deleted: 0,
                     },
                 ],
             },
@@ -943,6 +979,8 @@ mod tests {
                 changes: vec![PathChange {
                     path: "src/a.rs".to_owned(),
                     symbols: vec!["rust::src/a.rs::parse".to_owned()],
+                    lines_added: 10,
+                    lines_deleted: 0,
                 }],
             },
         ])
@@ -1107,5 +1145,83 @@ mod tests {
         };
         let reopened = GitIntelligenceStore::open(&path).unwrap();
         assert_eq!(reopened.load_active("repo").unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn line_churn_round_trips_and_is_isolated_per_generation() {
+        let store = GitIntelligenceStore::open_in_memory().unwrap();
+        let first = store.publish("repo", 1, &snapshot("c2", "c1")).unwrap();
+
+        let a = first
+            .snapshot
+            .file("src/a.rs")
+            .expect("src/a.rs signal present");
+        assert_eq!(a.lines_added, 14);
+        assert_eq!(a.lines_deleted, 1);
+        assert_eq!(a.line_churn, 15);
+        let b = first
+            .snapshot
+            .file("src/b.rs")
+            .expect("src/b.rs signal present");
+        assert_eq!(b.lines_added, 2);
+        assert_eq!(b.lines_deleted, 0);
+        assert_eq!(b.line_churn, 2);
+
+        let loaded = store.load_active("repo").unwrap().unwrap();
+        assert_eq!(loaded, first, "reload must reproduce persisted line churn");
+
+        // Publishing a new generation must not leak line-churn rows from the
+        // retired generation, even though both generations share `src/a.rs`.
+        let second_candidate = GitHistoryMiner::default().mine([CommitSample {
+            id: "c3".to_owned(),
+            author: Some("carol".to_owned()),
+            subject: "feature".to_owned(),
+            changes: vec![PathChange {
+                path: "src/a.rs".to_owned(),
+                symbols: Vec::new(),
+                lines_added: 999,
+                lines_deleted: 500,
+            }],
+        }]);
+        let second = store.publish("repo", 2, &second_candidate).unwrap();
+        let second_a = second
+            .snapshot
+            .file("src/a.rs")
+            .expect("second generation src/a.rs signal");
+        assert_eq!(second_a.lines_added, 999);
+        assert_eq!(second_a.lines_deleted, 500);
+        assert_ne!(
+            second_a.lines_added, a.lines_added,
+            "second generation must recompute its own churn, not inherit the first's"
+        );
+
+        // Only the active generation plus one immediate predecessor survive;
+        // publishing a third generation must purge the first's line-churn rows.
+        let third_candidate = GitHistoryMiner::default().mine([CommitSample {
+            id: "c4".to_owned(),
+            author: Some("dave".to_owned()),
+            subject: "chore".to_owned(),
+            changes: vec![PathChange {
+                path: "src/a.rs".to_owned(),
+                symbols: Vec::new(),
+                lines_added: 1,
+                lines_deleted: 1,
+            }],
+        }]);
+        store.publish("repo", 3, &third_candidate).unwrap();
+        let generation_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM git_intelligence_files \
+                 WHERE repository_id = 'repo' AND generation = ?1",
+                [first.generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            generation_rows, 0,
+            "the first generation's file rows (including line churn) must be purged \
+             once it is no longer the active generation or its immediate predecessor"
+        );
     }
 }
