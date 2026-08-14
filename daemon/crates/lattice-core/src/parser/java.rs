@@ -58,7 +58,10 @@ pub fn complexity_profile() -> &'static LanguageComplexityProfile {
 /// A `default:` (or `default ->`) label is the structural fall-through of a
 /// switch whose cases are already counted, so it is not a decision point.
 fn is_default_switch_label(node: Node, source: &[u8]) -> bool {
-    node.kind() == "switch_label" && profile_node_text(node, source).trim_start().starts_with("default")
+    node.kind() == "switch_label"
+        && profile_node_text(node, source)
+            .trim_start()
+            .starts_with("default")
 }
 
 /// Name methods `Owner.method`, exactly as [`extract_method`] names them.

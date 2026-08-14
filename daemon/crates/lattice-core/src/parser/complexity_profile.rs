@@ -47,6 +47,15 @@ pub struct GuardedKind {
     pub field: &'static str,
 }
 
+/// Language hook deciding whether a branch-kind node is an unconditional default.
+pub type DefaultBranchHook = fn(Node, &[u8]) -> bool;
+
+/// Language hook counting a function's declared parameters.
+pub type ParameterCountHook = fn(Node, &[u8]) -> Option<u32>;
+
+/// Language hook naming and keying a function unit.
+pub type UnitIdentityHook = fn(Node, &[u8]) -> Option<UnitIdentity>;
+
 /// The per-language node-kind sets used to compute complexity facts.
 #[derive(Debug, Clone, Copy)]
 pub struct LanguageComplexityProfile {
@@ -77,13 +86,13 @@ pub struct LanguageComplexityProfile {
     /// Language hook: is this branch-kind node an unconditional default arm?
     /// Defaults (`default:`, `_ =>`, `case _:`) are the structural `else` of a
     /// dispatch and are not decision points under the McCabe convention.
-    pub is_default_branch: Option<fn(Node, &[u8]) -> bool>,
+    pub is_default_branch: Option<DefaultBranchHook>,
     /// Language hook: full override of parameter counting, given the function node.
-    pub count_parameters: Option<fn(Node, &[u8]) -> Option<u32>>,
+    pub count_parameters: Option<ParameterCountHook>,
     /// Language hook: naming/keying override, given the function node.
     /// Returning `None` means the node is anonymous: its contents are attributed
     /// to the enclosing unit instead of forming a unit of its own.
-    pub unit_identity: Option<fn(Node, &[u8]) -> Option<UnitIdentity>>,
+    pub unit_identity: Option<UnitIdentityHook>,
 }
 
 impl LanguageComplexityProfile {

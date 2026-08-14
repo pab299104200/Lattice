@@ -806,7 +806,13 @@ fn file_without_functions_reports_no_extrema() {
 // Rollups
 // ---------------------------------------------------------------------------
 
-fn synthetic_unit(name: &str, complexity: u32, length: u32, nesting: u32, params: Option<u32>) -> SymbolComplexityFacts {
+fn synthetic_unit(
+    name: &str,
+    complexity: u32,
+    length: u32,
+    nesting: u32,
+    params: Option<u32>,
+) -> SymbolComplexityFacts {
     SymbolComplexityFacts {
         file: "src/synthetic.rs".to_string(),
         symbol: name.to_string(),

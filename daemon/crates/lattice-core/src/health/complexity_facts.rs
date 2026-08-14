@@ -79,8 +79,8 @@ impl FactAvailability {
         }
     }
 
-    /// Parse a stored code back into an availability.
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// Decode a stored code into an availability.
+    pub fn from_code(value: &str) -> Option<Self> {
         match value {
             "available" => Some(FactAvailability::Available),
             "degraded" => Some(FactAvailability::Degraded),
@@ -115,8 +115,8 @@ impl ComplexityUnavailableReason {
         }
     }
 
-    /// Parse a stored code back into a reason.
-    pub fn from_str(value: &str) -> Option<Self> {
+    /// Decode a stored code into a reason.
+    pub fn from_code(value: &str) -> Option<Self> {
         match value {
             "unsupported_language" => Some(ComplexityUnavailableReason::UnsupportedLanguage),
             "no_executable_control_flow" => {
@@ -486,7 +486,8 @@ impl<'a> UnitWalker<'a> {
                 unit.cyclomatic_complexity = unit.branch_count + 1;
             }
 
-            if self.profile.nesting_kinds.contains(&node.kind()) && !self.is_nesting_transparent(node)
+            if self.profile.nesting_kinds.contains(&node.kind())
+                && !self.is_nesting_transparent(node)
             {
                 depth += 1;
                 let unit = &mut self.units[index];
