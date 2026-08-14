@@ -8074,10 +8074,11 @@ fn format_line_span(node: &GraphNode) -> String {
 
 /// True when `file` is a test file by path or filename convention.
 ///
-/// Shared with [`crate::health::test_proximity_facts`], which reuses this
-/// exact classifier so "production file" vs "test file" is defined in exactly
-/// one place (see `docs/plans/2026-08-13-health-engine.md`, section "H2.4
-/// Test-proximity facts").
+/// `pub(crate)` so sibling fact producers ([`crate::health::test_proximity_facts`],
+/// [`crate::health::dead_symbol_facts`]) apply this exact classifier instead
+/// of defining a second, driftable copy — "production file" vs "test file" is
+/// defined in exactly one place (see `docs/plans/2026-08-13-health-engine.md`,
+/// sections "H2.3 Dead-symbol facts" and "H2.4 Test-proximity facts").
 pub(crate) fn is_test_file(file: &str) -> bool {
     file.starts_with("tests/")
         || file.starts_with("test/")

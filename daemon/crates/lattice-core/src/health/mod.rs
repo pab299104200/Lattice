@@ -17,5 +17,6 @@
 pub mod churn_facts;
 pub mod complexity_facts;
 pub mod config;
+pub mod dead_symbol_facts;
 pub mod graph_facts;
 pub mod test_proximity_facts;

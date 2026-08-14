@@ -1,6 +1,7 @@
 pub mod git_intelligence_store;
 pub mod graph_store;
 pub mod health_complexity_facts_store;
+pub mod health_dead_symbol_facts_store;
 pub mod health_graph_facts_store;
 pub mod health_test_proximity_facts_store;
 pub mod parsed_file_cache;
@@ -19,6 +20,10 @@ pub use git_intelligence_store::{
 pub use graph_store::{
     FileIndexEntry, GraphStore, GraphStoreRecovery, IndexSnapshot, IndexSnapshotLoad,
     ModuleDigestCache, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
+};
+pub use health_dead_symbol_facts_store::{
+    DeadSymbolFactsLoad, DeadSymbolFactsRecovery, HealthDeadSymbolFactsStore,
+    StoredDeadSymbolFacts,
 };
 pub use health_graph_facts_store::{
     GraphFactsLoad, GraphFactsRecovery, HealthGraphFactsStore, StoredGraphFacts,

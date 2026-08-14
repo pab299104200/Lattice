@@ -57,7 +57,11 @@ const SYMBOL_KEY_SEPARATOR: &str = "::";
 /// `Contains` is structural nesting, not dependency. `LinksTo`, `Mentions`, and
 /// `CoChanges` are documentation- and history-derived; admitting them would mix
 /// non-static evidence into a fact family declared to be graph-only.
-fn is_dependency_edge(kind: EdgeKind) -> bool {
+///
+/// `pub(crate)` so sibling fact producers that also derive evidence from
+/// dependency edges (e.g. [`crate::health::dead_symbol_facts`]) apply the same
+/// dependency-edge definition instead of defining a second, driftable copy.
+pub(crate) fn is_dependency_edge(kind: EdgeKind) -> bool {
     match kind {
         EdgeKind::Calls
         | EdgeKind::Imports

@@ -137,6 +137,26 @@ impl SymbolKind {
             SymbolKind::Section => "sec",
         }
     }
+
+    /// Inverse of [`SymbolKind::short_code`], for persisted fact references.
+    pub fn from_short_code(code: &str) -> Option<Self> {
+        match code {
+            "fn" => Some(SymbolKind::Function),
+            "cls" => Some(SymbolKind::Class),
+            "ifc" => Some(SymbolKind::Interface),
+            "type" => Some(SymbolKind::TypeAlias),
+            "enum" => Some(SymbolKind::Enum),
+            "mod" => Some(SymbolKind::Module),
+            "var" => Some(SymbolKind::Variable),
+            "const" => Some(SymbolKind::Constant),
+            "meth" => Some(SymbolKind::Method),
+            "trait" => Some(SymbolKind::Trait),
+            "struct" => Some(SymbolKind::Struct),
+            "doc" => Some(SymbolKind::Document),
+            "sec" => Some(SymbolKind::Section),
+            _ => None,
+        }
+    }
 }
 
 /// An import statement extracted from a file.
