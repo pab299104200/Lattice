@@ -164,6 +164,13 @@ pub struct RepositoryReport {
     pub positives: u32,
     /// Family comparison for this repository alone, uniform weights.
     pub families: Vec<FamilyResult>,
+    /// Standalone discriminative power per feature for this repository alone.
+    ///
+    /// Present so a reader can see whether a fact generalises or merely
+    /// reflects one codebase's habits. A fact that ranks well on one corpus and
+    /// at chance on the others is a fact about that corpus, not about
+    /// software, and must not be weighted as though it were the latter.
+    pub features: Vec<FeatureResult>,
 }
 
 /// The complete backtest report.
@@ -358,6 +365,15 @@ fn push_replay(
             })
             .collect();
 
+        let (repository_univariate, repository_coverage) =
+            univariate_discrimination(repository_frames);
+        let features = feature_results(
+            &repository_univariate,
+            &repository_coverage,
+            observations,
+            &FeatureWeights::from_univariate_roc(&repository_univariate),
+        );
+
         repositories.push(RepositoryReport {
             name: replay.name.clone(),
             head_commit: abbreviate(&replay.head_commit_id),
@@ -366,8 +382,32 @@ fn push_replay(
             observations,
             positives,
             families,
+            features,
         });
     }
+}
+
+/// Assemble the per-feature result rows from a univariate measurement.
+fn feature_results(
+    univariate: &[Option<u32>; FEATURE_COUNT],
+    coverage: &[u32; FEATURE_COUNT],
+    observations: u32,
+    weights: &FeatureWeights,
+) -> Vec<FeatureResult> {
+    ALL_FEATURES
+        .iter()
+        .map(|feature| FeatureResult {
+            feature: *feature,
+            family: feature.family(),
+            observations: coverage[feature.index()],
+            coverage_per_mille: per_mille(
+                u64::from(coverage[feature.index()]),
+                u64::from(observations),
+            ),
+            roc_auc_per_mille: univariate[feature.index()],
+            derived_weight: weights.get(*feature),
+        })
+        .collect()
 }
 
 /// Turn accumulated frames into the finished report.
@@ -407,20 +447,12 @@ fn finish_report(
         .map(|frame| frame.files.iter().filter(|file| file.label).count() as u32)
         .sum();
 
-    let features = ALL_FEATURES
-        .iter()
-        .map(|feature| FeatureResult {
-            feature: *feature,
-            family: feature.family(),
-            observations: coverage[feature.index()],
-            coverage_per_mille: per_mille(
-                u64::from(coverage[feature.index()]),
-                u64::from(pooled_observations),
-            ),
-            roc_auc_per_mille: univariate[feature.index()],
-            derived_weight: derived_weights.get(*feature),
-        })
-        .collect();
+    let features = feature_results(
+        &univariate,
+        &coverage,
+        pooled_observations,
+        &derived_weights,
+    );
 
     BacktestReport {
         harness_version: BACKTEST_HARNESS_VERSION,
@@ -576,6 +608,7 @@ impl BacktestReport {
         self.write_per_repository(&mut out);
         self.write_calibration(&mut out);
         self.write_features(&mut out);
+        self.write_feature_generalization(&mut out);
         self.write_audit(&mut out);
         self.write_windows(&mut out);
         self.write_conclusions(&mut out);
@@ -759,6 +792,55 @@ impl BacktestReport {
                 auc,
                 decimal(feature.derived_weight),
             ));
+        }
+        out.push('\n');
+    }
+
+    /// Cross-repository view of each fact's standalone discrimination.
+    ///
+    /// The pooled column above can be carried by a single large repository.
+    /// This table exists to catch that: a fact worth weighting should beat
+    /// chance in most corpora, not in one.
+    fn write_feature_generalization(&self, out: &mut String) {
+        if self.repositories.len() < 2 {
+            return;
+        }
+        out.push_str("### Does each fact generalise across repositories?\n\n");
+        out.push_str(
+            "Univariate ROC-AUC per repository. A fact that ranks well in one corpus and\nat chance in the others is a fact about that corpus, not about software, and\nH3 should not weight it as though it were the latter. `consistent` counts the\nrepositories where the fact beat chance.\n\n",
+        );
+
+        out.push_str("| Fact | Pooled |");
+        for repository in &self.repositories {
+            out.push_str(&format!(" {} |", repository.name));
+        }
+        out.push_str(" Consistent |\n| --- | ---: |");
+        for _ in &self.repositories {
+            out.push_str(" ---: |");
+        }
+        out.push_str(" ---: |\n");
+
+        for (index, feature) in ALL_FEATURES.iter().enumerate() {
+            let pooled = match self.features[index].roc_auc_per_mille {
+                Some(value) => decimal(value),
+                None => "n/a".to_owned(),
+            };
+            out.push_str(&format!("| `{}` | {} |", feature.as_str(), pooled));
+            let mut above_chance = 0usize;
+            let mut measured = 0usize;
+            for repository in &self.repositories {
+                match repository.features[index].roc_auc_per_mille {
+                    Some(value) => {
+                        measured += 1;
+                        if value > 500 {
+                            above_chance += 1;
+                        }
+                        out.push_str(&format!(" {} |", decimal(value)));
+                    }
+                    None => out.push_str(" n/a |"),
+                }
+            }
+            out.push_str(&format!(" {above_chance}/{measured} |\n"));
         }
         out.push('\n');
     }

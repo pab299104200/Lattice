@@ -385,6 +385,30 @@ fn streaming_repositories_in_one_at_a_time_matches_building_them_together() {
 }
 
 #[test]
+fn the_generalization_table_appears_only_when_there_is_something_to_compare() {
+    let (_directory, single) = fixture_report();
+    // One repository cannot show whether a fact generalises, so the section is
+    // omitted rather than printed with a single column that implies it does.
+    assert!(!single
+        .render_markdown()
+        .contains("Does each fact generalise"));
+
+    let first = tempfile::tempdir().expect("temp directory");
+    build_fixture(first.path());
+    let second = tempfile::tempdir().expect("temp directory");
+    build_fixture(second.path());
+    let pooled = build_report(&[
+        replay_repository(first.path(), fixture_limits()).expect("first replay"),
+        replay_repository(second.path(), fixture_limits()).expect("second replay"),
+    ]);
+    let markdown = pooled.render_markdown();
+    assert!(markdown.contains("Does each fact generalise"));
+    for repository in &pooled.repositories {
+        assert_eq!(repository.features.len(), FEATURE_COUNT);
+    }
+}
+
+#[test]
 fn per_mille_values_render_without_floating_point_drift() {
     assert_eq!(decimal(0), "0.000");
     assert_eq!(decimal(1), "0.001");
