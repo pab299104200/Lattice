@@ -23,6 +23,7 @@ mod socket_server;
 mod transport;
 mod transport_credentials;
 mod vector_sync;
+mod verification_producer;
 mod watcher;
 mod watcher_health;
 mod workspace_identity;
@@ -72,6 +73,10 @@ async fn main() -> Result<()> {
     if hook_adapter::is_hook_adapter_command() {
         hook_adapter::run_from_env().await;
         return Ok(());
+    }
+
+    if verification_producer::is_verification_producer_command() {
+        std::process::exit(verification_producer::run_from_env().await);
     }
 
     if is_memory_migrate_command() {

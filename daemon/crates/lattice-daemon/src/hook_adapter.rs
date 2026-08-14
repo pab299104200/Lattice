@@ -69,6 +69,7 @@ enum HookKind {
     UserPromptSubmit,
     PostToolUse,
     Stop,
+    StructuredFact,
     SessionEnd,
 }
 
@@ -79,6 +80,7 @@ impl HookKind {
             "user-prompt-submit" => Some(Self::UserPromptSubmit),
             "post-tool-use" => Some(Self::PostToolUse),
             "stop" => Some(Self::Stop),
+            "structured-fact" => Some(Self::StructuredFact),
             "session-end" => Some(Self::SessionEnd),
             _ => None,
         }
@@ -152,7 +154,9 @@ pub(crate) async fn run_from_env() {
 async fn run(invocation: Invocation) -> Result<Option<String>> {
     let input = read_bounded_stdin(std::io::stdin().lock())?;
     let fact = extract_host_fact(invocation.kind, &input)?;
-    if invocation.kind == HookKind::Stop && fact.payload.is_none() {
+    if matches!(invocation.kind, HookKind::Stop | HookKind::StructuredFact)
+        && fact.payload.is_none()
+    {
         return Ok(None);
     }
     let identity = checkout_identity_from_cwd()?;
@@ -239,6 +243,20 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
             let binding = client.load_binding(&key, now_ms)?;
             match client.enqueue(&key, payload, now_ms) {
                 Ok(_) | Err(HookSessionClientError::BindingClosed) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let mut wire = HookWire::connect(&identity).await?;
+            flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
+            Ok(None)
+        }
+        HookKind::StructuredFact => {
+            let Some(payload) = fact.payload else {
+                return Ok(None);
+            };
+            let binding = client.load_binding(&key, now_ms)?;
+            match client.enqueue(&key, payload, now_ms) {
+                Ok(_) => {}
+                Err(HookSessionClientError::BindingClosed) => return Ok(None),
                 Err(error) => return Err(error.into()),
             }
             let mut wire = HookWire::connect(&identity).await?;
@@ -656,6 +674,7 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
             object.get("last_assistant_message").and_then(Value::as_str),
         )
         .map(HookClientCapturePayload::TurnSummary),
+        HookKind::StructuredFact => extract_structured_fact(object)?,
         HookKind::SessionEnd => Some(HookClientCapturePayload::Close(
             parse_session_capture_close(
                 &json!({"schema_version": SESSION_CAPTURE_SCHEMA_VERSION}).to_string(),
@@ -696,6 +715,7 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
             acted_on_injection_id,
         }),
         HookKind::Stop => None,
+        HookKind::StructuredFact => None,
         HookKind::SessionEnd => None,
     };
     Ok(HostFact {
@@ -703,6 +723,37 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
         payload,
         presentation,
     })
+}
+
+fn extract_structured_fact(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<HookClientCapturePayload>> {
+    let allowed: &[&str] = match object.get("kind").and_then(Value::as_str) {
+        Some("check") => &["session_id", "schema_version", "kind", "label", "outcome"],
+        Some("error") => &[
+            "session_id",
+            "schema_version",
+            "kind",
+            "category",
+            "fingerprint",
+            "status",
+        ],
+        _ => return Ok(None),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Ok(None);
+    }
+    let mut event = object.clone();
+    event.remove("session_id");
+    let normalized = parse_session_capture_event(&Value::Object(event).to_string())
+        .map_err(|_| anyhow!("invalid structured fact"))?;
+    if !matches!(
+        normalized.fact,
+        SessionCaptureFact::Check { .. } | SessionCaptureFact::Error { .. }
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(HookClientCapturePayload::Event(normalized)))
 }
 
 fn extract_edit_event(
@@ -769,6 +820,9 @@ fn presentation_params(request: &HostPresentationRequest) -> Value {
         HookKind::UserPromptSubmit => "user-prompt-submit",
         HookKind::PostToolUse => "post-tool-use",
         HookKind::Stop => unreachable!("stop has no presentation request"),
+        HookKind::StructuredFact => {
+            unreachable!("structured facts have no presentation request")
+        }
         HookKind::SessionEnd => unreachable!("session end has no presentation request"),
     };
     let mut value = json!({
@@ -802,6 +856,9 @@ fn render_host_presentation(
                     HookKind::UserPromptSubmit => "UserPromptSubmit",
                     HookKind::PostToolUse => "PostToolUse",
                     HookKind::Stop => "Stop",
+                    HookKind::StructuredFact => {
+                        unreachable!("structured facts have no presentation")
+                    }
                     HookKind::SessionEnd => "SessionEnd",
                 },
                 "additionalContext": result.context,
@@ -1158,5 +1215,40 @@ mod tests {
     fn stop_is_supported_but_session_end_remains_the_terminal_hook() {
         assert_eq!(HookKind::parse("stop"), Some(HookKind::Stop));
         assert_eq!(HookKind::parse("session-end"), Some(HookKind::SessionEnd));
+    }
+
+    #[test]
+    fn structured_fact_accepts_only_exact_typed_check_and_error_envelopes() {
+        let check = br#"{
+            "session_id":"opaque-session",
+            "schema_version":1,
+            "kind":"check",
+            "label":"lattice core tests",
+            "outcome":"passed"
+        }"#;
+        let extracted = extract_host_fact(HookKind::StructuredFact, check).unwrap();
+        let HookClientCapturePayload::Event(event) = extracted.payload.unwrap() else {
+            panic!("expected typed event");
+        };
+        assert_eq!(
+            encode_event(&event),
+            json!({
+                "schema_version":1,
+                "kind":"check",
+                "label":"lattice core tests",
+                "outcome":"passed"
+            })
+        );
+
+        for rejected in [
+            json!({"session_id":"s","schema_version":1,"kind":"check","label":"safe","outcome":"passed","command":"private"}),
+            json!({"session_id":"s","schema_version":1,"kind":"check","label":"safe","outcome":"unknown"}),
+            json!({"session_id":"s","schema_version":1,"kind":"edited_path","path":"src/lib.rs"}),
+            json!({"session_id":"s","schema_version":1,"kind":"error","category":"test","fingerprint":format!("sha256:{}", "3".repeat(64)),"status":"resolved","summary":"not producer-declared"}),
+        ] {
+            let result =
+                extract_host_fact(HookKind::StructuredFact, rejected.to_string().as_bytes());
+            assert!(result.is_err() || result.unwrap().payload.is_none());
+        }
     }
 }

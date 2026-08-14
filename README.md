@@ -112,6 +112,14 @@ agent shutdown. Deterministic capture has no LLM dependency; the separate
 consolidation workflow is explicit opt-in, repository-scoped, and
 proposal-only.
 
+Typed verification evidence is also explicit opt-in. A trusted integration can
+select a strict check declaration from checkout-local
+`.lattice/verification-checks.json`; Lattice executes its argv without a shell,
+discards all process streams, and delivers only the fixed label plus categorical
+outcome under an already-open hook-session binding. Installation does not create
+or enable declarations, and no public MCP tool is added. Command, argv, output,
+environment, cwd, transcript data, and exit code never enter capture state.
+
 `lattice install --with-embeddings` provisions Lattice's pinned ONNX MiniLM model once for the current user, at `~/.lattice/models/all-minilm-l6-v2-1110a243/` (or `LATTICE_EMBEDDING_MODEL_DIR`). The installer stages both the model and tokenizer, verifies their SHA-256 digests, and atomically activates the completed bundle. It is idempotent; a missing or invalid bundle simply leaves semantic search disabled while normal lexical recall continues. The flag can also accompany a client installation, for example `lattice install mcp --with-embeddings --workspace /path/to/your/project`.
 
 The proxy forwards JSON-RPC to the daemon instead of implementing tool schemas locally, so `tools/list`, `tools/call`, and future MCP capabilities are exposed dynamically by the daemon. The internal proxy listener defaults to `127.0.0.1:47659`; set `LATTICE_DAEMON_ADDR` for a different loopback address. Proxy processes use a cross-process startup lock, so concurrent hooks and MCP clients recheck and reuse one daemon instead of racing to spawn several. If you need the proxy to respawn the daemon from an explicit binary path instead of its own invocation path, set `LATTICE_DAEMON_EXE=/absolute/path/to/lattice`.

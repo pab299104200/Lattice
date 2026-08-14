@@ -34,6 +34,20 @@ Every script locates the configured or installed Lattice binary and invokes the 
 
 Hook delivery is attributed by the daemon as `codex` / `hook`; installer fixture runs use a protected state root and skip metrics so verification does not pollute adoption reports.
 
+## Declared verification checks
+
+A trusted Codex plugin may explicitly run a check declared in the checkout's
+`.lattice/verification-checks.json` with the private
+`lattice __hook-verify codex <host-session-id> <check-id>` entry point. This is
+not installed or triggered automatically. The strict v1 manifest contains a
+safe ID, fixed display label, and argv array; an optional `error` object contains
+a fixed category and `sha256:` fingerprint. Lattice executes argv directly
+without a shell, discards all process streams, and forwards only the label and
+categorical outcome under an existing session binding. It never forwards or
+stores the ID, argv, command output, environment, cwd, transcript, or exit code.
+Malformed configuration, unknown IDs, missing/closed bindings, and transport
+failure produce no capture output and never create a binding.
+
 ## MCP
 
 Codex can also use Lattice through MCP with a single workspace registration:

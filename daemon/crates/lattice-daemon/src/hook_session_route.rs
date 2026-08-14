@@ -349,15 +349,7 @@ impl HookSessionRoute {
                         }
                         RegistryDeliveryKind::Close => unreachable!(),
                     }
-                    let mut normalized_value = serde_json::to_value(&event.fact)
-                        .map_err(|_| HookSessionRouteError::Unavailable)?;
-                    normalized_value
-                        .as_object_mut()
-                        .ok_or(HookSessionRouteError::Unavailable)?
-                        .insert(
-                            "schema_version".to_string(),
-                            serde_json::json!(event.schema_version),
-                        );
+                    let normalized_value = normalized_event_value(&event)?;
                     let normalized = serde_json::to_string(&normalized_value)
                         .map_err(|_| HookSessionRouteError::Unavailable)?;
                     (normalized.clone(), normalized)
@@ -442,6 +434,48 @@ impl HookSessionRoute {
         record_delivery_metric(&identity, metric, &result);
         result
     }
+}
+
+fn normalized_event_value(
+    event: &lattice_core::memory::SessionCaptureEvent,
+) -> Result<Value, HookSessionRouteError> {
+    let value = match &event.fact {
+        SessionCaptureFact::EditedPath { path } => serde_json::json!({
+            "schema_version": event.schema_version,
+            "kind": "edited_path",
+            "path": path,
+        }),
+        SessionCaptureFact::Check { label, outcome } => serde_json::json!({
+            "schema_version": event.schema_version,
+            "kind": "check",
+            "label": label,
+            "outcome": outcome,
+        }),
+        SessionCaptureFact::Error {
+            category,
+            fingerprint,
+            status,
+            summary,
+        } => {
+            let mut value = serde_json::json!({
+                "schema_version": event.schema_version,
+                "kind": "error",
+                "category": category,
+                "fingerprint": fingerprint,
+                "status": status,
+            });
+            if let Some(summary) = summary {
+                value["summary"] = Value::String(summary.clone());
+            }
+            value
+        }
+        SessionCaptureFact::TurnSummary { summary } => serde_json::json!({
+            "schema_version": event.schema_version,
+            "kind": "turn_summary",
+            "summary": summary,
+        }),
+    };
+    Ok(value)
 }
 
 #[derive(Clone, Copy)]
@@ -2574,6 +2608,24 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(checkout).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn normalized_error_without_summary_remains_reparseable() {
+        let event = parse_session_capture_event(
+            &serde_json::json!({
+                "schema_version": SESSION_CAPTURE_SCHEMA_VERSION,
+                "kind": "error",
+                "category": "test",
+                "fingerprint": format!("sha256:{}", "5".repeat(64)),
+                "status": "observed",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let normalized = normalized_event_value(&event).unwrap();
+        assert!(normalized.get("summary").is_none());
+        assert!(parse_session_capture_event(&normalized.to_string()).is_ok());
     }
 
     fn committed_repository(label: &str) -> PathBuf {

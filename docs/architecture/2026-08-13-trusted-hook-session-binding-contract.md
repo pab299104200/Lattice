@@ -256,11 +256,13 @@ bounded extraction before RPC:
 - `Stop` extracts only the documented top-level `last_assistant_message`,
   bounds it to 2000 bytes, and sends it through `hook/turn_summary` only when an
   existing authenticated binding is available;
-- structured check hooks extract a canonical check kind and typed outcome,
-  never a command line, arguments, environment, output, or stack;
-- structured error/resolution hooks extract a redacted category, stable local
-  fingerprint, status, and optional bounded safe symptom only when the host
-  supplies enough typed data; and
+- the explicit first-party verification producer executes only a strict
+  checkout-declared argv without a shell and emits a canonical check kind,
+  fixed label, and typed outcome; it never transmits command, arguments,
+  environment, output, cwd, or exit code;
+- that producer may emit an error observation/resolution only from a fixed
+  manifest category and SHA-256 fingerprint, with failure mapping to observed
+  and success mapping to resolved; host envelopes cannot supply these facts;
 - `SessionEnd` carries only a content-free close marker. Host transcript,
   reason, cwd, and summary fields are not admitted.
 

@@ -171,6 +171,34 @@ connection.execute(
 connection.commit()
 PY
   printf '%s\n' 'dirty working-set fixture' >"$e2e_repo/src/example.rs"
+  python3 - "$e2e_repo/.lattice/verification-checks.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+fingerprint = "sha256:" + ("4" * 64)
+Path(sys.argv[1]).write_text(json.dumps({
+    "schema_version": 1,
+    "checks": [
+        {
+            "id": "fixture-failure",
+            "label": "fixture declared failure",
+            "argv": [
+                "python3", "-c",
+                "import sys; print('private-check-output'); sys.exit(17)",
+                "private-check-argument"
+            ],
+            "error": {"category": "test", "fingerprint": fingerprint}
+        },
+        {
+            "id": "fixture-recovery",
+            "label": "fixture declared recovery",
+            "argv": ["python3", "-c", "raise SystemExit(0)"],
+            "error": {"category": "test", "fingerprint": fingerprint}
+        }
+    ]
+}), encoding="utf-8")
+PY
 
   for client in codex claude-code; do
     if [[ "$client" == codex ]]; then
@@ -197,6 +225,14 @@ PY
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
         <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"sentinel-$client\"}}" \
         >"$e2e_root/$client-post-tool.out"
+      set +e
+      env "${common_env[@]}" "$LATTICE_HOOK_E2E_BIN" \
+        __hook-verify "$client" "$session" fixture-failure
+      verification_status=$?
+      set -e
+      [[ "$verification_status" -eq 17 ]]
+      env "${common_env[@]}" "$LATTICE_HOOK_E2E_BIN" \
+        __hook-verify "$client" "$session" fixture-recovery
       env "${common_env[@]}" "$hooks_dir/stop.sh" \
         <<<"{\"session_id\":\"$session\",\"last_assistant_message\":\"bounded turn summary for $client\",\"transcript_path\":\"/tmp/never-open-$client\",\"cwd\":\"/forged\"}"
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
@@ -280,7 +316,18 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 count = connection.execute("select count(*) from session_digest_deliveries").fetchone()[0]
 assert count >= 2, count
+classes = dict(connection.execute(
+    "select memory_class, count(*) from memories group by memory_class"
+).fetchall())
+assert classes.get("workflow_outcome", 0) >= 4, classes
+assert classes.get("failure_pattern", 0) >= 2, classes
 PY
+  if rg -a -n 'private-check-output|private-check-argument|fixture-failure|fixture-recovery' \
+    "$e2e_repo/.lattice/memories.db" "$e2e_state" \
+    "$e2e_root/daemon.out" "$e2e_root/daemon.err"; then
+    printf 'verification execution authority crossed the typed capture boundary\n' >&2
+    exit 1
+  fi
   python3 - "$e2e_repo/.lattice/adoption_metrics.jsonl" <<'PY'
 import json
 import sys

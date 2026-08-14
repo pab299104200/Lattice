@@ -15,6 +15,7 @@ use crate::adoption_metrics::{capture_health_for_workspace, CaptureHealth};
 use crate::proxy::daemon_addr;
 use crate::rpc::server::read_message_sync;
 use crate::transport::{self, ClientKind, ProxyRequest};
+use crate::verification_producer::{verification_config_health, VerificationConfigHealth};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpRegistration {
@@ -148,6 +149,21 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
                 // Capture payloads and paths are intentionally absent from
                 // doctor output, including when the aggregate cannot load.
                 println!("WARN capture health unavailable");
+            }
+        }
+        match verification_config_health(root) {
+            VerificationConfigHealth::Absent => {}
+            VerificationConfigHealth::Valid { checks } => println!(
+                "PASS workspace {} verification manifest has {} declared check(s)",
+                root.display(),
+                checks
+            ),
+            VerificationConfigHealth::Invalid => {
+                failures += 1;
+                println!(
+                    "FAIL workspace {} verification manifest is unsafe or invalid",
+                    root.display()
+                );
             }
         }
     }

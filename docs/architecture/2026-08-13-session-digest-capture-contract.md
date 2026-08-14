@@ -22,8 +22,9 @@ ends. D3a currently sends only the structured facts that the installed hosts
 expose safely: an opaque session identifier at start, repository-relative
 edited paths from an allowlisted edit event, a bounded top-level
 `Stop.last_assistant_message` as a nonterminal turn summary, and a content-free
-close marker at `SessionEnd`. A future host adapter may add typed checks and
-typed errors only through an explicit schema change. Trusted
+close marker at `SessionEnd`. An explicit first-party verification producer
+can add typed checks and typed error transitions from a strict checkout-local
+declaration; host envelopes still cannot add them. Trusted
 session/repository/checkout authority is bound outside the payload. The daemon
 deterministically extracts and writes repository-local `WorkflowOutcome` and
 `FailurePattern` memories with evidence in one idempotent batch.
@@ -120,6 +121,51 @@ never opens a path named by the envelope. Repository, checkout, branch, and
 scope are derived by the daemon from the authenticated capability and current
 working tree. A host that cannot provide a safe structured field causes that
 fact to be omitted, not reconstructed from transcript or raw tool data.
+
+### Explicit verification producer
+
+Typed check and error evidence is opt-in through the private first-party
+producer. A checkout may declare at most 64 checks in
+`.lattice/verification-checks.json`:
+
+```json
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "id": "core-tests",
+      "label": "lattice core tests",
+      "argv": ["cargo", "test", "-p", "lattice-core"],
+      "error": {
+        "category": "test",
+        "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    }
+  ]
+}
+```
+
+The manifest is local execution authority and therefore requires deliberate
+operator creation; installation never creates or enables it. The private
+`lattice __hook-verify <codex|claude-code> <host-session-id> <check-id>` entry
+point is for a trusted host/plugin that already owns the opaque session ID. It
+selects only a declared ID, executes its argv directly without a shell from the
+canonical checkout, supplies null stdin, and discards stdout and stderr. It
+preserves an executed check's process status for the invoker. Missing,
+malformed, unknown, closed-session, or unavailable capture state is silent and
+does not create or resume a binding.
+
+Only the manifest's fixed human label and `passed`, `failed`, or `skipped`
+outcome cross into `__hook-adapter ... structured-fact`. When `error` is
+declared, failure emits `observed` and success emits `resolved` for the same
+fixed category and SHA-256 fingerprint; `skipped` emits no error transition.
+The adapter admits these exact typed shapes through the existing authenticated
+`hook/event` FIFO. Check ID, argv, process output, exit code, environment,
+working directory, transcript, and host envelope are never transmitted,
+logged, or stored. The manifest rejects unknown fields, duplicate or unsafe
+IDs, shell executables, absolute/escaping executable paths, oversized values,
+unsafe labels/categories/fingerprints, and symlinked config files before any
+process starts.
 
 ## Admission, normalization, and privacy
 
