@@ -1225,7 +1225,7 @@ impl McpHandler {
         *client = Some(name.to_string());
     }
 
-    fn handle_initialize(&self) -> Value {
+    pub(crate) fn protocol_initialize_response() -> Value {
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -1282,7 +1282,7 @@ impl McpHandler {
         status_snapshot_from_graph(engine.graph(), include_languages)
     }
 
-    fn handle_agent_tools_list(&self) -> Value {
+    pub(crate) fn agent_tools_list_response() -> Value {
         json!({
             "tools": [
                 {
@@ -7862,9 +7862,9 @@ impl RequestHandler for McpHandler {
         match method {
             "initialize" => {
                 self.remember_client_info(&params).await;
-                Ok(self.handle_initialize())
+                Ok(Self::protocol_initialize_response())
             }
-            "tools/list" => Ok(self.handle_agent_tools_list()),
+            "tools/list" => Ok(Self::agent_tools_list_response()),
             "tools/call" => self.handle_agent_tools_call(&params).await,
             "lattice/tools/list_all" => Ok(self.handle_tools_list()),
             "lattice/tool_call" | "lattice/tools/call" => self.handle_tools_call(&params).await,
