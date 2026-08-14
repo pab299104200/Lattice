@@ -28,10 +28,13 @@ prove the same input produces the same ordered output on every platform.
 A thin `git2` adapter owns repository discovery, reachable-commit traversal, and
 first-parent tree diffing. It intentionally collects file paths only: it does
 not parse historical blobs, resolve semantic renames, or apply mailmap
-normalization. A graph store adapter owns schema creation, commit reuse,
-snapshot publication, and reads. The daemon coordinates those adapters and
-schedules refreshes. Retrieval, `impact`, and hooks only read the published
-snapshot; they never traverse Git on a request path.
+normalization. It additionally records per-file added/deleted line counts for
+each diffed commit (H2.5, via `git2::Patch::line_stats()`), feeding the health
+engine's churn facts; this remains diff-stats-only — still no blob content, no
+blame, and no rename similarity. A graph store adapter owns schema creation,
+commit reuse, snapshot publication, and reads. The daemon coordinates those
+adapters and schedules refreshes. Retrieval, `impact`, and hooks only read the
+published snapshot; they never traverse Git on a request path.
 
 The adapter records only data required for aggregation:
 
@@ -172,8 +175,18 @@ are not used as relevance boosts.
 ### `impact`
 
 Within each existing graph-distance and impact-severity tier, `impact` orders
-dependents by descending symbol hotspot, then file hotspot, then the existing
-stable tie-break. History never invents a dependency.
+dependents primarily by the `defect_risk` health score bundle
+(`docs/architecture/2026-08-13-health-engine.md`), falling back to the
+existing stable tie-break when a score is unavailable. History-derived facts
+therefore contribute to `impact`'s primary ordering only through that bundle,
+which always carries its evidence (fact kind, value, window, and source
+range) alongside the entry — never as a bare hotspot count. This supersedes
+the previous tie-break-only rule for `impact` specifically; it is an explicit
+product decision recorded in this file's Decision log, not drift. Retrieval
+ranking, described above, keeps the tie-break-only rule: it has no
+evidence-bundle contract of its own to fall back on when history is
+unavailable, and continues to use history only as a bounded secondary
+feature. History never invents a dependency.
 
 `impact` also emits a separate `missing_cochange_partners` section: paths that
 co-changed with a current-diff path but are absent from that diff. Entries include
@@ -226,6 +239,30 @@ validation errors fail runtime construction rather than silently creating an
 empty snapshot. A failed refresh leaves the prior generation untouched; the
 next checkout-head event retries the same bounded path. There is no unbounded
 repair mode or request-time Git fallback.
+
+## Decision log
+
+- **2026-08-13 — the adapter now records per-file line stats (H2.5).** The
+  `git2` adapter's first-parent tree diff records per-file added/deleted line
+  counts via `git2::Patch::line_stats()`, feeding the health engine's churn
+  facts (`docs/architecture/2026-08-13-health-engine.md`). Diff stats only:
+  still no blob content, no blame, and no rename similarity. Rationale: line
+  churn measurably improves defect-risk discrimination over commit-count
+  hotspot alone (`docs/reports/health-backtest/2026-08-14.md`) and is cheap to
+  derive from the diff the adapter already computes. Per
+  `docs/plans/2026-08-13-health-engine.md` H4.1.
+- **2026-08-13 — history-derived facts may set `impact`'s primary ordering via
+  the health score bundle.** Superseded the tie-break-only rule for `impact`
+  specifically: dependents within a tier are now ordered primarily by the
+  `defect_risk` bundle, which always carries its evidence, rather than by a
+  bare hotspot tie-break. Retrieval ranking is unchanged and keeps the
+  tie-break-only rule. Rationale: an evidence-bearing score is a strictly more
+  explainable primary signal than a bare hotspot count, and the backtest
+  report demonstrates git-derived facts discriminate defect-prone files well
+  enough to justify primary rather than tie-break weight. Per
+  `docs/plans/2026-08-13-health-engine.md` H4.1/H4.2; see
+  `docs/architecture/2026-08-13-health-engine.md`'s own Decision log for the
+  mirrored entry.
 
 ## Acceptance tests
 
