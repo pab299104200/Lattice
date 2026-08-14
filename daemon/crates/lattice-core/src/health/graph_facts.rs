@@ -174,13 +174,16 @@ pub struct FileGraphFacts {
     pub fan_in: u32,
     /// Distinct other files this file depends on (efferent coupling, Ce).
     pub fan_out: u32,
-    /// Identifier of this file's strongly connected component.
+    /// Identifier of this file's strongly connected component: the lexically
+    /// smallest member path.
     ///
-    /// Ids are assigned by ascending lexical order of each component's smallest
-    /// member path, so they are stable for a given graph but carry no meaning
-    /// across generations. Every file has one; a file outside any cycle is the
-    /// sole member of its own component.
-    pub scc_id: u32,
+    /// A dense integer index would be the obvious encoding, but it would
+    /// renumber on every unrelated file insertion and so make the incremental
+    /// delta claim every file had changed. The representative path only moves
+    /// when the component's own membership moves, and it is directly
+    /// explainable to a reader ("in the cycle anchored at src/a.rs"). Every
+    /// file has one; a file outside any cycle represents itself.
+    pub scc_id: String,
     /// Number of files in this file's strongly connected component (>= 1).
     pub scc_size: u32,
     /// True when this file participates in a dependency cycle (`scc_size > 1`).
@@ -543,19 +546,19 @@ impl GraphFactProducer {
         let components = file_components(&ordered_files, &file_coupling);
 
         let file_facts: Vec<FileGraphFacts> = ordered_files
-            .into_iter()
+            .iter()
             .enumerate()
             .take(limits.max_files)
             .map(|(position, path)| {
-                let coupling = file_coupling.get(&path);
-                let component = components[position];
+                let coupling = file_coupling.get(path);
+                let component = &components[position];
                 let fan_in = coupling.map_or(0, |value| saturating_u32(value.dependents.len()));
                 let fan_out = coupling.map_or(0, |value| saturating_u32(value.dependencies.len()));
                 FileGraphFacts {
+                    path: path.clone(),
                     fan_in,
                     fan_out,
-                    path,
-                    scc_id: component.id,
+                    scc_id: ordered_files[component.representative].clone(),
                     scc_size: component.size,
                     cycle_member: component.size > 1,
                     instability_per_mille: instability_per_mille(fan_in, fan_out),
@@ -670,9 +673,10 @@ impl EdgeEvidence {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ComponentMembership {
-    id: u32,
+    /// Position of the component's lexically smallest member.
+    representative: usize,
     size: u32,
 }
 
@@ -710,24 +714,25 @@ fn file_components(
         }
     }
 
-    let mut components: Vec<Vec<usize>> = tarjan_scc(&condensation)
-        .into_iter()
-        .map(|component| {
-            let mut members: Vec<usize> = component.into_iter().map(|node| node.index()).collect();
-            members.sort_unstable();
-            members
+    let mut memberships: Vec<ComponentMembership> = (0..ordered_files.len())
+        .map(|position| ComponentMembership {
+            representative: position,
+            size: 1,
         })
         .collect();
-    components.sort_unstable_by_key(|members| members.first().copied().unwrap_or(usize::MAX));
-
-    let mut memberships = vec![ComponentMembership { id: 0, size: 1 }; ordered_files.len()];
-    for (id, members) in components.iter().enumerate() {
-        let membership = ComponentMembership {
-            id: saturating_u32(id),
-            size: saturating_u32(members.len()),
+    for component in tarjan_scc(&condensation) {
+        let members: Vec<usize> = component.into_iter().map(|node| node.index()).collect();
+        // `ordered_files` is lexically sorted, so the smallest position is the
+        // lexically smallest member path.
+        let Some(&representative) = members.iter().min() else {
+            continue;
         };
-        for &member in members {
-            memberships[member] = membership;
+        let size = saturating_u32(members.len());
+        for member in members {
+            memberships[member] = ComponentMembership {
+                representative,
+                size,
+            };
         }
     }
     memberships
@@ -1015,25 +1020,60 @@ mod tests {
         let cycle_paths: Vec<&str> = cycle.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(cycle_paths, ["cyc/a.rs", "cyc/b.rs", "cyc/c.rs"]);
         assert!(cycle.iter().all(|file| file.scc_size == 3));
-        let ids: BTreeSet<u32> = cycle.iter().map(|file| file.scc_id).collect();
-        assert_eq!(ids.len(), 1, "cycle members share one component id");
+        let ids: BTreeSet<&str> = cycle.iter().map(|file| file.scc_id.as_str()).collect();
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            ["cyc/a.rs"],
+            "cycle members share the component's smallest member as their id"
+        );
 
         for path in ["app/main.rs", "util/leaf.rs"] {
             let facts = snapshot.file(path).unwrap();
             assert_eq!(facts.scc_size, 1);
             assert!(!facts.cycle_member);
         }
-        // Four components: {app/main.rs}, {cyc/a,b,c}, {util/leaf.rs}.
-        let components: BTreeSet<u32> = snapshot.files.iter().map(|file| file.scc_id).collect();
-        assert_eq!(components.len(), 3);
+        // Three components: {app/main.rs}, {cyc/a,b,c}, {util/leaf.rs}.
+        let components: BTreeSet<&str> = snapshot
+            .files
+            .iter()
+            .map(|file| file.scc_id.as_str())
+            .collect();
+        assert_eq!(
+            components.into_iter().collect::<Vec<_>>(),
+            ["app/main.rs", "cyc/a.rs", "util/leaf.rs"]
+        );
     }
 
     #[test]
-    fn component_ids_follow_lexical_order_of_smallest_member() {
+    fn component_id_is_the_smallest_member_and_acyclic_files_represent_themselves() {
         let snapshot = GraphFactProducer::default().produce(&cyclic_graph(), true);
-        assert_eq!(snapshot.file("app/main.rs").unwrap().scc_id, 0);
-        assert_eq!(snapshot.file("cyc/a.rs").unwrap().scc_id, 1);
-        assert_eq!(snapshot.file("util/leaf.rs").unwrap().scc_id, 2);
+        assert_eq!(snapshot.file("app/main.rs").unwrap().scc_id, "app/main.rs");
+        assert_eq!(
+            snapshot.file("util/leaf.rs").unwrap().scc_id,
+            "util/leaf.rs"
+        );
+        for path in ["cyc/a.rs", "cyc/b.rs", "cyc/c.rs"] {
+            assert_eq!(snapshot.file(path).unwrap().scc_id, "cyc/a.rs");
+        }
+    }
+
+    #[test]
+    fn inserting_an_unrelated_file_does_not_renumber_existing_components() {
+        let producer = GraphFactProducer::default();
+        let before = producer.produce(&cyclic_graph(), true);
+
+        // A dense integer component index would have shifted every id that
+        // sorts after this new path, making the delta claim the whole
+        // repository had changed.
+        let mut graph = cyclic_graph();
+        let stranger = symbol("aaa/first.rs", "stranger");
+        add_symbol(&mut graph, &stranger, true, 1);
+        let after = producer.produce(&graph, true);
+
+        let delta = after.file_delta(&before);
+        assert_eq!(delta.added, ["aaa/first.rs"]);
+        assert!(delta.updated.is_empty());
+        assert!(delta.removed.is_empty());
     }
 
     #[test]
@@ -1051,7 +1091,7 @@ mod tests {
             let facts = snapshot.file(path).unwrap();
             assert_eq!(facts.scc_size, 2);
             assert!(facts.cycle_member);
-            assert_eq!(facts.scc_id, 0);
+            assert_eq!(facts.scc_id, "src/left.rs");
         }
     }
 
