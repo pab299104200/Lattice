@@ -4,6 +4,7 @@ mod adoption_metrics;
 mod cli;
 mod doctor;
 mod git_intelligence_runtime;
+mod health_facts_runtime;
 mod hook_adapter;
 mod hook_session_binding;
 mod hook_session_client;
@@ -52,7 +53,7 @@ use lattice_core::storage::{
     VectorIndex, VectorStore,
 };
 use lattice_core::workspace::WorkspaceManager;
-use rpc::mcp::GitIntelligenceSnapshotHandle;
+use rpc::mcp::{GitIntelligenceSnapshotHandle, HealthFactsSnapshotHandle};
 use rpc::mcp::McpHandler;
 use rpc::server::StdioServer;
 use runtime_support::{
@@ -462,6 +463,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&watcher_health),
                     Arc::clone(&index_health),
                     None,
+                    None,
                     watcher_session_id.clone(),
                 )
                 .with_parsed_cache(parsed_cache_for_watchers.clone());
@@ -629,17 +631,33 @@ pub(crate) async fn build_workspace_runtime(
     // active-generation audit must fail workspace construction, not surface
     // later as a detached background error.
     let mut git_refresh_handles = HashMap::new();
+    let mut health_refresh_handles = HashMap::new();
     let git_intelligence_snapshots = GitIntelligenceSnapshotHandle::default();
+    let health_fact_snapshots = HealthFactsSnapshotHandle::default();
     for root in &workspace_roots {
         let identity = crate::workspace_identity::WorkspaceIdentity::resolve(root)?;
         let (handle, runtime) = crate::git_intelligence_runtime::GitIntelligenceRuntime::open(
             root.clone(),
             &graph_path,
-            identity.repository_id,
+            identity.repository_id.clone(),
             Arc::clone(&index_work),
             git_intelligence_snapshots.clone(),
         )?;
         git_refresh_handles.insert(root.clone(), handle);
+        background_tasks.push(runtime.spawn());
+
+        // Same admission control and the same fail-at-construction rule: an
+        // unreadable health-fact generation must fail workspace construction
+        // rather than surface later as a detached background error.
+        let (handle, runtime) = crate::health_facts_runtime::HealthFactsRuntime::open(
+            root.clone(),
+            &graph_path,
+            identity.repository_id,
+            Arc::clone(&engine),
+            Arc::clone(&index_work),
+            health_fact_snapshots.clone(),
+        )?;
+        health_refresh_handles.insert(root.clone(), handle);
         background_tasks.push(runtime.spawn());
     }
 
@@ -821,6 +839,7 @@ pub(crate) async fn build_workspace_runtime(
                 Arc::clone(&watcher_health),
                 Arc::clone(&index_health),
                 git_refresh_handles.get(&root).cloned(),
+                health_refresh_handles.get(&root).cloned(),
                 watcher_session_id.clone(),
             )
             .with_parsed_cache(parsed_cache_runtime.clone());
@@ -881,7 +900,8 @@ pub(crate) async fn build_workspace_runtime(
             index_health,
         )
         .with_checkout_storage(memory_identity.checkout_id.clone(), parsed_cache_runtime)
-        .with_git_intelligence_snapshot_handle(git_intelligence_snapshots),
+        .with_git_intelligence_snapshot_handle(git_intelligence_snapshots)
+        .with_health_facts_snapshot_handle(health_fact_snapshots),
     );
     let session_digest_consolidation = session_digest_consolidation_runtime::start(
         memory_identity.repository_id.clone(),

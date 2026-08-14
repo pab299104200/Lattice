@@ -17,6 +17,7 @@ use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
 use crate::adoption_metrics::AdoptionMetricsStore;
 use crate::git_intelligence_runtime::GitIntelligenceRefreshHandle;
+use crate::health_facts_runtime::HealthFactsRefreshHandle;
 use crate::index_health::IndexHealth;
 use crate::index_work::{IndexReadiness, IndexWorkCoordinator};
 use crate::repo_state::RepoStateTracker;
@@ -81,6 +82,7 @@ pub struct FileWatcher {
     index_health: Arc<IndexHealth>,
     parsed_cache: Option<ParsedCacheRuntime>,
     git_intelligence: Option<GitIntelligenceRefreshHandle>,
+    health_facts: Option<HealthFactsRefreshHandle>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
     session_id: String,
     /// This baseline is intentionally owned by the watcher rather than the
@@ -110,6 +112,7 @@ impl FileWatcher {
         watcher_health: Arc<WatcherHealth>,
         index_health: Arc<IndexHealth>,
         git_intelligence: Option<GitIntelligenceRefreshHandle>,
+        health_facts: Option<HealthFactsRefreshHandle>,
         session_id: String,
     ) -> Self {
         let adoption_metrics = Arc::new(AdoptionMetricsStore::new(&workspace_root));
@@ -130,6 +133,7 @@ impl FileWatcher {
             index_health,
             parsed_cache: None,
             git_intelligence,
+            health_facts,
             adoption_metrics,
             session_id,
             observed_head: Arc::new(Mutex::new(None)),
@@ -481,8 +485,13 @@ impl FileWatcher {
                         "Watcher could not parse changed file; retaining its last valid graph entry"
                     );
                 }
+                // Requested after publication, not before: the runtime reads
+                // the engine's published graph, so triggering earlier would
+                // produce facts for the graph this batch is replacing.
+                let health_changes = changed_graph_files.clone();
                 self.persist_publish_and_sync(new_graph, changed_graph_files, target_epoch)
                     .await;
+                self.request_health_facts_refresh(health_changes);
             }
             Ok(None) => {
                 if let Some(epoch) = target_epoch {
@@ -560,6 +569,24 @@ impl FileWatcher {
     #[cfg(test)]
     fn head_read_count_for_test(&self) -> u64 {
         self.head_read_count.load(Ordering::Acquire)
+    }
+
+    /// Reports changed files to the health-fact runtime.
+    ///
+    /// Best-effort and non-blocking, exactly like the Git-intelligence
+    /// trigger. The runtime coalesces a burst of saves into one pass, so
+    /// calling this per batch is what bounds whole-graph fact production to
+    /// the settling window rather than to the number of files saved
+    /// (`crate::health_facts_runtime`, module header).
+    fn request_health_facts_refresh<I, S>(&self, changed: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let Some(runtime) = self.health_facts.as_ref() else {
+            return;
+        };
+        runtime.request(changed);
     }
 
     fn request_git_intelligence_refresh(&self, head: &ObservedCheckoutHead) {
@@ -1636,6 +1663,7 @@ mod tests {
             readiness,
             Arc::clone(&health),
             Arc::new(IndexHealth::default()),
+            None,
             None,
             "test-session".to_string(),
         );
