@@ -235,6 +235,65 @@ intelligence does; no new MCP tool exists for it (design decision 5).
   silence rules as the existing git-intelligence warning (best-effort, exits
   `0` when the daemon is unavailable).
 
+## Fact production and the read path
+
+Facts are produced by a per-repository runtime and served to requests from an
+in-memory handoff. They are never produced by a request.
+
+`rpc::mcp` must not reopen `graph.db` mid-request, so a stored generation
+cannot reach a request by loading it. `HealthFactsRuntime` — the health
+counterpart of `GitIntelligenceRuntime`, sharing its latest-wins debounce and
+the process-wide `IndexWorkCoordinator` — produces facts on watcher change
+notifications, publishes them through the four generational stores, and fills
+`HealthFactsSnapshotHandle`. A request clones an `Arc` from that handle.
+
+The preference is **per family, never all-or-nothing**. A family with no active
+generation falls back to deriving itself from the live graph, exactly as every
+request did before the handoff existed. A cold start or a partial publication
+therefore loses speed and never loses availability, which keeps the "unknown is
+never zero" guarantee intact: a family that is genuinely absent still reports
+`Degraded`/`Unavailable` and is named in `inputs_missing`.
+
+Complexity facts are the one family with no fallback and never will have one,
+because producing them means re-parsing file contents. Before the handoff
+existed they were permanently unavailable at runtime; a published generation is
+the only way they become available.
+
+### Incrementality per family
+
+| Family | Refresh | Why |
+| --- | --- | --- |
+| Graph | Whole-graph, coalesced to the settling window | Cycle membership is an SCC property: one added edge can merge components sharing no file with the edited one, so no changed-file subset bounds the recomputation. |
+| Dead symbol | Whole-graph, coalesced | "Dead" asserts that nothing *anywhere* depends on a symbol; one new call edge in an unrelated file can revive a candidate. |
+| Test proximity | Whole-graph, coalesced | Test linkage is reachability; a new edge anywhere can link a previously untested file. |
+| Complexity | True per-file incremental | The unit of computation is one file, and `write_file_facts` refreshes exactly one file's rows inside the published generation. |
+
+The `file_delta` and `candidate_delta` methods on the three snapshot families
+are *comparison* helpers — each takes an already-produced snapshot and reports
+which paths moved — not incremental producers. Wiring them into the runtime
+would not have avoided a pass. Coalescing is therefore the honest bound: the
+whole-graph pass runs at most once per settling window however many files were
+saved, instead of once per request.
+
+Changed paths accumulate across a burst rather than being replaced. The
+sequence number is latest-wins so the worker collapses a burst into one pass,
+but the *set* of touched files must survive that collapse or an incremental
+complexity refresh would skip files saved while a pass was running.
+
+### Measured effect
+
+Publication cost is unchanged by this design; what moved is the read path
+(`daemon/crates/lattice-core/benches/incremental_graph_maintenance.rs`,
+`health_index_read_path`):
+
+| Corpus | Live recomputation | Published generation |
+| --- | --- | --- |
+| 609 files | 10.43 ms | 0.97 ms |
+| 5,000 files | 94.35 ms | 11.29 ms |
+
+The residual cost on the published path is the ranking join, which still walks
+every fact to compute populations; it is not a graph traversal.
+
 ## Out of scope
 
 - Cross-file duplication / clone detection (design decision 7): the
