@@ -40,11 +40,60 @@ pub enum MetricSignal {
     ContradictionMissedRate,
     TestsRecommendedVsNeeded,
     WorkflowSuccessAfterFirstPlan,
+    /// Pooled held-out PR-AUC of the `graph+git+complexity` family.
+    ///
+    /// Phase H5 of `docs/plans/2026-08-13-health-engine.md`. Sourced from a
+    /// rerun of the H1 backtest harness and compared against the figure in
+    /// `docs/reports/health-backtest/2026-08-14.md`
+    /// § "Pooled, derived weights, held out".
+    HealthDefectPrAuc,
+    /// Pooled held-out ROC-AUC of the `graph+git+complexity` family.
+    ///
+    /// Same source and section as [`MetricSignal::HealthDefectPrAuc`].
+    HealthDefectRocAuc,
+    /// Held-out ROC-AUC of `graph+git+complexity` minus that of `graph-only`.
+    ///
+    /// This is success criterion 1 of `docs/plans/2026-08-13-health-engine.md`
+    /// § "Success criteria" expressed as a tracked number: the extra fact
+    /// families must keep beating graph facts alone, or the engine's central
+    /// claim has silently stopped being true.
+    HealthDefectFamilyUplift,
+    /// Enrichment of the H1.2 label-quality audit.
+    ///
+    /// How much more often `looks_like_bug_fix` commits co-modify tests and
+    /// production than commits in general. See
+    /// `docs/reports/health-backtest/2026-08-14.md`
+    /// § "H1.2 label-quality audit" for why enrichment — and not raw agreement
+    /// or Cohen's kappa — is the figure that carries evidence here.
+    HealthLabelAuditEnrichment,
 }
 
 impl MetricSignal {
-    /// Every spec-required Phase 9 signal in canonical order.
-    pub const ALL: [MetricSignal; 9] = [
+    /// Every spec-required Phase 9 signal in canonical order, followed by the
+    /// Phase H5 health regression signals.
+    pub const ALL: [MetricSignal; 13] = [
+        MetricSignal::ToolCallsPerSuccessfulTask,
+        MetricSignal::IrrelevantFilesOpenedPerTask,
+        MetricSignal::RelevantAnchorRecall,
+        MetricSignal::MemoryInclusionPrecision,
+        MetricSignal::MemoryLaterUsedRate,
+        MetricSignal::StaleMemorySurfacedRate,
+        MetricSignal::ContradictionMissedRate,
+        MetricSignal::TestsRecommendedVsNeeded,
+        MetricSignal::WorkflowSuccessAfterFirstPlan,
+        MetricSignal::HealthDefectPrAuc,
+        MetricSignal::HealthDefectRocAuc,
+        MetricSignal::HealthDefectFamilyUplift,
+        MetricSignal::HealthLabelAuditEnrichment,
+    ];
+
+    /// The nine Phase 9 signals collected from live session evidence.
+    ///
+    /// These are the signals a session-scoped surface can actually compute.
+    /// The health signals are deliberately excluded: they are produced by
+    /// replaying repository history offline, so returning them from a session
+    /// tool would only ever yield permanently-null rows.
+    pub const PHASE_9: [MetricSignal; 9] = [
         MetricSignal::ToolCallsPerSuccessfulTask,
         MetricSignal::IrrelevantFilesOpenedPerTask,
         MetricSignal::RelevantAnchorRecall,
@@ -55,6 +104,28 @@ impl MetricSignal {
         MetricSignal::TestsRecommendedVsNeeded,
         MetricSignal::WorkflowSuccessAfterFirstPlan,
     ];
+
+    /// The Phase H5 health regression signals, in canonical order.
+    ///
+    /// These are the only signals sourced from the backtest harness rather
+    /// than from the event log, memory store, verifier, or workflow outcomes.
+    pub const HEALTH: [MetricSignal; 4] = [
+        MetricSignal::HealthDefectPrAuc,
+        MetricSignal::HealthDefectRocAuc,
+        MetricSignal::HealthDefectFamilyUplift,
+        MetricSignal::HealthLabelAuditEnrichment,
+    ];
+
+    /// Whether this signal comes from the health backtest harness.
+    pub fn is_health(self) -> bool {
+        matches!(
+            self,
+            Self::HealthDefectPrAuc
+                | Self::HealthDefectRocAuc
+                | Self::HealthDefectFamilyUplift
+                | Self::HealthLabelAuditEnrichment
+        )
+    }
 
     /// Return the canonical snake_case wire name.
     pub fn as_str(self) -> &'static str {
@@ -68,6 +139,10 @@ impl MetricSignal {
             Self::ContradictionMissedRate => "contradiction_missed_rate",
             Self::TestsRecommendedVsNeeded => "tests_recommended_vs_needed",
             Self::WorkflowSuccessAfterFirstPlan => "workflow_success_after_first_plan",
+            Self::HealthDefectPrAuc => "health_defect_pr_auc",
+            Self::HealthDefectRocAuc => "health_defect_roc_auc",
+            Self::HealthDefectFamilyUplift => "health_defect_family_uplift",
+            Self::HealthLabelAuditEnrichment => "health_label_audit_enrichment",
         }
     }
 }
@@ -81,6 +156,9 @@ pub enum MetricSource {
     WorkflowOutcome,
     Verifier,
     SessionMetrics,
+    /// A replay of repository history by the Phase H1 backtest harness
+    /// (`crate::health::backtest`).
+    HealthBacktest,
 }
 
 /// Optional UTC time-range filter for collection.
@@ -457,6 +535,17 @@ impl MetricsCollector {
                 MetricSignal::WorkflowSuccessAfterFirstPlan => {
                     self.collect_workflow_success_after_first_plan(scope)
                 }
+                // Health signals are produced by replaying git history, not by
+                // reading this session's evidence, so the collector reports
+                // them as absent-with-a-reason rather than inventing a value.
+                // `crate::metrics::health_backtest` is their only producer.
+                MetricSignal::HealthDefectPrAuc
+                | MetricSignal::HealthDefectRocAuc
+                | MetricSignal::HealthDefectFamilyUplift
+                | MetricSignal::HealthLabelAuditEnrichment => SignalMetric::null(
+                    "health signals come from the backtest harness, not the metrics collector",
+                    false,
+                ),
             };
             return finalize_metric(metric, signal, source, scope.label(), self.now());
         };
@@ -707,11 +796,20 @@ fn signal_source(signal: MetricSignal) -> MetricSource {
         MetricSignal::ContradictionMissedRate => MetricSource::Verifier,
         MetricSignal::TestsRecommendedVsNeeded => MetricSource::WorkflowOutcome,
         MetricSignal::WorkflowSuccessAfterFirstPlan => MetricSource::WorkflowOutcome,
+        MetricSignal::HealthDefectPrAuc
+        | MetricSignal::HealthDefectRocAuc
+        | MetricSignal::HealthDefectFamilyUplift
+        | MetricSignal::HealthLabelAuditEnrichment => MetricSource::HealthBacktest,
     }
 }
 
-fn scope_needs_dimensions(_signal: MetricSignal) -> bool {
-    true
+/// Whether a signal is meaningless without session/branch scope dimensions.
+///
+/// The health signals are properties of a repository's whole replayed history,
+/// so a missing session dimension does not make them unmeasurable the way it
+/// does for the event-log signals.
+fn scope_needs_dimensions(signal: MetricSignal) -> bool {
+    !signal.is_health()
 }
 
 fn bounded_events(

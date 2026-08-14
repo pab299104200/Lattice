@@ -34,6 +34,23 @@ pub struct SuccessCriteriaThresholds {
     pub contradiction_missed_rate: f64,
     pub stale_memory_unlabeled_rate: f64,
     pub tests_recommended_vs_needed: f64,
+    /// Minimum pooled held-out PR-AUC before the health engine is considered
+    /// regressed.
+    ///
+    /// This and the three fields below are Phase H5 of
+    /// `docs/plans/2026-08-13-health-engine.md`. Unlike the Phase 9 thresholds
+    /// above, which come from that plan's own success criteria, these are
+    /// derived from a measurement: the committed figures in
+    /// `docs/reports/health-backtest/2026-08-14.md` minus a documented
+    /// tolerance. `crate::metrics::health_backtest` holds the derivation and
+    /// the reasoning behind each tolerance.
+    pub health_defect_pr_auc: f64,
+    /// Minimum pooled held-out ROC-AUC.
+    pub health_defect_roc_auc: f64,
+    /// Minimum ROC-AUC advantage of `graph+git+complexity` over `graph-only`.
+    pub health_defect_family_uplift: f64,
+    /// Minimum label-audit enrichment.
+    pub health_label_audit_enrichment: f64,
 }
 
 impl SuccessCriteriaThresholds {
@@ -45,8 +62,25 @@ impl SuccessCriteriaThresholds {
             contradiction_missed_rate: 0.0,
             stale_memory_unlabeled_rate: 0.0,
             tests_recommended_vs_needed: 0.90,
+            health_defect_pr_auc: health_floor(MetricSignal::HealthDefectPrAuc),
+            health_defect_roc_auc: health_floor(MetricSignal::HealthDefectRocAuc),
+            health_defect_family_uplift: health_floor(MetricSignal::HealthDefectFamilyUplift),
+            health_label_audit_enrichment: health_floor(
+                MetricSignal::HealthLabelAuditEnrichment,
+            ),
         }
     }
+}
+
+/// The per-mille floor for a health signal, as a ratio.
+///
+/// Panics for a non-health signal, which is unreachable: every call site names
+/// a health variant literally.
+fn health_floor(signal: MetricSignal) -> f64 {
+    super::health_backtest::per_mille_to_ratio(
+        super::health_backtest::floor_per_mille(signal)
+            .expect("every health signal declares a floor"),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +388,29 @@ fn evaluate_signal(
             thresholds.tests_recommended_vs_needed,
             ">=0.90 test recommendation recall",
         ),
+        // Phase H5 of `docs/plans/2026-08-13-health-engine.md`. Each is a
+        // floor rather than a reduction target: prediction quality must not
+        // fall, and there is no baseline-relative improvement being claimed.
+        MetricSignal::HealthDefectPrAuc => evaluate_minimum(
+            current,
+            thresholds.health_defect_pr_auc,
+            ">= committed held-out PR-AUC less tolerance",
+        ),
+        MetricSignal::HealthDefectRocAuc => evaluate_minimum(
+            current,
+            thresholds.health_defect_roc_auc,
+            ">= committed held-out ROC-AUC less tolerance",
+        ),
+        MetricSignal::HealthDefectFamilyUplift => evaluate_minimum(
+            current,
+            thresholds.health_defect_family_uplift,
+            ">= committed graph+git+complexity uplift over graph-only less tolerance",
+        ),
+        MetricSignal::HealthLabelAuditEnrichment => evaluate_minimum(
+            current,
+            thresholds.health_label_audit_enrichment,
+            ">1.00x enrichment, i.e. the fix classifier stays corroborated",
+        ),
         MetricSignal::RelevantAnchorRecall
         | MetricSignal::MemoryLaterUsedRate
         | MetricSignal::WorkflowSuccessAfterFirstPlan => (
@@ -649,6 +706,10 @@ pub(crate) fn benchmark_source(signal: MetricSignal) -> MetricSource {
         MetricSignal::TestsRecommendedVsNeeded | MetricSignal::WorkflowSuccessAfterFirstPlan => {
             MetricSource::WorkflowOutcome
         }
+        MetricSignal::HealthDefectPrAuc
+        | MetricSignal::HealthDefectRocAuc
+        | MetricSignal::HealthDefectFamilyUplift
+        | MetricSignal::HealthLabelAuditEnrichment => MetricSource::HealthBacktest,
     }
 }
 

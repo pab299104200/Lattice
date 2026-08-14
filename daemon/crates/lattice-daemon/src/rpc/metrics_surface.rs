@@ -569,6 +569,7 @@ fn metric_source_label(source: MetricSource) -> &'static str {
         MetricSource::WorkflowOutcome => "workflow_outcome",
         MetricSource::Verifier => "verifier",
         MetricSource::SessionMetrics => "session_metrics",
+        MetricSource::HealthBacktest => "health_backtest",
     }
 }
 

@@ -7,10 +7,13 @@
 //! `## Memory Graph`, and
 //! `## Verification Engine`.
 
+pub mod health_backtest;
 pub mod report;
 mod report_benchmark;
 pub mod signals;
 
+#[cfg(test)]
+mod health_backtest_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]

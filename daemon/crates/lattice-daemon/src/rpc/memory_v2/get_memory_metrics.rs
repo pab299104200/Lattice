@@ -104,7 +104,11 @@ pub fn parse_args(args: &Value) -> Result<GetMemoryMetricsArgs, String> {
 
 pub fn requested_signals(args: &GetMemoryMetricsArgs) -> Vec<MetricSignal> {
     if args.signals.is_empty() {
-        return MetricSignal::ALL.to_vec();
+        // Session-scoped surface: only the signals the collector can actually
+        // measure from this session's evidence. The Phase H5 health signals
+        // come from an offline history replay, so they are never defaulted in
+        // here — see `lattice_core::metrics::health_backtest`.
+        return MetricSignal::PHASE_9.to_vec();
     }
     args.signals.clone()
 }

@@ -20,6 +20,10 @@ use lattice_core::health::backtest::replay::{
     repository_name, replay_repository_streaming, ReplayLimits,
 };
 use lattice_core::health::backtest::report::ReportBuilder;
+use lattice_core::metrics::health_backtest;
+use lattice_core::metrics::{
+    report_exit_code, MetricScope, RegressionReport, ReportInput, SuccessCriteriaThresholds,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,7 +101,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--regression] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -1121,6 +1125,9 @@ struct HealthBacktestArgs {
     output: Option<PathBuf>,
     /// Bounds passed through to the replay engine.
     limits: ReplayLimits,
+    /// Emit the Phase H5 regression report instead of the backtest document,
+    /// and exit non-zero when a health signal has regressed.
+    regression: bool,
 }
 
 /// `lattice health-backtest` — Phase H1 of the health engine plan.
@@ -1130,11 +1137,11 @@ struct HealthBacktestArgs {
 /// eight-verb retrieval surface (spec design decision 5).
 fn run_health_backtest_command(args: Vec<String>) -> i32 {
     match parse_health_backtest_args(args).and_then(run_health_backtest) {
-        Ok(output) => {
-            if let Some(output) = output {
+        Ok(outcome) => {
+            if let Some(output) = outcome.rendered {
                 println!("{}", output.trim_end());
             }
-            0
+            outcome.exit_code
         }
         Err(error) => {
             eprintln!("lattice: {error:#}");
@@ -1143,8 +1150,25 @@ fn run_health_backtest_command(args: Vec<String>) -> i32 {
     }
 }
 
+/// What a `health-backtest` run produced and what it should exit with.
+struct HealthBacktestOutcome {
+    /// Rendered document, absent when it was written to a file instead.
+    rendered: Option<String>,
+    /// Non-zero only when `--regression` found a regressed health signal.
+    exit_code: i32,
+}
+
+impl HealthBacktestOutcome {
+    fn document(rendered: Option<String>) -> Self {
+        Self {
+            rendered,
+            exit_code: 0,
+        }
+    }
+}
+
 /// Replay every requested repository and render the report.
-fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
+fn run_health_backtest(args: HealthBacktestArgs) -> Result<HealthBacktestOutcome> {
     let mut builder = ReportBuilder::new();
     for repository in &args.repositories {
         // A repository that cannot be replayed fails the run rather than being
@@ -1169,6 +1193,9 @@ fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
     }
 
     let report = builder.finish();
+    if args.regression {
+        return health_regression_outcome(&report, args.json, args.output);
+    }
     let rendered = if args.json {
         report
             .render_json()
@@ -1189,9 +1216,68 @@ fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
             std::fs::write(&path, &rendered)
                 .with_context(|| format!("could not write `{}`", path.display()))?;
             eprintln!("lattice: wrote {}", path.display());
-            Ok(None)
+            Ok(HealthBacktestOutcome::document(None))
         }
-        None => Ok(Some(rendered)),
+        None => Ok(HealthBacktestOutcome::document(Some(rendered))),
+    }
+}
+
+/// Turn a fresh backtest into the Phase H5 regression report.
+///
+/// This is the CI-facing surface of `docs/plans/2026-08-13-health-engine.md`
+/// § "Phase H5 — Prove it stays honest": the run exits non-zero when a health
+/// signal has fallen below the floor derived from
+/// `docs/reports/health-backtest/2026-08-14.md`. A run whose corpus does not
+/// match that report's exits zero with missing rows rather than pretending to a
+/// comparison it cannot make — see `lattice_core::metrics::health_backtest`.
+fn health_regression_outcome(
+    report: &lattice_core::health::backtest::report::BacktestReport,
+    json: bool,
+    output: Option<PathBuf>,
+) -> Result<HealthBacktestOutcome> {
+    let now = lattice_core::Utc::now();
+    let regression = RegressionReport::build(ReportInput {
+        current: health_backtest::signals_from_report(report, now),
+        baseline: Some(health_backtest::committed_baseline(now)),
+        // The health signals carry their own evidence; no Phase 9 benchmark
+        // document contributes to them.
+        benchmark_report_path: PathBuf::new(),
+        scope: MetricScope::repo("health-backtest"),
+        success_criteria: SuccessCriteriaThresholds::initial(),
+    })
+    .context("could not build the health regression report")?;
+
+    let rendered = if json {
+        regression
+            .render_json()
+            .context("could not render the health regression report as JSON")?
+    } else {
+        regression.render_text()
+    };
+    let exit_code = report_exit_code(&regression, true);
+    eprintln!("lattice: {}", regression.render_ci_summary());
+
+    match output {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("could not create directory `{}`", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(&path, &rendered)
+                .with_context(|| format!("could not write `{}`", path.display()))?;
+            eprintln!("lattice: wrote {}", path.display());
+            Ok(HealthBacktestOutcome {
+                rendered: None,
+                exit_code,
+            })
+        }
+        None => Ok(HealthBacktestOutcome {
+            rendered: Some(rendered),
+            exit_code,
+        }),
     }
 }
 
@@ -1200,10 +1286,12 @@ fn parse_health_backtest_args(args: Vec<String>) -> Result<HealthBacktestArgs> {
     let mut json = false;
     let mut output = None;
     let mut limits = ReplayLimits::default();
+    let mut regression = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json = true,
+            "--regression" => regression = true,
             "--repo" | "-r" => {
                 let value = args
                     .get(i + 1)
@@ -1246,6 +1334,7 @@ fn parse_health_backtest_args(args: Vec<String>) -> Result<HealthBacktestArgs> {
         json,
         output,
         limits,
+        regression,
     })
 }
 
@@ -2101,6 +2190,22 @@ mod tests {
         assert!(!parsed.json);
         assert!(parsed.output.is_none());
         assert_eq!(parsed.limits.cut_points, ReplayLimits::default().cut_points);
+        // The default run produces the backtest document, not the CI gate.
+        assert!(!parsed.regression);
+    }
+
+    /// Phase H5: the regression gate is opt-in and composes with `--json`.
+    #[test]
+    fn health_backtest_regression_mode_is_requested_explicitly() {
+        let parsed = parse_health_backtest_args(vec![
+            "lattice".into(),
+            "health-backtest".into(),
+            "--regression".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert!(parsed.regression);
+        assert!(parsed.json);
     }
 
     #[test]
