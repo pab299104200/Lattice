@@ -20,6 +20,7 @@ use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelIns
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_MCP_TOOL_COUNT: usize = 8;
+const SESSION_START_RECOVERY_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
 
 const INSTALLED_HOOKS: [(&str, &str); 4] = [
     ("SessionStart", "session-start.sh"),
@@ -848,13 +849,46 @@ fn hook_fixture_payload(event: &str) -> &'static str {
     }
 }
 
-fn verify_hook_stdout(_client: HookClient, event: &str, output: &str) -> Result<()> {
-    if !output.trim().is_empty() {
+/// Hook verification is silent except for the bounded SessionStart recovery
+/// notice emitted when the deliberately unreachable fixture daemon is used.
+/// Keep this allowlist exact: accepting arbitrary hook output would conceal a
+/// host-envelope or transcript leak during installation verification.
+fn verify_hook_stdout(client: HookClient, event: &str, output: &str) -> Result<()> {
+    if !output.is_empty()
+        && !(event == "SessionStart"
+            && output_matches_line_terminated(
+                output,
+                &expected_session_start_recovery_notice(client),
+            ))
+    {
         return Err(anyhow!(
             "verification failed: {event} capture hook must not write stdout"
         ));
     }
     Ok(())
+}
+
+fn expected_session_start_recovery_notice(client: HookClient) -> String {
+    match client {
+        HookClient::Codex => SESSION_START_RECOVERY_NOTICE.to_string(),
+        HookClient::ClaudeCode => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SESSION_START_RECOVERY_NOTICE,
+            }
+        })
+        .to_string(),
+    }
+}
+
+/// Hook adapters write one rendered presentation with `println!`; accept that
+/// one platform-neutral line terminator, but no other surrounding bytes.
+fn output_matches_line_terminated(output: &str, expected: &str) -> bool {
+    output == expected
+        || output
+            .strip_suffix('\n')
+            .and_then(|output| output.strip_suffix('\r').or(Some(output)))
+            == Some(expected)
 }
 
 struct HookProcessContext<'a> {
@@ -1976,6 +2010,75 @@ mod tests {
                 .to_string()
         ));
         assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_allows_only_the_exact_session_start_recovery_notice() {
+        let codex_notice = expected_session_start_recovery_notice(HookClient::Codex);
+        assert_eq!(
+            codex_notice,
+            "lattice: daemon unreachable — run 'lattice doctor'"
+        );
+        assert!(verify_hook_stdout(HookClient::Codex, "SessionStart", &codex_notice).is_ok());
+        assert!(verify_hook_stdout(
+            HookClient::Codex,
+            "SessionStart",
+            &(codex_notice.clone() + "\r\n"),
+        )
+        .is_ok());
+
+        let claude_notice = expected_session_start_recovery_notice(HookClient::ClaudeCode);
+        let claude: Value = serde_json::from_str(&claude_notice).unwrap();
+        assert_eq!(
+            claude["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        assert_eq!(
+            claude["hookSpecificOutput"]["additionalContext"],
+            "lattice: daemon unreachable — run 'lattice doctor'"
+        );
+        assert!(verify_hook_stdout(HookClient::ClaudeCode, "SessionStart", &claude_notice).is_ok());
+
+        for (client, event, output) in [
+            (HookClient::Codex, "UserPromptSubmit", codex_notice.as_str()),
+            (HookClient::Codex, "SessionStart", "unexpected hook output"),
+            (
+                HookClient::Codex,
+                "SessionStart",
+                "lattice: daemon unreachable — run 'lattice doctor'\nextra",
+            ),
+            (HookClient::Codex, "SessionStart", claude_notice.as_str()),
+            (
+                HookClient::ClaudeCode,
+                "SessionStart",
+                codex_notice.as_str(),
+            ),
+        ] {
+            let error = verify_hook_stdout(client, event, output)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must not write stdout"), "{error}");
+        }
+    }
+
+    #[test]
+    fn install_verify_rejects_persisted_raw_fixture_and_transcript_data() {
+        let root = install_verify_state_root().unwrap();
+        fs::write(
+            root.join("hostile-capture"),
+            "lattice-install-verification-prompt /tmp/lattice-install-verification-transcript",
+        )
+        .unwrap();
+
+        let error = verify_hook_state_contains_no_fixture_data(&root)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("retained raw fixture or transcript data"),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
