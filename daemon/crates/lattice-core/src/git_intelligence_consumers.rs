@@ -159,41 +159,6 @@ pub fn secondary_ranking_evidence(
     })
 }
 
-/// A graph-dependent impact candidate plus the stable keys required to order it.
-///
-/// Call this only within one caller-defined graph-distance and severity tier.
-/// `stable_key` is the caller's existing deterministic final tie-break.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImpactCandidate<T> {
-    pub candidate: T,
-    pub stable_key: String,
-    pub file_path: Option<String>,
-    pub stable_symbol: Option<String>,
-}
-
-/// Orders candidates only within the supplied caller-defined impact tier.
-///
-/// Exact symbol hotspot descends first, then file hotspot, then `stable_key`.
-/// When history is unavailable every history score is zero, so this reduces to
-/// the caller's deterministic tie-break without inventing an impact edge.
-pub fn order_impact_within_tier<T>(
-    view: GitIntelligenceView<'_>,
-    candidates: &mut [ImpactCandidate<T>],
-) {
-    let snapshot = view.usable_snapshot();
-    let window = snapshot.and_then(window_commits);
-    candidates.sort_by(|left, right| {
-        let left_symbol = impact_symbol_hotspot(snapshot, window, left.stable_symbol.as_deref());
-        let right_symbol = impact_symbol_hotspot(snapshot, window, right.stable_symbol.as_deref());
-        let left_file = impact_file_hotspot(snapshot, window, left.file_path.as_deref());
-        let right_file = impact_file_hotspot(snapshot, window, right.file_path.as_deref());
-        right_symbol
-            .cmp(&left_symbol)
-            .then_with(|| right_file.cmp(&left_file))
-            .then_with(|| left.stable_key.cmp(&right.stable_key))
-    });
-}
-
 /// The separately surfaced co-change advisory for an impact response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactHistoryAdvisory {
@@ -282,34 +247,6 @@ fn normalize_count(observed_commits: u32, window_commits: u32) -> Option<Normali
 fn valid_bug_fix_density(signal: &FileHistorySignal) -> Option<u16> {
     (signal.bug_fix_density_per_mille <= PER_MILLE_SCALE as u16)
         .then_some(signal.bug_fix_density_per_mille)
-}
-
-fn impact_symbol_hotspot(
-    snapshot: Option<&GitIntelligenceSnapshot>,
-    window: Option<u32>,
-    symbol: Option<&str>,
-) -> u32 {
-    match (snapshot, window, symbol) {
-        (Some(snapshot), Some(window), Some(symbol)) => snapshot
-            .symbol(symbol)
-            .filter(|signal| signal.hotspot_score <= window)
-            .map_or(0, |signal| signal.hotspot_score),
-        _ => 0,
-    }
-}
-
-fn impact_file_hotspot(
-    snapshot: Option<&GitIntelligenceSnapshot>,
-    window: Option<u32>,
-    path: Option<&str>,
-) -> u32 {
-    match (snapshot, window, path) {
-        (Some(snapshot), Some(window), Some(path)) => snapshot
-            .file(path)
-            .filter(|signal| signal.hotspot_score <= window)
-            .map_or(0, |signal| signal.hotspot_score),
-        _ => 0,
-    }
 }
 
 fn advisory_partner(
@@ -442,68 +379,6 @@ mod tests {
             Some("a::high"),
         )
         .is_none());
-    }
-
-    #[test]
-    fn impact_ordering_only_breaks_ties_inside_its_supplied_tier() {
-        let history = snapshot();
-        let mut candidates = vec![
-            ImpactCandidate {
-                candidate: 1,
-                stable_key: "z".into(),
-                file_path: Some("src/b.rs".into()),
-                stable_symbol: None,
-            },
-            ImpactCandidate {
-                candidate: 2,
-                stable_key: "a".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: Some("a::high".into()),
-            },
-            ImpactCandidate {
-                candidate: 3,
-                stable_key: "b".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: None,
-            },
-        ];
-        order_impact_within_tier(
-            GitIntelligenceView::from_snapshot(&history, true),
-            &mut candidates,
-        );
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<Vec<_>>(),
-            vec![2, 3, 1]
-        );
-
-        let mut degraded_candidates = vec![
-            ImpactCandidate {
-                candidate: 1,
-                stable_key: "z".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: Some("a::high".into()),
-            },
-            ImpactCandidate {
-                candidate: 2,
-                stable_key: "a".into(),
-                file_path: None,
-                stable_symbol: None,
-            },
-        ];
-        order_impact_within_tier(
-            GitIntelligenceView::from_snapshot(&history, false),
-            &mut degraded_candidates,
-        );
-        assert_eq!(
-            degraded_candidates
-                .into_iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<Vec<_>>(),
-            vec![2, 1]
-        );
     }
 
     #[test]
