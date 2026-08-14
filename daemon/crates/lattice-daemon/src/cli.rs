@@ -17,7 +17,7 @@ use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
 use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelInstallStatus};
 use lattice_core::health::backtest::replay::{replay_repository, ReplayLimits};
-use lattice_core::health::backtest::report::build_report;
+use lattice_core::health::backtest::report::ReportBuilder;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1143,7 +1143,7 @@ fn run_health_backtest_command(args: Vec<String>) -> i32 {
 
 /// Replay every requested repository and render the report.
 fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
-    let mut replays = Vec::with_capacity(args.repositories.len());
+    let mut builder = ReportBuilder::new();
     for repository in &args.repositories {
         // A repository that cannot be replayed fails the run rather than being
         // quietly dropped: a pooled report that silently lost a repository
@@ -1157,10 +1157,14 @@ fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
             replay.cut_points.len(),
             replay.report.spine_length
         );
-        replays.push(replay);
+        builder.push(&replay);
+        // Each replay holds every cut point's full fact snapshots. Dropping it
+        // as soon as its normalized frames are folded in keeps peak memory at
+        // one repository instead of the whole corpus.
+        drop(replay);
     }
 
-    let report = build_report(&replays);
+    let report = builder.finish();
     let rendered = if args.json {
         report
             .render_json()

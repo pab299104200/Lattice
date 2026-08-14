@@ -221,13 +221,64 @@ fn per_mille(numerator: u64, denominator: u64) -> u32 {
     round_div(u128::from(numerator) * 1000, u128::from(denominator)) as u32
 }
 
-/// Build the report from one or more replayed repositories.
-pub fn build_report(replays: &[RepositoryReplay]) -> BacktestReport {
-    let mut frames: Vec<CutPointFrame> = Vec::new();
-    let mut audit_inputs: Vec<AuditInput> = Vec::new();
-    let mut repositories = Vec::new();
+/// Accumulates repositories one at a time into a report.
+///
+/// Pooling needs every repository's *normalized* observations, but not their
+/// replays: a `RepositoryReplay` carries the full fact snapshots for every cut
+/// point, which for a large repository is hundreds of megabytes. Feeding
+/// replays in one at a time and dropping each once its frames are extracted
+/// caps peak memory at a single repository rather than the whole corpus, which
+/// is what makes pooling across many repositories practical.
+#[derive(Default)]
+pub struct ReportBuilder {
+    frames: Vec<CutPointFrame>,
+    audit_inputs: Vec<AuditInput>,
+    repositories: Vec<RepositoryReport>,
+}
 
+impl ReportBuilder {
+    /// A builder with no repositories yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one replayed repository in. The replay may be dropped afterwards.
+    pub fn push(&mut self, replay: &RepositoryReplay) {
+        push_replay(
+            &mut self.frames,
+            &mut self.audit_inputs,
+            &mut self.repositories,
+            replay,
+        );
+    }
+
+    /// Finish the report.
+    pub fn finish(self) -> BacktestReport {
+        finish_report(self.frames, self.audit_inputs, self.repositories)
+    }
+}
+
+/// Build the report from one or more replayed repositories.
+///
+/// Convenience over [`ReportBuilder`] for callers that already hold every
+/// replay; a caller replaying many large repositories should use the builder
+/// so it can drop each replay as it goes.
+pub fn build_report(replays: &[RepositoryReplay]) -> BacktestReport {
+    let mut builder = ReportBuilder::new();
     for replay in replays {
+        builder.push(replay);
+    }
+    builder.finish()
+}
+
+/// Extract one repository's frames, audit inputs, and summary.
+fn push_replay(
+    frames: &mut Vec<CutPointFrame>,
+    audit_inputs: &mut Vec<AuditInput>,
+    repositories: &mut Vec<RepositoryReport>,
+    replay: &RepositoryReplay,
+) {
+    {
         let first_frame = frames.len();
         let mut cut_points = Vec::new();
 
@@ -317,7 +368,14 @@ pub fn build_report(replays: &[RepositoryReplay]) -> BacktestReport {
             families,
         });
     }
+}
 
+/// Turn accumulated frames into the finished report.
+fn finish_report(
+    frames: Vec<CutPointFrame>,
+    audit_inputs: Vec<AuditInput>,
+    repositories: Vec<RepositoryReport>,
+) -> BacktestReport {
     let uniform = FeatureWeights::uniform();
     let pooled_families = ALL_FAMILY_SETS
         .iter()

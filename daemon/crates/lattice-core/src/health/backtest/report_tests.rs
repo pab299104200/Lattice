@@ -362,6 +362,29 @@ fn pooling_across_repositories_sums_their_observations() {
 }
 
 #[test]
+fn streaming_repositories_in_one_at_a_time_matches_building_them_together() {
+    let first = tempfile::tempdir().expect("temp directory");
+    build_fixture(first.path());
+    let second = tempfile::tempdir().expect("temp directory");
+    build_fixture(second.path());
+
+    let replays = vec![
+        replay_repository(first.path(), fixture_limits()).expect("first replay"),
+        replay_repository(second.path(), fixture_limits()).expect("second replay"),
+    ];
+    let batched = build_report(&replays);
+
+    // The streaming path exists so a caller can drop each replay as it goes;
+    // it must not thereby produce a different report.
+    let mut builder = ReportBuilder::new();
+    for replay in replays {
+        builder.push(&replay);
+        drop(replay);
+    }
+    assert_eq!(builder.finish(), batched);
+}
+
+#[test]
 fn per_mille_values_render_without_floating_point_drift() {
     assert_eq!(decimal(0), "0.000");
     assert_eq!(decimal(1), "0.001");
