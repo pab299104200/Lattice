@@ -409,7 +409,6 @@ pub struct FactSourceRange {
 impl FactSourceRange {
     /// A range over one file.
     pub fn new(path: impl Into<String>, start_line: u32, end_line: u32) -> Self {
-        let start_line = start_line;
         Self {
             path: path.into(),
             start_line,

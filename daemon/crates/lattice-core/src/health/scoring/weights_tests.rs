@@ -54,6 +54,39 @@ fn the_shipped_defect_risk_weights_are_the_reports_derived_weights() {
 }
 
 #[test]
+fn the_harness_derives_the_same_weights_the_engine_ships() {
+    // The calibration loop, closed in code: the shipped table is compared
+    // against the harness's own derivation function
+    // (`health::backtest::features::FeatureWeights::from_univariate_roc`) run
+    // over the report's published ROC-AUC values. If either side's arithmetic
+    // changes, the two stop agreeing here rather than silently in production.
+    use crate::health::backtest::features::{FeatureWeights, ALL_FEATURES, FEATURE_COUNT};
+
+    let mut roc: [Option<u32>; FEATURE_COUNT] = [None; FEATURE_COUNT];
+    for (kind, value) in BACKTEST_ROC_AUC_PER_MILLE {
+        let feature = ALL_FEATURES
+            .iter()
+            .find(|feature| feature.as_str() == kind.as_str())
+            .unwrap_or_else(|| panic!("{} has no harness feature", kind.as_str()));
+        roc[feature.index()] = Some(value);
+    }
+    let harness = FeatureWeights::from_univariate_roc(&roc);
+
+    for (kind, _) in BACKTEST_ROC_AUC_PER_MILLE {
+        let feature = ALL_FEATURES
+            .iter()
+            .find(|feature| feature.as_str() == kind.as_str())
+            .expect("feature exists");
+        assert_eq!(
+            WEIGHTS_V1.weight(Axis::DefectRisk, kind),
+            harness.get(*feature),
+            "{} disagrees with the harness's own derivation",
+            kind.as_str()
+        );
+    }
+}
+
+#[test]
 fn every_backtested_fact_appears_in_the_cited_roc_table() {
     let cited: Vec<FactKind> = BACKTEST_ROC_AUC_PER_MILLE
         .iter()
