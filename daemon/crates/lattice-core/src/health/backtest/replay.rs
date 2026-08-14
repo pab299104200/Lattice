@@ -566,10 +566,16 @@ fn replay_cut_point(
     // Repository content is read from the tree object at the cut point. A later
     // commit's blobs are not reachable from it.
     let (parsed, complexity, tree) = read_tree(repository, path_label, cut_point.oid, limits)?;
-    let graph_snapshot = GraphFactProducer::default().produce(
-        &GraphBuilder::build_from_files(parsed.iter()),
-        tree.is_complete(),
-    );
+    let graph_snapshot = {
+        // The graph owns its own copy of every symbol body, so the parsed files
+        // are dead weight the moment it is built. Dropping them before
+        // producing facts keeps one copy of a historical codebase in memory
+        // rather than two — worth several gigabytes on the larger Cadres
+        // repositories.
+        let graph = GraphBuilder::build_from_files(parsed.iter());
+        drop(parsed);
+        GraphFactProducer::default().produce(&graph, tree.is_complete())
+    };
 
     // --- Everything above the cut point -------------------------------------
     // Ordered by increasing distance from the cut point: spine[index - 1] is
@@ -714,15 +720,19 @@ fn read_tree(
 
     let mut parsed = Vec::with_capacity(sources.len());
     let mut complexity = BTreeMap::new();
-    for (path, source) in &sources {
-        match parse_file(path, source) {
+    // Consume the source map so each file's text is freed as soon as it has
+    // been parsed and measured, instead of holding the whole historical
+    // codebase alongside the parses of it.
+    for (path, source) in std::mem::take(&mut sources) {
+        match parse_file(&path, &source) {
             Ok(file) => {
                 report.files_parsed += 1;
                 parsed.push(file);
             }
             Err(_) => report.parse_failures += 1,
         }
-        complexity.insert(path.clone(), compute_file_complexity_facts(path, source));
+        complexity.insert(path.clone(), compute_file_complexity_facts(&path, &source));
+        drop(source);
     }
 
     Ok((parsed, complexity, report))
