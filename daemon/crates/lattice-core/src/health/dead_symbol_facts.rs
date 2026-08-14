@@ -423,6 +423,69 @@ impl DeadSymbolFactsSnapshot {
     pub fn flagged(&self) -> impl Iterator<Item = &DeadSymbolCandidate> {
         self.candidates.iter().filter(|candidate| candidate.is_flagged())
     }
+
+    /// Which candidate keys moved between `previous` and this snapshot.
+    ///
+    /// Both vectors are ordered by key, so this is a single linear merge, the
+    /// same incremental-refresh shape as
+    /// [`crate::health::graph_facts::GraphFactsSnapshot::file_delta`].
+    pub fn candidate_delta(&self, previous: &DeadSymbolFactsSnapshot) -> CandidateFactDelta {
+        let mut delta = CandidateFactDelta::default();
+        let mut current = self.candidates.iter().peekable();
+        let mut earlier = previous.candidates.iter().peekable();
+        loop {
+            match (current.peek(), earlier.peek()) {
+                (Some(new), Some(old)) => match new.key.cmp(&old.key) {
+                    std::cmp::Ordering::Less => {
+                        delta.added.push(new.key.clone());
+                        current.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        delta.removed.push(old.key.clone());
+                        earlier.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if new != old {
+                            delta.updated.push(new.key.clone());
+                        }
+                        current.next();
+                        earlier.next();
+                    }
+                },
+                (Some(new), None) => {
+                    delta.added.push(new.key.clone());
+                    current.next();
+                }
+                (None, Some(old)) => {
+                    delta.removed.push(old.key.clone());
+                    earlier.next();
+                }
+                (None, None) => break,
+            }
+        }
+        delta
+    }
+}
+
+/// The per-candidate difference between two fact generations.
+///
+/// Facts are republished wholesale, but a consumer that refreshed one file
+/// needs to know which candidate keys actually moved so it can invalidate
+/// only those, without rescanning the whole graph.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateFactDelta {
+    /// Keys present now and absent before, ordered.
+    pub added: Vec<String>,
+    /// Keys present in both whose facts differ, ordered.
+    pub updated: Vec<String>,
+    /// Keys absent now and present before, ordered.
+    pub removed: Vec<String>,
+}
+
+impl CandidateFactDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// Caller-supplied exclusion evidence the graph does not yet carry directly.
@@ -1059,5 +1122,49 @@ mod tests {
         let candidate = snapshot.candidate("src/lib.rs::overloaded").unwrap();
         assert_eq!(candidate.definition_count, 2);
         assert_eq!(candidate.source_line, 3);
+    }
+
+    #[test]
+    fn candidate_delta_reports_added_updated_and_removed_keys() {
+        let mut before = CodeGraph::new();
+        let stable = symbol("src/a.rs", "stable_fn");
+        let removed = symbol("src/gone.rs", "removed_fn");
+        add_symbol(&mut before, &stable, true, 1);
+        add_symbol(&mut before, &removed, true, 1);
+        let producer = DeadSymbolFactProducer::default();
+        let exclusions = DeadSymbolExclusionInputs::default();
+        let earlier = producer.produce(&before, &exclusions, true);
+
+        let mut after = CodeGraph::new();
+        let added = symbol("src/new.rs", "added_fn");
+        add_symbol(&mut after, &stable, true, 1);
+        add_symbol(&mut after, &added, true, 1);
+        // `stable_fn` gains a caller between generations: same key, different
+        // facts (it is no longer a candidate at all), so it must not appear
+        // as "updated" once it drops out of the candidate list entirely —
+        // that is a removal, not an update.
+        let caller = symbol("src/caller.rs", "caller_fn");
+        add_symbol(&mut after, &caller, true, 1);
+        after.add_edge(&caller, &stable, EdgeKind::Calls);
+        let later = producer.produce(&after, &exclusions, true);
+
+        let delta = later.candidate_delta(&earlier);
+        assert_eq!(delta.added, vec!["src/caller.rs::caller_fn", "src/new.rs::added_fn"]);
+        assert_eq!(delta.removed, vec!["src/a.rs::stable_fn", "src/gone.rs::removed_fn"]);
+        assert!(delta.updated.is_empty());
+        assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn identical_generations_yield_an_empty_delta() {
+        let mut graph = CodeGraph::new();
+        let dead = symbol("src/lib.rs", "unused_fn");
+        add_symbol(&mut graph, &dead, true, 1);
+        let producer = DeadSymbolFactProducer::default();
+        let exclusions = DeadSymbolExclusionInputs::default();
+        let first = producer.produce(&graph, &exclusions, true);
+        let second = producer.produce(&graph, &exclusions, true);
+
+        assert!(first.candidate_delta(&second).is_empty());
     }
 }
