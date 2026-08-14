@@ -38,6 +38,17 @@ pub const MAX_FILE_FACTS: usize = 200_000;
 /// Upper bound on persisted per-symbol fact rows.
 pub const MAX_SYMBOL_FACTS: usize = 1_000_000;
 
+/// Upper bound on persisted unstable-dependency rows.
+pub const MAX_UNSTABLE_DEPENDENCIES: usize = 50_000;
+
+/// Default minimum instability gap, in per mille, before a dependency from a
+/// more stable file to a less stable one is flagged.
+///
+/// A small gap is normal churn in any real codebase; the flag is meant for the
+/// clear direction violations that make a stable module hostage to a volatile
+/// one, so the default deliberately sits well above noise.
+pub const DEFAULT_UNSTABLE_DEPENDENCY_THRESHOLD_PER_MILLE: u16 = 250;
+
 /// Separator between the file part and the name part of a symbol fact key.
 const SYMBOL_KEY_SEPARATOR: &str = "::";
 
@@ -62,6 +73,7 @@ fn is_dependency_edge(kind: EdgeKind) -> bool {
 pub struct GraphFactLimits {
     pub max_files: usize,
     pub max_symbols: usize,
+    pub max_unstable_dependencies: usize,
 }
 
 impl Default for GraphFactLimits {
@@ -69,6 +81,7 @@ impl Default for GraphFactLimits {
         Self {
             max_files: MAX_FILE_FACTS,
             max_symbols: MAX_SYMBOL_FACTS,
+            max_unstable_dependencies: MAX_UNSTABLE_DEPENDENCIES,
         }
     }
 }
@@ -78,6 +91,9 @@ impl GraphFactLimits {
         Self {
             max_files: self.max_files.min(MAX_FILE_FACTS),
             max_symbols: self.max_symbols.min(MAX_SYMBOL_FACTS),
+            max_unstable_dependencies: self
+                .max_unstable_dependencies
+                .min(MAX_UNSTABLE_DEPENDENCIES),
         }
     }
 }
@@ -99,6 +115,8 @@ pub enum FactAvailability {
 pub struct GraphFactsReport {
     pub facts_version: u32,
     pub limits: GraphFactLimits,
+    /// Instability gap, in per mille, above which a dependency is flagged.
+    pub unstable_dependency_threshold_per_mille: u16,
     /// Graph nodes examined, including nodes rejected for a non-canonical path.
     pub nodes_seen: u64,
     /// Graph edges examined, including non-dependency and rejected edges.
@@ -115,6 +133,8 @@ pub struct GraphFactsReport {
     pub file_overflow: bool,
     /// True when symbol rows were truncated by `limits.max_symbols`.
     pub symbol_overflow: bool,
+    /// True when unstable-dependency rows were truncated by their limit.
+    pub unstable_dependency_overflow: bool,
     /// Caller-supplied truth about whether the index behind the graph was whole.
     pub index_complete: bool,
 }
@@ -131,6 +151,7 @@ impl GraphFactsReport {
             || self.invalid_path_edges > 0
             || self.file_overflow
             || self.symbol_overflow
+            || self.unstable_dependency_overflow
     }
 
     /// An empty graph is unavailable, not "everything is zero".
@@ -164,6 +185,39 @@ pub struct FileGraphFacts {
     pub scc_size: u32,
     /// True when this file participates in a dependency cycle (`scc_size > 1`).
     pub cycle_member: bool,
+    /// Martin instability `Ce / (Ca + Ce)` in per mille, truncated toward zero.
+    ///
+    /// `None` for a file with no observed dependency in either direction: an
+    /// isolated file has no defined instability, and reporting `0` would claim
+    /// maximum stability for a file about which nothing is known.
+    pub instability_per_mille: Option<u16>,
+}
+
+/// A dependency pointing from a more stable file to a less stable one.
+///
+/// This is the classic stable-dependencies direction violation: the depending
+/// file is harder to change than the file it relies on, so the dependency's
+/// volatility propagates into code that is supposed to be settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnstableDependencySignal {
+    /// The more stable file, which holds the dependency.
+    pub from_path: String,
+    /// The less stable file being depended upon.
+    pub to_path: String,
+    pub from_instability_per_mille: u16,
+    pub to_instability_per_mille: u16,
+    /// `to_instability_per_mille - from_instability_per_mille`, always > 0.
+    pub instability_gap_per_mille: u16,
+    /// Kind of the representative import/call edge behind this file pair.
+    pub edge_kind: EdgeKind,
+    /// Name of the depending symbol that carries the representative edge.
+    pub from_symbol: String,
+    /// Name of the depended-upon symbol.
+    pub to_symbol: String,
+    /// First line of the depending symbol's source range (1-based, as parsed).
+    pub source_line: u32,
+    /// Last line of the depending symbol's source range.
+    pub source_end_line: u32,
 }
 
 /// Graph facts for one exported symbol, keyed by `<path>::<name>`.
@@ -192,6 +246,8 @@ pub struct GraphFactsSnapshot {
     pub files: Vec<FileGraphFacts>,
     /// Ordered by `key`, unique.
     pub symbols: Vec<SymbolGraphFacts>,
+    /// Ordered by descending gap, then by `(from_path, to_path)`; unique pairs.
+    pub unstable_dependencies: Vec<UnstableDependencySignal>,
     pub report: GraphFactsReport,
 }
 
@@ -201,9 +257,12 @@ impl GraphFactsSnapshot {
         Self {
             files: Vec::new(),
             symbols: Vec::new(),
+            unstable_dependencies: Vec::new(),
             report: GraphFactsReport {
                 facts_version: GRAPH_FACTS_VERSION,
                 limits: GraphFactLimits::default(),
+                unstable_dependency_threshold_per_mille:
+                    DEFAULT_UNSTABLE_DEPENDENCY_THRESHOLD_PER_MILLE,
                 nodes_seen: 0,
                 edges_seen: 0,
                 files_observed: 0,
@@ -212,6 +271,7 @@ impl GraphFactsSnapshot {
                 invalid_path_edges: 0,
                 file_overflow: false,
                 symbol_overflow: false,
+                unstable_dependency_overflow: false,
                 index_complete: true,
             },
         }
@@ -244,17 +304,51 @@ pub fn symbol_fact_key(path: &str, name: &str) -> String {
     format!("{path}{SYMBOL_KEY_SEPARATOR}{name}")
 }
 
+/// Instability `Ce / (Ca + Ce)` in per mille, truncated toward zero.
+///
+/// Integer arithmetic only: the intermediate product is widened to `u64` so
+/// that no realistic degree can overflow, and the result is exact and
+/// platform-independent, unlike a rounded float.
+pub fn instability_per_mille(fan_in: u32, fan_out: u32) -> Option<u16> {
+    let total = u64::from(fan_in) + u64::from(fan_out);
+    if total == 0 {
+        return None;
+    }
+    Some((u64::from(fan_out) * 1_000 / total) as u16)
+}
+
 /// Pure producer of graph facts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct GraphFactProducer {
     limits: GraphFactLimits,
+    unstable_dependency_threshold_per_mille: u16,
+}
+
+impl Default for GraphFactProducer {
+    fn default() -> Self {
+        Self {
+            limits: GraphFactLimits::default(),
+            unstable_dependency_threshold_per_mille:
+                DEFAULT_UNSTABLE_DEPENDENCY_THRESHOLD_PER_MILLE,
+        }
+    }
 }
 
 impl GraphFactProducer {
     pub fn new(limits: GraphFactLimits) -> Self {
         Self {
             limits: limits.bounded(),
+            ..Self::default()
         }
+    }
+
+    /// Overrides the instability gap above which a dependency is flagged.
+    ///
+    /// Values above 1000 are clamped: no real gap can exceed the per-mille
+    /// range, and a larger threshold would silently disable the fact.
+    pub fn with_unstable_dependency_threshold(mut self, threshold_per_mille: u16) -> Self {
+        self.unstable_dependency_threshold_per_mille = threshold_per_mille.min(1_000);
+        self
     }
 
     /// Produces a snapshot from `graph`.
@@ -301,6 +395,7 @@ impl GraphFactProducer {
         let mut edges_seen = 0_u64;
         let mut invalid_path_edges = 0_u64;
         let mut file_coupling: BTreeMap<String, FileCoupling> = BTreeMap::new();
+        let mut pair_evidence: BTreeMap<(String, String), EdgeEvidence> = BTreeMap::new();
 
         for (from, to, kind) in graph.all_edges() {
             edges_seen = edges_seen.saturating_add(1);
@@ -326,6 +421,25 @@ impl GraphFactProducer {
                     .or_default()
                     .dependents
                     .insert(from_path.clone());
+
+                // Keep one representative edge per ordered file pair, chosen by
+                // a total order so that the cited source range does not depend
+                // on graph traversal order.
+                let candidate = EdgeEvidence {
+                    source_line: saturating_u32(from.line),
+                    source_end_line: saturating_u32(from.end_line),
+                    from_symbol: from.name.clone(),
+                    to_symbol: to.name.clone(),
+                    edge_kind: kind,
+                };
+                pair_evidence
+                    .entry((from_path.clone(), to_path.clone()))
+                    .and_modify(|existing| {
+                        if candidate.sort_key() < existing.sort_key() {
+                            *existing = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
             }
 
             let from_name = from.name.trim();
@@ -364,16 +478,65 @@ impl GraphFactProducer {
             .map(|(position, path)| {
                 let coupling = file_coupling.get(&path);
                 let component = components[position];
+                let fan_in = coupling.map_or(0, |value| saturating_u32(value.dependents.len()));
+                let fan_out = coupling.map_or(0, |value| saturating_u32(value.dependencies.len()));
                 FileGraphFacts {
-                    fan_in: coupling.map_or(0, |value| saturating_u32(value.dependents.len())),
-                    fan_out: coupling.map_or(0, |value| saturating_u32(value.dependencies.len())),
+                    fan_in,
+                    fan_out,
                     path,
                     scc_id: component.id,
                     scc_size: component.size,
                     cycle_member: component.size > 1,
+                    instability_per_mille: instability_per_mille(fan_in, fan_out),
                 }
             })
             .collect();
+
+        // Instability is derived from the untruncated coupling map, so a
+        // dependency is judged against real degrees even when file rows spill.
+        let instabilities: BTreeMap<&str, u16> = file_coupling
+            .iter()
+            .filter_map(|(path, coupling)| {
+                instability_per_mille(
+                    saturating_u32(coupling.dependents.len()),
+                    saturating_u32(coupling.dependencies.len()),
+                )
+                .map(|value| (path.as_str(), value))
+            })
+            .collect();
+
+        let mut unstable_dependencies: Vec<UnstableDependencySignal> = pair_evidence
+            .iter()
+            .filter_map(|((from_path, to_path), evidence)| {
+                let from_instability = *instabilities.get(from_path.as_str())?;
+                let to_instability = *instabilities.get(to_path.as_str())?;
+                let gap = to_instability.checked_sub(from_instability)?;
+                (gap > self.unstable_dependency_threshold_per_mille).then(|| {
+                    UnstableDependencySignal {
+                        from_path: from_path.clone(),
+                        to_path: to_path.clone(),
+                        from_instability_per_mille: from_instability,
+                        to_instability_per_mille: to_instability,
+                        instability_gap_per_mille: gap,
+                        edge_kind: evidence.edge_kind,
+                        from_symbol: evidence.from_symbol.clone(),
+                        to_symbol: evidence.to_symbol.clone(),
+                        source_line: evidence.source_line,
+                        source_end_line: evidence.source_end_line,
+                    }
+                })
+            })
+            .collect();
+        unstable_dependencies.sort_by(|left, right| {
+            right
+                .instability_gap_per_mille
+                .cmp(&left.instability_gap_per_mille)
+                .then_with(|| left.from_path.cmp(&right.from_path))
+                .then_with(|| left.to_path.cmp(&right.to_path))
+        });
+        let unstable_dependency_overflow =
+            unstable_dependencies.len() > limits.max_unstable_dependencies;
+        unstable_dependencies.truncate(limits.max_unstable_dependencies);
 
         let symbol_facts: Vec<SymbolGraphFacts> = symbols
             .into_iter()
@@ -391,9 +554,12 @@ impl GraphFactProducer {
         GraphFactsSnapshot {
             files: file_facts,
             symbols: symbol_facts,
+            unstable_dependencies,
             report: GraphFactsReport {
                 facts_version: GRAPH_FACTS_VERSION,
                 limits,
+                unstable_dependency_threshold_per_mille: self
+                    .unstable_dependency_threshold_per_mille,
                 nodes_seen,
                 edges_seen,
                 files_observed,
@@ -402,9 +568,34 @@ impl GraphFactProducer {
                 invalid_path_edges,
                 file_overflow,
                 symbol_overflow,
+                unstable_dependency_overflow,
                 index_complete,
             },
         }
+    }
+}
+
+/// The representative import/call edge cited by an unstable-dependency flag.
+#[derive(Debug, Clone)]
+struct EdgeEvidence {
+    source_line: u32,
+    source_end_line: u32,
+    from_symbol: String,
+    to_symbol: String,
+    edge_kind: EdgeKind,
+}
+
+impl EdgeEvidence {
+    /// A total order over candidate edges for one file pair. `EdgeKind` has no
+    /// `Ord`, so its stable short code stands in for it.
+    fn sort_key(&self) -> (u32, u32, &str, &str, &'static str) {
+        (
+            self.source_line,
+            self.source_end_line,
+            self.from_symbol.as_str(),
+            self.to_symbol.as_str(),
+            self.edge_kind.short_code(),
+        )
     }
 }
 
@@ -814,7 +1005,7 @@ mod tests {
     fn truncated_snapshots_still_report_the_full_component_size() {
         let producer = GraphFactProducer::new(GraphFactLimits {
             max_files: 2,
-            max_symbols: MAX_SYMBOL_FACTS,
+            ..GraphFactLimits::default()
         });
         let snapshot = producer.produce(&cyclic_graph(), true);
         assert_eq!(snapshot.files.len(), 2);
@@ -824,10 +1015,246 @@ mod tests {
     }
 
     #[test]
+    fn instability_is_exact_integer_per_mille() {
+        // Truncation toward zero, never rounding, and never a float.
+        assert_eq!(instability_per_mille(0, 1), Some(1_000));
+        assert_eq!(instability_per_mille(1, 0), Some(0));
+        assert_eq!(instability_per_mille(1, 1), Some(500));
+        assert_eq!(instability_per_mille(2, 1), Some(333));
+        assert_eq!(instability_per_mille(1, 2), Some(666));
+        assert_eq!(instability_per_mille(3, 4), Some(571));
+        // 1/3 of a mille is dropped, not rounded up to 334.
+        assert_eq!(instability_per_mille(2_000_000, 1_000_000), Some(333));
+        assert_eq!(instability_per_mille(u32::MAX, u32::MAX), Some(500));
+    }
+
+    #[test]
+    fn isolated_files_have_unknown_instability_not_zero() {
+        let mut graph = CodeGraph::new();
+        let lonely = symbol("src/lonely.rs", "lonely");
+        add_symbol(&mut graph, &lonely, true, 1);
+
+        let snapshot = GraphFactProducer::default().produce(&graph, true);
+        let facts = snapshot.file("src/lonely.rs").unwrap();
+        assert_eq!((facts.fan_in, facts.fan_out), (0, 0));
+        assert_eq!(facts.instability_per_mille, None);
+    }
+
+    #[test]
+    fn chain_instability_matches_martin_definition() {
+        let snapshot = GraphFactProducer::default().produce(&chain_graph(), true);
+        // a.rs depends on one file and nothing depends on it: maximally unstable.
+        assert_eq!(
+            snapshot.file("src/a.rs").unwrap().instability_per_mille,
+            Some(1_000)
+        );
+        // b.rs is depended on once and depends once.
+        assert_eq!(
+            snapshot.file("src/b.rs").unwrap().instability_per_mille,
+            Some(500)
+        );
+        // c.rs depends on nothing: maximally stable.
+        assert_eq!(
+            snapshot.file("src/c.rs").unwrap().instability_per_mille,
+            Some(0)
+        );
+    }
+
+    /// `src/core.rs` (Ca 2, Ce 1 -> instability 333) reaching into
+    /// `src/volatile.rs` (Ca 1, Ce 3 -> instability 750) is a direction
+    /// violation with a gap of 417 per mille.
+    fn violation_graph() -> CodeGraph {
+        let mut graph = CodeGraph::new();
+        let core = symbol("src/core.rs", "core_entry");
+        let consumer_one = symbol("src/one.rs", "one");
+        let consumer_two = symbol("src/two.rs", "two");
+        let volatile = symbol("src/volatile.rs", "volatile_helper");
+        let sinks = [
+            symbol("src/sink_a.rs", "sink_a"),
+            symbol("src/sink_b.rs", "sink_b"),
+            symbol("src/sink_c.rs", "sink_c"),
+        ];
+        for id in [&core, &consumer_one, &consumer_two, &volatile] {
+            add_symbol(&mut graph, id, true, 1);
+        }
+        for sink in &sinks {
+            add_symbol(&mut graph, sink, true, 1);
+        }
+        add_edge(&mut graph, &consumer_one, &core, EdgeKind::Imports);
+        add_edge(&mut graph, &consumer_two, &core, EdgeKind::Imports);
+        add_edge(&mut graph, &core, &volatile, EdgeKind::Calls);
+        for sink in &sinks {
+            add_edge(&mut graph, &volatile, sink, EdgeKind::Calls);
+        }
+        graph
+    }
+
+    #[test]
+    fn unstable_dependency_carries_both_keys_and_the_source_range() {
+        let snapshot = GraphFactProducer::default().produce(&violation_graph(), true);
+        assert_eq!(snapshot.unstable_dependencies.len(), 1);
+        let signal = &snapshot.unstable_dependencies[0];
+        assert_eq!(signal.from_path, "src/core.rs");
+        assert_eq!(signal.to_path, "src/volatile.rs");
+        assert_eq!(signal.from_instability_per_mille, 333);
+        assert_eq!(signal.to_instability_per_mille, 750);
+        assert_eq!(signal.instability_gap_per_mille, 417);
+        assert_eq!(signal.edge_kind, EdgeKind::Calls);
+        assert_eq!(signal.from_symbol, "core_entry");
+        assert_eq!(signal.to_symbol, "volatile_helper");
+        assert_eq!((signal.source_line, signal.source_end_line), (1, 5));
+    }
+
+    #[test]
+    fn threshold_is_strict_and_bounds_the_flag() {
+        let graph = violation_graph();
+        // The observed gap is exactly 417.
+        let just_below = GraphFactProducer::default()
+            .with_unstable_dependency_threshold(416)
+            .produce(&graph, true);
+        assert_eq!(just_below.unstable_dependencies.len(), 1);
+
+        let exactly_at = GraphFactProducer::default()
+            .with_unstable_dependency_threshold(417)
+            .produce(&graph, true);
+        assert!(
+            exactly_at.unstable_dependencies.is_empty(),
+            "the comparison is strictly greater than the threshold"
+        );
+
+        let disabled = GraphFactProducer::default()
+            .with_unstable_dependency_threshold(u16::MAX)
+            .produce(&graph, true);
+        assert_eq!(
+            disabled.report.unstable_dependency_threshold_per_mille, 1_000,
+            "an out-of-range threshold is clamped into the per-mille domain"
+        );
+        assert!(disabled.unstable_dependencies.is_empty());
+    }
+
+    #[test]
+    fn dependencies_toward_more_stable_files_are_never_flagged() {
+        let snapshot = GraphFactProducer::default()
+            .with_unstable_dependency_threshold(0)
+            .produce(&chain_graph(), true);
+        // Every edge in the chain runs from less stable to more stable.
+        assert!(snapshot.unstable_dependencies.is_empty());
+    }
+
+    #[test]
+    fn unstable_dependencies_are_ordered_by_gap_then_path() {
+        // hub.rs: Ca 6, Ce 3 -> 333. mid.rs: Ca 1, Ce 1 -> 500 (gap 167).
+        // alt.rs and worst.rs: Ca 1, Ce 3 -> 750 (gap 417), and are symmetric,
+        // so their equal gaps must break on the dependency path.
+        let mut graph = CodeGraph::new();
+        let hub = symbol("src/hub.rs", "hub_fn");
+        let mid = symbol("src/mid.rs", "mid_fn");
+        let alt = symbol("src/alt.rs", "alt_fn");
+        let worst = symbol("src/worst.rs", "worst_fn");
+        let mid_sink = symbol("src/mid_sink.rs", "mid_sink_fn");
+        let shared: Vec<_> = (0..3)
+            .map(|index| symbol(&format!("src/shared_{index}.rs"), "shared_fn"))
+            .collect();
+        let dependents: Vec<_> = (0..6)
+            .map(|index| symbol(&format!("src/user_{index}.rs"), "user_fn"))
+            .collect();
+
+        for id in [&hub, &mid, &alt, &worst, &mid_sink] {
+            add_symbol(&mut graph, id, true, 1);
+        }
+        for id in shared.iter().chain(dependents.iter()) {
+            add_symbol(&mut graph, id, true, 1);
+        }
+        for user in &dependents {
+            add_edge(&mut graph, user, &hub, EdgeKind::Imports);
+        }
+        for target in [&mid, &alt, &worst] {
+            add_edge(&mut graph, &hub, target, EdgeKind::Calls);
+        }
+        add_edge(&mut graph, &mid, &mid_sink, EdgeKind::Calls);
+        for target in &shared {
+            add_edge(&mut graph, &alt, target, EdgeKind::Calls);
+            add_edge(&mut graph, &worst, target, EdgeKind::Calls);
+        }
+
+        let snapshot = GraphFactProducer::default()
+            .with_unstable_dependency_threshold(0)
+            .produce(&graph, true);
+        let pairs: Vec<(&str, &str, u16)> = snapshot
+            .unstable_dependencies
+            .iter()
+            .map(|signal| {
+                (
+                    signal.from_path.as_str(),
+                    signal.to_path.as_str(),
+                    signal.instability_gap_per_mille,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("src/hub.rs", "src/alt.rs", 417),
+                ("src/hub.rs", "src/worst.rs", 417),
+                ("src/hub.rs", "src/mid.rs", 167),
+            ]
+        );
+    }
+
+    #[test]
+    fn unstable_dependency_rows_truncate_and_flag_overflow() {
+        let producer = GraphFactProducer::new(GraphFactLimits {
+            max_unstable_dependencies: 0,
+            ..GraphFactLimits::default()
+        });
+        let snapshot = producer.produce(&violation_graph(), true);
+        assert!(snapshot.unstable_dependencies.is_empty());
+        assert!(snapshot.report.unstable_dependency_overflow);
+        assert_eq!(snapshot.availability(), FactAvailability::Degraded);
+    }
+
+    #[test]
+    fn representative_edge_is_the_lowest_source_range_not_traversal_order() {
+        let mut graph = CodeGraph::new();
+        let late = symbol_at("src/core.rs", "late_caller", 900);
+        let early = symbol_at("src/core.rs", "early_caller", 10);
+        let consumer_one = symbol("src/one.rs", "one");
+        let consumer_two = symbol("src/two.rs", "two");
+        let volatile = symbol("src/volatile.rs", "volatile_helper");
+        let sinks = [
+            symbol("src/sink_a.rs", "sink_a"),
+            symbol("src/sink_b.rs", "sink_b"),
+            symbol("src/sink_c.rs", "sink_c"),
+        ];
+        add_symbol(&mut graph, &late, true, 90);
+        add_symbol(&mut graph, &early, true, 12);
+        for id in [&consumer_one, &consumer_two, &volatile] {
+            add_symbol(&mut graph, id, true, 1);
+        }
+        for sink in &sinks {
+            add_symbol(&mut graph, sink, true, 1);
+        }
+        add_edge(&mut graph, &consumer_one, &late, EdgeKind::Imports);
+        add_edge(&mut graph, &consumer_two, &late, EdgeKind::Imports);
+        add_edge(&mut graph, &late, &volatile, EdgeKind::Calls);
+        add_edge(&mut graph, &early, &volatile, EdgeKind::TypeRef);
+        for sink in &sinks {
+            add_edge(&mut graph, &volatile, sink, EdgeKind::Calls);
+        }
+
+        let snapshot = GraphFactProducer::default().produce(&graph, true);
+        let signal = &snapshot.unstable_dependencies[0];
+        assert_eq!(signal.from_symbol, "early_caller");
+        assert_eq!(signal.edge_kind, EdgeKind::TypeRef);
+        assert_eq!((signal.source_line, signal.source_end_line), (12, 16));
+    }
+
+    #[test]
     fn limits_truncate_and_flag_overflow() {
         let producer = GraphFactProducer::new(GraphFactLimits {
             max_files: 2,
             max_symbols: 1,
+            ..GraphFactLimits::default()
         });
         let snapshot = producer.produce(&chain_graph(), true);
         assert_eq!(snapshot.files.len(), 2);
