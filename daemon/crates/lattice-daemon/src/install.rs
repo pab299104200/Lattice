@@ -199,10 +199,12 @@ fn validate_outer_timeout(client: HookClient, definition: HookDefinition) -> Res
 fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
     let root = object_mut(config, "hook configuration")?;
     let hooks = object_field_mut(root, "hooks", "hook configuration")?;
+    let mut empty_events = Vec::new();
     for (event, script) in STALE_LATTICE_HOOKS {
         let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
             continue;
         };
+        let mut removed_stale_hook = false;
         for entry in entries.iter_mut() {
             let Some(commands) = entry
                 .as_object_mut()
@@ -211,7 +213,9 @@ fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
             else {
                 continue;
             };
+            let command_count = commands.len();
             commands.retain(|hook| !is_stale_lattice_hook(hook, script));
+            removed_stale_hook |= commands.len() != command_count;
         }
         entries.retain(|entry| {
             entry
@@ -220,6 +224,12 @@ fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
                 .and_then(Value::as_array)
                 .is_none_or(|commands| !commands.is_empty())
         });
+        if removed_stale_hook && entries.is_empty() {
+            empty_events.push(event);
+        }
+    }
+    for event in empty_events {
+        hooks.remove(event);
     }
     Ok(())
 }
@@ -429,6 +439,28 @@ mod tests {
             config["hooks"]["Custom"][0]["hooks"][0]["command"],
             "custom-hook"
         );
+    }
+
+    #[test]
+    fn removes_stale_only_stop_event_for_codex_and_claude_idempotently() {
+        for client in [HookClient::Codex, HookClient::ClaudeCode] {
+            let stale_client = client.asset_directory();
+            let mut config = json!({
+                "hooks": {
+                    "Stop": [{"hooks": [{
+                        "type": "command",
+                        "command": format!("/old/integrations/{stale_client}/hooks/stop.sh")
+                    }] }]
+                }
+            });
+
+            reconcile_hook_config(&mut config, client, &paths()).unwrap();
+            let once = render_config(&config).unwrap();
+            assert!(!config["hooks"].as_object().unwrap().contains_key("Stop"));
+
+            reconcile_hook_config(&mut config, client, &paths()).unwrap();
+            assert_eq!(once, render_config(&config).unwrap());
+        }
     }
 
     #[test]
