@@ -11,6 +11,7 @@ pub mod git_intelligence;
 mod git_intelligence_adapter;
 pub mod git_intelligence_consumers;
 pub mod graph;
+pub mod health;
 pub mod identity;
 pub mod indexer;
 pub mod intelligence;
