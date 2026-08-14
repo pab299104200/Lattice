@@ -360,7 +360,7 @@ async fn main() -> Result<()> {
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
-                        let emb = Arc::new(emb_engine);
+                        let emb = emb_engine;
                         let _ = embedding_engine_bg.set(Arc::clone(&emb));
 
                         if background_vector_sync_enabled() {
@@ -747,7 +747,7 @@ pub(crate) async fn build_workspace_runtime(
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
-                        let emb = Arc::new(emb_engine);
+                        let emb = emb_engine;
                         let _ = embedding_engine_bg.set(Arc::clone(&emb));
                         if background_vector_sync_enabled() {
                             let graph_snapshot = {

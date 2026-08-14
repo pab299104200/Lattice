@@ -32,12 +32,22 @@ because a model path existed.
 The model bundle is deliberately distinct from ONNX Runtime. Before creating a
 session, Lattice explicitly and fallibly loads the runtime from
 `ORT_DYLIB_PATH`, when set, or from the platform default beside the executable.
-Absent, incompatible, or session-construction failures are bounded in the log
-and disable only semantic retrieval; they must never terminate the daemon or
-invalidate an otherwise checksum-verified model bundle. Operators can install a
-compatible runtime beside `lattice` or set `ORT_DYLIB_PATH` to its absolute
-path. The status surface reports lexical fallback until an embedding engine is
-available.
+`ORT_DYLIB_PATH` must be absolute. The resolved path must name a regular file;
+Lattice rejects a missing/default path before calling any `ort` API.
+
+Runtime and model-session initialization use one process-wide, serialized
+circuit breaker because ONNX Runtime dynamic loading is process-global. Every
+workspace shard shares the first successfully initialized engine. Any loader
+error, session-construction error, or panic permanently closes the semantic
+circuit for that daemon process, preserves a bounded reason for status and
+logs, and makes every current or later shard use lexical retrieval without
+another ONNX Runtime call. This prevents concurrent roots from retrying a
+partially initialized runtime or panicking on a poisoned loader lock. Restarting
+the daemon is the explicit retry boundary after repairing the runtime. These
+failures do not invalidate an otherwise checksum-verified model bundle.
+Operators can install a compatible runtime beside `lattice` or set
+`ORT_DYLIB_PATH` to its absolute path. The status surface reports the retained
+lexical-fallback reason until a new process initializes an embedding engine.
 
 ## Duplicate-memory safety
 

@@ -10,7 +10,7 @@ use tracing::Instrument;
 use lattice_core::consolidation::{
     EpisodeOutcome, EpisodeTemplate, SessionConsolidationConfig, SessionConsolidator,
 };
-use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::embeddings::{embedding_runtime_status, EmbeddingEngine, EmbeddingRuntimeStatus};
 use lattice_core::events::{
     Actor, BranchRef, EventKind, EventPage, EventQuery, EventReader, EventWriter, QueryOrder,
     SessionId,
@@ -910,6 +910,12 @@ impl McpHandler {
     fn semantic_retrieval_status(&self, is_indexing: bool) -> Value {
         if self.embedding_engine.get().is_some() {
             return json!({ "status": "available" });
+        }
+        if let EmbeddingRuntimeStatus::Disabled { reason } = embedding_runtime_status() {
+            return json!({
+                "status": "lexical_fallback",
+                "reason": reason
+            });
         }
         if is_indexing {
             return json!({

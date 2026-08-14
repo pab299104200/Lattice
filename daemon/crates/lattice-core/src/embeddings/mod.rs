@@ -3,7 +3,7 @@ pub mod engine;
 #[cfg(test)]
 mod tests;
 
-pub use engine::EmbeddingEngine;
+pub use engine::{embedding_runtime_status, EmbeddingEngine, EmbeddingRuntimeStatus};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};

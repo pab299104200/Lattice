@@ -4,8 +4,98 @@ use ort::session::Session;
 use ort::value::Tensor;
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokenizers::Tokenizer;
+
+static PROCESS_EMBEDDING_RUNTIME: OnceLock<ProcessEmbeddingRuntime<EmbeddingEngine>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingRuntimeStatus {
+    Uninitialized,
+    Available,
+    Disabled { reason: String },
+}
+
+enum ProcessEmbeddingState<T> {
+    Uninitialized,
+    Available(Arc<T>),
+    Disabled(String),
+}
+
+struct ProcessEmbeddingRuntime<T> {
+    state: Mutex<ProcessEmbeddingState<T>>,
+}
+
+impl<T> ProcessEmbeddingRuntime<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ProcessEmbeddingState::Uninitialized),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, ProcessEmbeddingState<T>> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                // A panic must not turn the semantic fallback coordinator into
+                // a second panic source. Permanently close the process-wide
+                // circuit and recover the protected state only to record why.
+                let mut state = poisoned.into_inner();
+                *state = ProcessEmbeddingState::Disabled(
+                    "embedding runtime coordination failed; semantic retrieval is disabled and lexical retrieval remains available"
+                        .to_string(),
+                );
+                state
+            }
+        }
+    }
+
+    fn get_or_try_init(
+        &self,
+        initializer: impl FnOnce() -> std::result::Result<T, String>,
+    ) -> std::result::Result<Arc<T>, String> {
+        let mut state = self.state();
+        match &*state {
+            ProcessEmbeddingState::Available(value) => return Ok(Arc::clone(value)),
+            ProcessEmbeddingState::Disabled(reason) => return Err(reason.clone()),
+            ProcessEmbeddingState::Uninitialized => {}
+        }
+
+        let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initializer));
+        match initialized {
+            Ok(Ok(value)) => {
+                let value = Arc::new(value);
+                *state = ProcessEmbeddingState::Available(Arc::clone(&value));
+                Ok(value)
+            }
+            Ok(Err(reason)) => {
+                let reason = bounded_error(&reason);
+                *state = ProcessEmbeddingState::Disabled(reason.clone());
+                Err(reason)
+            }
+            Err(panic) => {
+                let reason = format!(
+                    "ONNX embedding engine initialization panicked: {}; semantic retrieval is disabled and lexical retrieval remains available",
+                    panic_payload_message(panic.as_ref())
+                );
+                let reason = bounded_error(&reason);
+                *state = ProcessEmbeddingState::Disabled(reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    fn status(&self) -> EmbeddingRuntimeStatus {
+        match &*self.state() {
+            ProcessEmbeddingState::Uninitialized => EmbeddingRuntimeStatus::Uninitialized,
+            ProcessEmbeddingState::Available(_) => EmbeddingRuntimeStatus::Available,
+            ProcessEmbeddingState::Disabled(reason) => EmbeddingRuntimeStatus::Disabled {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
 
 pub struct EmbeddingEngine {
     session: Mutex<Session>,
@@ -17,17 +107,15 @@ impl EmbeddingEngine {
     ///
     /// The `model_path` should point to an ONNX model file (e.g., all-MiniLM-L6-v2.onnx).
     /// The tokenizer.json file is expected to be in the same directory as the model.
-    pub fn new(model_path: &str) -> Result<Self> {
-        initialize_onnx_runtime()?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::new_after_runtime_load(model_path)
-        }))
-        .map_err(|panic| {
-            anyhow::anyhow!(
-                "ONNX embedding engine initialization panicked: {}; semantic retrieval is disabled and lexical retrieval remains available",
-                panic_payload_message(panic.as_ref())
-            )
-        })?
+    pub fn new(model_path: &str) -> Result<Arc<Self>> {
+        PROCESS_EMBEDDING_RUNTIME
+            .get_or_init(ProcessEmbeddingRuntime::new)
+            .get_or_try_init(|| {
+                initialize_onnx_runtime()
+                    .and_then(|_| Self::new_after_runtime_load(model_path))
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(anyhow::Error::msg)
     }
 
     fn new_after_runtime_load(model_path: &str) -> Result<Self> {
@@ -181,11 +269,19 @@ impl EmbeddingEngine {
     }
 }
 
+/// Process-wide semantic runtime state. All workspace shards share this
+/// circuit breaker because `ort` dynamically loads one process-global runtime.
+pub fn embedding_runtime_status() -> EmbeddingRuntimeStatus {
+    PROCESS_EMBEDDING_RUNTIME
+        .get_or_init(ProcessEmbeddingRuntime::new)
+        .status()
+}
+
 /// Loads ONNX Runtime before any `ort` API can invoke its implicit, panicking
 /// loader. The explicit path turns an absent or incompatible shared library
 /// into the normal semantic-to-lexical fallback rather than a daemon crash.
 fn initialize_onnx_runtime() -> Result<()> {
-    let runtime_path = onnx_runtime_library_path();
+    let runtime_path = onnx_runtime_library_path()?;
     initialize_onnx_runtime_with(&runtime_path, |path| {
         ort::init_from(path)
             .map(|builder| {
@@ -208,9 +304,16 @@ fn initialize_onnx_runtime_with(
     })
 }
 
-fn onnx_runtime_library_path() -> PathBuf {
+fn onnx_runtime_library_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("ORT_DYLIB_PATH").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "ORT_DYLIB_PATH must be an absolute path, got `{}`; semantic retrieval is disabled and lexical retrieval remains available",
+                path.display()
+            );
+        }
+        return validate_onnx_runtime_library(path);
     }
 
     #[cfg(target_os = "windows")]
@@ -220,7 +323,30 @@ fn onnx_runtime_library_path() -> PathBuf {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let default_name = "libonnxruntime.dylib";
 
-    PathBuf::from(default_name)
+    let executable = std::env::current_exe()
+        .context("resolve the lattice executable while locating ONNX Runtime")?;
+    let executable_dir = executable.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "lattice executable `{}` has no parent directory; semantic retrieval is disabled and lexical retrieval remains available",
+            executable.display()
+        )
+    })?;
+    validate_onnx_runtime_library(executable_dir.join(default_name))
+}
+
+fn validate_onnx_runtime_library(path: PathBuf) -> Result<PathBuf> {
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Ok(path),
+        Ok(_) => anyhow::bail!(
+            "ONNX Runtime path `{}` is not a regular file; semantic retrieval is disabled and lexical retrieval remains available",
+            path.display()
+        ),
+        Err(error) => anyhow::bail!(
+            "ONNX Runtime is unavailable at `{}`: {}; semantic retrieval is disabled and lexical retrieval remains available. Install a compatible ONNX Runtime library beside the lattice executable or set ORT_DYLIB_PATH to its absolute path",
+            path.display(),
+            bounded_error(&error.to_string())
+        ),
+    }
 }
 
 fn bounded_error(error: &str) -> String {
@@ -243,8 +369,13 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_error, initialize_onnx_runtime_with};
+    use super::{
+        bounded_error, initialize_onnx_runtime_with, validate_onnx_runtime_library,
+        EmbeddingRuntimeStatus, ProcessEmbeddingRuntime,
+    };
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn missing_runtime_is_an_actionable_lexical_fallback() {
@@ -267,5 +398,102 @@ mod tests {
         let bounded = bounded_error(&error);
         assert!(bounded.ends_with('…'));
         assert_eq!(bounded.chars().count(), 401);
+    }
+
+    #[test]
+    fn missing_runtime_is_rejected_before_dynamic_loader() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("libonnxruntime-missing.so");
+        let error = validate_onnx_runtime_library(missing.clone())
+            .expect_err("missing runtime must be rejected before ORT is called");
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        assert!(error
+            .to_string()
+            .contains("lexical retrieval remains available"));
+    }
+
+    #[test]
+    fn concurrent_runtime_failure_is_attempted_once_and_never_panics() {
+        let runtime = Arc::new(ProcessEmbeddingRuntime::<usize>::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..16 {
+            let runtime = Arc::clone(&runtime);
+            let attempts = Arc::clone(&attempts);
+            workers.push(std::thread::spawn(move || {
+                runtime.get_or_try_init(|| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err("incompatible ONNX Runtime".to_string())
+                })
+            }));
+        }
+
+        for worker in workers {
+            let error = worker
+                .join()
+                .expect("runtime failure must not escape as a panic")
+                .expect_err("every shard must receive lexical fallback");
+            assert_eq!(error, "incompatible ONNX Runtime");
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.status(),
+            EmbeddingRuntimeStatus::Disabled {
+                reason: "incompatible ONNX Runtime".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn panicking_runtime_is_permanently_disabled_without_poisoning_gate() {
+        let runtime = ProcessEmbeddingRuntime::<usize>::new();
+        let attempts = AtomicUsize::new(0);
+
+        let first = runtime.get_or_try_init(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            panic!("invalid ORT handle")
+        });
+        let second = runtime.get_or_try_init(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(42)
+        });
+
+        let first = first.expect_err("panic must close the semantic circuit");
+        let second = second.expect_err("closed circuit must never retry ORT");
+        assert!(first.contains("initialization panicked"));
+        assert!(first.contains("invalid ORT handle"));
+        assert_eq!(second, first);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_runtime_success_is_shared_across_shards() {
+        let runtime = Arc::new(ProcessEmbeddingRuntime::<usize>::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let runtime = Arc::clone(&runtime);
+            let attempts = Arc::clone(&attempts);
+            workers.push(std::thread::spawn(move || {
+                runtime
+                    .get_or_try_init(|| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    })
+                    .expect("shared initialization succeeds")
+            }));
+        }
+
+        let values: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker must not panic"))
+            .collect();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(values.iter().all(|value| **value == 42));
+        assert!(values
+            .windows(2)
+            .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
     }
 }
