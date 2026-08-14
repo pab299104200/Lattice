@@ -466,6 +466,114 @@ fn go_facts_are_deterministic_and_join_to_symbols() {
 }
 
 // ---------------------------------------------------------------------------
+// Java
+// ---------------------------------------------------------------------------
+
+const JAVA_SAMPLE: &str = r#"class Sample {
+    int straightLine(int a) {
+        return a + 1;
+    }
+
+    int threeIfs(int a, int b, int c) {
+        if (a > 0) { return 1; }
+        if (b > 0) { return 2; }
+        if (c > 0) { return 3; }
+        return 0;
+    }
+
+    int branches(int a, String b) {
+        if (a > 0 && b != null) {
+            for (int i = 0; i < a; i++) {
+                while (i > 2) { return i; }
+            }
+        } else if (a < 0) {
+            return -1;
+        } else {
+            return 0;
+        }
+        return 1;
+    }
+
+    int handler(int a) {
+        try {
+            return a;
+        } catch (IllegalArgumentException e) {
+            return 1;
+        } catch (Exception e) {
+            return 2;
+        } finally {
+            a = 0;
+        }
+    }
+
+    int switching(int a) {
+        switch (a) {
+            case 1: return 1;
+            case 2: return 2;
+            default: return 0;
+        }
+    }
+
+    int ternary(int a) {
+        return a > 0 ? 1 : 2;
+    }
+
+    void varargs(String first, int... rest) {
+    }
+}
+"#;
+
+#[test]
+fn java_straight_line_method_scores_one() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    assert_eq!(facts.language, Language::Java);
+    assert_eq!(facts.availability, FactAvailability::Available);
+    assert_unit(&facts, "Sample.straightLine", 1, 0, Some(1));
+}
+
+#[test]
+fn java_three_independent_ifs_score_four() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    assert_unit(&facts, "Sample.threeIfs", 4, 1, Some(3));
+}
+
+#[test]
+fn java_counts_short_circuits_loops_and_else_if() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    // if + && + for + while + the `else if` conditional = 5 decision points.
+    assert_unit(&facts, "Sample.branches", 6, 3, Some(2));
+}
+
+#[test]
+fn java_counts_each_catch_but_not_finally() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    assert_unit(&facts, "Sample.handler", 3, 1, Some(1));
+}
+
+#[test]
+fn java_switch_counts_case_labels_but_not_default() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    assert_unit(&facts, "Sample.switching", 3, 1, Some(1));
+}
+
+#[test]
+fn java_counts_ternaries_and_varargs_parameters() {
+    let facts = compute_file_complexity_facts("Sample.java", JAVA_SAMPLE);
+    assert_unit(&facts, "Sample.ternary", 2, 0, Some(1));
+    assert_unit(&facts, "Sample.varargs", 1, 0, Some(2));
+}
+
+#[test]
+fn java_facts_are_deterministic_and_join_to_symbols() {
+    assert_deterministic("Sample.java", JAVA_SAMPLE);
+    assert_joins_to_symbols(
+        "Sample.java",
+        JAVA_SAMPLE,
+        &["Sample.threeIfs", "Sample.switching", "Sample.varargs"],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Availability
 // ---------------------------------------------------------------------------
 

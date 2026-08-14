@@ -36,6 +36,7 @@ pub fn complexity_profile_for(language: Language) -> Option<&'static LanguageCom
         Language::Rust => Some(rust_lang::complexity_profile()),
         Language::Python => Some(python::complexity_profile()),
         Language::Go => Some(go_lang::complexity_profile()),
+        Language::Java => Some(java::complexity_profile()),
         _ => None,
     }
 }
