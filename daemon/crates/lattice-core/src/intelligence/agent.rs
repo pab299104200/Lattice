@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -7506,13 +7507,13 @@ fn downstream_impact_count(graph: &CodeGraph, node: &GraphNode, hops: usize) -> 
 /// per request rather than once per symbol. That fallback declares itself
 /// incomplete: it was derived on the fly from one graph rather than read from a
 /// published fact generation, so nothing it produces may claim to be whole.
-fn health_index_or_graph_facts(
+fn health_index_or_graph_facts<'a>(
     graph: &CodeGraph,
-    supplied: Option<&HealthFactIndex>,
-) -> HealthFactIndex {
+    supplied: Option<&'a HealthFactIndex>,
+) -> Cow<'a, HealthFactIndex> {
     match supplied {
-        Some(index) => index.clone(),
-        None => HealthFactIndex::from_graph(graph, false),
+        Some(index) => Cow::Borrowed(index),
+        None => Cow::Owned(HealthFactIndex::from_graph(graph, false)),
     }
 }
 
