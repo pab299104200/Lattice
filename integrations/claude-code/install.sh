@@ -54,6 +54,13 @@ desired = {
             ],
         },
     ],
+    "Stop": [
+        {
+            "hooks": [
+                {"type": "command", "command": str(hook_dir / "stop.sh"), "timeout": 5},
+            ],
+        },
+    ],
     "SessionEnd": [
         {
             "hooks": [
@@ -62,27 +69,6 @@ desired = {
         },
     ],
 }
-
-# Remove superseded Lattice Stop hooks without disturbing foreign Stop hooks.
-for entry in hooks.get("Stop", []):
-    if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
-        entry["hooks"] = [
-            hook for hook in entry["hooks"]
-            if not (
-                isinstance(hook, dict)
-                and isinstance(hook.get("command"), str)
-                and Path(hook["command"]).name == "stop.sh"
-                and "integrations" in Path(hook["command"]).parts
-                and "hooks" in Path(hook["command"]).parts
-                and any(part in {"codex", "claude-code"} for part in Path(hook["command"]).parts)
-            )
-        ]
-hooks["Stop"] = [
-    entry for entry in hooks.get("Stop", [])
-    if not isinstance(entry, dict) or entry.get("hooks")
-]
-if not hooks.get("Stop"):
-    hooks.pop("Stop", None)
 
 for event, entries in desired.items():
     current = hooks.setdefault(event, [])

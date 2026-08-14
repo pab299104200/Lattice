@@ -721,6 +721,7 @@ fn is_lattice_hook_path(command: &str) -> bool {
                 "session-start.sh"
                     | "user-prompt-submit.sh"
                     | "post-tool-use.sh"
+                    | "stop.sh"
                     | "session-end.sh"
             )
         )
@@ -1097,6 +1098,9 @@ fn hook_fixture_payload(event: &str) -> &'static str {
         }
         "PostToolUse" => {
             r#"{"session_id":"doctor-hook-fixture","tool_name":"apply_patch","file_path":"README.md"}"#
+        }
+        "Stop" => {
+            r#"{"session_id":"doctor-hook-fixture","last_assistant_message":"bounded doctor turn summary","transcript_path":"/tmp/private","cwd":"/private"}"#
         }
         "SessionEnd" => {
             r#"{"session_id":"doctor-hook-fixture","transcript_path":"/tmp/private","reason":"private","cwd":"/private","final_summary":"private"}"#

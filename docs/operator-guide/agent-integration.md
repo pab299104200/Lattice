@@ -46,6 +46,8 @@ The installed hooks are:
 - `SessionStart`: injects task memory and repo rules from `lattice recall --mode task --json`.
 - `UserPromptSubmit`: injects `lattice context "<prompt>" --mode auto` only when the relevance threshold is met.
 - `PostToolUse` on `Edit|Write`: injects a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
+- `Stop`: captures only the bounded top-level `last_assistant_message` as a
+  nonterminal turn summary under an existing authenticated binding.
 - `SessionEnd`: makes a best-effort protected close-marker attempt for the current
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
@@ -69,6 +71,8 @@ The installed hooks are:
 - `SessionStart`: runs task-memory recall and repo-rule context concurrently, then prints their bounded results.
 - `UserPromptSubmit`: prints `lattice context "<prompt>" --mode auto` only when the relevance threshold is met and hook stdout is supported.
 - `PostToolUse` on `apply_patch|Edit|Write`: prints a short `lattice impact <edited-file> --no-tests` summary for non-leaf edits.
+- `Stop`: captures only the bounded top-level `last_assistant_message` as a
+  nonterminal turn summary under an existing authenticated binding.
 - `SessionEnd`: makes a best-effort protected close-marker attempt for the current
   host session. It does not write an ordinary outcome memory or read a
   transcript; unavailable capture is silent and never blocks shutdown.
@@ -79,11 +83,13 @@ All hooks exit `0` without output if the binary is missing, the daemon is down, 
 
 The installed adapters accept only bounded structured host fields. `SessionStart`
 uses the opaque host session identifier; an edit event uses the allowlisted
-tool kind and dedicated file path; `SessionEnd` carries only a close marker.
+tool kind and dedicated file path; `Stop` admits only a bounded top-level
+`last_assistant_message` and remains nonterminal; `SessionEnd` carries only a
+close marker and is the sole terminal event.
 The adapter ignores `cwd`, reason, final summary, repository/checkout/scope claims, prompts,
 transcripts, tool input/output, commands, terminal output, and environment
-values. It never opens a host `transcript_path`. Lattice deliberately removes
-its former per-turn `Stop` registration during reconciliation.
+values. It never opens a host `transcript_path`. A missing, non-string, empty,
+or oversized turn summary is silently omitted without opening a binding.
 
 D3a state is repository-local and bound to the exact canonical checkout by a
 daemon-minted capability. The short-lived adapter stores only protected

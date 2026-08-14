@@ -25,7 +25,8 @@ same command after moving or reinstalling Lattice.
 - `SessionStart`: calls `lattice recall "session start" --mode task --json`, adds current task memory and repo rules as `additionalContext`, and clips output to about 1500 tokens.
 - `UserPromptSubmit`: calls `lattice context "<prompt>" --mode auto --min-relevance 0.25`, clips output to about 1200 tokens, and emits nothing when the result is too small or not relevant.
 - `PostToolUse`: for `Edit|Write`, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
-- `SessionEnd`: sends an authenticated, content-free close marker for the host session. Per-turn `Stop` is deliberately not registered. The daemon reduces a verified close into repository-local session memory; unavailable capture is not reported as successful.
+- `Stop`: sends only the bounded top-level `last_assistant_message` as a nonterminal turn-summary fact under the existing authenticated binding. It never opens a transcript or creates a binding.
+- `SessionEnd`: sends an authenticated, content-free close marker for the host session. This is the sole terminal event. The daemon reduces a verified close into repository-local session memory; unavailable capture is not reported as successful.
 
 Every script locates the configured or installed Lattice binary and invokes the
 bounded adapter. If the binary is missing, the daemon is unavailable, or the

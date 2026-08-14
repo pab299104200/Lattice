@@ -247,12 +247,27 @@ pub struct PendingHookDelivery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HookClientCapturePayload {
     Event(SessionCaptureEvent),
+    TurnSummary(SessionCaptureEvent),
     Close(SessionCaptureClose),
 }
 
 impl HookClientCapturePayload {
     fn is_close(&self) -> bool {
         matches!(self, Self::Close(_))
+    }
+
+    fn validate_kind(&self) -> Result<(), HookSessionClientError> {
+        match self {
+            Self::Event(event) if matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) => {
+                Err(HookSessionClientError::InvalidInput)
+            }
+            Self::TurnSummary(event)
+                if !matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) =>
+            {
+                Err(HookSessionClientError::InvalidInput)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -403,6 +418,7 @@ impl HookSessionClient {
         payload: HookClientCapturePayload,
         now_ms: i64,
     ) -> Result<HookClientEnqueueOutcome, HookSessionClientError> {
+        payload.validate_kind()?;
         self.with_lock(|| {
             let fingerprint = key.fingerprint(&self.cryptography)?;
             let mut record = self.load_record_by_fingerprint(&fingerprint)?;
@@ -761,6 +777,7 @@ impl PendingRecord {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StoredCapturePayload {
     Event { event: StoredCaptureEvent },
+    TurnSummary { event: StoredCaptureEvent },
     Close { close: StoredCaptureClose },
 }
 
@@ -771,7 +788,16 @@ impl StoredCapturePayload {
 
     fn validate(&self) -> Result<(), HookSessionClientError> {
         match self {
-            Self::Event { event } => event.to_event().map(|_| ()),
+            Self::Event { event } => match event.to_event()?.fact {
+                SessionCaptureFact::TurnSummary { .. } => {
+                    Err(HookSessionClientError::MalformedState)
+                }
+                _ => Ok(()),
+            },
+            Self::TurnSummary { event } => match event.to_event()?.fact {
+                SessionCaptureFact::TurnSummary { .. } => Ok(()),
+                _ => Err(HookSessionClientError::MalformedState),
+            },
             Self::Close { close } => close.to_close().map(|_| ()),
         }
     }
@@ -781,6 +807,9 @@ impl From<HookClientCapturePayload> for StoredCapturePayload {
     fn from(payload: HookClientCapturePayload) -> Self {
         match payload {
             HookClientCapturePayload::Event(event) => Self::Event {
+                event: event.into(),
+            },
+            HookClientCapturePayload::TurnSummary(event) => Self::TurnSummary {
                 event: event.into(),
             },
             HookClientCapturePayload::Close(close) => Self::Close {
@@ -795,7 +824,20 @@ impl TryFrom<StoredCapturePayload> for HookClientCapturePayload {
 
     fn try_from(payload: StoredCapturePayload) -> Result<Self, Self::Error> {
         match payload {
-            StoredCapturePayload::Event { event } => Ok(Self::Event(event.to_event()?)),
+            StoredCapturePayload::Event { event } => {
+                let event = event.to_event()?;
+                if matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) {
+                    return Err(HookSessionClientError::MalformedState);
+                }
+                Ok(Self::Event(event))
+            }
+            StoredCapturePayload::TurnSummary { event } => {
+                let event = event.to_event()?;
+                if !matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) {
+                    return Err(HookSessionClientError::MalformedState);
+                }
+                Ok(Self::TurnSummary(event))
+            }
             StoredCapturePayload::Close { close } => Ok(Self::Close(close.to_close()?)),
         }
     }
@@ -824,6 +866,9 @@ enum StoredCaptureFact {
         status: ErrorStatus,
         summary: Option<String>,
     },
+    TurnSummary {
+        summary: String,
+    },
 }
 
 impl From<SessionCaptureEvent> for StoredCaptureEvent {
@@ -844,6 +889,9 @@ impl From<SessionCaptureEvent> for StoredCaptureEvent {
                 status,
                 summary,
             },
+            SessionCaptureFact::TurnSummary { summary } => {
+                StoredCaptureFact::TurnSummary { summary }
+            }
         };
         Self {
             schema_version: event.schema_version,
@@ -878,6 +926,11 @@ impl StoredCaptureEvent {
                 }
                 value
             }
+            StoredCaptureFact::TurnSummary { summary } => serde_json::json!({
+                "schema_version": self.schema_version,
+                "kind": "turn_summary",
+                "summary": summary,
+            }),
         };
         lattice_core::memory::parse_session_capture_event(&serde_json::to_string(&value)?)
             .map_err(|_| HookSessionClientError::MalformedState)
@@ -1217,6 +1270,12 @@ mod tests {
         )
     }
 
+    fn turn_summary(summary: &str) -> HookClientCapturePayload {
+        HookClientCapturePayload::TurnSummary(
+            lattice_core::memory::session_capture_turn_summary_from_host(Some(summary)).unwrap(),
+        )
+    }
+
     fn client(label: &str) -> (HookSessionClient, PathBuf) {
         let root = fixture_root(label);
         let client = HookSessionClient::open_at(&root, HookClientQueueConfig::default()).unwrap();
@@ -1313,8 +1372,12 @@ mod tests {
         let key = key();
         client.store_binding(&key, &binding()).unwrap();
         let first = client.enqueue(&key, event("src/a.rs"), 1).unwrap().delivery;
-        let second = client.enqueue(&key, event("src/b.rs"), 2).unwrap().delivery;
-        let closing = client.enqueue(&key, close(), 3).unwrap().delivery;
+        let summary = client
+            .enqueue(&key, turn_summary("bounded turn result"), 2)
+            .unwrap()
+            .delivery;
+        let second = client.enqueue(&key, event("src/b.rs"), 3).unwrap().delivery;
+        let closing = client.enqueue(&key, close(), 4).unwrap().delivery;
         assert_eq!(
             client
                 .pending(&key)
@@ -1322,21 +1385,26 @@ mod tests {
                 .iter()
                 .map(|item| item.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 3, 4]
         );
         assert!(matches!(
-            client.enqueue(&key, event("src/c.rs"), 4),
+            client.pending(&key).unwrap()[1].payload,
+            HookClientCapturePayload::TurnSummary(_)
+        ));
+        assert!(matches!(
+            client.enqueue(&key, event("src/c.rs"), 5),
             Err(HookSessionClientError::BindingClosed)
         ));
-        client.acknowledge(&key, &first.delivery_id, 4).unwrap();
-        client.acknowledge(&key, &second.delivery_id, 4).unwrap();
-        client.acknowledge(&key, &closing.delivery_id, 4).unwrap();
+        client.acknowledge(&key, &first.delivery_id, 5).unwrap();
+        client.acknowledge(&key, &summary.delivery_id, 5).unwrap();
+        client.acknowledge(&key, &second.delivery_id, 5).unwrap();
+        client.acknowledge(&key, &closing.delivery_id, 5).unwrap();
         assert!(client.load_binding(&key, 5).is_ok());
         assert!(!client
-            .prune(&key, 4 + DEFAULT_CLOSE_RETRY_GRACE_MS - 1)
+            .prune(&key, 5 + DEFAULT_CLOSE_RETRY_GRACE_MS - 1)
             .unwrap());
         assert!(client
-            .prune(&key, 4 + DEFAULT_CLOSE_RETRY_GRACE_MS)
+            .prune(&key, 5 + DEFAULT_CLOSE_RETRY_GRACE_MS)
             .unwrap());
         assert!(matches!(
             client.pending(&key),
@@ -1389,6 +1457,9 @@ mod tests {
         let key = key();
         client.store_binding(&key, &binding()).unwrap();
         client.enqueue(&key, event("src/a.rs"), 1).unwrap();
+        client
+            .enqueue(&key, turn_summary("bounded typed summary"), 2)
+            .unwrap();
         let contents = fs::read_dir(&root)
             .unwrap()
             .filter_map(Result::ok)
@@ -1397,6 +1468,30 @@ mod tests {
             .join("\n");
         assert!(!contents.contains("transcript") && !contents.contains("host-session-private"));
         assert!(contents.contains("edited_path"));
+        assert!(contents.contains("turn_summary"));
+        assert!(contents.contains("bounded typed summary"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payload_variants_cannot_cross_event_and_turn_summary_routes() {
+        let (client, root) = client("payload-kind");
+        let key = key();
+        client.store_binding(&key, &binding()).unwrap();
+        let summary =
+            lattice_core::memory::session_capture_turn_summary_from_host(Some("safe")).unwrap();
+        assert!(matches!(
+            client.enqueue(&key, HookClientCapturePayload::Event(summary), 1),
+            Err(HookSessionClientError::InvalidInput)
+        ));
+        let HookClientCapturePayload::Event(edit) = event("src/a.rs") else {
+            unreachable!()
+        };
+        assert!(matches!(
+            client.enqueue(&key, HookClientCapturePayload::TurnSummary(edit), 1),
+            Err(HookSessionClientError::InvalidInput)
+        ));
+        assert!(client.pending(&key).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -49,6 +49,7 @@ exercise_package() {
     'session-start.sh:session-start'
     'user-prompt-submit.sh:user-prompt-submit'
     'post-tool-use.sh:post-tool-use'
+    'stop.sh:stop'
     'session-end.sh:session-end'
   )
 
@@ -94,8 +95,10 @@ Path(sys.argv[1]).write_text('#!/usr/bin/env bash\nexit 23\n', encoding='utf-8')
 PY
 chmod 755 "$unavailable"
 for hooks_dir in "$codex_hooks_dir" "$claude_hooks_dir"; do
-  output="$(LATTICE_BIN="$unavailable" "$hooks_dir/session-end.sh" <<<'{"session_id":"unavailable"}')"
-  [[ -z "$output" ]]
+  for hook in stop.sh session-end.sh; do
+    output="$(LATTICE_BIN="$unavailable" "$hooks_dir/$hook" <<<'{"session_id":"unavailable","last_assistant_message":"safe summary"}')"
+    [[ -z "$output" ]]
+  done
 done
 
 if [[ -n "${LATTICE_HOOK_E2E_BIN:-}" ]]; then
@@ -194,6 +197,8 @@ PY
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
         <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"sentinel-$client\"}}" \
         >"$e2e_root/$client-post-tool.out"
+      env "${common_env[@]}" "$hooks_dir/stop.sh" \
+        <<<"{\"session_id\":\"$session\",\"last_assistant_message\":\"bounded turn summary for $client\",\"transcript_path\":\"/tmp/never-open-$client\",\"cwd\":\"/forged\"}"
       env "${common_env[@]}" "$hooks_dir/post-tool-use.sh" \
         <<<"{\"session_id\":\"$session\",\"transcript_path\":\"/tmp/never-open-$client\",\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"src/example.rs\",\"content\":\"second-sentinel-$client\"}}" \
         >"$e2e_root/$client-post-tool-second.out"

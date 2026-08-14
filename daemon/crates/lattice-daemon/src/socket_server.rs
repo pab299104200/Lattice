@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::hook_session_route::{
     HookSessionRoute, HOOK_EVENT_METHOD, HOOK_SESSION_CLOSE_METHOD, HOOK_SESSION_OPEN_METHOD,
+    HOOK_TURN_SUMMARY_METHOD,
 };
 use crate::lifecycle_log;
 use crate::proxy::daemon_addr;
@@ -1051,7 +1052,10 @@ async fn run_json_rpc_connection(
 
                 if matches!(
                     request.method.as_str(),
-                    HOOK_SESSION_OPEN_METHOD | HOOK_EVENT_METHOD | HOOK_SESSION_CLOSE_METHOD
+                    HOOK_SESSION_OPEN_METHOD
+                        | HOOK_EVENT_METHOD
+                        | HOOK_TURN_SUMMARY_METHOD
+                        | HOOK_SESSION_CLOSE_METHOD
                 ) {
                     if is_notification {
                         continue;
@@ -1074,6 +1078,9 @@ async fn run_json_rpc_connection(
                                     }
                                     HOOK_EVENT_METHOD => {
                                         route.handle_event(&hook_request, request.params)
+                                    }
+                                    HOOK_TURN_SUMMARY_METHOD => {
+                                        route.handle_turn_summary(&hook_request, request.params)
                                     }
                                     HOOK_SESSION_CLOSE_METHOD => {
                                         route.handle_close(&hook_request, request.params)

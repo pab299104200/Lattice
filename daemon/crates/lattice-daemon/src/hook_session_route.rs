@@ -61,6 +61,7 @@ const CAPTURE_EXTRACTOR_VERSION: u32 = 1;
 
 pub(crate) const HOOK_SESSION_OPEN_METHOD: &str = "hook/session_open";
 pub(crate) const HOOK_EVENT_METHOD: &str = "hook/event";
+pub(crate) const HOOK_TURN_SUMMARY_METHOD: &str = "hook/turn_summary";
 pub(crate) const HOOK_SESSION_CLOSE_METHOD: &str = "hook/session_close";
 
 #[derive(Debug)]
@@ -250,6 +251,14 @@ impl HookSessionRoute {
         self.handle_delivery(hello, params, RegistryDeliveryKind::Close)
     }
 
+    pub(crate) fn handle_turn_summary(
+        &self,
+        hello: &ProxyRequest,
+        params: Value,
+    ) -> Result<Value, HookSessionRouteError> {
+        self.handle_delivery(hello, params, RegistryDeliveryKind::TurnSummary)
+    }
+
     fn handle_delivery(
         &self,
         hello: &ProxyRequest,
@@ -323,10 +332,23 @@ impl HookSessionRoute {
             let payload_json = serde_json::to_string(&params.event)
                 .map_err(|_| HookSessionRouteError::InvalidRequest)?;
             let (normalized_json, hash_json) = match kind {
-                RegistryDeliveryKind::Event => {
+                RegistryDeliveryKind::Event | RegistryDeliveryKind::TurnSummary => {
                     let event = parse_session_capture_event(&payload_json)
                         .map_err(|_| HookSessionRouteError::InvalidRequest)?;
-                    validate_event_path(&identity.checkout_root, &event.fact)?;
+                    match kind {
+                        RegistryDeliveryKind::Event => {
+                            if matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) {
+                                return Err(HookSessionRouteError::InvalidRequest);
+                            }
+                            validate_event_path(&identity.checkout_root, &event.fact)?;
+                        }
+                        RegistryDeliveryKind::TurnSummary => {
+                            if !matches!(event.fact, SessionCaptureFact::TurnSummary { .. }) {
+                                return Err(HookSessionRouteError::InvalidRequest);
+                            }
+                        }
+                        RegistryDeliveryKind::Close => unreachable!(),
+                    }
                     let mut normalized_value = serde_json::to_value(&event.fact)
                         .map_err(|_| HookSessionRouteError::Unavailable)?;
                     normalized_value
@@ -1117,7 +1139,7 @@ impl CaptureJournal {
                     binding_id BLOB NOT NULL,
                     delivery_id BLOB NOT NULL,
                     sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
-                    delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('event','close')),
+                    delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('event','turn_summary','close')),
                     normalized_hash BLOB NOT NULL CHECK(length(normalized_hash) = 32),
                     normalized_json TEXT NOT NULL,
                     branch TEXT,
@@ -1128,6 +1150,38 @@ impl CaptureJournal {
                  );",
             )
             .map_err(|_| HookSessionRouteError::Unavailable)?;
+        let schema_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'hook_capture_journal'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| HookSessionRouteError::Unavailable)?;
+        if !schema_sql.contains("turn_summary") {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE hook_capture_journal RENAME TO hook_capture_journal_v2;
+                     CREATE TABLE hook_capture_journal (
+                        binding_id BLOB NOT NULL,
+                        delivery_id BLOB NOT NULL,
+                        sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
+                        delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('event','turn_summary','close')),
+                        normalized_hash BLOB NOT NULL CHECK(length(normalized_hash) = 32),
+                        normalized_json TEXT NOT NULL,
+                        branch TEXT,
+                        revision TEXT NOT NULL,
+                        received_at_ms INTEGER NOT NULL,
+                        PRIMARY KEY(binding_id, delivery_id),
+                        UNIQUE(binding_id, sequence_number)
+                     );
+                     INSERT INTO hook_capture_journal
+                     SELECT * FROM hook_capture_journal_v2;
+                     DROP TABLE hook_capture_journal_v2;
+                     COMMIT;",
+                )
+                .map_err(|_| HookSessionRouteError::Unavailable)?;
+        }
         if let Ok(cutoff) = now_ms().map(|now| now.saturating_sub(RETENTION_MS)) {
             connection
                 .execute(
@@ -1241,7 +1295,7 @@ impl CaptureJournal {
                 "SELECT sequence_number, delivery_kind, normalized_hash,
                         normalized_json, branch, revision, received_at_ms
                  FROM hook_capture_journal
-                 WHERE binding_id = ?1 AND delivery_kind = 'event'
+                 WHERE binding_id = ?1 AND delivery_kind IN ('event', 'turn_summary')
                    AND sequence_number < ?2
                  ORDER BY sequence_number ASC",
             )
@@ -1273,6 +1327,7 @@ impl CaptureJournal {
 fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
     let kind = match row.get::<_, String>(1)?.as_str() {
         "event" => RegistryDeliveryKind::Event,
+        "turn_summary" => RegistryDeliveryKind::TurnSummary,
         "close" => RegistryDeliveryKind::Close,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
@@ -1293,6 +1348,7 @@ fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
 fn delivery_kind_str(kind: RegistryDeliveryKind) -> &'static str {
     match kind {
         RegistryDeliveryKind::Event => "event",
+        RegistryDeliveryKind::TurnSummary => "turn_summary",
         RegistryDeliveryKind::Close => "close",
     }
 }
@@ -1339,7 +1395,9 @@ fn drain_binding(
                 delivery_id: pending.delivery_id,
                 normalized_hash: pending.normalized_hash,
                 status: match pending.kind {
-                    RegistryDeliveryKind::Event => RegistryReceiptStatus::Reduced,
+                    RegistryDeliveryKind::Event | RegistryDeliveryKind::TurnSummary => {
+                        RegistryReceiptStatus::Reduced
+                    }
                     RegistryDeliveryKind::Close => RegistryReceiptStatus::Sealed,
                 },
                 completed_at_ms: now_ms.max(pending.admitted_at_ms),
@@ -1992,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn session_start_two_edits_and_session_end_preserve_order_and_seal_idempotently() {
+    fn turn_summary_is_nonterminal_and_session_end_preserves_order_and_seals_idempotently() {
         let directory = test_directory("capture-state");
         let checkout = committed_repository("capture-checkout");
         let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
@@ -2072,13 +2130,59 @@ mod tests {
             RegistryReceiptStatus::Reduced
         );
 
+        let summary_on_event_route = route.handle_event(
+            &hello,
+            authority(
+                3,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "turn_summary",
+                    "summary": "must use dedicated route",
+                }),
+            ),
+        );
+        assert!(matches!(
+            summary_on_event_route,
+            Err(HookSessionRouteError::InvalidRequest)
+        ));
+        let edit_on_summary_route = route.handle_turn_summary(
+            &hello,
+            authority(
+                3,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "edited_path",
+                    "path": "fixture.txt",
+                }),
+            ),
+        );
+        assert!(matches!(
+            edit_on_summary_route,
+            Err(HookSessionRouteError::InvalidRequest)
+        ));
+
+        let summary = route
+            .handle_turn_summary(
+                &hello,
+                authority(
+                    3,
+                    "33333333333333333333333333333333",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "turn_summary",
+                        "summary": "Completed capture routing.",
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(summary["status"], "reduced");
+
         let close_params = authority(
-            3,
-            "33333333333333333333333333333333",
-            serde_json::json!({
-                "schema_version": 1,
-                "final_summary": "Completed capture routing.",
-            }),
+            4,
+            "44444444444444444444444444444444",
+            serde_json::json!({"schema_version": 1}),
         );
         let closed = route.handle_close(&hello, close_params.clone()).unwrap();
         assert_eq!(closed["status"], "sealed");
@@ -2087,17 +2191,11 @@ mod tests {
         assert_eq!(replayed["status"], "sealed");
         assert_eq!(replayed["replayed"], true);
 
-        let connection = Connection::open(identity.memories_path()).unwrap();
-        let memory_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
-            .unwrap();
-        assert!(memory_count > 0);
-
         let rejected = route.handle_event(
             &hello,
             authority(
-                4,
-                "44444444444444444444444444444444",
+                5,
+                "55555555555555555555555555555555",
                 serde_json::json!({"not": "parsed after seal"}),
             ),
         );
@@ -2105,6 +2203,12 @@ mod tests {
             rejected,
             Err(HookSessionRouteError::AuthorityRejected)
         ));
+
+        let connection = Connection::open(identity.memories_path()).unwrap();
+        let memory_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert!(memory_count > 0);
 
         let next_generation = route
             .handle_open(
@@ -2121,7 +2225,7 @@ mod tests {
             "binding_id": next_generation["binding_id"],
             "capability": next_generation["capability"],
             "integration": "codex/v1",
-            "delivery_id": "55555555555555555555555555555555",
+            "delivery_id": "66666666666666666666666666666666",
             "sequence": 1,
             "event": {
                 "schema_version": 1,
@@ -2137,13 +2241,13 @@ mod tests {
         let capture_health =
             crate::adoption_metrics::capture_health_for_workspace(&identity.repository_root)
                 .expect("read capture counters");
-        assert_eq!(capture_health.total_attempts, 5);
+        assert_eq!(capture_health.total_attempts, 8);
         assert_eq!(capture_health.outcomes.get("queued"), Some(&1));
-        assert_eq!(capture_health.outcomes.get("captured"), Some(&3));
-        assert_eq!(capture_health.outcomes.get("rejected"), Some(&1));
-        // The close replay is a transport retry of the same admitted delivery;
-        // it must not create a second capture metric.
-        assert_eq!(capture_health.outcomes.values().sum::<u64>(), 5);
+        assert_eq!(capture_health.outcomes.get("captured"), Some(&4));
+        assert_eq!(capture_health.outcomes.get("rejected"), Some(&3));
+        // The close replay is an exact transport retry and must not create a
+        // duplicate capture metric.
+        assert_eq!(capture_health.outcomes.values().sum::<u64>(), 8);
 
         let metrics = std::fs::read_to_string(
             identity

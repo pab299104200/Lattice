@@ -936,7 +936,8 @@ mod tests {
             "Resolved the compiler failure and all checks passed."
         );
         assert!(candidates.iter().all(|candidate| {
-            candidate.kind != SessionDigestCandidateKind::ResolvedFailure
+            candidate.kind != SessionDigestCandidateKind::CheckOutcome
+                && candidate.kind != SessionDigestCandidateKind::ResolvedFailure
                 && candidate.memory_class != MemoryClass::FailurePattern
         }));
     }

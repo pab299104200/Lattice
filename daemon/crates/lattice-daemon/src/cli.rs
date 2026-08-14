@@ -22,10 +22,11 @@ const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_MCP_TOOL_COUNT: usize = 8;
 const SESSION_START_RECOVERY_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
 
-const INSTALLED_HOOKS: [(&str, &str); 4] = [
+const INSTALLED_HOOKS: [(&str, &str); 5] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
 ];
 
@@ -841,6 +842,9 @@ fn hook_fixture_payload(event: &str) -> &'static str {
         }
         "PostToolUse" => {
             r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md","tool_input":"lattice-install-verification-tool-input","tool_response":"lattice-install-verification-tool-output","transcript_path":"/tmp/lattice-install-verification-transcript"}"#
+        }
+        "Stop" => {
+            r#"{"session_id":"install-verification","last_assistant_message":"bounded install verification summary","transcript_path":"/tmp/lattice-install-verification-transcript","cwd":"/private"}"#
         }
         "SessionEnd" => {
             r#"{"session_id":"install-verification","transcript_path":"/tmp/lattice-install-verification-transcript","reason":"private","cwd":"/private","final_summary":"lattice-install-verification-prompt"}"#

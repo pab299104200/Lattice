@@ -18,16 +18,17 @@ separate consolidation workflow remains explicit and proposal-only.
 ## Decision
 
 Lattice captures a small structured `session-digest` when an agent session
-stops. D3a currently sends only the structured facts that the installed hosts
+ends. D3a currently sends only the structured facts that the installed hosts
 expose safely: an opaque session identifier at start, repository-relative
-edited paths from an allowlisted edit event, and a close marker at Stop. A
-future host adapter may add typed checks, typed errors, and a dedicated
-final-summary field only through an explicit schema change. Trusted
+edited paths from an allowlisted edit event, a bounded top-level
+`Stop.last_assistant_message` as a nonterminal turn summary, and a content-free
+close marker at `SessionEnd`. A future host adapter may add typed checks and
+typed errors only through an explicit schema change. Trusted
 session/repository/checkout authority is bound outside the payload. The daemon
 deterministically extracts and writes repository-local `WorkflowOutcome` and
 `FailurePattern` memories with evidence in one idempotent batch.
 
-The system never stores or forwards a raw transcript, transcript path, prompt, tool input/output, command line, terminal output, environment, editor buffer, or diff as session memory. The stop hook is best-effort and fast: capture failure does not fail or delay agent shutdown. The daemon enforces all policy, including for direct or malformed CLI callers.
+The system never stores or forwards a raw transcript, transcript path, prompt, tool input/output, command line, terminal output, environment, editor buffer, or diff as session memory. Capture hooks are best-effort and fast: failure does not fail or delay the host. The daemon enforces all policy, including for direct or malformed CLI callers.
 
 Optional LLM consolidation is background-only, explicitly opt-in, and creates review proposals for `Decision` or `Constraint` memories. It never writes those memories directly.
 
@@ -46,10 +47,10 @@ It does not archive agent conversations, act as telemetry, infer secrets, promot
 
 ## Payload boundary
 
-The bundled `SessionEnd` hook invokes the private `__hook-adapter` entry point. This is
+The bundled `Stop` and `SessionEnd` hooks invoke the private `__hook-adapter` entry point. This is
 an implemented best-effort transport adapter, not a user-facing memory-write
-command: it opens/resumes a capability binding, queues a sanitized close
-marker, and the authenticated daemon route reduces the complete bound journal
+command: it queues a sanitized turn summary under an existing binding or a
+content-free close marker, and the authenticated daemon route reduces the complete bound journal
 into repository-local memories. There is no public
 `remember --kind session-digest` admission command. The parser accepts content
 only; it rejects identity fields as unknown input. The capture handler binds
@@ -98,10 +99,21 @@ The live adapters have a narrower contract than the future digest shape above:
   `tool_input.file_path` fallback). It emits only a normalized repository-
   relative `edited_path` fact; command arguments, tool input/output, and
   terminal text are discarded.
+- `Stop` admits only the documented top-level `last_assistant_message`, bounded
+  to 2000 bytes after normalization. It queues a nonterminal `turn_summary`
+  fact only under an existing binding. Aliases, nested fields, transcripts,
+  reason, cwd, and raw output are ignored; invalid or absent summaries cause no
+  RPC and never open or resume a binding.
 - `SessionEnd` admits the host `session_id` and emits only a close marker. The
   installed adapters do not admit `edited_files`, a prompt, a transcript path,
-  reason, cwd, or a final summary from the host envelope. Lattice does not
-  register per-turn `Stop` as a lifecycle boundary.
+  reason, cwd, or a final summary from the host envelope. Only `SessionEnd`
+  seals the binding.
+
+A turn summary is contextual prose, not evidence. The reducer may attach the
+latest safe summary from a branch segment to that segment's final digest only
+when the same segment contains an independently typed check or error
+observation. A summary alone cannot certify a check, invent an error, or infer
+resolution, and it does not create a standalone memory.
 
 Every adapter requires bounded JSON, drops unknown keys before transport, and
 never opens a path named by the envelope. Repository, checkout, branch, and

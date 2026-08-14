@@ -192,7 +192,7 @@ no delivery remains pending; an unacknowledged close stays retryable.
 
 ### Presenting authority
 
-Every `hook/event` and `hook/session_close` request is sent on an authenticated
+Every `hook/event`, `hook/turn_summary`, and `hook/session_close` request is sent on an authenticated
 transport and includes binding ID, hook-session capability, integration,
 delivery ID, and sanitized schema-versioned event. The daemon verifies all of
 the following before parsing any optional event text:
@@ -242,7 +242,8 @@ branch-scoped memory.
 
 Moving or recreating a worktree changes checkout identity and invalidates the
 old binding. A later authenticated `SessionStart` creates a new generation; a
-`SessionEnd` event alone cannot silently rebind. Per-turn `Stop` is not a terminal event and is not registered by Lattice.
+`SessionEnd` event alone cannot silently rebind. Per-turn `Stop` is registered
+only for a bounded nonterminal summary and cannot seal or create a binding.
 
 ## No-transcript data path
 
@@ -252,6 +253,9 @@ bounded extraction before RPC:
 
 - `SessionStart` extracts host session/event identity only;
 - edit hooks extract normalized candidate paths only;
+- `Stop` extracts only the documented top-level `last_assistant_message`,
+  bounds it to 2000 bytes, and sends it through `hook/turn_summary` only when an
+  existing authenticated binding is available;
 - structured check hooks extract a canonical check kind and typed outcome,
   never a command line, arguments, environment, output, or stack;
 - structured error/resolution hooks extract a redacted category, stable local
@@ -261,8 +265,10 @@ bounded extraction before RPC:
   reason, cwd, and summary fields are not admitted.
 
 Transcript mining is not a fallback. The adapter does not derive tests,
-failures, resolutions, or a final summary from conversation text. When a host
-does not expose safe structured facts, those fields are omitted. Edited-file
+failures, or resolutions from conversation text. The documented bounded
+`last_assistant_message` is admitted only as non-evidentiary summary context;
+it cannot certify a check or resolution. When a host does not expose safe
+structured facts, those fields are omitted. Edited-file
 evidence may be reconciled with daemon watcher observations for the same exact
 checkout and internal session, but neither source may infer a passing check or
 resolved error.
@@ -345,8 +351,8 @@ repository deployment contract already requires.
 ## Public and internal surfaces
 
 The following authenticated hook routes are daemon-internal integration
-surfaces, not MCP tools: `hook/session_open`, `hook/event`, and
-`hook/session_close`. They are callable only by the hook-adapter client kind;
+surfaces, not MCP tools: `hook/session_open`, `hook/event`,
+`hook/turn_summary`, and `hook/session_close`. They are callable only by the hook-adapter client kind;
 ordinary CLI/MCP clients receive method-not-found. The installed adapters
 present the capability, and the daemon connects parsing, registry
 admission/outbox completion, authority binding, capture-journal reduction, and
@@ -394,7 +400,8 @@ daemon boundaries:
   unauthenticated compatibility hello is rejected;
 - binding authority is derived from the exact checkout and repository role,
   while the handler runtime ID remains distinct from hook-session identity;
-- `hook/session_open`, `hook/event`, and `hook/session_close` are accepted only
+- `hook/session_open`, `hook/event`, `hook/turn_summary`, and
+  `hook/session_close` are accepted only
   from the hook-adapter client kind and are routed before ordinary MCP tools;
 - capability files, pending deliveries, registry receipts, and the capture
   journal are protected, bounded, replay-safe, and payload-limited;

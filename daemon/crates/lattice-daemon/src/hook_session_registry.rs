@@ -19,7 +19,7 @@ use crate::hook_session_binding::{
     HostSessionId,
 };
 
-pub const HOOK_REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const HOOK_REGISTRY_SCHEMA_VERSION: u32 = 3;
 const APPLICATION_ID: i64 = 0x4c_48_53_52; // "LHSR"
 const MAX_OPAQUE_ID_BYTES: usize = 4096;
 const SHA256_BYTES: usize = 32;
@@ -127,6 +127,7 @@ impl RegistryBindingState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryDeliveryKind {
     Event,
+    TurnSummary,
     Close,
 }
 
@@ -134,6 +135,7 @@ impl RegistryDeliveryKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Event => "event",
+            Self::TurnSummary => "turn_summary",
             Self::Close => "close",
         }
     }
@@ -141,6 +143,7 @@ impl RegistryDeliveryKind {
     fn parse(value: &str) -> rusqlite::Result<Self> {
         match value {
             "event" => Ok(Self::Event),
+            "turn_summary" => Ok(Self::TurnSummary),
             "close" => Ok(Self::Close),
             _ => Err(rusqlite::Error::InvalidQuery),
         }
@@ -987,7 +990,9 @@ impl HookSessionRegistry {
             return Err(HookRegistryError::OrderViolation);
         }
         let expected_status = match receipt.kind {
-            RegistryDeliveryKind::Event => RegistryReceiptStatus::Reduced,
+            RegistryDeliveryKind::Event | RegistryDeliveryKind::TurnSummary => {
+                RegistryReceiptStatus::Reduced
+            }
             RegistryDeliveryKind::Close => RegistryReceiptStatus::Sealed,
         };
         if completion.status != expected_status {
@@ -1107,6 +1112,18 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
             expected: HOOK_REGISTRY_SCHEMA_VERSION,
         });
     }
+    if found == 2 {
+        let application_id =
+            connection.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?;
+        if application_id != APPLICATION_ID {
+            return Err(HookRegistryError::UnsupportedSchema {
+                found,
+                expected: HOOK_REGISTRY_SCHEMA_VERSION,
+            });
+        }
+        migrate_v2_to_v3(connection)?;
+        found = 3;
+    }
     if found == 1 {
         let application_id =
             connection.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?;
@@ -1116,10 +1133,9 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
                 expected: HOOK_REGISTRY_SCHEMA_VERSION,
             });
         }
-        // D3 was not wired while schema v1 existed, and v1 did not retain the
-        // identity needed to authenticate or migrate a binding. Preserving
-        // unverifiable rows would create authority, so the v2 transition
-        // deliberately invalidates that prerelease state.
+        // Schema v1 did not retain the identity required to migrate a binding
+        // without manufacturing authority, so only that obsolete prerelease
+        // generation is invalidated.
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              DROP TABLE IF EXISTS hook_outbox;
@@ -1135,7 +1151,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
             "BEGIN IMMEDIATE;
              PRAGMA application_id = {APPLICATION_ID};
              CREATE TABLE hook_bindings (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 3),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB PRIMARY KEY NOT NULL CHECK (length(binding_id) BETWEEN 1 AND 256),
                  authority_fingerprint BLOB NOT NULL CHECK (length(authority_fingerprint) = 32),
@@ -1164,12 +1180,12 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
              CREATE UNIQUE INDEX hook_bindings_one_open_tuple_idx
                  ON hook_bindings(authority_fingerprint) WHERE state = 'open';
              CREATE TABLE hook_receipts (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 3),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB NOT NULL REFERENCES hook_bindings(binding_id) ON DELETE CASCADE,
                  delivery_id BLOB NOT NULL CHECK (length(delivery_id) BETWEEN 1 AND 256),
                  sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
-                 delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'close')),
+                 delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'turn_summary', 'close')),
                  event_schema_version INTEGER NOT NULL CHECK (event_schema_version > 0),
                  normalized_hash BLOB NOT NULL CHECK (length(normalized_hash) = 32),
                  receipt_status TEXT NOT NULL CHECK (receipt_status IN ('pending', 'reduced', 'sealed')),
@@ -1183,12 +1199,12 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
                  CHECK (admitted_at_ms <= prune_after_ms)
              );
              CREATE TABLE hook_outbox (
-                 schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                 schema_version INTEGER NOT NULL CHECK (schema_version = 3),
                  row_version INTEGER NOT NULL CHECK (row_version > 0),
                  binding_id BLOB NOT NULL,
                  delivery_id BLOB NOT NULL,
                  sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
-                 delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'close')),
+                 delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'turn_summary', 'close')),
                  event_schema_version INTEGER NOT NULL CHECK (event_schema_version > 0),
                  normalized_hash BLOB NOT NULL CHECK (length(normalized_hash) = 32),
                  admitted_at_ms INTEGER NOT NULL,
@@ -1215,6 +1231,108 @@ fn initialize_schema(connection: &Connection) -> Result<(), HookRegistryError> {
             });
         }
     }
+    Ok(())
+}
+
+fn migrate_v2_to_v3(connection: &Connection) -> Result<(), HookRegistryError> {
+    connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         BEGIN IMMEDIATE;
+         CREATE TABLE hook_bindings_v3 (
+             schema_version INTEGER NOT NULL CHECK (schema_version = 3),
+             row_version INTEGER NOT NULL CHECK (row_version > 0),
+             binding_id BLOB PRIMARY KEY NOT NULL CHECK (length(binding_id) BETWEEN 1 AND 256),
+             authority_fingerprint BLOB NOT NULL CHECK (length(authority_fingerprint) = 32),
+             capability_verifier BLOB NOT NULL CHECK (length(capability_verifier) = 32),
+             internal_session_id BLOB NOT NULL CHECK (length(internal_session_id) = 16),
+             integration_id BLOB NOT NULL CHECK (length(integration_id) BETWEEN 1 AND 128),
+             repository_id BLOB NOT NULL CHECK (length(repository_id) BETWEEN 1 AND 4096),
+             checkout_id BLOB NOT NULL CHECK (length(checkout_id) BETWEEN 1 AND 4096),
+             start_branch TEXT,
+             start_revision TEXT NOT NULL CHECK (length(start_revision) BETWEEN 1 AND 256),
+             generation INTEGER NOT NULL CHECK (generation > 0),
+             state TEXT NOT NULL CHECK (state IN ('open', 'sealed', 'expired', 'revoked')),
+             created_at_ms INTEGER NOT NULL,
+             last_seen_at_ms INTEGER NOT NULL,
+             idle_deadline_ms INTEGER NOT NULL,
+             absolute_deadline_ms INTEGER NOT NULL,
+             prune_after_ms INTEGER NOT NULL,
+             sealed_at_ms INTEGER,
+             next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+             closing_sequence INTEGER,
+             CHECK (created_at_ms <= last_seen_at_ms),
+             CHECK (created_at_ms < idle_deadline_ms),
+             CHECK (created_at_ms < absolute_deadline_ms),
+             CHECK (absolute_deadline_ms <= prune_after_ms)
+         );
+         CREATE TABLE hook_receipts_v3 (
+             schema_version INTEGER NOT NULL CHECK (schema_version = 3),
+             row_version INTEGER NOT NULL CHECK (row_version > 0),
+             binding_id BLOB NOT NULL REFERENCES hook_bindings_v3(binding_id) ON DELETE CASCADE,
+             delivery_id BLOB NOT NULL CHECK (length(delivery_id) BETWEEN 1 AND 256),
+             sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
+             delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'turn_summary', 'close')),
+             event_schema_version INTEGER NOT NULL CHECK (event_schema_version > 0),
+             normalized_hash BLOB NOT NULL CHECK (length(normalized_hash) = 32),
+             receipt_status TEXT NOT NULL CHECK (receipt_status IN ('pending', 'reduced', 'sealed')),
+             admitted_at_ms INTEGER NOT NULL,
+             completed_at_ms INTEGER,
+             prune_after_ms INTEGER NOT NULL,
+             PRIMARY KEY (binding_id, delivery_id),
+             UNIQUE (binding_id, sequence_number),
+             CHECK ((receipt_status = 'pending' AND completed_at_ms IS NULL)
+                 OR (receipt_status != 'pending' AND completed_at_ms IS NOT NULL)),
+             CHECK (admitted_at_ms <= prune_after_ms)
+         );
+         CREATE TABLE hook_outbox_v3 (
+             schema_version INTEGER NOT NULL CHECK (schema_version = 3),
+             row_version INTEGER NOT NULL CHECK (row_version > 0),
+             binding_id BLOB NOT NULL,
+             delivery_id BLOB NOT NULL,
+             sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
+             delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('event', 'turn_summary', 'close')),
+             event_schema_version INTEGER NOT NULL CHECK (event_schema_version > 0),
+             normalized_hash BLOB NOT NULL CHECK (length(normalized_hash) = 32),
+             admitted_at_ms INTEGER NOT NULL,
+             attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+             available_after_ms INTEGER NOT NULL,
+             PRIMARY KEY (binding_id, delivery_id),
+             FOREIGN KEY (binding_id, delivery_id)
+                 REFERENCES hook_receipts_v3(binding_id, delivery_id) ON DELETE CASCADE
+         );
+         INSERT INTO hook_bindings_v3
+         SELECT 3, row_version, binding_id, authority_fingerprint, capability_verifier,
+                internal_session_id, integration_id, repository_id, checkout_id,
+                start_branch, start_revision, generation, state, created_at_ms,
+                last_seen_at_ms, idle_deadline_ms, absolute_deadline_ms,
+                prune_after_ms, sealed_at_ms, next_sequence, closing_sequence
+         FROM hook_bindings;
+         INSERT INTO hook_receipts_v3
+         SELECT 3, row_version, binding_id, delivery_id, sequence_number,
+                delivery_kind, event_schema_version, normalized_hash,
+                receipt_status, admitted_at_ms, completed_at_ms, prune_after_ms
+         FROM hook_receipts;
+         INSERT INTO hook_outbox_v3
+         SELECT 3, row_version, binding_id, delivery_id, sequence_number,
+                delivery_kind, event_schema_version, normalized_hash,
+                admitted_at_ms, attempt_count, available_after_ms
+         FROM hook_outbox;
+         DROP TABLE hook_outbox;
+         DROP TABLE hook_receipts;
+         DROP TABLE hook_bindings;
+         ALTER TABLE hook_bindings_v3 RENAME TO hook_bindings;
+         ALTER TABLE hook_receipts_v3 RENAME TO hook_receipts;
+         ALTER TABLE hook_outbox_v3 RENAME TO hook_outbox;
+         CREATE UNIQUE INDEX hook_bindings_one_open_tuple_idx
+             ON hook_bindings(authority_fingerprint) WHERE state = 'open';
+         CREATE INDEX hook_outbox_available_idx
+             ON hook_outbox(available_after_ms, admitted_at_ms);
+         CREATE INDEX hook_receipts_prune_idx
+             ON hook_receipts(prune_after_ms) WHERE receipt_status != 'pending';
+         PRAGMA user_version = 3;
+         COMMIT;
+         PRAGMA foreign_keys = ON;",
+    )?;
     Ok(())
 }
 
@@ -1735,7 +1853,7 @@ mod tests {
 
         let outcome = registry.admit(admission("delivery-1", 1, 7)).unwrap();
         assert!(!outcome.idempotent_replay);
-        assert_eq!(outcome.receipt.schema_version, 2);
+        assert_eq!(outcome.receipt.schema_version, 3);
         assert_eq!(outcome.receipt.row_version, 1);
         assert_eq!(registry.pending(20, 10).unwrap().len(), 1);
 
@@ -1941,6 +2059,26 @@ mod tests {
                 expected: HOOK_REGISTRY_SCHEMA_VERSION
             }
         ));
+        clean_db(&path);
+    }
+
+    #[test]
+    fn schema_v2_transition_preserves_live_binding_authority() {
+        let path = temp_db("schema-v2-migration");
+        {
+            let mut registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+            registry.insert_test_binding(binding()).unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        drop(connection);
+
+        let registry = HookSessionRegistry::open(&path, Default::default()).unwrap();
+        assert_eq!(registry.schema_version(), 3);
+        let migrated = registry.binding(&id("binding-1")).unwrap().unwrap();
+        assert_eq!(migrated.state, RegistryBindingState::Open);
+        assert_eq!(migrated.next_sequence, 1);
+        drop(registry);
         clean_db(&path);
     }
 

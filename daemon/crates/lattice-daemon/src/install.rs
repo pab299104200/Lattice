@@ -76,7 +76,7 @@ struct HookDefinition {
     status_message: &'static str,
 }
 
-const HOOKS: [HookDefinition; 4] = [
+const HOOKS: [HookDefinition; 5] = [
     HookDefinition {
         event: "SessionStart",
         script: "session-start.sh",
@@ -99,6 +99,13 @@ const HOOKS: [HookDefinition; 4] = [
         status_message: "Checking Lattice edit impact",
     },
     HookDefinition {
+        event: "Stop",
+        script: "stop.sh",
+        matcher: None,
+        timeout_secs: 5,
+        status_message: "Capturing bounded Lattice turn summary",
+    },
+    HookDefinition {
         event: "SessionEnd",
         script: "session-end.sh",
         matcher: None,
@@ -106,8 +113,6 @@ const HOOKS: [HookDefinition; 4] = [
         status_message: "Finalizing protected Lattice session capture",
     },
 ];
-
-const STALE_LATTICE_HOOKS: [(&str, &str); 1] = [("Stop", "stop.sh")];
 
 /// Reconcile Lattice's hook entries while preserving unrelated client hooks.
 ///
@@ -119,7 +124,6 @@ pub(crate) fn reconcile_hook_config(
     client: HookClient,
     paths: &InstallPaths,
 ) -> Result<()> {
-    remove_stale_lattice_hooks(config)?;
     for definition in HOOKS {
         validate_outer_timeout(client, definition)?;
         reconcile_hook(config, client, paths, definition)?;
@@ -194,60 +198,6 @@ fn validate_outer_timeout(client: HookClient, definition: HookDefinition) -> Res
         );
     }
     Ok(())
-}
-
-fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
-    let root = object_mut(config, "hook configuration")?;
-    let hooks = object_field_mut(root, "hooks", "hook configuration")?;
-    let mut empty_events = Vec::new();
-    for (event, script) in STALE_LATTICE_HOOKS {
-        let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for entry in entries.iter_mut() {
-            let Some(commands) = entry
-                .as_object_mut()
-                .and_then(|entry| entry.get_mut("hooks"))
-                .and_then(Value::as_array_mut)
-            else {
-                continue;
-            };
-            commands.retain(|hook| !is_stale_lattice_hook(hook, script));
-        }
-        entries.retain(|entry| {
-            entry
-                .as_object()
-                .and_then(|entry| entry.get("hooks"))
-                .and_then(Value::as_array)
-                .is_none_or(|commands| !commands.is_empty())
-        });
-        if entries.is_empty() {
-            empty_events.push(event);
-        }
-    }
-    for event in empty_events {
-        hooks.remove(event);
-    }
-    Ok(())
-}
-
-fn is_stale_lattice_hook(hook: &Value, script: &str) -> bool {
-    let Some(command) = hook
-        .as_object()
-        .and_then(|hook| hook.get("command"))
-        .and_then(Value::as_str)
-    else {
-        return false;
-    };
-    let path = Path::new(command);
-    path.file_name().and_then(|name| name.to_str()) == Some(script)
-        && path
-            .components()
-            .any(|part| part.as_os_str() == "integrations")
-        && path.components().any(|part| part.as_os_str() == "hooks")
-        && path
-            .components()
-            .any(|part| matches!(part.as_os_str().to_str(), Some("codex" | "claude-code")))
 }
 
 fn reconcile_hook(
@@ -428,10 +378,14 @@ mod tests {
         );
         assert_eq!(config["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5);
         assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
-        assert_eq!(
-            config["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "foreign-stop.sh"
-        );
+        let stop_commands = config["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(stop_commands.len(), 2);
+        assert!(stop_commands
+            .iter()
+            .any(|hook| { hook["command"] == "/opt/lattice/integrations/codex/hooks/stop.sh" }));
+        assert!(stop_commands
+            .iter()
+            .any(|hook| hook["command"] == "foreign-stop.sh"));
         assert_eq!(
             config["hooks"]["Custom"][0]["hooks"][0]["command"],
             "custom-hook"
@@ -439,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_stale_only_stop_event_for_codex_and_claude_idempotently() {
+    fn replaces_stale_stop_asset_for_codex_and_claude_idempotently() {
         for client in [HookClient::Codex, HookClient::ClaudeCode] {
             let stale_client = client.asset_directory();
             let mut config = json!({
@@ -453,7 +407,10 @@ mod tests {
 
             reconcile_hook_config(&mut config, client, &paths()).unwrap();
             let once = render_config(&config).unwrap();
-            assert!(!config["hooks"].as_object().unwrap().contains_key("Stop"));
+            assert_eq!(
+                config["hooks"]["Stop"][0]["hooks"][0]["command"],
+                format!("/opt/lattice/integrations/{stale_client}/hooks/stop.sh")
+            );
 
             reconcile_hook_config(&mut config, client, &paths()).unwrap();
             assert_eq!(once, render_config(&config).unwrap());
@@ -461,10 +418,13 @@ mod tests {
     }
 
     #[test]
-    fn removes_empty_stop_event_container_without_removing_foreign_stop_hooks() {
+    fn fills_empty_stop_event_container_without_removing_foreign_stop_hooks() {
         let mut empty_config = json!({"hooks": {"Stop": []}});
         reconcile_hook_config(&mut empty_config, HookClient::Codex, &paths()).unwrap();
-        assert!(!empty_config["hooks"].as_object().unwrap().contains_key("Stop"));
+        assert_eq!(
+            empty_config["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/lattice/integrations/codex/hooks/stop.sh"
+        );
 
         let mut foreign_config = json!({
             "hooks": {
@@ -475,10 +435,18 @@ mod tests {
             }
         });
         reconcile_hook_config(&mut foreign_config, HookClient::Codex, &paths()).unwrap();
-        assert_eq!(
-            foreign_config["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "foreign-stop.sh"
-        );
+        let commands = foreign_config["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        assert!(commands
+            .iter()
+            .any(|hook| hook["command"] == "foreign-stop.sh"));
+        assert!(commands
+            .iter()
+            .any(|hook| { hook["command"] == "/opt/lattice/integrations/codex/hooks/stop.sh" }));
     }
 
     #[test]

@@ -94,8 +94,10 @@ lattice doctor --workspace /path/to/your/project
 `install mcp` updates `.mcp.json`; the hook targets update `.claude/settings.json` or `.codex/hooks.json`. Hook targets require one workspace; MCP registration accepts multiple `--workspace` values. Installation preserves unrelated configuration and removes duplicate Lattice entries. `--verify` re-reads the written file, checks canonical serialization and required assets, then exercises the configured MCP process (`initialize` and `tools/list`) or each configured hook with bounded structured fixture input. `doctor` repeats the configured hook fixture check after validating paths and outer timeouts. Fixture checks redirect protected state to a disposable directory and use an unavailable loopback endpoint, so they cannot create live capture state. A failed protocol, hook, or tool-surface check is reported as an error. The standalone packages under `integrations/` remain available for package-level installation and testing.
 
 Installed hook adapters implement the D3a boundary, not a transcript recorder.
-They accept an opaque host session ID, allowlisted edit metadata, and a
-best-effort `SessionEnd` close marker. They do not read `transcript_path` or retain
+They accept an opaque host session ID, allowlisted edit metadata, a bounded
+top-level `Stop.last_assistant_message` turn summary, and a best-effort
+`SessionEnd` close marker. `Stop` is nonterminal; only `SessionEnd` seals the
+session. They do not read `transcript_path` or retain
 prompts, raw tool input/output, commands, terminal output, environment values,
 or caller-supplied repository, checkout, branch, or organization scope. The
 protected capability record and bounded retry queue are repository-local and
@@ -103,7 +105,9 @@ exact-checkout-bound; retries reuse delivery IDs, and expired/acknowledged
 state is pruned. The transport/state primitives are implemented, while
 verified `SessionEnd` close is reduced into deterministic repository-local session
 memories for task-scoped recall; a failed or unavailable `SessionEnd` is never
-reported as a successful capture. Capture is best-effort and never blocks
+reported as a successful capture. A turn summary can annotate a final digest
+only when the same branch segment contains a typed check or error observation;
+assistant prose never certifies checks or resolutions by itself. Capture is best-effort and never blocks
 agent shutdown. Deterministic capture has no LLM dependency; the separate
 consolidation workflow is explicit opt-in, repository-scoped, and
 proposal-only.
