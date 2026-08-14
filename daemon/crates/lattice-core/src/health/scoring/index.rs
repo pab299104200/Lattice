@@ -31,6 +31,7 @@
 //! engine reports in `inputs_missing` and pays for by widening the band.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::git_intelligence::GitIntelligenceSnapshot;
 use crate::graph::CodeGraph;
@@ -211,44 +212,81 @@ impl HealthFactIndex {
 ///
 /// Every input is optional: an index over fewer families is not an error, it is
 /// a score with more missing inputs and a wider band.
+/// Every input is held behind an [`Arc`] so that a runtime which has already
+/// published a generation can hand the same snapshot to many requests without
+/// deep-copying it. `build` only ever reads its inputs, so sharing them changes
+/// no result; on a repository the size of the committed backtest corpus
+/// (`docs/reports/health-backtest/2026-08-14.md`) a per-request deep clone of
+/// the file vectors would dominate the read path it is meant to make cheap.
 #[derive(Debug, Default)]
 pub struct HealthFactIndexBuilder {
-    graph: Option<GraphFactsSnapshot>,
-    git: Option<GitIntelligenceSnapshot>,
-    complexity: BTreeMap<String, FileComplexityFacts>,
+    graph: Option<Arc<GraphFactsSnapshot>>,
+    git: Option<Arc<GitIntelligenceSnapshot>>,
+    complexity: Arc<BTreeMap<String, FileComplexityFacts>>,
     complexity_supplied: bool,
-    test_proximity: Option<TestProximitySnapshot>,
-    dead_symbols: Option<DeadSymbolFactsSnapshot>,
+    test_proximity: Option<Arc<TestProximitySnapshot>>,
+    dead_symbols: Option<Arc<DeadSymbolFactsSnapshot>>,
 }
 
 impl HealthFactIndexBuilder {
     /// Add published graph facts (H2.1).
-    pub fn with_graph_facts(mut self, snapshot: GraphFactsSnapshot) -> Self {
+    pub fn with_graph_facts(self, snapshot: GraphFactsSnapshot) -> Self {
+        self.with_shared_graph_facts(Arc::new(snapshot))
+    }
+
+    /// Add already-shared published graph facts (H2.1).
+    pub fn with_shared_graph_facts(mut self, snapshot: Arc<GraphFactsSnapshot>) -> Self {
         self.graph = Some(snapshot);
         self
     }
 
     /// Add a published git-intelligence snapshot, including line churn (H2.5).
-    pub fn with_git_intelligence(mut self, snapshot: GitIntelligenceSnapshot) -> Self {
+    pub fn with_git_intelligence(self, snapshot: GitIntelligenceSnapshot) -> Self {
+        self.with_shared_git_intelligence(Arc::new(snapshot))
+    }
+
+    /// Add an already-shared published git-intelligence snapshot (H2.5).
+    pub fn with_shared_git_intelligence(mut self, snapshot: Arc<GitIntelligenceSnapshot>) -> Self {
         self.git = Some(snapshot);
         self
     }
 
     /// Add published complexity facts (H2.2), keyed by path.
-    pub fn with_complexity_facts(mut self, facts: BTreeMap<String, FileComplexityFacts>) -> Self {
+    pub fn with_complexity_facts(self, facts: BTreeMap<String, FileComplexityFacts>) -> Self {
+        self.with_shared_complexity_facts(Arc::new(facts))
+    }
+
+    /// Add already-shared published complexity facts (H2.2), keyed by path.
+    pub fn with_shared_complexity_facts(
+        mut self,
+        facts: Arc<BTreeMap<String, FileComplexityFacts>>,
+    ) -> Self {
         self.complexity = facts;
         self.complexity_supplied = true;
         self
     }
 
     /// Add published test-proximity facts (H2.4).
-    pub fn with_test_proximity_facts(mut self, snapshot: TestProximitySnapshot) -> Self {
+    pub fn with_test_proximity_facts(self, snapshot: TestProximitySnapshot) -> Self {
+        self.with_shared_test_proximity_facts(Arc::new(snapshot))
+    }
+
+    /// Add already-shared published test-proximity facts (H2.4).
+    pub fn with_shared_test_proximity_facts(mut self, snapshot: Arc<TestProximitySnapshot>) -> Self {
         self.test_proximity = Some(snapshot);
         self
     }
 
     /// Add published dead-symbol facts (H2.3).
-    pub fn with_dead_symbol_facts(mut self, snapshot: DeadSymbolFactsSnapshot) -> Self {
+    pub fn with_dead_symbol_facts(self, snapshot: DeadSymbolFactsSnapshot) -> Self {
+        self.with_shared_dead_symbol_facts(Arc::new(snapshot))
+    }
+
+    /// Add already-shared published dead-symbol facts (H2.3).
+    pub fn with_shared_dead_symbol_facts(
+        mut self,
+        snapshot: Arc<DeadSymbolFactsSnapshot>,
+    ) -> Self {
         self.dead_symbols = Some(snapshot);
         self
     }
@@ -498,7 +536,7 @@ impl HealthFactIndexBuilder {
         raw: &mut BTreeMap<String, Vec<RawFact>>,
         availability: &mut FactAvailability,
     ) {
-        for (path, facts) in &self.complexity {
+        for (path, facts) in self.complexity.iter() {
             let file_availability: FactAvailability = facts.availability.into();
             *availability = availability.worst(file_availability);
             let Some(rollup) = &facts.rollup else {
