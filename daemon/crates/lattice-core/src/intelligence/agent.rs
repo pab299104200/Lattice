@@ -7678,7 +7678,7 @@ fn unique_graph_files(graph: &CodeGraph) -> Vec<String> {
     files
 }
 
-fn is_queryable_graph_file(file: &str) -> bool {
+pub(crate) fn is_queryable_graph_file(file: &str) -> bool {
     !is_assistant_artifact_path(file)
 }
 
@@ -8072,7 +8072,13 @@ fn format_line_span(node: &GraphNode) -> String {
     }
 }
 
-fn is_test_file(file: &str) -> bool {
+/// True when `file` is a test file by path or filename convention.
+///
+/// Shared with [`crate::health::test_proximity_facts`], which reuses this
+/// exact classifier so "production file" vs "test file" is defined in exactly
+/// one place (see `docs/plans/2026-08-13-health-engine.md`, section "H2.4
+/// Test-proximity facts").
+pub(crate) fn is_test_file(file: &str) -> bool {
     file.starts_with("tests/")
         || file.starts_with("test/")
         || file.starts_with("__tests__/")
@@ -8088,7 +8094,7 @@ fn is_test_file(file: &str) -> bool {
         || file.ends_with("_test.py")
 }
 
-fn is_test_support_file(file: &str) -> bool {
+pub(crate) fn is_test_support_file(file: &str) -> bool {
     let basename = file.rsplit('/').next().unwrap_or(file);
     basename == "conftest.py"
 }
