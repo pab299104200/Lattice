@@ -297,6 +297,77 @@ impl GraphFactsSnapshot {
             .ok()
             .map(|index| &self.symbols[index])
     }
+
+    /// Which files' facts moved between `previous` and this snapshot.
+    ///
+    /// Both vectors are ordered by path, so this is a single linear merge.
+    pub fn file_delta(&self, previous: &GraphFactsSnapshot) -> FileFactDelta {
+        let mut delta = FileFactDelta::default();
+        let mut current = self.files.iter().peekable();
+        let mut earlier = previous.files.iter().peekable();
+        loop {
+            match (current.peek(), earlier.peek()) {
+                (Some(new), Some(old)) => match new.path.cmp(&old.path) {
+                    std::cmp::Ordering::Less => {
+                        delta.added.push(new.path.clone());
+                        current.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        delta.removed.push(old.path.clone());
+                        earlier.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if new != old {
+                            delta.updated.push(new.path.clone());
+                        }
+                        current.next();
+                        earlier.next();
+                    }
+                },
+                (Some(new), None) => {
+                    delta.added.push(new.path.clone());
+                    current.next();
+                }
+                (None, Some(old)) => {
+                    delta.removed.push(old.path.clone());
+                    earlier.next();
+                }
+                (None, None) => break,
+            }
+        }
+        delta
+    }
+}
+
+/// The per-file difference between two fact generations.
+///
+/// Facts are republished wholesale, but a consumer that refreshed one file
+/// needs to know which files' facts actually moved so it can invalidate only
+/// those. Because both snapshots are ordered by path, the comparison is a
+/// linear merge and no rescan of the graph is required.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFactDelta {
+    /// Paths present now and absent before, ordered.
+    pub added: Vec<String>,
+    /// Paths present in both whose facts differ, ordered.
+    pub updated: Vec<String>,
+    /// Paths absent now and present before, ordered.
+    pub removed: Vec<String>,
+}
+
+impl FileFactDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
+    }
+
+    /// Every touched path, ordered and deduplicated.
+    pub fn touched_paths(&self) -> Vec<&str> {
+        let mut paths: BTreeSet<&str> = BTreeSet::new();
+        for path in self.added.iter().chain(&self.updated).chain(&self.removed) {
+            paths.insert(path.as_str());
+        }
+        paths.into_iter().collect()
+    }
 }
 
 /// Builds a [`SymbolGraphFacts::key`] from a canonical path and a symbol name.
@@ -1247,6 +1318,76 @@ mod tests {
         assert_eq!(signal.from_symbol, "early_caller");
         assert_eq!(signal.edge_kind, EdgeKind::TypeRef);
         assert_eq!((signal.source_line, signal.source_end_line), (12, 16));
+    }
+
+    #[test]
+    fn reproducing_an_unchanged_graph_yields_an_empty_delta() {
+        let producer = GraphFactProducer::default();
+        let before = producer.produce(&chain_graph(), true);
+        let after = producer.produce(&chain_graph(), true);
+        assert!(after.file_delta(&before).is_empty());
+    }
+
+    #[test]
+    fn reindexing_one_file_moves_only_that_file_and_its_new_neighbour() {
+        let producer = GraphFactProducer::default();
+        let before = producer.produce(&chain_graph(), true);
+
+        // Simulate an incremental reindex of src/b.rs that adds one import.
+        let mut graph = chain_graph();
+        let b = symbol("src/b.rs", "beta");
+        let d = symbol("src/d.rs", "delta");
+        add_symbol(&mut graph, &d, true, 1);
+        add_edge(&mut graph, &b, &d, EdgeKind::Imports);
+        let after = producer.produce(&graph, true);
+
+        let delta = after.file_delta(&before);
+        assert_eq!(delta.added, ["src/d.rs"]);
+        assert_eq!(delta.updated, ["src/b.rs"]);
+        assert!(delta.removed.is_empty());
+        assert_eq!(delta.touched_paths(), ["src/b.rs", "src/d.rs"]);
+
+        // The untouched files are byte-identical, so a consumer may keep them.
+        for path in ["src/a.rs", "src/c.rs"] {
+            assert_eq!(before.file(path), after.file(path));
+        }
+    }
+
+    #[test]
+    fn deleting_a_file_is_reported_as_removed_with_its_dependents_updated() {
+        let producer = GraphFactProducer::default();
+        let before = producer.produce(&chain_graph(), true);
+
+        let mut graph = chain_graph();
+        graph.remove_file_nodes("src/c.rs");
+        let after = producer.produce(&graph, true);
+
+        let delta = after.file_delta(&before);
+        assert_eq!(delta.removed, ["src/c.rs"]);
+        assert_eq!(delta.updated, ["src/b.rs"]);
+        assert!(delta.added.is_empty());
+        assert_eq!(before.file("src/a.rs"), after.file("src/a.rs"));
+    }
+
+    #[test]
+    fn a_change_that_closes_a_cycle_honestly_updates_every_member() {
+        let producer = GraphFactProducer::default();
+        let before = producer.produce(&chain_graph(), true);
+
+        // One new edge turns the acyclic chain into a three-file cycle, so the
+        // delta must report all three files rather than only the edited one.
+        let mut graph = chain_graph();
+        let a = symbol("src/a.rs", "alpha");
+        let c = symbol("src/c.rs", "gamma");
+        add_edge(&mut graph, &c, &a, EdgeKind::Calls);
+        let after = producer.produce(&graph, true);
+
+        let delta = after.file_delta(&before);
+        assert_eq!(delta.updated, ["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert!(after
+            .files
+            .iter()
+            .all(|file| file.cycle_member && file.scc_size == 3));
     }
 
     #[test]
