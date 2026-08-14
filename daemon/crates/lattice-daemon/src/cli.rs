@@ -16,7 +16,9 @@ use crate::install::{
 use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
 use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelInstallStatus};
-use lattice_core::health::backtest::replay::{replay_repository, ReplayLimits};
+use lattice_core::health::backtest::replay::{
+    repository_name, replay_repository_streaming, ReplayLimits,
+};
 use lattice_core::health::backtest::report::ReportBuilder;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1148,20 +1150,22 @@ fn run_health_backtest(args: HealthBacktestArgs) -> Result<Option<String>> {
         // A repository that cannot be replayed fails the run rather than being
         // quietly dropped: a pooled report that silently lost a repository
         // would misstate the evidence it rests on.
-        let replay = replay_repository(repository, args.limits).with_context(|| {
-            format!("could not replay repository `{}`", repository.display())
-        })?;
+        // Cut points are folded in and dropped one at a time. A single cut
+        // point of a large repository carries hundreds of megabytes of fact
+        // snapshots, so collecting even one repository's worth was measured
+        // above four gigabytes; streaming keeps peak memory at one cut point.
+        builder.start_repository(&repository_name(repository));
+        let mut cut_points = 0usize;
+        let summary = replay_repository_streaming(repository, args.limits, |cut_point| {
+            cut_points += 1;
+            builder.push_cut_point(&cut_point);
+        })
+        .with_context(|| format!("could not replay repository `{}`", repository.display()))?;
         eprintln!(
             "lattice: replayed {} — {} cut points over {} first-parent commits",
-            replay.name,
-            replay.cut_points.len(),
-            replay.report.spine_length
+            summary.name, cut_points, summary.report.spine_length
         );
-        builder.push(&replay);
-        // Each replay holds every cut point's full fact snapshots. Dropping it
-        // as soon as its normalized frames are folded in keeps peak memory at
-        // one repository instead of the whole corpus.
-        drop(replay);
+        builder.finish_repository(&summary);
     }
 
     let report = builder.finish();

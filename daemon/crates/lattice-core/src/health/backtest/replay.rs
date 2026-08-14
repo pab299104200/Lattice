@@ -312,11 +312,40 @@ struct SpineCommit {
     subject: String,
 }
 
-/// Replay a repository's history at evenly spaced cut points.
-pub fn replay_repository(
+/// A replayed repository's identity and accounting, without its cut points.
+///
+/// Returned by [`replay_repository_streaming`] so a caller that consumes cut
+/// points as they are produced still receives everything describing the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaySummary {
+    /// Display name of the repository (its directory name).
+    pub name: String,
+    /// Commit id of `HEAD` at replay time.
+    pub head_commit_id: String,
+    /// What the replay read and clamped.
+    pub report: ReplayReport,
+}
+
+/// Replay a repository's history, handing each cut point to `on_cut_point`.
+///
+/// A [`CutPointReplay`] carries the complete fact snapshots for one moment in
+/// a repository's history — every graph symbol, every function's complexity,
+/// the whole mined window. For a large repository that is hundreds of
+/// megabytes, and holding all six at once was measured at over four gigabytes
+/// on one of the Cadres repositories. Handing each cut point to a callback
+/// lets a caller extract what it needs and drop the rest, which caps peak
+/// memory at a single cut point.
+///
+/// [`replay_repository`] is the collecting form, kept for callers that
+/// genuinely want every cut point at once.
+pub fn replay_repository_streaming<F>(
     repository_path: &Path,
     limits: ReplayLimits,
-) -> Result<RepositoryReplay, ReplayError> {
+    mut on_cut_point: F,
+) -> Result<ReplaySummary, ReplayError>
+where
+    F: FnMut(CutPointReplay),
+{
     let limits = limits.bounded();
     let path_label = repository_path.display().to_string();
     let repository = Repository::open(repository_path).map_err(|source| ReplayError::Open {
@@ -362,9 +391,9 @@ pub fn replay_repository(
     }
 
     let adapter = GitHistoryAdapter::new(limits.git);
-    let mut cut_points = Vec::with_capacity(indices.len());
     for index in &indices {
-        cut_points.push(replay_cut_point(
+        // Handed over and dropped by the caller before the next one is built.
+        on_cut_point(replay_cut_point(
             &repository,
             &path_label,
             &spine,
@@ -374,10 +403,9 @@ pub fn replay_repository(
         )?);
     }
 
-    Ok(RepositoryReplay {
+    Ok(ReplaySummary {
         name: repository_name(repository_path),
         head_commit_id: spine[0].oid.to_string(),
-        cut_points,
         report: ReplayReport {
             limits,
             spine_length: spine.len() as u32,
@@ -387,6 +415,27 @@ pub fn replay_repository(
             horizon_reserve: horizon_reserve as u32,
             mining_reserve: mining_reserve as u32,
         },
+    })
+}
+
+/// Replay a repository's history at evenly spaced cut points, collecting them.
+///
+/// Convenience over [`replay_repository_streaming`]. A caller replaying a
+/// large repository should prefer the streaming form: this one holds every cut
+/// point's full fact snapshots at once.
+pub fn replay_repository(
+    repository_path: &Path,
+    limits: ReplayLimits,
+) -> Result<RepositoryReplay, ReplayError> {
+    let mut cut_points = Vec::new();
+    let summary = replay_repository_streaming(repository_path, limits, |cut_point| {
+        cut_points.push(cut_point)
+    })?;
+    Ok(RepositoryReplay {
+        name: summary.name,
+        head_commit_id: summary.head_commit_id,
+        cut_points,
+        report: summary.report,
     })
 }
 
@@ -431,8 +480,11 @@ pub fn replay_at_commit(
     replay_cut_point(&repository, &path_label, &spine, index, &adapter, limits)
 }
 
-/// Display name for a repository path.
-fn repository_name(repository_path: &Path) -> String {
+/// Display name for a repository path: its directory name.
+///
+/// Public so a streaming caller can label a repository before its replay
+/// finishes, which is when [`ReplaySummary`] would otherwise supply the name.
+pub fn repository_name(repository_path: &Path) -> String {
     repository_path
         .file_name()
         .and_then(|name| name.to_str())

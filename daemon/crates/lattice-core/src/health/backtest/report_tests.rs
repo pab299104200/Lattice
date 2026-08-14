@@ -8,7 +8,9 @@ use git2::{IndexAddOption, Repository, Signature, Time};
 use tempfile::TempDir;
 
 use super::super::labels::HorizonLimits;
-use super::super::replay::{replay_repository, ReplayLimits};
+use super::super::replay::{
+    repository_name, replay_repository, replay_repository_streaming, ReplayLimits,
+};
 use super::*;
 
 const BASE_TIME: i64 = 1_600_000_000;
@@ -382,6 +384,46 @@ fn streaming_repositories_in_one_at_a_time_matches_building_them_together() {
         drop(replay);
     }
     assert_eq!(builder.finish(), batched);
+}
+
+#[test]
+fn streaming_cut_points_one_at_a_time_matches_collecting_them() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    build_fixture(directory.path());
+
+    let collected = build_report(&[
+        replay_repository(directory.path(), fixture_limits()).expect("collecting replay")
+    ]);
+
+    // The streaming path exists so a caller can drop each cut point's fact
+    // snapshots as it goes. It must not thereby produce a different report.
+    let mut builder = ReportBuilder::new();
+    builder.start_repository(&repository_name(directory.path()));
+    let summary = replay_repository_streaming(directory.path(), fixture_limits(), |cut_point| {
+        builder.push_cut_point(&cut_point);
+        drop(cut_point);
+    })
+    .expect("streaming replay");
+    builder.finish_repository(&summary);
+
+    assert_eq!(builder.finish(), collected);
+}
+
+#[test]
+fn a_streaming_replay_reports_the_same_summary_the_collecting_one_does() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    build_fixture(directory.path());
+
+    let collected = replay_repository(directory.path(), fixture_limits()).expect("replay");
+    let mut streamed_cut_points = 0usize;
+    let summary =
+        replay_repository_streaming(directory.path(), fixture_limits(), |_| streamed_cut_points += 1)
+            .expect("streaming replay");
+
+    assert_eq!(summary.name, collected.name);
+    assert_eq!(summary.head_commit_id, collected.head_commit_id);
+    assert_eq!(summary.report, collected.report);
+    assert_eq!(streamed_cut_points, collected.cut_points.len());
 }
 
 #[test]

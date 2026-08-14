@@ -39,7 +39,7 @@ use super::features::{
     ALL_FAMILY_SETS, ALL_FEATURES, FEATURE_COUNT,
 };
 use super::metrics::{evaluate, CalibrationBucket, Evaluation, EvaluationUnavailable, ScoredObservation};
-use super::replay::{RepositoryReplay, ReplayReport, TreeReadReport};
+use super::replay::{CutPointReplay, ReplayReport, ReplaySummary, RepositoryReplay, TreeReadReport};
 use super::BACKTEST_HARNESS_VERSION;
 
 /// How a family's features were weighted for one evaluation.
@@ -241,6 +241,14 @@ pub struct ReportBuilder {
     frames: Vec<CutPointFrame>,
     audit_inputs: Vec<AuditInput>,
     repositories: Vec<RepositoryReport>,
+    pending: Option<PendingRepository>,
+}
+
+/// A repository whose cut points are still arriving.
+struct PendingRepository {
+    name: String,
+    first_frame: usize,
+    cut_points: Vec<CutPointReport>,
 }
 
 impl ReportBuilder {
@@ -249,20 +257,169 @@ impl ReportBuilder {
         Self::default()
     }
 
-    /// Fold one replayed repository in. The replay may be dropped afterwards.
+    /// Fold one fully replayed repository in.
+    ///
+    /// The replay may be dropped immediately afterwards. For a large
+    /// repository, prefer the streaming trio
+    /// ([`ReportBuilder::start_repository`],
+    /// [`ReportBuilder::push_cut_point`],
+    /// [`ReportBuilder::finish_repository`]) so cut points can be dropped one
+    /// at a time.
     pub fn push(&mut self, replay: &RepositoryReplay) {
-        push_replay(
-            &mut self.frames,
-            &mut self.audit_inputs,
-            &mut self.repositories,
-            replay,
+        self.start_repository(&replay.name);
+        for cut_point in &replay.cut_points {
+            self.push_cut_point(cut_point);
+        }
+        self.finish_repository(&ReplaySummary {
+            name: replay.name.clone(),
+            head_commit_id: replay.head_commit_id.clone(),
+            report: replay.report.clone(),
+        });
+    }
+
+    /// Begin a repository; every cut point pushed next belongs to it.
+    pub fn start_repository(&mut self, name: &str) {
+        self.pending = Some(PendingRepository {
+            name: name.to_owned(),
+            first_frame: self.frames.len(),
+            cut_points: Vec::new(),
+        });
+    }
+
+    /// Fold one cut point in. It may be dropped immediately afterwards.
+    ///
+    /// Everything the report needs is extracted here: the normalized feature
+    /// vectors, the labels, the audit inputs, and the accounting. The fact
+    /// snapshots themselves are not retained.
+    pub fn push_cut_point(&mut self, cut_point: &CutPointReplay) {
+        let Some(pending) = self.pending.as_mut() else {
+            debug_assert!(false, "push_cut_point called outside start_repository");
+            return;
+        };
+        let (frame, report) = extract_cut_point(&pending.name, cut_point, &mut self.audit_inputs);
+        pending.cut_points.push(report);
+        self.frames.push(frame);
+    }
+
+    /// Close the repository opened by [`ReportBuilder::start_repository`].
+    pub fn finish_repository(&mut self, summary: &ReplaySummary) {
+        let Some(pending) = self.pending.take() else {
+            debug_assert!(false, "finish_repository called without start_repository");
+            return;
+        };
+        let repository_frames = &self.frames[pending.first_frame..];
+        let observations: u32 = repository_frames
+            .iter()
+            .map(|frame| frame.files.len() as u32)
+            .sum();
+        let positives: u32 = repository_frames
+            .iter()
+            .map(|frame| frame.files.iter().filter(|file| file.label).count() as u32)
+            .sum();
+
+        let uniform = FeatureWeights::uniform();
+        let families = ALL_FAMILY_SETS
+            .iter()
+            .map(|set| {
+                FamilyResult::new(
+                    *set,
+                    Weighting::Uniform,
+                    evaluate(scored(repository_frames, *set, &uniform)),
+                )
+            })
+            .collect();
+
+        let (univariate, coverage) = univariate_discrimination(repository_frames);
+        let features = feature_results(
+            &univariate,
+            &coverage,
+            observations,
+            &FeatureWeights::from_univariate_roc(&univariate),
         );
+
+        self.repositories.push(RepositoryReport {
+            name: summary.name.clone(),
+            head_commit: abbreviate(&summary.head_commit_id),
+            replay: summary.report.clone(),
+            cut_points: pending.cut_points,
+            observations,
+            positives,
+            families,
+            features,
+        });
     }
 
     /// Finish the report.
     pub fn finish(self) -> BacktestReport {
+        debug_assert!(
+            self.pending.is_none(),
+            "finish called with a repository still open"
+        );
         finish_report(self.frames, self.audit_inputs, self.repositories)
     }
+}
+
+/// Extract everything the report needs from one cut point.
+fn extract_cut_point(
+    repository: &str,
+    cut_point: &CutPointReplay,
+    audit_inputs: &mut Vec<AuditInput>,
+) -> (CutPointFrame, CutPointReport) {
+    // Normalization is per cut point: a file's percentile describes its
+    // standing among the files that existed alongside it, not among files from
+    // a different era or repository.
+    let vectors: Vec<_> = cut_point
+        .observations
+        .iter()
+        .map(|observation| observation.features.clone())
+        .collect();
+    let normalized = normalize(&vectors);
+    let files: Vec<FrameFile> = normalized
+        .into_iter()
+        .zip(cut_point.observations.iter())
+        .map(|(vector, observation)| FrameFile {
+            key: format!(
+                "{}#{:06}:{}",
+                repository, cut_point.spine_index, observation.path
+            ),
+            vector,
+            label: observation.label,
+        })
+        .collect();
+
+    let defective_files = files.iter().filter(|file| file.label).count() as u32;
+    let report = CutPointReport {
+        spine_index: cut_point.spine_index,
+        commit: abbreviate(&cut_point.commit_id),
+        subject: cut_point.subject.clone(),
+        window_commits: cut_point.git.processed_commits.len() as u32,
+        files_scored: files.len() as u32,
+        defective_files,
+        horizon_commits: cut_point.labels.report.selected_commits,
+        horizon_fix_commits: cut_point.labels.report.fix_shaped_commits,
+        horizon_truncated_by_commit_cap: cut_point.labels.report.truncated_by_commit_cap,
+        horizon_truncated_by_day_cap: cut_point.labels.report.truncated_by_day_cap,
+        horizon_path_overflow_commits: cut_point.labels.report.path_overflow_commits,
+        window_path_overflow_commits: cut_point.git.report.path_overflow_commits,
+        tree: cut_point.tree.clone(),
+    };
+
+    for commit in &cut_point.window_commits {
+        audit_inputs.push(AuditInput {
+            id: commit.id.clone(),
+            subject: commit.subject.clone(),
+            paths: commit.paths.clone(),
+        });
+    }
+
+    (
+        CutPointFrame {
+            repository: repository.to_owned(),
+            spine_index: cut_point.spine_index,
+            files,
+        },
+        report,
+    )
 }
 
 /// Build the report from one or more replayed repositories.
@@ -278,114 +435,6 @@ pub fn build_report(replays: &[RepositoryReplay]) -> BacktestReport {
     builder.finish()
 }
 
-/// Extract one repository's frames, audit inputs, and summary.
-fn push_replay(
-    frames: &mut Vec<CutPointFrame>,
-    audit_inputs: &mut Vec<AuditInput>,
-    repositories: &mut Vec<RepositoryReport>,
-    replay: &RepositoryReplay,
-) {
-    {
-        let first_frame = frames.len();
-        let mut cut_points = Vec::new();
-
-        for cut_point in &replay.cut_points {
-            // Normalization is per cut point: a file's percentile describes its
-            // standing among the files that existed alongside it, not among
-            // files from a different era or repository.
-            let vectors: Vec<_> = cut_point
-                .observations
-                .iter()
-                .map(|observation| observation.features.clone())
-                .collect();
-            let normalized = normalize(&vectors);
-            let files: Vec<FrameFile> = normalized
-                .into_iter()
-                .zip(cut_point.observations.iter())
-                .map(|(vector, observation)| FrameFile {
-                    key: format!(
-                        "{}#{:06}:{}",
-                        replay.name, cut_point.spine_index, observation.path
-                    ),
-                    vector,
-                    label: observation.label,
-                })
-                .collect();
-
-            let defective_files = files.iter().filter(|file| file.label).count() as u32;
-            cut_points.push(CutPointReport {
-                spine_index: cut_point.spine_index,
-                commit: abbreviate(&cut_point.commit_id),
-                subject: cut_point.subject.clone(),
-                window_commits: cut_point.git.processed_commits.len() as u32,
-                files_scored: files.len() as u32,
-                defective_files,
-                horizon_commits: cut_point.labels.report.selected_commits,
-                horizon_fix_commits: cut_point.labels.report.fix_shaped_commits,
-                horizon_truncated_by_commit_cap: cut_point.labels.report.truncated_by_commit_cap,
-                horizon_truncated_by_day_cap: cut_point.labels.report.truncated_by_day_cap,
-                horizon_path_overflow_commits: cut_point.labels.report.path_overflow_commits,
-                window_path_overflow_commits: cut_point.git.report.path_overflow_commits,
-                tree: cut_point.tree.clone(),
-            });
-
-            for commit in &cut_point.window_commits {
-                audit_inputs.push(AuditInput {
-                    id: commit.id.clone(),
-                    subject: commit.subject.clone(),
-                    paths: commit.paths.clone(),
-                });
-            }
-
-            frames.push(CutPointFrame {
-                repository: replay.name.clone(),
-                spine_index: cut_point.spine_index,
-                files,
-            });
-        }
-
-        let repository_frames = &frames[first_frame..];
-        let observations: u32 = repository_frames
-            .iter()
-            .map(|frame| frame.files.len() as u32)
-            .sum();
-        let positives: u32 = repository_frames
-            .iter()
-            .map(|frame| frame.files.iter().filter(|file| file.label).count() as u32)
-            .sum();
-        let uniform = FeatureWeights::uniform();
-        let families = ALL_FAMILY_SETS
-            .iter()
-            .map(|set| {
-                FamilyResult::new(
-                    *set,
-                    Weighting::Uniform,
-                    evaluate(scored(repository_frames, *set, &uniform)),
-                )
-            })
-            .collect();
-
-        let (repository_univariate, repository_coverage) =
-            univariate_discrimination(repository_frames);
-        let features = feature_results(
-            &repository_univariate,
-            &repository_coverage,
-            observations,
-            &FeatureWeights::from_univariate_roc(&repository_univariate),
-        );
-
-        repositories.push(RepositoryReport {
-            name: replay.name.clone(),
-            head_commit: abbreviate(&replay.head_commit_id),
-            replay: replay.report.clone(),
-            cut_points,
-            observations,
-            positives,
-            families,
-            features,
-        });
-    }
-}
 
 /// Assemble the per-feature result rows from a univariate measurement.
 fn feature_results(
