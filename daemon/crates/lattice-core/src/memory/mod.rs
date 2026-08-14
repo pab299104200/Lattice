@@ -18,9 +18,10 @@ pub use router::{
 };
 pub use session_capture::{
     parse_session_capture_close, parse_session_capture_event, reduce_session_capture,
-    reduce_session_capture_candidates, DaemonSessionCaptureEvent, SessionCaptureClose,
-    SessionCaptureError, SessionCaptureEvent, SessionCaptureFact, MAX_SESSION_CAPTURE_CLOSE_BYTES,
-    MAX_SESSION_CAPTURE_EVENT_BYTES, SESSION_CAPTURE_SCHEMA_VERSION,
+    reduce_session_capture_candidates, session_capture_turn_summary_from_host,
+    DaemonSessionCaptureEvent, SessionCaptureClose, SessionCaptureError, SessionCaptureEvent,
+    SessionCaptureFact, MAX_SESSION_CAPTURE_CLOSE_BYTES, MAX_SESSION_CAPTURE_EVENT_BYTES,
+    MAX_TURN_SUMMARY_BYTES, SESSION_CAPTURE_SCHEMA_VERSION,
 };
 pub use session_digest::{
     bind_session_digest_authority, extract_default_session_digest_candidates,

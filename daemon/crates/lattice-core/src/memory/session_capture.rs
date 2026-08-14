@@ -24,6 +24,8 @@ pub const SESSION_CAPTURE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SESSION_CAPTURE_EVENT_BYTES: usize = 4 * 1024;
 pub const MAX_SESSION_CAPTURE_CLOSE_BYTES: usize = 4 * 1024;
 pub const MAX_SESSION_CAPTURE_SELECTOR_BYTES: usize = 512;
+/// Maximum admitted size of a sanitized host-provided assistant turn summary.
+pub const MAX_TURN_SUMMARY_BYTES: usize = MAX_FINAL_SUMMARY_BYTES;
 
 /// Repository-local lifecycle bounds for the sanitized capture journal.
 ///
@@ -158,6 +160,12 @@ pub enum SessionCaptureFact {
         status: ErrorStatus,
         summary: Option<String>,
     },
+    /// Non-authoritative prose from the host's `last_assistant_message` field.
+    /// It can supplement typed observations at session end but cannot certify
+    /// an outcome by itself.
+    TurnSummary {
+        summary: String,
+    },
 }
 
 /// A normalized authenticated close payload. Capture and end time are supplied
@@ -194,6 +202,8 @@ pub enum SessionCaptureError {
     InvalidCheck,
     #[error("invalid session capture error observation")]
     InvalidError,
+    #[error("invalid session capture turn summary")]
+    InvalidTurnSummary,
     #[error("session capture authority does not match the closing session")]
     AuthorityMismatch,
     #[error("session capture segments are not ordered")]
@@ -208,9 +218,10 @@ pub enum SessionCaptureError {
 
 /// Parse one narrow event envelope.
 ///
-/// Accepted shapes are `edited_path`, `check`, and `error`. Exact keys are
-/// enforced for every shape, so authority-like fields and unknown metadata are
-/// rejected instead of being retained or silently interpreted.
+/// Accepted shapes are `edited_path`, `check`, `error`, and `turn_summary`.
+/// Exact keys are enforced for every shape, so authority-like fields and
+/// unknown metadata are rejected instead of being retained or silently
+/// interpreted.
 pub fn parse_session_capture_event(
     input: &str,
 ) -> Result<SessionCaptureEvent, SessionCaptureError> {
@@ -303,12 +314,38 @@ pub fn parse_session_capture_event(
                 summary,
             }
         }
+        "turn_summary" => {
+            require_exact_keys(object, &["schema_version", "kind", "summary"])?;
+            let summary = object
+                .get("summary")
+                .and_then(Value::as_str)
+                .and_then(normalize_turn_summary)
+                .ok_or(SessionCaptureError::InvalidTurnSummary)?;
+            SessionCaptureFact::TurnSummary { summary }
+        }
         _ => return Err(SessionCaptureError::InvalidEventKind),
     };
 
     Ok(SessionCaptureEvent {
         schema_version: SESSION_CAPTURE_SCHEMA_VERSION,
         fact,
+    })
+}
+
+/// Admit the host's bounded `last_assistant_message` as non-authoritative
+/// narrative prose.
+///
+/// Adapters should call this function only for that dedicated host field. An
+/// absent, oversized, or unsafe value is omitted rather than truncated or
+/// retained. The returned fact still cannot produce memory without a typed
+/// observation in the same daemon-owned segment.
+pub fn session_capture_turn_summary_from_host(
+    last_assistant_message: Option<&str>,
+) -> Option<SessionCaptureEvent> {
+    let summary = normalize_turn_summary(last_assistant_message?)?;
+    Some(SessionCaptureEvent {
+        schema_version: SESSION_CAPTURE_SCHEMA_VERSION,
+        fact: SessionCaptureFact::TurnSummary { summary },
     })
 }
 
@@ -343,8 +380,10 @@ pub fn parse_session_capture_close(
 }
 
 /// Reduce ordered admitted events into one digest per daemon-observed Git
-/// segment. The close authority identifies the final segment. Summary content
-/// is attached only there and does not create typed checks or resolutions.
+/// segment. The close authority identifies the final segment. Each segment
+/// retains its latest safe turn summary until the true close, then attaches it
+/// only when the segment also contains a typed observation. Summary prose does
+/// not create typed checks or resolutions.
 pub fn reduce_session_capture(
     ordered_events: &[DaemonSessionCaptureEvent],
     close: &SessionCaptureClose,
@@ -356,7 +395,7 @@ pub fn reduce_session_capture(
         edited_paths: Vec<String>,
         observations: Vec<SessionDigestObservation>,
         observed_error_fingerprints: BTreeSet<String>,
-        final_summary: Option<String>,
+        latest_turn_summary: Option<String>,
     }
 
     if close.schema_version != SESSION_CAPTURE_SCHEMA_VERSION {
@@ -423,6 +462,13 @@ pub fn reduce_session_capture(
                     });
                 }
             }
+            SessionCaptureFact::TurnSummary { summary } => {
+                // Defend the reduction boundary even if a caller constructed
+                // the public fact directly instead of using the parser.
+                if let Some(summary) = normalize_turn_summary(summary) {
+                    segment.latest_turn_summary = Some(summary);
+                }
+            }
         }
     }
 
@@ -437,7 +483,9 @@ pub fn reduce_session_capture(
         None => final_segment.authority = Some(close_authority.clone()),
         _ => {}
     }
-    final_segment.final_summary = close.final_summary.clone();
+    if let Some(summary) = &close.final_summary {
+        final_segment.latest_turn_summary = Some(summary.clone());
+    }
 
     let mut digests = Vec::with_capacity(segments.len());
     for (_, mut facts) in segments {
@@ -450,12 +498,20 @@ pub fn reduce_session_capture(
                 .cmp(&serde_json::to_string(right).expect("observation serialization"))
         });
         facts.observations.dedup();
+        // Narrative prose is retained only when a typed observation from the
+        // same daemon-owned segment corroborates that work occurred. Edited
+        // paths alone are not check or error evidence.
+        let final_summary = if facts.observations.is_empty() {
+            None
+        } else {
+            facts.latest_turn_summary
+        };
         let mut content = SessionDigestContent {
             schema_version: SESSION_DIGEST_SCHEMA_VERSION,
             ended_at: close.received_at,
             received_at: close.received_at,
             edited_paths: facts.edited_paths,
-            final_summary: facts.final_summary,
+            final_summary,
             observations: facts.observations,
             payload_hash: String::new(),
             dropped_observation_count: 0,
@@ -520,6 +576,13 @@ fn map_digest_authority_error(_: SessionDigestError) -> SessionCaptureError {
     SessionCaptureError::InvalidAuthority
 }
 
+fn normalize_turn_summary(value: &str) -> Option<String> {
+    if value.len() > MAX_TURN_SUMMARY_BYTES {
+        return None;
+    }
+    sanitize_text(value, MAX_TURN_SUMMARY_BYTES)
+}
+
 fn valid_opaque_selector_component(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_SESSION_CAPTURE_SELECTOR_BYTES
@@ -529,7 +592,7 @@ fn valid_opaque_selector_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::SessionDigestCandidateKind;
+    use crate::memory::{MemoryClass, SessionDigestCandidateKind};
 
     const FINGERPRINT: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -595,6 +658,75 @@ mod tests {
                 parse_session_capture_close(&close, now()),
                 Err(SessionCaptureError::InvalidJson),
                 "close field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_turn_summary_admission_drops_oversized_and_unsafe_text() {
+        let admitted = session_capture_turn_summary_from_host(Some("  Implemented   capture.  "))
+            .expect("safe host summary");
+        assert_eq!(
+            admitted.fact,
+            SessionCaptureFact::TurnSummary {
+                summary: "Implemented capture.".to_owned(),
+            }
+        );
+        assert!(session_capture_turn_summary_from_host(None).is_none());
+        assert!(session_capture_turn_summary_from_host(Some(
+            &"x".repeat(MAX_TURN_SUMMARY_BYTES + 1)
+        ))
+        .is_none());
+        assert!(session_capture_turn_summary_from_host(Some(
+            "Finished with token=secret-value-that-must-not-be-retained"
+        ))
+        .is_none());
+
+        let oversized = format!(
+            r#"{{"schema_version":1,"kind":"turn_summary","summary":"{}"}}"#,
+            "x".repeat(MAX_TURN_SUMMARY_BYTES + 1)
+        );
+        assert_eq!(
+            parse_session_capture_event(&oversized),
+            Err(SessionCaptureError::InvalidTurnSummary)
+        );
+        assert_eq!(
+            parse_session_capture_event(
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"ran `secret command`"}"#
+            ),
+            Err(SessionCaptureError::InvalidTurnSummary)
+        );
+    }
+
+    #[test]
+    fn turn_summary_wire_rejects_raw_host_authority_transcript_and_tool_fields() {
+        let prohibited = [
+            "last_assistant_message",
+            "session_id",
+            "repository_id",
+            "checkout_id",
+            "branch",
+            "revision",
+            "segment",
+            "scope",
+            "organization",
+            "cwd",
+            "transcript",
+            "transcript_path",
+            "tool_name",
+            "tool_input",
+            "tool_output",
+            "command",
+            "metadata",
+        ];
+        for field in prohibited {
+            let input = format!(
+                r#"{{"schema_version":1,"kind":"turn_summary","summary":"Safe summary.","{field}":"raw"}}"#
+            );
+            assert_eq!(
+                parse_session_capture_event(&input),
+                Err(SessionCaptureError::InvalidJson),
+                "turn-summary field {field}"
             );
         }
     }
@@ -716,6 +848,97 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn latest_safe_turn_summary_wins_independently_per_segment() {
+        let first = authority(0, Some("main"), "abc123");
+        let second = authority(1, Some("feature/d3"), "def456");
+        let events = vec![
+            event(
+                first.clone(),
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"First draft."}"#,
+            ),
+            event(
+                first.clone(),
+                r#"{"schema_version":1,"kind":"check","label":"core tests","outcome":"passed"}"#,
+            ),
+            event(
+                first,
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"First segment final."}"#,
+            ),
+            event(
+                second.clone(),
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"Second draft."}"#,
+            ),
+            event(
+                second.clone(),
+                r#"{"schema_version":1,"kind":"check","label":"integration tests","outcome":"passed"}"#,
+            ),
+            event(
+                second.clone(),
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"Second segment final."}"#,
+            ),
+        ];
+        let close = parse_session_capture_close(r#"{"schema_version":1}"#, now()).unwrap();
+
+        let digests = reduce_session_capture(&events, &close, &second).unwrap();
+        assert_eq!(digests.len(), 2);
+        assert_eq!(
+            digests[0].final_summary.as_deref(),
+            Some("First segment final.")
+        );
+        assert_eq!(
+            digests[1].final_summary.as_deref(),
+            Some("Second segment final.")
+        );
+    }
+
+    #[test]
+    fn turn_summary_alone_is_discarded_and_generates_no_candidate() {
+        let auth = authority(0, Some("main"), "abc123");
+        let events = vec![event(
+            auth.clone(),
+            r#"{"schema_version":1,"kind":"turn_summary","summary":"All checks passed and errors resolved."}"#,
+        )];
+        let close = parse_session_capture_close(r#"{"schema_version":1}"#, now()).unwrap();
+
+        let digests = reduce_session_capture(&events, &close, &auth).unwrap();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].final_summary, None);
+        assert!(extract_session_digest_candidates(&digests[0], "capture-v1").is_empty());
+    }
+
+    #[test]
+    fn turn_summary_with_typed_observation_adds_narrative_but_no_failure_pattern() {
+        let auth = authority(0, Some("main"), "abc123");
+        let observed = format!(
+            r#"{{"schema_version":1,"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"observed"}}"#
+        );
+        let events = vec![
+            event(auth.clone(), &observed),
+            event(
+                auth.clone(),
+                r#"{"schema_version":1,"kind":"turn_summary","summary":"Resolved the compiler failure and all checks passed."}"#,
+            ),
+        ];
+        let close = parse_session_capture_close(r#"{"schema_version":1}"#, now()).unwrap();
+
+        let candidates =
+            reduce_session_capture_candidates(&events, &close, &auth, "capture-v1").unwrap();
+        let narrative = candidates
+            .iter()
+            .find(|candidate| candidate.kind == SessionDigestCandidateKind::Narrative)
+            .expect("corroborated narrative candidate");
+        assert_eq!(narrative.memory_class, MemoryClass::WorkflowOutcome);
+        assert_eq!(
+            narrative.claim,
+            "Resolved the compiler failure and all checks passed."
+        );
+        assert!(candidates.iter().all(|candidate| {
+            candidate.kind != SessionDigestCandidateKind::ResolvedFailure
+                && candidate.memory_class != MemoryClass::FailurePattern
+        }));
     }
 
     #[test]
