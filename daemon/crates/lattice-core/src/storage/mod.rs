@@ -1,5 +1,6 @@
 pub mod git_intelligence_store;
 pub mod graph_store;
+pub mod health_complexity_facts_store;
 pub mod parsed_file_cache;
 pub mod schema;
 pub mod usearch_index;
@@ -20,6 +21,9 @@ pub use graph_store::{
 pub use parsed_file_cache::{
     content_sha256, ParsedCacheLookup, ParsedFileCache, PARSED_CACHE_CONFIG_VERSION,
     PARSED_CACHE_PARSER_VERSION, PARSED_CACHE_SCHEMA_VERSION,
+};
+pub use health_complexity_facts_store::{
+    validate_canonical_path, GenerationStatus, HealthComplexityFactsStore,
 };
 pub use usearch_index::UsearchVectorIndex;
 pub use vector_index::{SharedVectorIndex, VectorIndex, VectorScope, VectorSearchResult};

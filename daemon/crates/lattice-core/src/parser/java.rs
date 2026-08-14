@@ -1,7 +1,94 @@
 use tree_sitter::{Node, Parser};
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{
+    enclosing_owner_name, node_text as profile_node_text, LanguageComplexityProfile,
+    ProfileApplicability, UnitIdentity,
+};
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Java complexity vocabulary, verified against `tree_sitter_java::LANGUAGE`.
+///
+/// Decision points: `if` (each `else if` is its own `if_statement`), `for`,
+/// enhanced `for`, `while`, `do`, each `catch` clause, each non-default `switch`
+/// label (the grammar uses `switch_label` for both the classic `case x:` and the
+/// arrow `case x ->` forms), the ternary operator, and each `&&`/`||`.
+/// `default:` labels and `finally` are unconditional and do not count.
+static JAVA_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::Java,
+    applicability: ProfileApplicability::Supported,
+    function_kinds: &["method_declaration", "constructor_declaration"],
+    branch_kinds: &[
+        "if_statement",
+        "for_statement",
+        "enhanced_for_statement",
+        "while_statement",
+        "do_statement",
+        "catch_clause",
+        "switch_label",
+        "ternary_expression",
+    ],
+    boolean_operator_parent_kinds: &["binary_expression"],
+    boolean_operator_kinds: &["&&", "||"],
+    guarded_kinds: &[],
+    nesting_kinds: &[
+        "if_statement",
+        "for_statement",
+        "enhanced_for_statement",
+        "while_statement",
+        "do_statement",
+        "try_statement",
+        "switch_expression",
+    ],
+    // Java attaches `else if` directly as the `alternative` field.
+    nesting_transparent_parent_kinds: &[],
+    nesting_transparent_fields: &["alternative"],
+    parameter_list_field: "parameters",
+    parameter_kinds: &["formal_parameter", "spread_parameter"],
+    is_default_branch: Some(is_default_switch_label),
+    count_parameters: None,
+    unit_identity: Some(java_unit_identity),
+};
+
+/// The Java complexity profile contributed by this parser.
+pub fn complexity_profile() -> &'static LanguageComplexityProfile {
+    &JAVA_COMPLEXITY_PROFILE
+}
+
+/// A `default:` (or `default ->`) label is the structural fall-through of a
+/// switch whose cases are already counted, so it is not a decision point.
+fn is_default_switch_label(node: Node, source: &[u8]) -> bool {
+    node.kind() == "switch_label"
+        && profile_node_text(node, source)
+            .trim_start()
+            .starts_with("default")
+}
+
+/// Name methods `Owner.method`, exactly as [`extract_method`] names them.
+fn java_unit_identity(node: Node, source: &[u8]) -> Option<UnitIdentity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = profile_node_text(name_node, source);
+
+    let qualified = match enclosing_owner_name(
+        node,
+        source,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+        ],
+        "name",
+    ) {
+        Some(owner) => format!("{}.{}", owner, name),
+        None => name,
+    };
+
+    Some(UnitIdentity {
+        name: qualified,
+        byte_offset: node.start_byte(),
+    })
+}
 
 /// Parse a Java source file and extract symbols.
 pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> {

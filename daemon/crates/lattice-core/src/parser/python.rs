@@ -1,7 +1,146 @@
 use tree_sitter::{Node, Parser};
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{
+    node_text as profile_node_text, LanguageComplexityProfile, ProfileApplicability, UnitIdentity,
+};
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Python complexity vocabulary, verified against `tree_sitter_python::LANGUAGE`.
+///
+/// Decision points: `if`, each `elif`, `for`, `while`, each `except` handler,
+/// each non-wildcard `match` case, conditional expressions, comprehension `if`
+/// guards, and each `and`/`or` (the grammar models both as `boolean_operator`,
+/// one node per operator). `else`/`finally` are unconditional and `case _:` is
+/// the structural default, so neither counts.
+static PYTHON_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::Python,
+    applicability: ProfileApplicability::Supported,
+    function_kinds: &["function_definition"],
+    branch_kinds: &[
+        "if_statement",
+        "elif_clause",
+        "for_statement",
+        "while_statement",
+        "except_clause",
+        "except_group_clause",
+        "conditional_expression",
+        "case_clause",
+        "boolean_operator",
+        "if_clause",
+    ],
+    // `boolean_operator` is itself the decision point, so no operator-token scan.
+    boolean_operator_parent_kinds: &[],
+    boolean_operator_kinds: &[],
+    guarded_kinds: &[],
+    nesting_kinds: &[
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "try_statement",
+        "with_statement",
+        "match_statement",
+    ],
+    // `elif` is an `elif_clause` inside the same `if_statement`, so an elif chain
+    // is already one level; no transparency rule is needed.
+    nesting_transparent_parent_kinds: &[],
+    nesting_transparent_fields: &[],
+    parameter_list_field: "parameters",
+    parameter_kinds: &[
+        "identifier",
+        "default_parameter",
+        "typed_parameter",
+        "typed_default_parameter",
+        "list_splat_pattern",
+        "dictionary_splat_pattern",
+    ],
+    is_default_branch: Some(is_wildcard_case_clause),
+    count_parameters: Some(count_python_parameters),
+    unit_identity: Some(python_unit_identity),
+};
+
+/// The Python complexity profile contributed by this parser.
+pub fn complexity_profile() -> &'static LanguageComplexityProfile {
+    &PYTHON_COMPLEXITY_PROFILE
+}
+
+/// `case _:` is the structural default of a `match` and is not a decision point.
+fn is_wildcard_case_clause(node: Node, source: &[u8]) -> bool {
+    if node.kind() != "case_clause" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let mut patterns = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "case_pattern");
+    match patterns.next() {
+        Some(pattern) => {
+            patterns.next().is_none() && profile_node_text(pattern, source).trim() == "_"
+        }
+        None => false,
+    }
+}
+
+/// Count declared parameters, excluding an implicit `self`/`cls` receiver.
+///
+/// The receiver is bound by the call protocol rather than declared by the
+/// caller, so it is excluded exactly as Go method receivers and Rust `self` are.
+fn count_python_parameters(node: Node, source: &[u8]) -> Option<u32> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let declared: Vec<Node> = parameters
+        .named_children(&mut cursor)
+        .filter(|child| {
+            PYTHON_COMPLEXITY_PROFILE
+                .parameter_kinds
+                .contains(&child.kind())
+        })
+        .collect();
+
+    let is_method = nearest_owner(node, source).is_some();
+    let skip_receiver = is_method
+        && declared
+            .first()
+            .map(|first| {
+                first.kind() == "identifier"
+                    && matches!(profile_node_text(*first, source).trim(), "self" | "cls")
+            })
+            .unwrap_or(false);
+
+    Some((declared.len() - usize::from(skip_receiver)) as u32)
+}
+
+/// Name methods `Class.method`, exactly as [`extract_method`] names them.
+fn python_unit_identity(node: Node, source: &[u8]) -> Option<UnitIdentity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = profile_node_text(name_node, source);
+    let qualified = match nearest_owner(node, source) {
+        Some(class_name) => format!("{}.{}", class_name, name),
+        None => name,
+    };
+    Some(UnitIdentity {
+        name: qualified,
+        byte_offset: node.start_byte(),
+    })
+}
+
+/// The class a function is defined directly in, if any. A function nested inside
+/// another function is not a method, so the search stops at a function boundary.
+fn nearest_owner(node: Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "class_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .map(|name| profile_node_text(name, source));
+            }
+            "function_definition" => return None,
+            _ => current = parent.parent(),
+        }
+    }
+    None
+}
 
 /// Parse a Python source file and extract symbols.
 pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> {

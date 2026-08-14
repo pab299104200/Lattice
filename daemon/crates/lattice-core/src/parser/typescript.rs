@@ -1,7 +1,143 @@
 use tree_sitter::{Node, Parser};
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{
+    enclosing_owner_name, node_text as profile_node_text, LanguageComplexityProfile,
+    ProfileApplicability, UnitIdentity,
+};
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Node kinds that introduce a function, shared by the TypeScript and
+/// JavaScript grammars. Anonymous ones only form a unit when they are bound to
+/// a name (see [`typescript_unit_identity`]).
+const FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "generator_function",
+    "generator_function_declaration",
+    "arrow_function",
+    "method_definition",
+];
+
+/// Decision-point kinds shared by the TypeScript and JavaScript grammars.
+///
+/// `if`, `for` (all three forms), `while`, `do`, each `catch`, each non-default
+/// `switch` case and the ternary operator. `else` and `default:` are the
+/// structural fall-through of a construct already counted.
+const BRANCH_KINDS: &[&str] = &[
+    "if_statement",
+    "for_statement",
+    "for_in_statement",
+    "for_of_statement",
+    "while_statement",
+    "do_statement",
+    "catch_clause",
+    "switch_case",
+    "ternary_expression",
+];
+
+/// Structural nesting kinds shared by both grammars.
+const NESTING_KINDS: &[&str] = &[
+    "if_statement",
+    "for_statement",
+    "for_in_statement",
+    "for_of_statement",
+    "while_statement",
+    "do_statement",
+    "try_statement",
+    "switch_statement",
+];
+
+/// `&&`, `||` and `??` all short-circuit, so each is a decision point.
+const BOOLEAN_OPERATOR_KINDS: &[&str] = &["&&", "||", "??"];
+
+/// Parameter kinds across both grammars: TypeScript wraps parameters in
+/// `required_parameter`/`optional_parameter`, JavaScript uses bare patterns.
+const PARAMETER_KINDS: &[&str] = &[
+    "required_parameter",
+    "optional_parameter",
+    "identifier",
+    "assignment_pattern",
+    "rest_pattern",
+    "object_pattern",
+    "array_pattern",
+];
+
+/// TypeScript complexity vocabulary, verified against
+/// `tree_sitter_typescript::LANGUAGE_TYPESCRIPT`.
+static TYPESCRIPT_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::TypeScript,
+    applicability: ProfileApplicability::Supported,
+    function_kinds: FUNCTION_KINDS,
+    branch_kinds: BRANCH_KINDS,
+    boolean_operator_parent_kinds: &["binary_expression"],
+    boolean_operator_kinds: BOOLEAN_OPERATOR_KINDS,
+    guarded_kinds: &[],
+    nesting_kinds: NESTING_KINDS,
+    nesting_transparent_parent_kinds: &["else_clause"],
+    nesting_transparent_fields: &[],
+    parameter_list_field: "parameters",
+    parameter_kinds: PARAMETER_KINDS,
+    is_default_branch: None,
+    count_parameters: None,
+    unit_identity: Some(typescript_unit_identity),
+};
+
+/// JavaScript complexity vocabulary, verified against
+/// `tree_sitter_javascript::LANGUAGE`.
+static JAVASCRIPT_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::JavaScript,
+    ..TYPESCRIPT_COMPLEXITY_PROFILE
+};
+
+/// The complexity profile this parser contributes for a language it serves.
+pub fn complexity_profile(language: Language) -> &'static LanguageComplexityProfile {
+    match language {
+        Language::JavaScript => &JAVASCRIPT_COMPLEXITY_PROFILE,
+        _ => &TYPESCRIPT_COMPLEXITY_PROFILE,
+    }
+}
+
+/// Identify a function unit the way the symbol extractor names and keys it.
+///
+/// * declarations and generators: their own name;
+/// * methods: `Class.method` from the enclosing class;
+/// * function expressions and arrows bound to a variable: the variable's name,
+///   keyed at the `variable_declarator` offset [`extract_variable`] uses;
+/// * anything else (inline callbacks, IIFEs): anonymous, so its decision points
+///   are attributed to the function that encloses it.
+fn typescript_unit_identity(node: Node, source: &[u8]) -> Option<UnitIdentity> {
+    if node.kind() == "method_definition" {
+        let name = profile_node_text(node.child_by_field_name("name")?, source);
+        let qualified =
+            match enclosing_owner_name(node, source, &["class_declaration", "class"], "name") {
+                Some(owner) => format!("{}.{}", owner, name),
+                None => name,
+            };
+        return Some(UnitIdentity {
+            name: qualified,
+            byte_offset: node.start_byte(),
+        });
+    }
+
+    if let Some(name_node) = node.child_by_field_name("name") {
+        return Some(UnitIdentity {
+            name: profile_node_text(name_node, source),
+            byte_offset: node.start_byte(),
+        });
+    }
+
+    let parent = node.parent()?;
+    if parent.kind() == "variable_declarator" {
+        let name_node = parent.child_by_field_name("name")?;
+        return Some(UnitIdentity {
+            name: profile_node_text(name_node, source),
+            byte_offset: parent.start_byte(),
+        });
+    }
+
+    None
+}
 
 /// Parse a TypeScript or JavaScript source file and extract symbols.
 pub fn parse(

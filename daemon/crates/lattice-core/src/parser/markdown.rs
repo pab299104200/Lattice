@@ -1,7 +1,43 @@
 use std::path::Path;
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{LanguageComplexityProfile, ProfileApplicability};
 use crate::symbols::{Language, LinkInfo, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Markdown is exempt from complexity facts.
+///
+/// The language has no functions and no executable control flow, so cyclomatic
+/// complexity, nesting depth and parameter count are undefined for it rather
+/// than zero. Documents are indexed as headings and sections, and the fact
+/// producer reports `unavailable` with this reason instead of publishing
+/// fabricated low-complexity facts that would make every document look like the
+/// healthiest file in the repository (spec design decision 4, "unknown is never
+/// zero"). Document size and link structure are the responsibility of other
+/// fact families, not this one.
+static MARKDOWN_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::Markdown,
+    applicability: ProfileApplicability::NotApplicable {
+        reason: "Markdown has no functions or executable control flow, so complexity facts are undefined rather than zero",
+    },
+    function_kinds: &[],
+    branch_kinds: &[],
+    boolean_operator_parent_kinds: &[],
+    boolean_operator_kinds: &[],
+    guarded_kinds: &[],
+    nesting_kinds: &[],
+    nesting_transparent_parent_kinds: &[],
+    nesting_transparent_fields: &[],
+    parameter_list_field: "",
+    parameter_kinds: &[],
+    is_default_branch: None,
+    count_parameters: None,
+    unit_identity: None,
+};
+
+/// The Markdown complexity profile contributed by this parser.
+pub fn complexity_profile() -> &'static LanguageComplexityProfile {
+    &MARKDOWN_COMPLEXITY_PROFILE
+}
 
 #[derive(Debug, Clone)]
 struct Heading {
