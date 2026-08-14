@@ -21,8 +21,17 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use lattice_core::git_intelligence::GitIntelligenceSnapshot;
 use lattice_core::graph::builder::GraphBuilder;
 use lattice_core::graph::{CodeGraph, EdgeKind};
+use lattice_core::health::churn_facts::line_churn_fact;
+use lattice_core::health::complexity_facts::compute_file_complexity_facts;
+use lattice_core::health::complexity_facts::FileComplexityFacts;
+use lattice_core::health::dead_symbol_facts::{DeadSymbolExclusionInputs, DeadSymbolFactProducer};
+use lattice_core::health::graph_facts::GraphFactProducer;
+use lattice_core::health::scoring::HealthFactIndex;
+use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
+use std::collections::BTreeMap;
 use lattice_core::symbols::{Language, ParsedFile, Symbol, SymbolId, SymbolKind};
 
 const REPO_FILE_COUNT: usize = 609;
@@ -224,6 +233,184 @@ fn assert_graph_equivalent(actual: &CodeGraph, expected: &CodeGraph) {
     );
 }
 
+/// Budget for one single-file incremental update, from
+/// `docs/plans/2026-02-25-lattice-design.md` § "Performance Targets"
+/// ("Incremental update (single file) | < 200ms").
+///
+/// Phase H5 of `docs/plans/2026-08-13-health-engine.md` requires proof that
+/// producing the H2 fact families fits inside that budget. Fact publishing is
+/// only one part of an incremental update — parsing and the graph pass also
+/// have to fit — so this benchmark holds fact production to a fraction of the
+/// whole-update budget rather than to all of it. Exceeding the fraction is not
+/// automatically a correctness failure, but it means health facts have started
+/// consuming an unreasonable share of the deadline, which is the regression
+/// this gate exists to catch.
+const INCREMENTAL_UPDATE_BUDGET: Duration = Duration::from_millis(200);
+
+/// Share of the whole-update budget that fact publishing may consume at this
+/// repository's scale.
+///
+/// # Why the gate is scale-dependent
+///
+/// Every H2 producer except complexity is a *whole-graph* pass: an incremental
+/// single-file update republishes facts for the entire corpus and then diffs
+/// the snapshots. Publishing cost therefore tracks corpus size, not change
+/// size, and the headroom under a fixed per-update budget narrows as a
+/// repository grows. Measured on an Apple M-series machine, the full publish
+/// takes ~10.8 ms over 609 files but ~96.4 ms over 5,000 — comfortably inside
+/// the budget at this repository's scale and close to consuming it whole an
+/// order of magnitude up.
+///
+/// `docs/plans/2026-08-13-health-engine.md` § "Phase H5 — Prove it stays
+/// honest" asks for the publish to be "within the index deadline bounds on
+/// this repo", so the strict half-budget gate is applied at repository scale.
+/// The large corpus is held to the full update budget instead, and is here to
+/// record the scaling curve rather than to certify a repository size Lattice
+/// has not been measured against. Making the large-corpus publish incremental
+/// rather than whole-graph is the fix if that number ever needs to come down;
+/// it is deliberately not attempted here, because nothing measured says it is
+/// needed yet.
+const HEALTH_FACT_BUDGET_SHARE: u32 = 2;
+
+/// Everything the health engine persists for one generation.
+///
+/// The H2 producers are whole-graph passes, so an incremental single-file
+/// update republishes them against the updated graph and diffs the result
+/// (`GraphFactsSnapshot::file_delta` and friends). Only complexity facts are
+/// genuinely per-file, and only the changed file's are recomputed. This is the
+/// same composition the H3 fact index is built from — see
+/// `docs/architecture/2026-08-13-health-engine.md`.
+fn publish_health_facts(
+    graph: &CodeGraph,
+    complexity: &BTreeMap<String, FileComplexityFacts>,
+    git: &GitIntelligenceSnapshot,
+) -> HealthFactIndex {
+    HealthFactIndex::builder()
+        .with_graph_facts(GraphFactProducer::default().produce(graph, true))
+        .with_git_intelligence(git.clone())
+        .with_complexity_facts(complexity.clone())
+        .with_test_proximity_facts(TestProximityFactProducer::default().produce(graph, true))
+        .with_dead_symbol_facts(DeadSymbolFactProducer::default().produce(
+            graph,
+            &DeadSymbolExclusionInputs::default(),
+            true,
+        ))
+        .build()
+}
+
+/// Synthetic source text for a corpus file, so complexity facts have something
+/// to parse. Shaped to carry real branch and nesting structure rather than a
+/// trivial body, so the complexity pass is not measured against an empty file.
+fn synthetic_source(file_index: usize) -> String {
+    let mut source = String::new();
+    for local_index in 0..SYMBOLS_PER_FILE {
+        source.push_str(&format!(
+            "pub fn symbol_{file_index:05}_{local_index}(input: usize) -> usize {{\n\
+             \x20   if input > {local_index} {{\n\
+             \x20       for step in 0..input {{\n\
+             \x20           if step % 2 == 0 && input > 3 {{\n\
+             \x20               return step;\n\
+             \x20           }}\n\
+             \x20       }}\n\
+             \x20   }}\n\
+             \x20   match input {{\n\
+             \x20       0 => 1,\n\
+             \x20       _ => input,\n\
+             \x20   }}\n\
+             }}\n\n"
+        ));
+    }
+    source
+}
+
+/// Baseline complexity facts for a whole corpus.
+fn corpus_complexity(file_count: usize) -> BTreeMap<String, FileComplexityFacts> {
+    (0..file_count)
+        .map(|index| {
+            let path = format!("src/module_{index:05}.rs");
+            let facts = lattice_core::health::complexity_facts::compute_file_complexity_facts(
+                &path,
+                &synthetic_source(index),
+            );
+            (path, facts)
+        })
+        .collect()
+}
+
+fn bench_health_facts_publish(c: &mut Criterion) {
+    let mut group = c.benchmark_group("health_facts_publish");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(4));
+    group.sample_size(20);
+
+    for file_count in [REPO_FILE_COUNT, LARGE_FILE_COUNT] {
+        // Strict at this repository's scale, which is what the spec asks to be
+        // certified; the large corpus records the scaling curve against the
+        // whole-update budget. See `HEALTH_FACT_BUDGET_SHARE`.
+        let budget = if file_count == REPO_FILE_COUNT {
+            INCREMENTAL_UPDATE_BUDGET / HEALTH_FACT_BUDGET_SHARE
+        } else {
+            INCREMENTAL_UPDATE_BUDGET
+        };
+        let fixture = Fixture::new(file_count);
+        let git = GitIntelligenceSnapshot::empty();
+
+        // The graph as it stands after the one-file scoped update, which is
+        // the state an incremental republish actually sees.
+        let mut updated_graph = fixture.baseline.clone();
+        apply_scoped_update(&mut updated_graph, &fixture.update);
+
+        let changed_index = CHANGED_FILE_INDEX.min(file_count - 1);
+        let mut complexity = corpus_complexity(file_count);
+        complexity.insert(
+            fixture.update.changed_file.clone(),
+            lattice_core::health::complexity_facts::compute_file_complexity_facts(
+                &fixture.update.changed_file,
+                &synthetic_source(changed_index),
+            ),
+        );
+
+        // Prove the publish is within budget before recording any timing, in
+        // the same spirit as the correctness assertions above: a benchmark
+        // that silently records an over-budget number is worse than one that
+        // fails. Measured after one warm run so the figure is not dominated by
+        // first-touch allocation.
+        let _ = publish_health_facts(&updated_graph, &complexity, &git);
+        let started = std::time::Instant::now();
+        let published = publish_health_facts(&updated_graph, &complexity, &git);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            published.file_count(),
+            file_count,
+            "health fact publish should cover every file in the corpus"
+        );
+        assert!(
+            elapsed <= budget,
+            "publishing all health fact families for a single-file incremental \
+             update of a {file_count}-file corpus took {elapsed:?}, over the \
+             {budget:?} share of the {INCREMENTAL_UPDATE_BUDGET:?} incremental-update \
+             budget in docs/plans/2026-02-25-lattice-design.md"
+        );
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new("all_families_one_file_update", file_count),
+            &(updated_graph, complexity, git),
+            |bencher, (graph, complexity, git)| {
+                bencher.iter(|| {
+                    black_box(publish_health_facts(
+                        black_box(graph),
+                        black_box(complexity),
+                        black_box(git),
+                    ))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_incremental_graph_maintenance(c: &mut Criterion) {
     let mut group = c.benchmark_group("incremental_graph_maintenance");
     group.warm_up_time(Duration::from_secs(1));
@@ -266,5 +453,9 @@ fn bench_incremental_graph_maintenance(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_incremental_graph_maintenance);
+criterion_group!(
+    benches,
+    bench_incremental_graph_maintenance,
+    bench_health_facts_publish
+);
 criterion_main!(benches);
