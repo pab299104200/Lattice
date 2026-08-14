@@ -8072,7 +8072,11 @@ fn format_line_span(node: &GraphNode) -> String {
     }
 }
 
-fn is_test_file(file: &str) -> bool {
+/// `pub(crate)` so sibling fact producers (e.g.
+/// [`crate::health::dead_symbol_facts`]) apply the same test-file heuristic
+/// used for `find_relevant_tests` instead of defining a second, driftable
+/// copy.
+pub(crate) fn is_test_file(file: &str) -> bool {
     file.starts_with("tests/")
         || file.starts_with("test/")
         || file.starts_with("__tests__/")
