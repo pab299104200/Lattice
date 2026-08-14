@@ -35,6 +35,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::health::arithmetic::round_div;
+
 /// Which fact producer a feature comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -319,14 +321,6 @@ impl NormalizedFeatureVector {
     pub fn get(&self, feature: FeatureKind) -> Option<u32> {
         self.percentiles[feature.index()]
     }
-}
-
-/// Round `numerator / denominator` to the nearest integer, halves up.
-fn round_div(numerator: u128, denominator: u128) -> u128 {
-    if denominator == 0 {
-        return 0;
-    }
-    (numerator * 2 + denominator) / (denominator * 2)
 }
 
 /// Convert raw feature values to rank percentiles within one cut point.

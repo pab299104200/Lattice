@@ -52,6 +52,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::git_intelligence::looks_like_bug_fix;
+use crate::health::arithmetic::per_mille;
 use crate::query::engine::is_test_file;
 
 /// Default number of subjects emitted for human spot-review.
@@ -186,22 +187,6 @@ pub struct LabelAudit {
     pub verdict: AuditVerdict,
     /// Subjects for human spot-review.
     pub sample: Vec<AuditSample>,
-}
-
-/// Round `numerator / denominator` to the nearest integer, halves up.
-fn round_div(numerator: u128, denominator: u128) -> u128 {
-    if denominator == 0 {
-        return 0;
-    }
-    (numerator * 2 + denominator) / (denominator * 2)
-}
-
-/// `numerator / denominator` in per-mille, rounded half up.
-fn per_mille(numerator: u64, denominator: u64) -> u32 {
-    if denominator == 0 {
-        return 0;
-    }
-    round_div(u128::from(numerator) * 1000, u128::from(denominator)) as u32
 }
 
 /// Words that name repair work, matched anywhere in a subject as whole words.

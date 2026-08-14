@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::health::arithmetic::{per_mille, round_div};
+
 /// A single scored observation: one file at one cut point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoredObservation {
@@ -128,25 +130,6 @@ pub struct Evaluation {
 
 /// The thresholds every evaluation reports operating points for, descending.
 const OPERATING_THRESHOLDS: [u32; 9] = [900, 800, 700, 600, 500, 400, 300, 200, 100];
-
-/// Round `numerator / denominator` to the nearest integer, halves up.
-///
-/// Deterministic on every platform: no floating point is involved anywhere in
-/// this module.
-fn round_div(numerator: u128, denominator: u128) -> u128 {
-    if denominator == 0 {
-        return 0;
-    }
-    (numerator * 2 + denominator) / (denominator * 2)
-}
-
-/// `numerator / denominator` expressed in per-mille, rounded half up.
-fn per_mille(numerator: u64, denominator: u64) -> u32 {
-    if denominator == 0 {
-        return 0;
-    }
-    round_div(u128::from(numerator) * 1000, u128::from(denominator)) as u32
-}
 
 /// Evaluate a ranking against its ground-truth labels.
 ///

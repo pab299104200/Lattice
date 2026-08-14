@@ -31,6 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::health::arithmetic::per_mille;
 use crate::health::config::HEALTH_CONFIG_VERSION;
 
 use super::audit::{audit_labels, AuditInput, LabelAudit, DEFAULT_SAMPLE_SIZE};
@@ -211,21 +212,6 @@ struct FrameFile {
     key: String,
     vector: NormalizedFeatureVector,
     label: bool,
-}
-
-/// Round `numerator / denominator` to the nearest integer, halves up.
-fn round_div(numerator: u128, denominator: u128) -> u128 {
-    if denominator == 0 {
-        return 0;
-    }
-    (numerator * 2 + denominator) / (denominator * 2)
-}
-
-fn per_mille(numerator: u64, denominator: u64) -> u32 {
-    if denominator == 0 {
-        return 0;
-    }
-    round_div(u128::from(numerator) * 1000, u128::from(denominator)) as u32
 }
 
 /// Accumulates repositories one at a time into a report.

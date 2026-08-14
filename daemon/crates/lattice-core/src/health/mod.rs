@@ -14,6 +14,7 @@
 //! facts) land as their own submodules here without touching this file's
 //! existing declarations.
 
+pub mod arithmetic;
 pub mod backtest;
 pub mod churn_facts;
 pub mod complexity_facts;
