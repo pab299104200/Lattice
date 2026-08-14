@@ -464,6 +464,268 @@ where
     entries
 }
 
+/// The committed report the `defect_risk` weights were derived from.
+///
+/// Echoed in `status` so an agent can read the evidence, and its limits,
+/// without being told where to look.
+pub const BACKTEST_REPORT_PATH: &str = "docs/reports/health-backtest/2026-08-14.md";
+
+/// Files named per axis in a `status` report.
+pub const MAX_HEALTH_STATUS_TOP_FILES: usize = 5;
+
+/// What the caller knows about the analysis behind the facts.
+///
+/// Kept as caller-supplied input so this module stays pure: parse failures and
+/// history freshness are the indexer's and the git runtime's truth, not
+/// something a fact index can discover about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthStatusInputs {
+    /// Whether the index behind the graph was whole.
+    pub index_complete: bool,
+    /// Files the parser could not read, from index health.
+    pub parse_failures: u32,
+    /// The git view's own availability word, e.g. `available` or `stale`.
+    pub git_availability: String,
+    /// Commits the published history window actually covered.
+    pub git_window_commits: u32,
+    /// Generation of the published history snapshot, when there is one.
+    pub git_generation: Option<i64>,
+}
+
+/// How much of one fact family reached the index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthFamilyStatus {
+    /// Producing family, e.g. `complexity`.
+    pub family: String,
+    /// Worst availability of any fact this family contributed.
+    pub availability: String,
+    /// Files for which the family contributed at least one fact.
+    pub files_covered: usize,
+    /// Share of the index's files the family covered, per-mille.
+    pub coverage_per_mille: u32,
+    /// Whether a committed backtest measured this family's weights.
+    pub backtested: bool,
+}
+
+/// How many files fall in each band on one axis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthBandHistogram {
+    /// Which axis was scored.
+    pub axis: String,
+    /// Band name to file count, weakest band first.
+    pub bands: Vec<(String, usize)>,
+    /// Files the axis could not score at all.
+    pub unknown: usize,
+    /// Files whose missing inputs left the band a range rather than a point.
+    pub inexact: usize,
+    /// The heaviest-scoring files, with the evidence behind them.
+    pub top_files: Vec<HealthEvidence>,
+}
+
+/// Repository-wide health state, for `status{scope:"health"}` (spec H4.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthStatusReport {
+    /// Worst availability of any family the index holds.
+    pub availability: String,
+    /// Files the index holds facts for.
+    pub files_scored: usize,
+    /// Version of the weight table scores are computed under.
+    pub weights_version: u32,
+    /// Version of the health config the facts were produced under.
+    pub config_version: u32,
+    /// Per-family freshness and coverage.
+    pub families: Vec<HealthFamilyStatus>,
+    /// Band histogram and top files, per axis.
+    pub axes: Vec<HealthBandHistogram>,
+    /// Everything known to be missing or partial, in plain words.
+    ///
+    /// Present so an agent can distrust the numbers correctly rather than
+    /// having to infer degradation from a silence.
+    pub incomplete_analysis: Vec<String>,
+    /// Where the weights came from, and where their limits are recorded.
+    pub backtest_report: String,
+}
+
+/// Build the repository-wide health status.
+pub fn health_status(
+    health: Option<&HealthFactIndex>,
+    inputs: &HealthStatusInputs,
+    top_files: usize,
+) -> HealthStatusReport {
+    use crate::health::config::HEALTH_CONFIG_VERSION;
+    use crate::health::scoring::{ALL_AXES, ALL_BANDS, ALL_FACT_KINDS};
+
+    let mut incomplete_analysis: Vec<String> = Vec::new();
+    if !inputs.index_complete {
+        incomplete_analysis.push(
+            "the index behind these facts was incomplete, so every graph-derived fact is degraded"
+                .to_string(),
+        );
+    }
+    if inputs.parse_failures > 0 {
+        incomplete_analysis.push(format!(
+            "{} file(s) failed to parse, so their symbols and complexity are absent rather than zero",
+            inputs.parse_failures
+        ));
+    }
+    if inputs.git_availability != "available" {
+        incomplete_analysis.push(format!(
+            "history is {}, so no git-derived fact contributed to any score",
+            inputs.git_availability
+        ));
+    } else if inputs.git_window_commits == 0 {
+        incomplete_analysis.push(
+            "the history window covered no commits, so git-derived facts are absent".to_string(),
+        );
+    }
+
+    let Some(health) = health else {
+        incomplete_analysis.push(
+            "no health facts have been produced for this workspace; nothing here is scored"
+                .to_string(),
+        );
+        return HealthStatusReport {
+            availability: FactAvailability::Unavailable.as_str().to_string(),
+            files_scored: 0,
+            weights_version: 0,
+            config_version: HEALTH_CONFIG_VERSION,
+            families: Vec::new(),
+            axes: Vec::new(),
+            incomplete_analysis,
+            backtest_report: BACKTEST_REPORT_PATH.to_string(),
+        };
+    };
+
+    let files_scored = health.file_count();
+
+    // Family coverage, walked once over the index rather than once per family.
+    let mut family_files: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut family_availability: std::collections::BTreeMap<&'static str, FactAvailability> =
+        Default::default();
+    for path in health.paths() {
+        let Some(facts) = health.facts(path) else {
+            continue;
+        };
+        let mut seen: Vec<&'static str> = Vec::new();
+        for value in &facts.values {
+            let family = value.kind.family().as_str();
+            if !seen.contains(&family) {
+                seen.push(family);
+                *family_files.entry(family).or_insert(0) += 1;
+            }
+            let entry = family_availability
+                .entry(family)
+                .or_insert(FactAvailability::Available);
+            *entry = entry.worst(value.availability);
+        }
+    }
+
+    // Every family is listed, including the ones that contributed nothing: a
+    // family absent from the report would read as a family with no problems.
+    let mut families: Vec<HealthFamilyStatus> = Vec::new();
+    let mut listed: Vec<&'static str> = Vec::new();
+    for kind in ALL_FACT_KINDS {
+        let family = kind.family().as_str();
+        if listed.contains(&family) {
+            continue;
+        }
+        listed.push(family);
+        let covered = family_files.get(family).copied().unwrap_or(0);
+        families.push(HealthFamilyStatus {
+            family: family.to_string(),
+            availability: family_availability
+                .get(family)
+                .copied()
+                .unwrap_or(FactAvailability::Unavailable)
+                .as_str()
+                .to_string(),
+            files_covered: covered,
+            coverage_per_mille: if files_scored == 0 {
+                0
+            } else {
+                ((covered as u64 * 1000) / files_scored as u64) as u32
+            },
+            backtested: kind.is_backtested(),
+        });
+    }
+    for family in &families {
+        if family.availability == FactAvailability::Unavailable.as_str() {
+            incomplete_analysis.push(format!(
+                "no {} facts reached the index, so every score names them as missing inputs",
+                family.family
+            ));
+        }
+    }
+
+    let mut axes: Vec<HealthBandHistogram> = Vec::new();
+    for axis in ALL_AXES {
+        let mut counts: Vec<(String, usize)> = ALL_BANDS
+            .iter()
+            .map(|band| (band.as_str().to_string(), 0))
+            .collect();
+        let mut unknown = 0;
+        let mut inexact = 0;
+        let mut ranked: Vec<(u16, String)> = Vec::new();
+
+        for path in health.paths() {
+            let score = health.score(path, axis);
+            if score.availability == FactAvailability::Unavailable {
+                unknown += 1;
+                continue;
+            }
+            if !score.is_exact() {
+                inexact += 1;
+            }
+            if let Some(entry) = counts
+                .iter_mut()
+                .find(|(name, _)| name == score.band.as_str())
+            {
+                entry.1 += 1;
+            }
+            ranked.push((score.score_per_mille, path.to_string()));
+        }
+
+        // Heaviest first, path-ordered on ties, so the report is byte-stable.
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        ranked.truncate(top_files);
+        let top = ranked
+            .into_iter()
+            .map(|(_, path)| {
+                HealthEvidence::from_score(
+                    &path,
+                    &health.score(&path, axis),
+                    HEALTH_EVIDENCE_FACT_LIMIT,
+                )
+            })
+            .collect();
+
+        axes.push(HealthBandHistogram {
+            axis: axis.as_str().to_string(),
+            bands: counts,
+            unknown,
+            inexact,
+            top_files: top,
+        });
+    }
+
+    if files_scored == 0 {
+        incomplete_analysis
+            .push("the index holds facts for no file at all; nothing here is scored".to_string());
+    }
+    incomplete_analysis.dedup();
+
+    HealthStatusReport {
+        availability: health.availability().as_str().to_string(),
+        files_scored,
+        weights_version: health.weights().version,
+        config_version: HEALTH_CONFIG_VERSION,
+        families,
+        axes,
+        incomplete_analysis,
+        backtest_report: BACKTEST_REPORT_PATH.to_string(),
+    }
+}
+
 /// `defect_risk` as a strictly secondary ranking key for `diagnose` (spec
 /// H4.4).
 ///

@@ -403,6 +403,160 @@ fn diagnose_ranking_only_permutes_the_candidates_the_trace_selected() {
     assert!(!paths.contains(&"src/core.rs"));
 }
 
+fn healthy_status_inputs() -> HealthStatusInputs {
+    HealthStatusInputs {
+        index_complete: true,
+        parse_failures: 0,
+        git_availability: "available".to_string(),
+        git_window_commits: 500,
+        git_generation: Some(7),
+    }
+}
+
+#[test]
+fn health_status_reports_coverage_bands_and_provenance() {
+    let index = full_index();
+    let report = health_status(
+        Some(&index),
+        &healthy_status_inputs(),
+        MAX_HEALTH_STATUS_TOP_FILES,
+    );
+
+    assert_eq!(report.files_scored, index.file_count());
+    assert_eq!(report.weights_version, index.weights().version);
+    assert_eq!(report.backtest_report, BACKTEST_REPORT_PATH);
+
+    // Every family is listed, including ones that contributed nothing: an
+    // absent family would read as a family with no problems.
+    let families: Vec<&str> = report
+        .families
+        .iter()
+        .map(|family| family.family.as_str())
+        .collect();
+    for expected in [
+        "graph",
+        "git",
+        "complexity",
+        "test_proximity",
+        "dead_symbol",
+    ] {
+        assert!(families.contains(&expected), "{families:?}");
+    }
+    let graph = report
+        .families
+        .iter()
+        .find(|family| family.family == "graph")
+        .expect("graph family");
+    assert!(graph.files_covered > 0);
+    assert!(graph.coverage_per_mille > 0);
+    assert!(graph.backtested);
+
+    let test_proximity = report
+        .families
+        .iter()
+        .find(|family| family.family == "test_proximity")
+        .expect("test-proximity family");
+    assert!(
+        !test_proximity.backtested,
+        "a provisional weight must be visible as one"
+    );
+
+    // Both axes, each with a full band histogram and its heaviest files.
+    let axes: Vec<&str> = report.axes.iter().map(|axis| axis.axis.as_str()).collect();
+    assert_eq!(axes, vec!["defect_risk", "maintainability"]);
+    let defect_risk = &report.axes[0];
+    assert_eq!(defect_risk.bands.len(), 4);
+    assert_eq!(
+        defect_risk.bands.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+        vec!["low", "moderate", "high", "critical"]
+    );
+    let banded: usize = defect_risk.bands.iter().map(|(_, count)| count).sum();
+    assert_eq!(banded + defect_risk.unknown, report.files_scored);
+    assert!(!defect_risk.top_files.is_empty());
+    assert!(!defect_risk.top_files[0].facts.is_empty());
+    // Heaviest first.
+    for pair in defect_risk.top_files.windows(2) {
+        assert!(pair[0].score_per_mille >= pair[1].score_per_mille);
+    }
+}
+
+#[test]
+fn health_status_names_every_missing_input_in_plain_words() {
+    let graph_only = HealthFactIndex::from_graph(&fixture_graph(), false);
+    let report = health_status(
+        Some(&graph_only),
+        &HealthStatusInputs {
+            index_complete: false,
+            parse_failures: 3,
+            git_availability: "stale".to_string(),
+            git_window_commits: 0,
+            git_generation: None,
+        },
+        MAX_HEALTH_STATUS_TOP_FILES,
+    );
+
+    let stated = report.incomplete_analysis.join(" | ");
+    assert!(stated.contains("index behind these facts was incomplete"), "{stated}");
+    assert!(stated.contains("3 file(s) failed to parse"), "{stated}");
+    assert!(stated.contains("history is stale"), "{stated}");
+    // The families that produced nothing are each named.
+    assert!(stated.contains("no git facts reached the index"), "{stated}");
+    assert!(stated.contains("no complexity facts reached the index"), "{stated}");
+    assert!(stated.contains("no test_proximity facts reached the index"), "{stated}");
+
+    let git = report
+        .families
+        .iter()
+        .find(|family| family.family == "git")
+        .expect("git family");
+    assert_eq!(git.availability, "unavailable");
+    assert_eq!(git.files_covered, 0);
+    assert_eq!(git.coverage_per_mille, 0);
+
+    // Missing inputs widen bands rather than faking precision.
+    assert!(report.axes[0].inexact > 0);
+}
+
+#[test]
+fn health_status_without_an_index_says_so_rather_than_reporting_zero() {
+    let report = health_status(None, &healthy_status_inputs(), MAX_HEALTH_STATUS_TOP_FILES);
+
+    assert_eq!(report.availability, "unavailable");
+    assert_eq!(report.files_scored, 0);
+    assert!(report.families.is_empty());
+    assert!(report.axes.is_empty());
+    assert!(report
+        .incomplete_analysis
+        .iter()
+        .any(|line| line.contains("no health facts have been produced")));
+    assert_eq!(report.backtest_report, BACKTEST_REPORT_PATH);
+}
+
+#[test]
+fn health_status_is_deterministic() {
+    let index = full_index();
+    let inputs = healthy_status_inputs();
+    let first = health_status(Some(&index), &inputs, MAX_HEALTH_STATUS_TOP_FILES);
+    let second = health_status(Some(&index), &inputs, MAX_HEALTH_STATUS_TOP_FILES);
+    assert_eq!(
+        serde_json::to_string(&first).expect("serialize"),
+        serde_json::to_string(&second).expect("serialize")
+    );
+}
+
+#[test]
+fn the_committed_backtest_report_health_status_cites_exists() {
+    // A provenance pointer nobody can follow is not provenance.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join(BACKTEST_REPORT_PATH);
+    assert!(
+        path.exists(),
+        "status cites a backtest report that is not in the repository: {}",
+        path.display()
+    );
+}
+
 /// Vocabulary that would turn measured evidence into a claim about the future.
 ///
 /// The backtest is correlational, its ground truth is a subject-line heuristic

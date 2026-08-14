@@ -26,8 +26,8 @@ use lattice_core::health::graph_facts::GraphFactProducer;
 use lattice_core::health::scoring::HealthFactIndex;
 use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
 use lattice_core::health_consumers::{
-    health_section, order_impact_within_tier_by_defect_risk, untested_changes,
-    HealthImpactCandidate, MAX_HEALTH_SECTION_FILES,
+    health_section, health_status, order_impact_within_tier_by_defect_risk, untested_changes,
+    HealthImpactCandidate, HealthStatusInputs, MAX_HEALTH_SECTION_FILES,
 };
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
@@ -923,6 +923,57 @@ impl McpHandler {
         health_fact_index(engine.graph(), git, false)
     }
 
+    /// `status{scope:"health"}` (spec H4.5).
+    ///
+    /// Reports fact freshness and coverage per family, the band histogram and
+    /// the heaviest files per axis, the weights version scores were computed
+    /// under, and the committed backtest report those weights came from. The
+    /// `incomplete_analysis` list states every known gap in plain words, so an
+    /// agent can distrust the numbers correctly instead of inferring
+    /// degradation from a silence.
+    async fn tool_health_status(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let top_files = (args["limit"].as_u64().unwrap_or(5) as usize).clamp(1, 25);
+        let git_intelligence = self.git_intelligence_snapshot();
+        let view = git_intelligence_view(git_intelligence.as_ref());
+        let metadata = view.metadata();
+        let index_health = self.index_health.snapshot(0);
+
+        let health = self
+            .health_fact_index_for_request(git_intelligence.as_ref())
+            .await;
+        let inputs = HealthStatusInputs {
+            index_complete: !index_health.is_partial,
+            parse_failures: index_health.parse_failures as u32,
+            git_availability: serde_json::to_value(&metadata)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("availability")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "unavailable".to_string()),
+            git_window_commits: serde_json::to_value(&metadata)
+                .ok()
+                .and_then(|value| value.get("window_commits").and_then(Value::as_u64))
+                .unwrap_or(0) as u32,
+            git_generation: git_intelligence
+                .as_ref()
+                .map(|published| published.generation),
+        };
+
+        let report = health_status(Some(&health), &inputs, top_files);
+        let mut value = serde_json::to_value(&report)
+            .map_err(|error| (-32603, format!("Serialization error: {error}")))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "git_generation".to_string(),
+                json!(inputs.git_generation),
+            );
+        }
+        Ok(wrap_tool_result(value))
+    }
+
     fn embed_query_for_fallback(&self, query: &str) -> Option<Vec<f32>> {
         self.embedding_engine
             .get()
@@ -1494,13 +1545,13 @@ impl McpHandler {
                 },
                 {
                     "name": "status",
-                    "description": "Reports indexing, stale-doc, stale-memory, and conflict health — the operational state grep cannot see. Call when results look incomplete or memory may be stale.",
+                    "description": "Reports indexing, stale-doc, stale-memory, conflict, and code-health state — the operational state grep cannot see. Call when results look incomplete, memory may be stale, or you need to know how far to trust a risk band.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
                             "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
-                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts"], "default": AGENT_STATUS_SCOPE_DEFAULT },
+                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts", "health"], "default": AGENT_STATUS_SCOPE_DEFAULT },
                             "query": { "type": "string" },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
@@ -1836,6 +1887,7 @@ impl McpHandler {
 
     async fn tool_agent_status(&self, args: &Value) -> Result<Value, (i32, String)> {
         match args["scope"].as_str().unwrap_or(AGENT_STATUS_SCOPE_DEFAULT) {
+            "health" => self.tool_health_status(args).await,
             "docs" => self.tool_find_stale_docs(args).await,
             "memory" => self.tool_list_stale_memories(args).await,
             "conflicts" => self.tool_list_memory_conflicts(args).await,
