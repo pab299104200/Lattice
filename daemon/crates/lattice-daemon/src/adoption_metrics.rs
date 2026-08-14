@@ -75,6 +75,21 @@ pub(crate) struct MemoryInjectionActionRecord {
     pub(crate) acted_count: u64,
 }
 
+/// A durable observation that a response carried health evidence about
+/// specific files (spec H4.5).
+///
+/// The cited paths are recorded so a later edit can be attributed to the
+/// evidence that named the file, reusing the same edit-follow-through join the
+/// `context` and `impact` rows already use rather than a parallel pipeline.
+#[derive(Debug, Clone)]
+pub(crate) struct HealthEvidenceRecord {
+    pub(crate) session_id: String,
+    pub(crate) client: String,
+    pub(crate) channel: String,
+    pub(crate) tool: String,
+    pub(crate) cited_files: Vec<String>,
+}
+
 /// Content-free terminal or deferred state for one session-capture attempt.
 /// These names are deliberately a fixed allowlist so capture telemetry cannot
 /// become an unbounded diagnostic or payload channel.
@@ -158,6 +173,15 @@ pub(crate) struct AdoptionCounter {
     pub(crate) memory_injections: u64,
     pub(crate) memory_injected_items: u64,
     pub(crate) memory_injection_actions: u64,
+    /// Responses that carried health evidence about at least one file.
+    #[serde(default)]
+    pub(crate) health_evidence_injections: u64,
+    /// Distinct files those responses cited.
+    #[serde(default)]
+    pub(crate) health_evidence_cited_files: u64,
+    /// Injections followed by an edit to a file the evidence named.
+    #[serde(default)]
+    pub(crate) health_evidence_followed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +262,16 @@ enum AdoptionEvent {
         metric_id: Option<String>,
         injection_id: String,
         acted_count: u64,
+    },
+    HealthEvidenceInjection {
+        timestamp_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_id: Option<String>,
+        session_id: String,
+        client: String,
+        channel: String,
+        tool: String,
+        cited_files: BTreeSet<String>,
     },
     CaptureOutcome {
         timestamp_secs: u64,
@@ -435,6 +469,28 @@ impl AdoptionMetricsStore {
     /// Appends an injection-action metric exactly once for a caller-supplied
     /// stable metric id, with the same retry and conflict contract as
     /// record_memory_injection_once.
+    /// Records that a response carried health evidence naming specific files.
+    ///
+    /// Best-effort like every other write here: a metrics failure must never
+    /// change a response or fail a tool call.
+    pub(crate) fn record_health_evidence(&self, record: HealthEvidenceRecord) -> Result<()> {
+        let cited_files: BTreeSet<String> = normalize_suggested_files(record.cited_files)
+            .into_iter()
+            .collect();
+        if cited_files.is_empty() {
+            return Ok(());
+        }
+        self.append_event(AdoptionEvent::HealthEvidenceInjection {
+            timestamp_secs: now_secs(),
+            metric_id: None,
+            session_id: clean_key(&record.session_id, "unknown-session"),
+            client: clean_key(&record.client, "unknown-client"),
+            channel: clean_key(&record.channel, "unknown-channel"),
+            tool: clean_key(&record.tool, "unknown-tool"),
+            cited_files,
+        })
+    }
+
     pub(crate) fn record_memory_injection_action_once(
         &self,
         metric_id: &str,
@@ -898,6 +954,10 @@ pub(crate) fn capture_health_for_workspace(workspace: &Path) -> Result<CaptureHe
 fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
     let mut ledger = AdoptionLedger::default();
     let mut pending = Vec::new();
+    // Health injections join edits through their own pending list. Sharing the
+    // one above would let a health citation and a `context` call compete for
+    // the same edit, so crediting one would silently rob the other.
+    let mut health_pending: Vec<PendingAssistance> = Vec::new();
     let mut memory_retrievals = BTreeMap::new();
     let mut memory_injections = BTreeMap::new();
     for event in events {
@@ -945,6 +1005,27 @@ fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
                 session_id,
                 file,
             } => {
+                // Health evidence is credited independently of the tool-call
+                // follow-through above: one edit can confirm both.
+                if let Some(cited) = health_pending.iter_mut().rev().find(|candidate| {
+                    !candidate.credited
+                        && candidate.session_id == *session_id
+                        && *timestamp_secs >= candidate.timestamp_secs
+                        && timestamp_secs.saturating_sub(candidate.timestamp_secs)
+                            <= FOLLOW_THROUGH_WINDOW_SECS
+                        && candidate.suggested_files.contains(file)
+                }) {
+                    cited.credited = true;
+                    if let Some(counter) = ledger
+                        .days
+                        .get_mut(&cited.counter_key.day)
+                        .and_then(|clients| clients.get_mut(&cited.counter_key.client))
+                        .and_then(|channels| channels.get_mut(&cited.counter_key.channel))
+                        .and_then(|tools| tools.get_mut(&cited.counter_key.tool))
+                    {
+                        counter.health_evidence_followed += 1;
+                    }
+                }
                 let Some(candidate) = pending.iter_mut().rev().find(|candidate| {
                     !candidate.credited
                         && candidate.session_id == *session_id
@@ -965,6 +1046,26 @@ fn ledger_from_events(events: &[AdoptionEvent]) -> AdoptionLedger {
                 {
                     counter.follow_through_edits += 1;
                 }
+            }
+            AdoptionEvent::HealthEvidenceInjection {
+                timestamp_secs,
+                session_id,
+                client,
+                channel,
+                cited_files,
+                ..
+            } => {
+                let counter_key = health_counter_key(*timestamp_secs, client, channel);
+                let counter = counter_for_key(&mut ledger, &counter_key);
+                counter.health_evidence_injections += 1;
+                counter.health_evidence_cited_files += cited_files.len() as u64;
+                health_pending.push(PendingAssistance {
+                    timestamp_secs: *timestamp_secs,
+                    session_id: session_id.clone(),
+                    suggested_files: cited_files.clone(),
+                    counter_key,
+                    credited: false,
+                });
             }
             AdoptionEvent::MemoryRetrieval {
                 timestamp_secs,
@@ -1083,6 +1184,17 @@ fn memory_counter_key(timestamp_secs: u64, client: &str, channel: &str) -> Count
     }
 }
 
+/// Health evidence is filed under its own synthetic tool key, exactly as memory
+/// events are, so it never distorts a real verb's call and latency counts.
+fn health_counter_key(timestamp_secs: u64, client: &str, channel: &str) -> CounterKey {
+    CounterKey {
+        day: date_key_from_epoch_day(timestamp_secs / SECS_PER_DAY),
+        client: client.to_string(),
+        channel: channel.to_string(),
+        tool: "health".to_string(),
+    }
+}
+
 fn counter_for_key<'a>(
     ledger: &'a mut AdoptionLedger,
     key: &CounterKey,
@@ -1107,6 +1219,7 @@ fn event_timestamp(event: &AdoptionEvent) -> u64 {
         | AdoptionEvent::MemoryUse { timestamp_secs, .. }
         | AdoptionEvent::MemoryInjection { timestamp_secs, .. }
         | AdoptionEvent::MemoryInjectionAction { timestamp_secs, .. }
+        | AdoptionEvent::HealthEvidenceInjection { timestamp_secs, .. }
         | AdoptionEvent::CaptureOutcome { timestamp_secs, .. } => *timestamp_secs,
     }
 }
@@ -1347,6 +1460,86 @@ mod tests {
 
         assert_eq!(tools["context"].follow_through_edits, 1);
         assert_eq!(tools["impact"].follow_through_edits, 1);
+    }
+
+    fn health_evidence(timestamp: u64, session: &str, tool: &str, files: &[&str]) -> AdoptionEvent {
+        AdoptionEvent::HealthEvidenceInjection {
+            timestamp_secs: timestamp,
+            metric_id: None,
+            session_id: session.to_string(),
+            client: "codex".to_string(),
+            channel: "mcp".to_string(),
+            tool: tool.to_string(),
+            cited_files: files.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// Spec H4.5: whether injected health evidence was followed.
+    #[test]
+    fn health_evidence_is_credited_when_a_cited_file_is_edited() {
+        let events = vec![
+            health_evidence(10, "session-a", "impact", &["src/hot.rs", "src/calm.rs"]),
+            edit(12, "session-a", "src/hot.rs"),
+        ];
+        let counter = today_tools(&ledger_from_events(&events))["health"].clone();
+
+        assert_eq!(counter.health_evidence_injections, 1);
+        assert_eq!(counter.health_evidence_cited_files, 2);
+        assert_eq!(counter.health_evidence_followed, 1);
+    }
+
+    #[test]
+    fn health_evidence_is_not_credited_for_an_unrelated_or_late_edit() {
+        let events = vec![
+            health_evidence(10, "session-a", "impact", &["src/hot.rs"]),
+            // Right file, wrong session.
+            edit(11, "session-b", "src/hot.rs"),
+            // Right session, wrong file.
+            edit(12, "session-a", "src/elsewhere.rs"),
+            // Right session and file, outside the window.
+            edit(10 + FOLLOW_THROUGH_WINDOW_SECS + 1, "session-a", "src/hot.rs"),
+        ];
+        let counter = today_tools(&ledger_from_events(&events))["health"].clone();
+
+        assert_eq!(counter.health_evidence_injections, 1);
+        assert_eq!(counter.health_evidence_followed, 0);
+    }
+
+    /// Health evidence must not steal an edit from the verb that suggested the
+    /// same file: one edit can honestly confirm both.
+    #[test]
+    fn health_evidence_credit_does_not_displace_tool_follow_through() {
+        let events = vec![
+            call(10, "session-a", "impact", &["src/hot.rs"]),
+            health_evidence(10, "session-a", "impact", &["src/hot.rs"]),
+            edit(12, "session-a", "src/hot.rs"),
+        ];
+        let ledger = ledger_from_events(&events);
+        let tools = today_tools(&ledger);
+
+        assert_eq!(tools["impact"].follow_through_edits, 1);
+        assert_eq!(tools["health"].health_evidence_followed, 1);
+        // The health row is synthetic and must not inflate real call counts.
+        assert_eq!(tools["health"].calls, 0);
+    }
+
+    /// Replaying the same log twice must produce the same counters.
+    #[test]
+    fn health_evidence_replay_is_deterministic_and_credited_at_most_once() {
+        let events = vec![
+            health_evidence(10, "session-a", "impact", &["src/hot.rs"]),
+            edit(11, "session-a", "src/hot.rs"),
+            edit(12, "session-a", "src/hot.rs"),
+        ];
+        let first = today_tools(&ledger_from_events(&events))["health"].clone();
+        let second = today_tools(&ledger_from_events(&events))["health"].clone();
+
+        assert_eq!(
+            first.health_evidence_followed, 1,
+            "a single injection is credited once however many edits follow"
+        );
+        assert_eq!(first.health_evidence_followed, second.health_evidence_followed);
+        assert_eq!(first.health_evidence_injections, second.health_evidence_injections);
     }
 
     #[test]

@@ -264,44 +264,6 @@ impl GitIntelligenceSnapshot {
         partners.truncate(limit);
         partners
     }
-
-    /// Returns the decile cutoff for nonzero file hotness, if one exists.
-    ///
-    /// A caller should warn only when a file's score is at least this value. The
-    /// value is derived from files, never commits, and intentionally excludes
-    /// zeroes because no unobserved path belongs in a history-derived warning.
-    pub fn top_decile_hotspot_cutoff(&self) -> Option<u32> {
-        if self.report.is_degraded() {
-            return None;
-        }
-        let mut histogram = vec![0_usize; self.processed_commits.len().saturating_add(1)];
-        let mut nonzero_files = 0_usize;
-        for file in &self.files {
-            let score = usize::try_from(file.hotspot_score).ok()?;
-            if score == 0 {
-                continue;
-            }
-            // Reject corrupt persisted aggregates instead of allocating from or
-            // issuing warnings based on an impossible score.
-            if score >= histogram.len() {
-                return None;
-            }
-            histogram[score] = histogram[score].saturating_add(1);
-            nonzero_files = nonzero_files.saturating_add(1);
-        }
-        if nonzero_files == 0 {
-            return None;
-        }
-        let target_index = (nonzero_files - 1) / 10;
-        let mut seen = 0_usize;
-        for score in (1..histogram.len()).rev() {
-            seen = seen.saturating_add(histogram[score]);
-            if seen > target_index {
-                return u32::try_from(score).ok();
-            }
-        }
-        None
-    }
 }
 
 /// History-derived signal for one repository-relative file.
@@ -1102,22 +1064,6 @@ mod tests {
     }
 
     #[test]
-    fn hotspot_cutoff_uses_a_bounded_histogram_and_rejects_corrupt_scores() {
-        let changes: Vec<PathChange> = (0..11)
-            .map(|index| change(&format!("src/{index}.rs"), &[]))
-            .collect();
-        let mut snapshot = GitHistoryMiner::default().mine(vec![
-            commit("c2", Some("A"), "feature", changes),
-            commit("c1", Some("A"), "feature", vec![change("src/0.rs", &[])]),
-        ]);
-
-        // Two files form the top decile of an eleven-file population.
-        assert_eq!(snapshot.top_decile_hotspot_cutoff(), Some(1));
-        snapshot.files[0].hotspot_score = 3;
-        assert_eq!(snapshot.top_decile_hotspot_cutoff(), None);
-    }
-
-    #[test]
     fn rejects_unsafe_paths_and_keeps_unknown_authorship_honest() {
         let snapshot = GitHistoryMiner::default().mine(vec![
             commit(" ", None, "patch", vec![change("ignored", &[])]),
@@ -1140,7 +1086,6 @@ mod tests {
         assert_eq!(snapshot.files[0].top_author_share_per_mille, None);
         assert_eq!(snapshot.report.invalid_commit_ids, 1);
         assert_eq!(snapshot.report.invalid_path_entries, 3);
-        assert!(snapshot.top_decile_hotspot_cutoff().is_none());
     }
 
     #[test]

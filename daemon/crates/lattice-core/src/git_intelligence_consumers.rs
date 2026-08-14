@@ -5,8 +5,6 @@
 //! with its publication freshness; every consumer then applies the same
 //! completeness gate before exposing history-derived behavior.
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::git_intelligence::{
@@ -17,8 +15,6 @@ use crate::git_intelligence::{
 pub const MAX_MISSING_CO_CHANGE_PARTNERS: usize = 10;
 /// A co-change advisory needs at least this many distinct commits.
 pub const MIN_CO_CHANGE_PARTNER_COMMITS: u32 = 2;
-/// Maximum number of files included in one non-blocking hotspot warning.
-pub const MAX_HOTSPOT_WARNINGS: usize = 5;
 const PER_MILLE_SCALE: u64 = 1_000;
 
 /// Whether a history snapshot may affect a consumer response.
@@ -163,41 +159,6 @@ pub fn secondary_ranking_evidence(
     })
 }
 
-/// A graph-dependent impact candidate plus the stable keys required to order it.
-///
-/// Call this only within one caller-defined graph-distance and severity tier.
-/// `stable_key` is the caller's existing deterministic final tie-break.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImpactCandidate<T> {
-    pub candidate: T,
-    pub stable_key: String,
-    pub file_path: Option<String>,
-    pub stable_symbol: Option<String>,
-}
-
-/// Orders candidates only within the supplied caller-defined impact tier.
-///
-/// Exact symbol hotspot descends first, then file hotspot, then `stable_key`.
-/// When history is unavailable every history score is zero, so this reduces to
-/// the caller's deterministic tie-break without inventing an impact edge.
-pub fn order_impact_within_tier<T>(
-    view: GitIntelligenceView<'_>,
-    candidates: &mut [ImpactCandidate<T>],
-) {
-    let snapshot = view.usable_snapshot();
-    let window = snapshot.and_then(window_commits);
-    candidates.sort_by(|left, right| {
-        let left_symbol = impact_symbol_hotspot(snapshot, window, left.stable_symbol.as_deref());
-        let right_symbol = impact_symbol_hotspot(snapshot, window, right.stable_symbol.as_deref());
-        let left_file = impact_file_hotspot(snapshot, window, left.file_path.as_deref());
-        let right_file = impact_file_hotspot(snapshot, window, right.file_path.as_deref());
-        right_symbol
-            .cmp(&left_symbol)
-            .then_with(|| right_file.cmp(&left_file))
-            .then_with(|| left.stable_key.cmp(&right.stable_key))
-    });
-}
-
 /// The separately surfaced co-change advisory for an impact response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactHistoryAdvisory {
@@ -250,62 +211,6 @@ where
     }
 }
 
-/// One top-decile hotspot warning safe for a non-blocking hook response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HotspotWarning {
-    pub path: String,
-    pub hotspot_score: u32,
-    pub window_commits: u32,
-    pub head_commit_id: Option<String>,
-}
-
-/// Selects at most five unique edited paths at or above the file top-decile.
-///
-/// The caller is responsible for passing only successful, workspace-scoped edit
-/// paths. This function performs no filesystem access and suppresses warnings
-/// for unavailable, stale, degraded, empty, or corrupt history.
-pub fn select_hotspot_warnings<I, S>(view: GitIntelligenceView<'_>, paths: I) -> Vec<HotspotWarning>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let Some(snapshot) = view.usable_snapshot() else {
-        return Vec::new();
-    };
-    let Some(window_commits) = window_commits(snapshot) else {
-        return Vec::new();
-    };
-    let Some(cutoff) = snapshot.top_decile_hotspot_cutoff() else {
-        return Vec::new();
-    };
-
-    let mut warnings = BTreeSet::new();
-    for path in paths {
-        let Some(file) = snapshot.file(path.as_ref()) else {
-            continue;
-        };
-        if file.hotspot_score <= window_commits && file.hotspot_score >= cutoff {
-            warnings.insert((file.path.clone(), file.hotspot_score));
-        }
-    }
-    let mut warnings: Vec<_> = warnings.into_iter().collect();
-    warnings.sort_unstable_by(|(left_path, left_score), (right_path, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_path.cmp(right_path))
-    });
-    warnings.truncate(MAX_HOTSPOT_WARNINGS);
-    warnings
-        .into_iter()
-        .map(|(path, hotspot_score)| HotspotWarning {
-            path,
-            hotspot_score,
-            window_commits,
-            head_commit_id: snapshot.head_commit_id().map(str::to_owned),
-        })
-        .collect()
-}
-
 fn window_commits(snapshot: &GitIntelligenceSnapshot) -> Option<u32> {
     u32::try_from(snapshot.processed_commits.len())
         .ok()
@@ -342,34 +247,6 @@ fn normalize_count(observed_commits: u32, window_commits: u32) -> Option<Normali
 fn valid_bug_fix_density(signal: &FileHistorySignal) -> Option<u16> {
     (signal.bug_fix_density_per_mille <= PER_MILLE_SCALE as u16)
         .then_some(signal.bug_fix_density_per_mille)
-}
-
-fn impact_symbol_hotspot(
-    snapshot: Option<&GitIntelligenceSnapshot>,
-    window: Option<u32>,
-    symbol: Option<&str>,
-) -> u32 {
-    match (snapshot, window, symbol) {
-        (Some(snapshot), Some(window), Some(symbol)) => snapshot
-            .symbol(symbol)
-            .filter(|signal| signal.hotspot_score <= window)
-            .map_or(0, |signal| signal.hotspot_score),
-        _ => 0,
-    }
-}
-
-fn impact_file_hotspot(
-    snapshot: Option<&GitIntelligenceSnapshot>,
-    window: Option<u32>,
-    path: Option<&str>,
-) -> u32 {
-    match (snapshot, window, path) {
-        (Some(snapshot), Some(window), Some(path)) => snapshot
-            .file(path)
-            .filter(|signal| signal.hotspot_score <= window)
-            .map_or(0, |signal| signal.hotspot_score),
-        _ => 0,
-    }
 }
 
 fn advisory_partner(
@@ -505,68 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn impact_ordering_only_breaks_ties_inside_its_supplied_tier() {
-        let history = snapshot();
-        let mut candidates = vec![
-            ImpactCandidate {
-                candidate: 1,
-                stable_key: "z".into(),
-                file_path: Some("src/b.rs".into()),
-                stable_symbol: None,
-            },
-            ImpactCandidate {
-                candidate: 2,
-                stable_key: "a".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: Some("a::high".into()),
-            },
-            ImpactCandidate {
-                candidate: 3,
-                stable_key: "b".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: None,
-            },
-        ];
-        order_impact_within_tier(
-            GitIntelligenceView::from_snapshot(&history, true),
-            &mut candidates,
-        );
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<Vec<_>>(),
-            vec![2, 3, 1]
-        );
-
-        let mut degraded_candidates = vec![
-            ImpactCandidate {
-                candidate: 1,
-                stable_key: "z".into(),
-                file_path: Some("src/a.rs".into()),
-                stable_symbol: Some("a::high".into()),
-            },
-            ImpactCandidate {
-                candidate: 2,
-                stable_key: "a".into(),
-                file_path: None,
-                stable_symbol: None,
-            },
-        ];
-        order_impact_within_tier(
-            GitIntelligenceView::from_snapshot(&history, false),
-            &mut degraded_candidates,
-        );
-        assert_eq!(
-            degraded_candidates
-                .into_iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<Vec<_>>(),
-            vec![2, 1]
-        );
-    }
-
-    #[test]
     fn missing_partners_are_minimum_supported_capped_and_include_metadata() {
         let history = snapshot();
         let advisory = missing_cochange_partners(
@@ -596,29 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn warnings_are_top_decile_deduplicated_and_never_emitted_from_degraded_history() {
-        let history = snapshot();
-        let warnings = select_hotspot_warnings(
-            GitIntelligenceView::from_snapshot(&history, true),
-            ["src/b.rs", "src/a.rs", "src/a.rs", "src/c.rs"],
-        );
-        assert_eq!(
-            warnings
-                .into_iter()
-                .map(|warning| warning.path)
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs"]
-        );
-        let mut degraded = history.clone();
-        degraded.report.co_changes_complete = false;
-        assert!(select_hotspot_warnings(
-            GitIntelligenceView::from_snapshot(&degraded, true),
-            ["src/a.rs"]
-        )
-        .is_empty());
-    }
-
-    #[test]
     fn consumer_output_limits_are_hard_caps() {
         let mut history = snapshot();
         history.files = (0..12)
@@ -628,11 +420,6 @@ mod tests {
             .map(|index| co_change("src/file-00.rs", &format!("src/partner-{index:02}.rs"), 2))
             .collect();
         let view = GitIntelligenceView::from_snapshot(&history, true);
-        let paths: Vec<_> = history.files.iter().map(|file| file.path.clone()).collect();
-        assert_eq!(
-            select_hotspot_warnings(view, paths).len(),
-            MAX_HOTSPOT_WARNINGS
-        );
         let advisory = missing_cochange_partners(view, ["src/file-00.rs"]);
         assert_eq!(
             advisory.missing_cochange_partners.len(),

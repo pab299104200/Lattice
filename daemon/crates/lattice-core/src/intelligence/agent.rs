@@ -4085,6 +4085,7 @@ pub fn diagnose_failure(
         finalize_symbol_recommendations(suspect_scores),
         &extracted_files,
     );
+    rank_suspects_by_defect_risk_within_proximity_tiers(&health, &mut suspects);
     calibrate_symbol_recommendations(&mut suspects);
     suspects.truncate(mode.active_symbol_limit());
     let suspect_keys: HashSet<(String, String)> = suspects
@@ -8542,6 +8543,81 @@ fn calibrate_file_recommendations(items: &mut [FileRecommendation]) {
             RecommendationKind::File,
         );
     }
+}
+
+/// Orders fault candidates by `defect_risk` inside each trace-proximity tier,
+/// and records the evidence in the candidate's own explanation (spec H4.4).
+///
+/// `defect_risk` is strictly *secondary*. The trace and graph evidence has
+/// already chosen both the candidates and their tiers; this only permutes
+/// entries that already share a proximity score, so it can never admit a file
+/// the trace evidence did not select, nor lift one above a closer candidate.
+///
+/// A candidate the health engine has no facts for keeps its place rather than
+/// sinking as though it had scored low, and gains no evidence line: an
+/// unmeasured file is unknown, not healthy.
+///
+/// Test files are never reordered either. Their health facts describe the test,
+/// not the code under test, so a churning test file is not evidence that the
+/// fault lies in it — promoting one over the production symbol it exercises
+/// would be exactly the false lead this ranking exists to avoid.
+///
+/// The sort is stable, so candidates the health engine cannot separate keep the
+/// order the trace ranker gave them.
+fn rank_suspects_by_defect_risk_within_proximity_tiers(
+    health: &HealthFactIndex,
+    suspects: &mut Vec<SymbolRecommendation>,
+) {
+    let original = std::mem::take(suspects);
+    let mut ordered: Vec<SymbolRecommendation> = Vec::with_capacity(original.len());
+    let mut start = 0;
+    while start < original.len() {
+        let score = original[start].score.to_bits();
+        let end = original[start..]
+            .iter()
+            .position(|item| item.score.to_bits() != score)
+            .map_or(original.len(), |offset| start + offset);
+
+        let mut tier: Vec<(SymbolRecommendation, Option<AxisScore>)> = original[start..end]
+            .iter()
+            .cloned()
+            .map(|item| {
+                if is_test_file(&item.file) {
+                    return (item, None);
+                }
+                let scored = health.score(&item.file, Axis::DefectRisk);
+                let scored =
+                    (scored.availability != FactAvailability::Unavailable).then_some(scored);
+                (item, scored)
+            })
+            .collect();
+
+        // Stable: where the health engine has no opinion, the trace ranker's
+        // order stands untouched.
+        tier.sort_by(|(_, left_score), (_, right_score)| {
+            match (left_score, right_score) {
+                (Some(left_score), Some(right_score)) => right_score
+                    .score_per_mille
+                    .cmp(&left_score.score_per_mille),
+                // Scored before unscored, so an unmeasured or test-file
+                // candidate is never ranked as though it had scored low.
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        });
+
+        for (mut item, scored) in tier {
+            if let Some(scored) = scored {
+                // The contributing facts belong in the explanation, so a reader
+                // can see what secondary evidence moved this candidate.
+                item.evidence.push(scored.summary(3));
+            }
+            ordered.push(item);
+        }
+        start = end;
+    }
+    *suspects = ordered;
 }
 
 fn calibrate_symbol_recommendations(items: &mut [SymbolRecommendation]) {

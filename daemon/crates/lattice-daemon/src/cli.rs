@@ -97,7 +97,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory]\n  health-backtest [--json] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -1268,11 +1268,15 @@ where
 }
 
 fn run_metrics_command(args: Vec<String>) -> i32 {
-    match parse_metrics_args(args).and_then(|(workspace, days, json, memory)| {
-        if memory {
-            render_memory_metrics_for_workspace(&workspace, days, json)
-        } else {
-            render_metrics_for_workspace(&workspace, days, json)
+    match parse_metrics_args(args).and_then(|(workspace, days, json, projection)| {
+        match projection {
+            MetricsProjection::Memory => {
+                render_memory_metrics_for_workspace(&workspace, days, json)
+            }
+            MetricsProjection::Health => {
+                render_health_metrics_for_workspace(&workspace, days, json)
+            }
+            MetricsProjection::All => render_metrics_for_workspace(&workspace, days, json),
         }
     }) {
         Ok(output) => {
@@ -1286,16 +1290,28 @@ fn run_metrics_command(args: Vec<String>) -> i32 {
     }
 }
 
-fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool, bool)> {
+/// Which counters `lattice metrics` projects out of the one durable ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetricsProjection {
+    /// The per-tool call and follow-through table.
+    All,
+    /// The memory retrieval and injection counters.
+    Memory,
+    /// The health-evidence injection and follow-through counters.
+    Health,
+}
+
+fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool, MetricsProjection)> {
     let mut workspace = None;
     let mut days = 14usize;
     let mut json = false;
-    let mut memory = false;
+    let mut projection = MetricsProjection::All;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json = true,
-            "--memory" => memory = true,
+            "--memory" => projection = MetricsProjection::Memory,
+            "--health" => projection = MetricsProjection::Health,
             "--workspace" | "-w" => {
                 let value = args
                     .get(i + 1)
@@ -1323,8 +1339,93 @@ fn parse_metrics_args(args: Vec<String>) -> Result<(PathBuf, usize, bool, bool)>
         workspace.unwrap_or(detect_workspace_root()?),
         days,
         json,
-        memory,
+        projection,
     ))
+}
+
+/// Project the health-evidence counters from the durable adoption ledger.
+///
+/// Answers spec H4.5's question — whether injected health evidence was followed
+/// — by reusing the same edit-follow-through join and retention behaviour as
+/// the other views, read-only, over the one ledger.
+fn render_health_metrics_for_workspace(
+    workspace: &Path,
+    days: usize,
+    json: bool,
+) -> Result<String> {
+    let visible_days = render_metrics_for_workspace(workspace, days, false)?
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split('|').next().map(str::trim))
+        .filter(|day| !day.is_empty() && !day.starts_with('_'))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let ledger_text = render_metrics_for_workspace(workspace, days, true)?;
+    let ledger: Value =
+        serde_json::from_str(&ledger_text).context("adoption metrics ledger is not valid JSON")?;
+    let days_value = ledger
+        .get("days")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("adoption metrics ledger has no days object"))?;
+
+    let mut rows = Vec::new();
+    for (day, clients) in days_value {
+        if !visible_days.contains(day) {
+            continue;
+        }
+        let Some(clients) = clients.as_object() else {
+            continue;
+        };
+        for (client, channels) in clients {
+            let Some(channels) = channels.as_object() else {
+                continue;
+            };
+            for (channel, tools) in channels {
+                let Some(counter) = tools.get("health") else {
+                    continue;
+                };
+                rows.push(json!({
+                    "day": day,
+                    "client": client,
+                    "channel": channel,
+                    "injections": counter.get("health_evidence_injections").cloned().unwrap_or_else(|| json!(0)),
+                    "files_cited": counter.get("health_evidence_cited_files").cloned().unwrap_or_else(|| json!(0)),
+                    "followed": counter.get("health_evidence_followed").cloned().unwrap_or_else(|| json!(0)),
+                }));
+            }
+        }
+    }
+    if json {
+        return Ok(serde_json::to_string_pretty(&json!({ "days": rows }))?);
+    }
+    let mut out = String::from(
+        "day | client | channel | injections | files_cited | followed | follow_rate\n",
+    );
+    out.push_str("--- | --- | --- | ---: | ---: | ---: | ---:\n");
+    if rows.is_empty() {
+        out.push_str("_no health metrics recorded_\n");
+        return Ok(out);
+    }
+    for row in rows {
+        let injections = row["injections"].as_u64().unwrap_or(0);
+        let followed = row["followed"].as_u64().unwrap_or(0);
+        let follow_rate = if injections == 0 {
+            0.0
+        } else {
+            followed as f64 * 100.0 / injections as f64
+        };
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {} | {} | {:.0}%\n",
+            row["day"].as_str().unwrap_or("unknown"),
+            row["client"].as_str().unwrap_or("unknown"),
+            row["channel"].as_str().unwrap_or("unknown"),
+            row["injections"],
+            row["files_cited"],
+            row["followed"],
+            follow_rate,
+        ));
+    }
+    Ok(out)
 }
 
 /// Project the memory counters from the durable adoption ledger. This keeps
@@ -2081,7 +2182,7 @@ mod tests {
     #[test]
     fn parses_memory_metrics_view_flag() {
         let workspace = std::env::current_dir().unwrap();
-        let (parsed_workspace, days, json, memory) = parse_metrics_args(vec![
+        let (parsed_workspace, days, json, projection) = parse_metrics_args(vec![
             "lattice".into(),
             "metrics".into(),
             "--memory".into(),
@@ -2095,7 +2196,34 @@ mod tests {
         assert_eq!(parsed_workspace, workspace.canonicalize().unwrap());
         assert_eq!(days, 7);
         assert!(json);
-        assert!(memory);
+        assert_eq!(projection, MetricsProjection::Memory);
+    }
+
+    #[test]
+    fn parses_health_metrics_view_flag() {
+        let workspace = std::env::current_dir().unwrap();
+        let (_, _, _, projection) = parse_metrics_args(vec![
+            "lattice".into(),
+            "metrics".into(),
+            "--health".into(),
+            "--workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(projection, MetricsProjection::Health);
+    }
+
+    #[test]
+    fn metrics_defaults_to_the_full_projection() {
+        let workspace = std::env::current_dir().unwrap();
+        let (_, _, _, projection) = parse_metrics_args(vec![
+            "lattice".into(),
+            "metrics".into(),
+            "--workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(projection, MetricsProjection::All);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::super::mcp::{
     AGENT_STATUS_SCOPE_DEFAULT,
 };
 use super::super::server::RequestHandler;
-use super::{call_args, SchemaFixture};
+use super::{call_args, parse_tool_payload, SchemaFixture};
 
 /// The 8 advertised agent-facing tool names in the order they appear in the reference.
 pub(crate) const ADVERTISED_TOOLS: &[&str] = &[
@@ -127,6 +127,100 @@ async fn advertised_defaults_match_dispatcher_defaults() {
     assert_eq!(
         schema_for("status")["properties"]["scope"]["default"],
         AGENT_STATUS_SCOPE_DEFAULT
+    );
+}
+
+/// Every scope the `status` dispatcher routes must be advertised, and every
+/// advertised scope must route somewhere.
+///
+/// Nothing pinned the scope list before, so a scope could be added to the
+/// dispatcher and never reach a caller — or advertised and silently fall
+/// through to `index`.
+#[tokio::test]
+async fn advertised_status_scopes_match_the_dispatcher() {
+    let fixture = SchemaFixture::new("schema-status-scopes");
+    let response = fixture
+        .handler
+        .handle("tools/list", json!({}))
+        .await
+        .expect("tools/list succeeds");
+    let scopes = response["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"] == "status")
+        .expect("status tool")["inputSchema"]["properties"]["scope"]["enum"]
+        .as_array()
+        .expect("status scope enum")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope string").to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        scopes,
+        vec!["index", "docs", "memory", "conflicts", "health"],
+        "the advertised scope list is the agent-facing contract"
+    );
+    assert!(scopes.contains(&AGENT_STATUS_SCOPE_DEFAULT.to_string()));
+
+    // Each advertised scope reaches its own handler rather than silently
+    // falling through to `index`. `conflicts` needs a memory this empty fixture
+    // has no way to supply, so it proves its routing by returning its own
+    // handler's error rather than an index payload.
+    for scope in &scopes {
+        let result = fixture
+            .handler
+            .handle("tools/call", call_args("status", json!({ "scope": scope })))
+            .await;
+        match result {
+            Ok(response) => assert!(
+                response["content"][0]["text"].is_string(),
+                "status scope {scope} returned no text block: {response:?}"
+            ),
+            Err(error) => assert_eq!(
+                scope, "conflicts",
+                "status scope {scope} must route to a handler that answers: {error:?}"
+            ),
+        }
+    }
+}
+
+/// `status{scope:"health"}` must report its provenance and its gaps, not just
+/// numbers (spec H4.5).
+#[tokio::test]
+async fn health_status_scope_reports_provenance_and_incomplete_analysis() {
+    let fixture = SchemaFixture::new("schema-status-health");
+    let response = fixture
+        .handler
+        .handle("tools/call", call_args("status", json!({ "scope": "health" })))
+        .await
+        .expect("health status succeeds");
+    let payload = parse_tool_payload(&response);
+
+    assert_eq!(
+        payload["backtest_report"],
+        "docs/reports/health-backtest/2026-08-14.md",
+        "the weights must cite the report they came from"
+    );
+    assert!(payload["weights_version"].is_u64());
+    assert!(payload["config_version"].is_u64());
+    assert!(payload["availability"].is_string());
+
+    // An empty fixture workspace has nothing measured, and must say so rather
+    // than reporting a clean bill of health.
+    let stated = payload["incomplete_analysis"]
+        .as_array()
+        .expect("incomplete analysis")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(!stated.is_empty(), "{payload:?}");
+    assert!(
+        stated.contains("no git facts reached the index")
+            || stated.contains("history is")
+            || stated.contains("nothing here is scored"),
+        "{stated}"
     );
 }
 
