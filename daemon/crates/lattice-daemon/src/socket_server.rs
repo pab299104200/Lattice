@@ -124,8 +124,22 @@ impl ShardEntry {
             .store(now_epoch_secs(), Ordering::Release);
     }
 
+    /// The single definition of "this shard can be dropped without destroying
+    /// work in flight".  Cold start is two sequential phases of one operation:
+    /// `build_workspace_runtime` registers the workspace's index job before it
+    /// returns, and `bootstrapping` only clears after that.  A shard is
+    /// therefore safe to evict only when it serves no request, has published
+    /// its runtime, and has no queued or running index work.  Both the
+    /// capacity-admission path and the idle sweeper must ask this same
+    /// question, or one of them will evict a shard the other considers busy.
+    fn is_evictable(&self) -> bool {
+        self.active_connections.load(Ordering::Acquire) == 0
+            && !self.is_bootstrapping()
+            && !self.index_work.workspace_is_busy(&shard_key(&self.root))
+    }
+
     fn is_idle(&self, now_epoch_secs: u64, idle_ttl_secs: u64) -> bool {
-        if self.active_connections.load(Ordering::Acquire) != 0 || self.is_bootstrapping() {
+        if !self.is_evictable() {
             return false;
         }
         let last_used = self.last_used_epoch_secs.load(Ordering::Acquire);
@@ -1059,13 +1073,7 @@ impl GlobalDaemon {
             } else {
                 let victim_key = shards
                     .iter()
-                    .filter(|(_, entry)| {
-                        entry.active_connections.load(Ordering::Acquire) == 0
-                            && !entry.is_bootstrapping()
-                            && !self
-                                .index_work
-                                .workspace_is_busy(&shard_key(&entry.root))
-                    })
+                    .filter(|(_, entry)| entry.is_evictable())
                     .min_by_key(|(_, entry)| entry.last_used_epoch_secs.load(Ordering::Acquire))
                     .map(|(candidate, _)| candidate.clone());
                 let Some(victim_key) = victim_key else {
@@ -1975,6 +1983,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_shard_is_not_evictable_until_bootstrap_publishes_its_runtime() {
+        let root = unique_test_root("lattice-bootstrap-evictable");
+        std::fs::create_dir_all(&root).expect("create bootstrap root");
+        let root = root.canonicalize().unwrap_or(root);
+        let daemon = Arc::new(GlobalDaemon::new_with_config(2, false));
+
+        let lease = daemon
+            .handler_for(&ProxyRequest {
+                workspace_roots: vec![root.to_string_lossy().to_string()],
+                focus_files: Vec::new(),
+                focus_dirs: Vec::new(),
+            })
+            .await
+            .expect("load shard");
+        drop(lease);
+
+        {
+            let shards = daemon.shards.lock().await;
+            let entry = shards.get(&shard_key(&root)).expect("shard is resident");
+            assert_eq!(
+                entry.active_connections.load(Ordering::Acquire),
+                0,
+                "dropping the lease must release the shard's request retention"
+            );
+            assert!(
+                entry.is_bootstrapping(),
+                "a just-leased shard is still bootstrapping its runtime"
+            );
+            assert!(
+                !entry.is_evictable(),
+                "a shard whose runtime bootstrap is still in flight must not be evictable, \
+                 even though no index work has been enqueued yet"
+            );
+        }
+
+        wait_for_shard_evictable(&daemon, &root).await;
+        {
+            let shards = daemon.shards.lock().await;
+            let entry = shards.get(&shard_key(&root)).expect("shard is resident");
+            assert!(
+                !entry.is_bootstrapping() && !daemon.index_work.workspace_is_busy(&shard_key(&root)),
+                "an evictable shard has finished both bootstrap and index work"
+            );
+            assert!(entry.is_evictable());
+            assert!(
+                entry.is_idle(now_epoch_secs() + 10_000, 1),
+                "an evictable shard past its idle TTL is also idle-sweepable"
+            );
+        }
+
+        shutdown_all_shards(&daemon).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn shard_capacity_evicts_inactive_runtime_before_loading_another() {
         let roots = (0..3)
             .map(|index| {
@@ -1995,7 +2058,7 @@ mod tests {
                 .await
                 .expect("load shard within bounded capacity");
             drop(lease);
-            wait_for_index_work(&daemon, root).await;
+            wait_for_shard_evictable(&daemon, root).await;
         }
 
         let shards = daemon.shards.lock().await;
@@ -2040,7 +2103,7 @@ mod tests {
         assert!(error.to_string().contains("all are active or indexing"));
 
         drop(retained);
-        wait_for_index_work(&daemon, &root_a).await;
+        wait_for_shard_evictable(&daemon, &root_a).await;
         daemon
             .shard_for(root_b.clone(), Vec::new(), Vec::new(), false)
             .await
@@ -2652,15 +2715,25 @@ mod tests {
         serde_json::from_str(&line).expect("parse JSON-RPC response")
     }
 
-    async fn wait_for_index_work(daemon: &GlobalDaemon, root: &PathBuf) {
+    /// Wait until a shard has actually reached the state the eviction paths
+    /// call evictable.  Polling index work alone is not that state: a shard
+    /// that has just been leased is still bootstrapping and has not enqueued
+    /// its index job yet, so an index-only poll reports "quiet" during the
+    /// busiest moment of cold start.
+    async fn wait_for_shard_evictable(daemon: &GlobalDaemon, root: &PathBuf) {
         let key = shard_key(root);
-        for _ in 0..100 {
-            if !daemon.index_work.workspace_is_busy(&key) {
-                return;
+        for _ in 0..500 {
+            {
+                let shards = daemon.shards.lock().await;
+                match shards.get(&key) {
+                    Some(entry) if entry.is_evictable() => return,
+                    None => return,
+                    Some(_) => {}
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("index work did not finish for {}", root.display());
+        panic!("shard never became evictable for {}", root.display());
     }
 
     struct NoopRequestHandler;
