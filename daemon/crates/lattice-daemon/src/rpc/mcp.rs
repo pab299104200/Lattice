@@ -17,11 +17,18 @@ use lattice_core::events::{
 };
 use lattice_core::git_intelligence::GitIntelligenceSnapshot;
 use lattice_core::git_intelligence_consumers::{
-    missing_cochange_partners, order_impact_within_tier, secondary_ranking_evidence,
-    select_hotspot_warnings, GitIntelligenceView, ImpactCandidate,
+    missing_cochange_partners, secondary_ranking_evidence, select_hotspot_warnings,
+    GitIntelligenceView,
 };
 use lattice_core::graph::model::CodeGraph;
+use lattice_core::health::dead_symbol_facts::{DeadSymbolExclusionInputs, DeadSymbolFactProducer};
+use lattice_core::health::graph_facts::GraphFactProducer;
 use lattice_core::health::scoring::HealthFactIndex;
+use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
+use lattice_core::health_consumers::{
+    health_section, order_impact_within_tier_by_defect_risk, untested_changes,
+    HealthImpactCandidate, MAX_HEALTH_SECTION_FILES,
+};
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
 use lattice_core::intelligence::{
@@ -902,6 +909,20 @@ impl McpHandler {
         }
     }
 
+    /// One health fact index for this request, built from the graph the engine
+    /// already holds plus any usable published history window.
+    ///
+    /// Takes and releases the engine lock on its own, so a caller must not be
+    /// holding it. Built once per request rather than once per section: a score
+    /// walks every input weight and the index ranks the whole file population.
+    async fn health_fact_index_for_request(
+        &self,
+        git: Option<&McpGitIntelligenceSnapshot>,
+    ) -> HealthFactIndex {
+        let engine = self.engine.lock().await;
+        health_fact_index(engine.graph(), git, false)
+    }
+
     fn embed_query_for_fallback(&self, query: &str) -> Option<Vec<f32>> {
         self.embedding_engine
             .get()
@@ -1614,11 +1635,15 @@ impl McpHandler {
         changed_paths.sort();
         changed_paths.dedup();
         let git_intelligence = self.git_intelligence_snapshot();
+        let health = self
+            .health_fact_index_for_request(git_intelligence.as_ref())
+            .await;
         if direction == "tests" {
             let mut result = self.tool_find_relevant_tests(&routed).await?;
             enrich_impact_tool_result_with_git_intelligence(
                 &mut result,
                 git_intelligence.as_ref(),
+                Some(&health),
                 &changed_paths,
             );
             return Ok(result);
@@ -1648,6 +1673,7 @@ impl McpHandler {
         enrich_impact_tool_result_with_git_intelligence(
             &mut result,
             git_intelligence.as_ref(),
+            Some(&health),
             &changed_paths,
         );
         Ok(result)
@@ -3715,9 +3741,7 @@ impl McpHandler {
         let (bundle, metadata) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            // See `tool_prepare_change`: one graph-derived index per request
-            // until H4 supplies the published fact generations.
-            let health = HealthFactIndex::from_graph(engine.graph(), false);
+            let health = health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
             let report = impact_from_diff(
                 engine.graph(),
                 diff,
@@ -3756,6 +3780,7 @@ impl McpHandler {
             enrich_impact_bundle_with_git_intelligence(
                 &mut bundle,
                 git_intelligence.as_ref(),
+                Some(&health),
                 changed_paths,
             );
 
@@ -7696,6 +7721,40 @@ fn git_intelligence_view(snapshot: Option<&McpGitIntelligenceSnapshot>) -> GitIn
     })
 }
 
+/// Builds the richest health fact index a request may compute in process.
+///
+/// Graph, test-proximity and dead-symbol facts are pure functions of the graph
+/// the engine already holds, so a request may derive them without touching the
+/// filesystem. Git facts come from the snapshot the runtime already published,
+/// and only when that snapshot is usable — a stale window must not rank files.
+///
+/// Complexity facts are deliberately absent. Producing them means re-parsing
+/// file contents, and loading the published generation instead would mean
+/// reopening `graph.db`, which request handling must never do (see the
+/// `git_intelligence` field on `McpHandler`). They are reported through
+/// `inputs_missing` on every score, which widens the band rather than letting a
+/// file read as simple because nobody measured it.
+fn health_fact_index(
+    graph: &CodeGraph,
+    git: Option<&McpGitIntelligenceSnapshot>,
+    index_complete: bool,
+) -> HealthFactIndex {
+    let mut builder = HealthFactIndex::builder()
+        .with_graph_facts(GraphFactProducer::default().produce(graph, index_complete))
+        .with_test_proximity_facts(
+            TestProximityFactProducer::default().produce(graph, index_complete),
+        )
+        .with_dead_symbol_facts(DeadSymbolFactProducer::default().produce(
+            graph,
+            &DeadSymbolExclusionInputs::default(),
+            index_complete,
+        ));
+    if let Some(snapshot) = git_intelligence_view(git).usable_snapshot() {
+        builder = builder.with_git_intelligence(snapshot.clone());
+    }
+    builder.build()
+}
+
 fn enrich_context_bundle_with_git_intelligence(
     bundle: &mut WorkflowBundle,
     snapshot: Option<&McpGitIntelligenceSnapshot>,
@@ -7727,14 +7786,19 @@ fn enrich_context_bundle_with_git_intelligence(
 fn enrich_impact_bundle_with_git_intelligence<I, S>(
     bundle: &mut WorkflowBundle,
     snapshot: Option<&McpGitIntelligenceSnapshot>,
+    health: Option<&HealthFactIndex>,
     changed_paths: I,
 ) where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let view = git_intelligence_view(snapshot);
-    order_impact_pivots_within_primary_tiers(view, &mut bundle.ranked_pivots);
-    let advisory = missing_cochange_partners(view, changed_paths);
+    let changed: Vec<String> = changed_paths
+        .into_iter()
+        .map(|path| path.as_ref().to_string())
+        .collect();
+    order_impact_pivots_within_primary_tiers(health, &mut bundle.ranked_pivots);
+    let advisory = missing_cochange_partners(view, &changed);
     attach_git_intelligence_presentation(
         &mut bundle.structured_payload,
         json!({
@@ -7742,11 +7806,47 @@ fn enrich_impact_bundle_with_git_intelligence<I, S>(
             "impact_advisory": advisory,
         }),
     );
+    attach_impact_health_presentation(&mut bundle.structured_payload, health, &changed);
+}
+
+/// Attaches the `impact` health section: the ranked change set with its
+/// evidence, plus the changed files measured to have no edge-linked test.
+///
+/// Spec H4.2. The section covers the diff's own files only; `impact` already
+/// ranks everything else and health must not balloon into every path a response
+/// happens to mention.
+fn attach_impact_health_presentation(
+    payload: &mut Value,
+    health: Option<&HealthFactIndex>,
+    changed_paths: &[String],
+) {
+    let section = health_section(health, changed_paths, MAX_HEALTH_SECTION_FILES);
+    let untested = untested_changes(health, changed_paths);
+    let mut presentation = serde_json::to_value(&section).unwrap_or_else(|_| json!({}));
+    if let Some(object) = presentation.as_object_mut() {
+        object.insert("untested_changes".to_string(), json!(untested));
+    }
+    attach_health_presentation(payload, presentation);
+}
+
+/// Inserts the `health` section into a structured payload.
+///
+/// Mirrors `attach_git_intelligence_presentation`: health is a top-level
+/// section of the response, never folded into another verb's payload.
+fn attach_health_presentation(payload: &mut Value, presentation: Value) {
+    if !payload.is_object() {
+        let original = std::mem::take(payload);
+        *payload = json!({ "result": original });
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("health".to_string(), presentation);
+    }
 }
 
 fn enrich_impact_tool_result_with_git_intelligence(
     result: &mut Value,
     snapshot: Option<&McpGitIntelligenceSnapshot>,
+    health: Option<&HealthFactIndex>,
     changed_paths: &[String],
 ) {
     let view = git_intelligence_view(snapshot);
@@ -7764,11 +7864,20 @@ fn enrich_impact_tool_result_with_git_intelligence(
             .insert("hotspot_warnings".to_string(), json!(hotspot_warnings));
     }
     attach_git_intelligence_presentation(&mut payload, presentation);
+    attach_impact_health_presentation(&mut payload, health, changed_paths);
     *result = wrap_tool_result(payload);
 }
 
+/// Orders impact pivots inside each graph-distance tier by `defect_risk`.
+///
+/// The tiers themselves are the graph's, and are never crossed: this only
+/// permutes pivots that already share a score. Within a tier the health bundle
+/// is the ordering key, superseding the hotspot tie-break
+/// (`docs/architecture/2026-08-13-git-intelligence.md`, § "Consumer contracts →
+/// impact"). History still reaches the primary ordering, but only through a
+/// score that carries its own evidence, never as a bare count.
 fn order_impact_pivots_within_primary_tiers(
-    view: GitIntelligenceView<'_>,
+    health: Option<&HealthFactIndex>,
     pivots: &mut Vec<workflow_v2::Pivot>,
 ) {
     let original = std::mem::take(pivots);
@@ -7783,7 +7892,7 @@ fn order_impact_pivots_within_primary_tiers(
         let mut tier = original[start..end]
             .iter()
             .cloned()
-            .map(|pivot| ImpactCandidate {
+            .map(|pivot| HealthImpactCandidate {
                 stable_key: format!(
                     "{}\0{}\0{}",
                     pivot.file.as_deref().unwrap_or_default(),
@@ -7791,11 +7900,10 @@ fn order_impact_pivots_within_primary_tiers(
                     pivot.line.unwrap_or_default()
                 ),
                 file_path: pivot.file.clone(),
-                stable_symbol: pivot.symbol.clone(),
                 candidate: pivot,
             })
             .collect::<Vec<_>>();
-        order_impact_within_tier(view, &mut tier);
+        order_impact_within_tier_by_defect_risk(health, &mut tier);
         ordered.extend(tier.into_iter().map(|candidate| candidate.candidate));
         start = end;
     }
@@ -9310,6 +9418,7 @@ fn dense_key(key: &str) -> &str {
         "single_anchor_used" => "sa",
         "semantic_fallback_used" => "se",
         "outcome_memory_reuse_count" => "or",
+        "health" => "hlth",
         "agent_retrieval_contract" => "arc",
         "next_action" => "na",
         "budget" => "bg",
@@ -13702,6 +13811,46 @@ def detect_agent_version_drift(agent, rollout):
         }
     }
 
+    /// A graph in which `src/hot.rs` is central and cyclic and `src/cold.rs` is
+    /// a leaf, so `defect_risk` separates the two pivots of
+    /// `git_presentation_bundle` on graph evidence alone.
+    fn health_presentation_index() -> lattice_core::health::scoring::HealthFactIndex {
+        use lattice_core::graph::model::EdgeKind;
+        use lattice_core::symbols::{Language, SymbolId, SymbolKind};
+
+        let id = |file: &str, name: &str| SymbolId {
+            file: file.to_string(),
+            name: name.to_string(),
+            byte_offset: 0,
+        };
+        let mut graph = CodeGraph::new();
+        let hot = id("src/hot.rs", "hot::run");
+        let cold = id("src/cold.rs", "cold::run");
+        let partner = id("src/partner.rs", "partner::run");
+        let caller = id("src/caller.rs", "caller::run");
+        for symbol in [&hot, &cold, &partner, &caller] {
+            graph.add_node(
+                symbol.clone(),
+                SymbolKind::Function,
+                symbol.name.clone(),
+                format!("fn {}()", symbol.name),
+                "",
+                symbol.file.clone(),
+                1,
+                5,
+                true,
+                Language::Rust,
+            );
+        }
+        // Everything depends on `hot`, and `hot` sits in a cycle with
+        // `partner`; `cold` depends on nothing and nothing depends on it.
+        graph.add_edge(&partner, &hot, EdgeKind::Calls);
+        graph.add_edge(&hot, &partner, EdgeKind::Calls);
+        graph.add_edge(&caller, &hot, EdgeKind::Calls);
+        graph.add_edge(&cold, &hot, EdgeKind::Calls);
+        super::health_fact_index(&graph, None, true)
+    }
+
     #[test]
     fn git_intelligence_handoff_is_repository_scoped_and_explicitly_stale() {
         let handle = GitIntelligenceSnapshotHandle::default();
@@ -13770,14 +13919,19 @@ def detect_agent_version_drift(agent, rollout):
             snapshot: Arc::new(stored.snapshot),
             is_fresh: true,
         };
+        let health = health_presentation_index();
         let mut bundle = git_presentation_bundle();
 
         super::enrich_impact_bundle_with_git_intelligence(
             &mut bundle,
             Some(&published),
+            Some(&health),
             ["src/hot.rs"],
         );
 
+        // Both pivots share a graph score, so the tier is ordered by the
+        // `defect_risk` bundle. `cold` sorts first by stable key, so this can
+        // only pass because health evidence moved it.
         assert_eq!(bundle.ranked_pivots[0].label, "hot");
         assert_eq!(bundle.ranked_pivots[1].label, "cold");
         let advisory = &bundle.structured_payload["git_intelligence"]["impact_advisory"];
@@ -13786,6 +13940,210 @@ def detect_agent_version_drift(agent, rollout):
             advisory["missing_cochange_partners"][0]["partner_path"],
             "src/partner.rs"
         );
+    }
+
+    #[test]
+    fn impact_health_section_ranks_the_changed_files_with_readable_evidence() {
+        let health = health_presentation_index();
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            None,
+            Some(&health),
+            ["src/cold.rs", "src/hot.rs"],
+        );
+
+        let section = &bundle.structured_payload["health"];
+        assert_eq!(section["considered"], 2);
+        let files = section["files"].as_array().expect("health files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], "src/hot.rs");
+
+        let risk = &files[0]["defect_risk"];
+        assert_eq!(risk["axis"], "defect_risk");
+        let facts = risk["facts"].as_array().expect("cited facts");
+        assert!(!facts.is_empty(), "a score must ship its evidence");
+        assert!(facts.len() <= 3);
+        // Every ranked entry is explainable from its printed facts alone.
+        let summary = risk["summary"].as_str().expect("summary");
+        assert!(summary.starts_with("defect risk "));
+        for fact in facts {
+            let description = fact["description"].as_str().expect("fact description");
+            assert!(summary.contains(description), "{summary} missing {description}");
+        }
+        // Graph-only facts here, so the score names the families it lacked.
+        assert_eq!(risk["exact"], false);
+        assert!(risk["inputs_missing"]
+            .as_array()
+            .expect("missing inputs")
+            .iter()
+            .any(|kind| kind == "bug_fix_commits"));
+    }
+
+    #[test]
+    fn impact_health_section_reports_untested_changed_files() {
+        let health = health_presentation_index();
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            None,
+            Some(&health),
+            ["src/hot.rs"],
+        );
+
+        // The fixture graph contains no test files, so the changed production
+        // file is measured as having no edge-linked test.
+        let untested = bundle.structured_payload["health"]["untested_changes"]
+            .as_array()
+            .expect("untested entries");
+        assert_eq!(untested.len(), 1);
+        assert_eq!(untested[0]["path"], "src/hot.rs");
+        assert_eq!(untested[0]["linked_test_count"], 0);
+    }
+
+    /// A structured payload carrying a `health` section, as `impact` builds it.
+    fn health_rendered_payload() -> Value {
+        let health = health_presentation_index();
+        let mut bundle = git_presentation_bundle();
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            None,
+            Some(&health),
+            ["src/cold.rs", "src/hot.rs"],
+        );
+        bundle.structured_payload
+    }
+
+    #[test]
+    fn markdown_render_states_the_health_band_and_its_evidence_once_per_file() {
+        let payload = health_rendered_payload();
+        let summary = super::build_tool_result_summary(&payload).expect("impact summary");
+
+        assert!(
+            summary.contains("- Health: `src/hot.rs` — defect risk "),
+            "{summary}"
+        );
+        // A band and a per-mille score, never a bare number on its own.
+        assert!(summary.contains("/1000)"), "{summary}");
+        // The evidence a reader needs travels with the band.
+        assert!(summary.contains("fan-in") || summary.contains("fan-out"), "{summary}");
+        assert!(
+            summary.contains(
+                "- Untested change: no edge-linked tests for `src/cold.rs`, `src/hot.rs`."
+            ),
+            "{summary}"
+        );
+        assert_eq!(
+            summary.matches("- Health: `src/hot.rs`").count(),
+            1,
+            "each file is summarised once: {summary}"
+        );
+    }
+
+    #[test]
+    fn markdown_render_states_absence_rather_than_going_silent() {
+        let mut bundle = git_presentation_bundle();
+        super::enrich_impact_bundle_with_git_intelligence(&mut bundle, None, None, ["src/hot.rs"]);
+        let summary =
+            super::build_tool_result_summary(&bundle.structured_payload).expect("impact summary");
+
+        assert!(
+            summary.contains(
+                "- Health: no health facts have been produced for this workspace."
+            ),
+            "an agent must be able to tell 'nothing measured' from 'no risk': {summary}"
+        );
+        assert!(!summary.contains("- Untested change:"), "{summary}");
+    }
+
+    #[test]
+    fn markdown_render_of_a_payload_without_a_health_section_stays_unchanged() {
+        let summary = super::build_tool_result_summary(&json!({ "overview": "plain" }))
+            .expect("plain summary");
+        assert!(!summary.contains("- Health:"), "{summary}");
+        assert!(!summary.contains("- Untested change:"), "{summary}");
+    }
+
+    #[test]
+    fn the_health_section_renders_identically_under_the_dense_wire_format() {
+        let payload = health_rendered_payload();
+        let standard = super::build_tool_result_summary(&payload).expect("standard summary");
+        let dense = super::densify_workflow_value(payload);
+        let densified = super::build_tool_result_summary(&dense).expect("dense summary");
+
+        let health_lines = |summary: &str| {
+            summary
+                .lines()
+                .filter(|line| line.starts_with("- Health:") || line.starts_with("- Untested"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(health_lines(&standard), health_lines(&densified));
+        assert!(!health_lines(&densified).is_empty());
+    }
+
+    #[test]
+    fn json_render_carries_the_health_section_verbatim_and_prints_no_summary() {
+        let payload = health_rendered_payload();
+        let wrapped =
+            super::wrap_workflow_tool_result(payload.clone(), super::WorkflowRenderMode::Json);
+        let text = wrapped["content"][0]["text"].as_str().expect("JSON text");
+        let parsed: Value = serde_json::from_str(text).expect("valid JSON payload");
+
+        assert_eq!(parsed["health"], payload["health"]);
+        assert_eq!(parsed["health"]["files"][0]["path"], "src/hot.rs");
+        assert!(!parsed["health"]["files"][0]["defect_risk"]["facts"]
+            .as_array()
+            .expect("facts")
+            .is_empty());
+        assert!(!text.contains("### Summary"));
+        assert!(!text.contains("lattice-metrics"));
+    }
+
+    #[test]
+    fn markdown_render_of_the_health_section_carries_no_structured_payload_or_telemetry() {
+        let wrapped = super::wrap_workflow_tool_result(
+            health_rendered_payload(),
+            super::WorkflowRenderMode::Markdown,
+        );
+        let text = wrapped["content"][0]["text"]
+            .as_str()
+            .expect("Markdown text");
+
+        assert!(text.contains("### Summary"));
+        assert!(text.contains("- Health: `src/hot.rs`"));
+        assert!(!text.contains("### Structured Payload"));
+        assert!(!text.contains("```json"));
+        assert!(!text.contains("lattice-metrics"));
+    }
+
+    #[test]
+    fn impact_without_health_facts_states_its_absence_and_invents_no_order() {
+        let mut bundle = git_presentation_bundle();
+
+        super::enrich_impact_bundle_with_git_intelligence(
+            &mut bundle,
+            None,
+            None,
+            ["src/hot.rs"],
+        );
+
+        // Ordering falls back to the caller's stable key, so the original
+        // order survives untouched.
+        assert_eq!(bundle.ranked_pivots[0].label, "cold");
+        let section = &bundle.structured_payload["health"];
+        assert_eq!(section["availability"], "unavailable");
+        assert_eq!(
+            section["unavailable_reason"],
+            "no health facts have been produced for this workspace"
+        );
+        assert!(section["files"].as_array().expect("files").is_empty());
+        assert!(section["untested_changes"]
+            .as_array()
+            .expect("untested")
+            .is_empty());
     }
 
     #[test]
@@ -13801,6 +14159,7 @@ def detect_agent_version_drift(agent, rollout):
         super::enrich_impact_tool_result_with_git_intelligence(
             &mut result,
             Some(&published),
+            None,
             &["src/hot.rs".to_string()],
         );
 
@@ -13851,6 +14210,7 @@ def detect_agent_version_drift(agent, rollout):
             super::enrich_impact_tool_result_with_git_intelligence(
                 &mut result,
                 snapshot.as_ref(),
+                None,
                 &["src/hot.rs".to_string()],
             );
 
@@ -13893,6 +14253,7 @@ def detect_agent_version_drift(agent, rollout):
         super::enrich_impact_bundle_with_git_intelligence(
             &mut impact,
             Some(&stale),
+            None,
             ["src/hot.rs"],
         );
         assert_eq!(impact.ranked_pivots[0].label, "cold");
@@ -14588,6 +14949,7 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
     }
 
     lines.extend(git_intelligence_hotspot_warning_summary(object));
+    lines.extend(health_summary_lines(object));
 
     if let Some(contract) =
         object_get(object, &["agent_retrieval_contract", "arc"]).and_then(|item| item.as_object())
@@ -14672,6 +15034,97 @@ fn git_intelligence_hotspot_warning_summary(
             ))
         })
         .collect()
+}
+
+/// Markdown lines for the `health` section, bounded to what a reader can act
+/// on: the ranked files with their evidence, then the untested changed files.
+///
+/// Each line restates the score's own summary, which already names the band,
+/// the score and the heaviest facts, so the markdown render never reduces a
+/// score to a bare number
+/// (`docs/architecture/2026-08-13-health-engine.md`, § "Component boundary").
+/// An unavailable section renders one honest line rather than silence, so an
+/// agent can tell "no risk found" from "nothing was measured".
+fn health_summary_lines(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    /// Files named in the markdown summary. The structured payload carries the
+    /// rest; a summary that lists ten files stops being a summary.
+    const MAX_SUMMARY_FILES: usize = 3;
+    /// Untested changed files named in the markdown summary.
+    const MAX_SUMMARY_UNTESTED: usize = 3;
+
+    let Some(health) = health_presentation(object).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+    // Read through `object_get`: the dense wire format rewrites `files` and
+    // `truncated`, and the summary must render identically under both formats.
+    let files = object_get(health, &["files", "fs"]).and_then(Value::as_array);
+    match files {
+        Some(files) if !files.is_empty() => {
+            for file in files.iter().take(MAX_SUMMARY_FILES) {
+                let Some(path) = file.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(summary) = file
+                    .get("defect_risk")
+                    .and_then(Value::as_object)
+                    .and_then(|risk| object_get(risk, &["summary", "sm"]))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                lines.push(format!("- Health: `{path}` — {summary}"));
+            }
+            let hidden = files.len().saturating_sub(MAX_SUMMARY_FILES)
+                + object_get(health, &["truncated", "tr"])
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+            if hidden > 0 {
+                lines.push(format!("- Health: {hidden} further file(s) not shown."));
+            }
+        }
+        _ => {
+            if let Some(reason) = health.get("unavailable_reason").and_then(Value::as_str) {
+                lines.push(format!("- Health: {reason}."));
+            }
+        }
+    }
+
+    if let Some(untested) = health.get("untested_changes").and_then(Value::as_array) {
+        let paths: Vec<&str> = untested
+            .iter()
+            .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+            .take(MAX_SUMMARY_UNTESTED)
+            .collect();
+        if !paths.is_empty() {
+            let extra = untested.len().saturating_sub(paths.len());
+            let suffix = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "- Untested change: no edge-linked tests for {}{suffix}.",
+                paths
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    lines
+}
+
+fn health_presentation<'a>(object: &'a serde_json::Map<String, Value>) -> Option<&'a Value> {
+    object_get(object, &["health", "hlth"]).or_else(|| {
+        object
+            .get("structured_payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| object_get(payload, &["health", "hlth"]))
+    })
 }
 
 fn git_intelligence_presentation<'a>(
