@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use ort::session::Session;
 use ort::value::Tensor;
+use std::any::Any;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
@@ -16,6 +18,19 @@ impl EmbeddingEngine {
     /// The `model_path` should point to an ONNX model file (e.g., all-MiniLM-L6-v2.onnx).
     /// The tokenizer.json file is expected to be in the same directory as the model.
     pub fn new(model_path: &str) -> Result<Self> {
+        initialize_onnx_runtime()?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::new_after_runtime_load(model_path)
+        }))
+        .map_err(|panic| {
+            anyhow::anyhow!(
+                "ONNX embedding engine initialization panicked: {}; semantic retrieval is disabled and lexical retrieval remains available",
+                panic_payload_message(panic.as_ref())
+            )
+        })?
+    }
+
+    fn new_after_runtime_load(model_path: &str) -> Result<Self> {
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("Failed to create session builder: {}", e))?
             .with_intra_threads(4)
@@ -163,5 +178,94 @@ impl EmbeddingEngine {
     /// Returns the dimensionality of the embedding vectors (384 for all-MiniLM-L6-v2).
     pub fn dimension(&self) -> usize {
         384
+    }
+}
+
+/// Loads ONNX Runtime before any `ort` API can invoke its implicit, panicking
+/// loader. The explicit path turns an absent or incompatible shared library
+/// into the normal semantic-to-lexical fallback rather than a daemon crash.
+fn initialize_onnx_runtime() -> Result<()> {
+    let runtime_path = onnx_runtime_library_path();
+    initialize_onnx_runtime_with(&runtime_path, |path| {
+        ort::init_from(path)
+            .map(|builder| {
+                builder.commit();
+            })
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn initialize_onnx_runtime_with(
+    runtime_path: &Path,
+    loader: impl FnOnce(&Path) -> std::result::Result<(), String>,
+) -> Result<()> {
+    loader(runtime_path).map_err(|error| {
+        anyhow::anyhow!(
+            "ONNX Runtime is unavailable at `{}`: {}; semantic retrieval is disabled and lexical retrieval remains available. Install a compatible ONNX Runtime library beside the lattice executable or set ORT_DYLIB_PATH to its absolute path",
+            runtime_path.display(),
+            bounded_error(&error)
+        )
+    })
+}
+
+fn onnx_runtime_library_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    let default_name = "onnxruntime.dll";
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let default_name = "libonnxruntime.so";
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let default_name = "libonnxruntime.dylib";
+
+    PathBuf::from(default_name)
+}
+
+fn bounded_error(error: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 400;
+    if error.chars().count() <= MAX_ERROR_CHARS {
+        return error.to_string();
+    }
+    let prefix: String = error.chars().take(MAX_ERROR_CHARS).collect();
+    format!("{prefix}…")
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    bounded_error(&message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_error, initialize_onnx_runtime_with};
+    use std::path::Path;
+
+    #[test]
+    fn missing_runtime_is_an_actionable_lexical_fallback() {
+        let error =
+            initialize_onnx_runtime_with(Path::new("/missing/libonnxruntime.dylib"), |_| {
+                Err("library not found".to_string())
+            })
+            .expect_err("a missing ONNX Runtime must not be treated as available");
+        let message = error.to_string();
+
+        assert!(message.contains("ONNX Runtime is unavailable"));
+        assert!(message.contains("semantic retrieval is disabled"));
+        assert!(message.contains("lexical retrieval remains available"));
+        assert!(message.contains("ORT_DYLIB_PATH"));
+    }
+
+    #[test]
+    fn runtime_failure_reason_is_bounded() {
+        let error = "x".repeat(500);
+        let bounded = bounded_error(&error);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded.chars().count(), 401);
     }
 }

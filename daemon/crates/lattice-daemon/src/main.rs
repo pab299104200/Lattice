@@ -407,7 +407,10 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        tracing::info!("No ONNX model: {}", e);
+                        tracing::warn!(
+                            error = %e,
+                            "Semantic retrieval unavailable; continuing with lexical retrieval"
+                        );
                     }
                 }
             } else {
@@ -771,7 +774,10 @@ pub(crate) async fn build_workspace_runtime(
                             );
                         }
                     }
-                    Err(e) => tracing::info!("No ONNX model: {}", e),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "Semantic retrieval unavailable; continuing with lexical retrieval"
+                    ),
                 }
             } else {
                 tracing::info!(

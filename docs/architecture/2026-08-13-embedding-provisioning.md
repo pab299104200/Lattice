@@ -29,6 +29,16 @@ the daemon logs the ordinary semantic-path absence/failure and continues with
 lexical retrieval. No caller should infer that semantic recall was active just
 because a model path existed.
 
+The model bundle is deliberately distinct from ONNX Runtime. Before creating a
+session, Lattice explicitly and fallibly loads the runtime from
+`ORT_DYLIB_PATH`, when set, or from the platform default beside the executable.
+Absent, incompatible, or session-construction failures are bounded in the log
+and disable only semantic retrieval; they must never terminate the daemon or
+invalidate an otherwise checksum-verified model bundle. Operators can install a
+compatible runtime beside `lattice` or set `ORT_DYLIB_PATH` to its absolute
+path. The status surface reports lexical fallback until an embedding engine is
+available.
+
 ## Duplicate-memory safety
 
 The old 64-dimensional FNV token fingerprint remains a lightweight utility but

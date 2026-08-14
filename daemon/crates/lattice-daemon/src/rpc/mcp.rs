@@ -907,6 +907,22 @@ impl McpHandler {
             .and_then(|eng| eng.embed(query).ok())
     }
 
+    fn semantic_retrieval_status(&self, is_indexing: bool) -> Value {
+        if self.embedding_engine.get().is_some() {
+            return json!({ "status": "available" });
+        }
+        if is_indexing {
+            return json!({
+                "status": "initializing",
+                "reason": "embedding initialization is pending; lexical retrieval remains available"
+            });
+        }
+        json!({
+            "status": "lexical_fallback",
+            "reason": "embedding engine is unavailable; lexical retrieval remains available. Install a compatible ONNX Runtime library beside lattice or set ORT_DYLIB_PATH"
+        })
+    }
+
     fn is_indexing(&self) -> bool {
         self.indexing.load(Ordering::Relaxed)
             || self
@@ -5925,6 +5941,7 @@ impl McpHandler {
             "workspace_role": "shard",
             "workspace_field_meaning": "shard_workspace",
             "request_workspace": self.workspace_root.to_string_lossy(),
+            "semantic_retrieval": self.semantic_retrieval_status(is_indexing),
             "nodes": snapshot.stats.node_count,
             "edges": snapshot.stats.edge_count,
             "files": snapshot.stats.file_count,
@@ -12255,6 +12272,11 @@ export function greet(name: string): string {
         let payload = parse_wrapped_tool_payload(text).expect("expected parseable wrapped payload");
 
         assert_eq!(payload["status"].as_str(), Some("indexing"));
+        assert_eq!(payload["semantic_retrieval"]["status"], "initializing");
+        assert!(payload["semantic_retrieval"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lexical retrieval remains available"));
         assert_eq!(payload["files"].as_u64(), Some(1));
         assert!(payload["nodes"].as_u64().unwrap_or_default() >= 1);
         assert!(payload["edges"].as_u64().is_some());
