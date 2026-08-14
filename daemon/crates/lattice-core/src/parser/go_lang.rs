@@ -1,7 +1,114 @@
 use tree_sitter::{Node, Parser};
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{
+    node_text as profile_node_text, LanguageComplexityProfile, ProfileApplicability, UnitIdentity,
+};
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Go complexity vocabulary, verified against `tree_sitter_go::LANGUAGE`.
+///
+/// Decision points: `if` (each `else if` is its own `if_statement`), `for`
+/// (including `range` loops), each `case` of an expression switch, type switch
+/// or `select`, and each `&&`/`||`. `default_case` is the structural fall-through
+/// of a switch already counted by its own cases, so it does not count.
+static GO_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::Go,
+    applicability: ProfileApplicability::Supported,
+    function_kinds: &["function_declaration", "method_declaration"],
+    branch_kinds: &[
+        "if_statement",
+        "for_statement",
+        "expression_case",
+        "type_case",
+        "communication_case",
+    ],
+    boolean_operator_parent_kinds: &["binary_expression"],
+    boolean_operator_kinds: &["&&", "||"],
+    guarded_kinds: &[],
+    nesting_kinds: &[
+        "if_statement",
+        "for_statement",
+        "expression_switch_statement",
+        "type_switch_statement",
+        "select_statement",
+    ],
+    // Go attaches `else if` directly as the `alternative` field of the outer
+    // `if_statement`, so the field rule keeps a chain at one level.
+    nesting_transparent_parent_kinds: &[],
+    nesting_transparent_fields: &["alternative"],
+    parameter_list_field: "parameters",
+    parameter_kinds: &["parameter_declaration", "variadic_parameter_declaration"],
+    is_default_branch: None,
+    count_parameters: Some(count_go_parameters),
+    unit_identity: Some(go_unit_identity),
+};
+
+/// The Go complexity profile contributed by this parser.
+pub fn complexity_profile() -> &'static LanguageComplexityProfile {
+    &GO_COMPLEXITY_PROFILE
+}
+
+/// Count declared parameters, expanding grouped declarations (`b, c string`
+/// declares two) and excluding the method receiver, which the grammar keeps in
+/// its own `receiver` field.
+fn count_go_parameters(node: Node, _source: &[u8]) -> Option<u32> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let declarations: Vec<Node> = parameters
+        .named_children(&mut cursor)
+        .filter(|child| {
+            GO_COMPLEXITY_PROFILE
+                .parameter_kinds
+                .contains(&child.kind())
+        })
+        .collect();
+
+    let mut total = 0u32;
+    for declaration in declarations {
+        let mut name_cursor = declaration.walk();
+        let names = declaration
+            .children_by_field_name("name", &mut name_cursor)
+            .count() as u32;
+        // An unnamed parameter (`func(int)`) still declares one argument.
+        total += names.max(1);
+    }
+    Some(total)
+}
+
+/// Name methods `Receiver.method`, exactly as [`extract_method`] names them.
+fn go_unit_identity(node: Node, source: &[u8]) -> Option<UnitIdentity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = profile_node_text(name_node, source);
+
+    let qualified = match receiver_type_name(node, source) {
+        Some(receiver) if !receiver.is_empty() => format!("{}.{}", receiver, name),
+        _ => name,
+    };
+
+    Some(UnitIdentity {
+        name: qualified,
+        byte_offset: node.start_byte(),
+    })
+}
+
+/// Receiver type of a method declaration, with any pointer prefix stripped.
+fn receiver_type_name(node: Node, source: &[u8]) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    for child in receiver.children(&mut cursor) {
+        if child.kind() == "parameter_declaration" {
+            if let Some(type_node) = child.child_by_field_name("type") {
+                return Some(
+                    profile_node_text(type_node, source)
+                        .trim_start_matches('*')
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
+}
 
 /// Parse a Go source file and extract symbols.
 pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> {

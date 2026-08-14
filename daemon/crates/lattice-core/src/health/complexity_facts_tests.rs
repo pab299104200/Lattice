@@ -365,6 +365,107 @@ fn python_facts_are_deterministic_and_join_to_symbols() {
 }
 
 // ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+
+const GO_SAMPLE: &str = r#"package sample
+
+func straightLine(a int) int {
+	return a + 1
+}
+
+func threeIfs(a, b, c int) int {
+	if a > 0 {
+		return 1
+	}
+	if b > 0 {
+		return 2
+	}
+	if c > 0 {
+		return 3
+	}
+	return 0
+}
+
+func branches(a int, b string) int {
+	if a > 0 && b != "" {
+		for i := 0; i < a; i++ {
+			if i > 3 {
+				return i
+			}
+		}
+	} else if a < 0 {
+		return -1
+	} else {
+		return 0
+	}
+	return 1
+}
+
+func switching(a int) int {
+	switch a {
+	case 1:
+		return 1
+	case 2, 3:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func (s *Service) Handle(a int, b, c string) int {
+	for range []int{} {
+	}
+	return a
+}
+"#;
+
+#[test]
+fn go_straight_line_function_scores_one() {
+    let facts = compute_file_complexity_facts("sample.go", GO_SAMPLE);
+    assert_eq!(facts.language, Language::Go);
+    assert_eq!(facts.availability, FactAvailability::Available);
+    assert_unit(&facts, "straightLine", 1, 0, Some(1));
+}
+
+#[test]
+fn go_grouped_parameter_declarations_count_each_name() {
+    let facts = compute_file_complexity_facts("sample.go", GO_SAMPLE);
+    // `a, b, c int` is one declaration naming three parameters.
+    assert_unit(&facts, "threeIfs", 4, 1, Some(3));
+}
+
+#[test]
+fn go_counts_short_circuits_loops_and_else_if() {
+    let facts = compute_file_complexity_facts("sample.go", GO_SAMPLE);
+    // if + && + for + inner if + the `else if` conditional = 5 decision points.
+    assert_unit(&facts, "branches", 6, 3, Some(2));
+}
+
+#[test]
+fn go_switch_counts_cases_but_not_default() {
+    let facts = compute_file_complexity_facts("sample.go", GO_SAMPLE);
+    assert_unit(&facts, "switching", 3, 1, Some(1));
+}
+
+#[test]
+fn go_methods_are_qualified_and_exclude_the_receiver() {
+    let facts = compute_file_complexity_facts("sample.go", GO_SAMPLE);
+    // `a int, b, c string` declares three parameters; the receiver is not one.
+    assert_unit(&facts, "Service.Handle", 2, 1, Some(3));
+}
+
+#[test]
+fn go_facts_are_deterministic_and_join_to_symbols() {
+    assert_deterministic("sample.go", GO_SAMPLE);
+    assert_joins_to_symbols(
+        "sample.go",
+        GO_SAMPLE,
+        &["threeIfs", "switching", "Service.Handle"],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Availability
 // ---------------------------------------------------------------------------
 
