@@ -204,7 +204,6 @@ fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
         let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
             continue;
         };
-        let mut removed_stale_hook = false;
         for entry in entries.iter_mut() {
             let Some(commands) = entry
                 .as_object_mut()
@@ -213,9 +212,7 @@ fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
             else {
                 continue;
             };
-            let command_count = commands.len();
             commands.retain(|hook| !is_stale_lattice_hook(hook, script));
-            removed_stale_hook |= commands.len() != command_count;
         }
         entries.retain(|entry| {
             entry
@@ -224,7 +221,7 @@ fn remove_stale_lattice_hooks(config: &mut Value) -> Result<()> {
                 .and_then(Value::as_array)
                 .is_none_or(|commands| !commands.is_empty())
         });
-        if removed_stale_hook && entries.is_empty() {
+        if entries.is_empty() {
             empty_events.push(event);
         }
     }
@@ -461,6 +458,27 @@ mod tests {
             reconcile_hook_config(&mut config, client, &paths()).unwrap();
             assert_eq!(once, render_config(&config).unwrap());
         }
+    }
+
+    #[test]
+    fn removes_empty_stop_event_container_without_removing_foreign_stop_hooks() {
+        let mut empty_config = json!({"hooks": {"Stop": []}});
+        reconcile_hook_config(&mut empty_config, HookClient::Codex, &paths()).unwrap();
+        assert!(!empty_config["hooks"].as_object().unwrap().contains_key("Stop"));
+
+        let mut foreign_config = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{
+                    "type": "command",
+                    "command": "foreign-stop.sh"
+                }]}]
+            }
+        });
+        reconcile_hook_config(&mut foreign_config, HookClient::Codex, &paths()).unwrap();
+        assert_eq!(
+            foreign_config["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "foreign-stop.sh"
+        );
     }
 
     #[test]
