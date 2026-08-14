@@ -4390,12 +4390,12 @@ impl McpHandler {
             return Ok(response);
         }
 
+        let git_intelligence = self.git_intelligence_snapshot();
         let (mut report, metadata_mode_reason) = {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
-            // See `tool_prepare_change`: one graph-derived index per request
-            // until H4 supplies the published fact generations.
-            let health = HealthFactIndex::from_graph(engine.graph(), false);
+            // See `tool_prepare_change`: one index per request.
+            let health = health_fact_index(engine.graph(), git_intelligence.as_ref(), false);
             let compact_report = diagnose_failure(
                 engine.graph(),
                 input,

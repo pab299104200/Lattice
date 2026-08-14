@@ -1,10 +1,11 @@
 use serde_json::json;
 
 use crate::graph::model::{CodeGraph, EdgeKind};
+use crate::health::scoring::HealthFactIndex;
 use crate::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, get_repo_playbook,
     get_working_set_context, impact_from_diff, prepare_change, summarize_subsystem, trace_scenario,
-    BundleMode, ExpandContextSeed, RulesDetector,
+    BundleMode, ExpandContextSeed, FailureDiagnosis, RulesDetector,
 };
 use crate::query::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
 use crate::symbols::{Language, SymbolId, SymbolKind};
@@ -2668,4 +2669,213 @@ fn test_trace_scenario_surfaces_guard_failure_and_relevant_tests_docs() {
         refresh_confidence,
         login_confidence
     );
+}
+
+
+/// Two production files named by one stack trace, tied on trace proximity.
+/// `backend/hot.rs` is central and cyclic; `backend/calm.rs` is a leaf, so
+/// `defect_risk` can separate them while the trace evidence cannot.
+fn build_diagnose_health_tiebreak_graph() -> CodeGraph {
+    let mut graph = CodeGraph::new();
+    let hot = make_id("backend/hot.rs", "hot_step", 0);
+    let calm = make_id("backend/calm.rs", "calm_step", 0);
+    let partner = make_id("backend/partner.rs", "partner_step", 0);
+    let caller = make_id("backend/caller.rs", "caller_step", 0);
+
+    for (id, line) in [(&hot, 40_usize), (&calm, 40), (&partner, 1), (&caller, 1)] {
+        graph.add_node(
+            id.clone(),
+            SymbolKind::Function,
+            id.name.clone(),
+            format!("fn {}()", id.name),
+            format!("fn {}() {{ panic!() }}", id.name),
+            id.file.clone(),
+            line,
+            line + 8,
+            true,
+            Language::Rust,
+        );
+    }
+
+    // Everything leans on `hot`, and `hot` sits in a cycle with `partner`.
+    graph.add_edge(&partner, &hot, EdgeKind::Calls);
+    graph.add_edge(&hot, &partner, EdgeKind::Calls);
+    graph.add_edge(&caller, &hot, EdgeKind::Calls);
+    graph.add_edge(&calm, &hot, EdgeKind::Calls);
+    graph
+}
+
+/// Spec H4.4: `defect_risk` is a secondary ranking feature for `diagnose`,
+/// applied after stack-trace and graph proximity.
+#[test]
+fn diagnose_breaks_trace_proximity_ties_with_defect_risk() {
+    let graph = build_diagnose_health_tiebreak_graph();
+    let health = HealthFactIndex::from_graph(&graph, true);
+    let trace = "backend/calm.rs:42: panicked\nbackend/hot.rs:42: panicked";
+
+    let scored = diagnose_failure(
+        &graph,
+        trace,
+        Some("panic"),
+        &[],
+        BundleMode::Full,
+        Some(&health),
+    );
+    let order: Vec<&str> = scored
+        .suspects
+        .iter()
+        .map(|item| item.symbol.as_str())
+        .collect();
+
+    let tied: Vec<&str> = scored
+        .suspects
+        .iter()
+        .filter(|item| item.symbol == "hot_step" || item.symbol == "calm_step")
+        .map(|item| item.symbol.as_str())
+        .collect();
+    assert_eq!(
+        tied,
+        vec!["hot_step", "calm_step"],
+        "the riskier of two equally close candidates leads: {order:?}"
+    );
+}
+
+/// The secondary key may reorder candidates, never introduce them.
+///
+/// The candidate *set* is chosen entirely by trace and graph proximity, so
+/// scoring must leave it identical and change only the order.
+#[test]
+fn diagnose_health_ranking_never_admits_a_candidate_the_trace_did_not_select() {
+    let graph = build_diagnose_health_tiebreak_graph();
+    let health = HealthFactIndex::from_graph(&graph, true);
+    let empty = HealthFactIndex::empty();
+    let trace = "backend/calm.rs:42: panicked";
+
+    let selected = |index: &HealthFactIndex| -> Vec<String> {
+        let mut files: Vec<String> = diagnose_failure(
+            &graph,
+            trace,
+            Some("panic"),
+            &[],
+            BundleMode::Full,
+            Some(index),
+        )
+        .suspects
+        .iter()
+        .map(|item| item.file.clone())
+        .collect();
+        files.sort();
+        files.dedup();
+        files
+    };
+
+    assert_eq!(
+        selected(&health),
+        selected(&empty),
+        "health must permute the candidate set, never change its membership"
+    );
+    assert!(
+        selected(&empty).contains(&"backend/calm.rs".to_string()),
+        "the trace-selected file must be a suspect"
+    );
+}
+
+/// The contributing facts go in the explanation, per spec H4.4.
+#[test]
+fn diagnose_suspects_carry_the_health_evidence_that_ranked_them() {
+    let graph = build_diagnose_health_tiebreak_graph();
+    let health = HealthFactIndex::from_graph(&graph, true);
+
+    let report = diagnose_failure(
+        &graph,
+        "backend/hot.rs:42: panicked",
+        Some("panic"),
+        &[],
+        BundleMode::Full,
+        Some(&health),
+    );
+
+    let suspect = report
+        .suspects
+        .iter()
+        .find(|item| item.file == "backend/hot.rs")
+        .expect("hot.rs is a suspect");
+    let evidence = suspect
+        .evidence
+        .iter()
+        .find(|line| line.starts_with("defect risk "))
+        .unwrap_or_else(|| panic!("expected health evidence: {:?}", suspect.evidence));
+    assert!(evidence.contains("/1000)"), "{evidence}");
+    assert!(
+        evidence.contains("fan-in") || evidence.contains("fan-out"),
+        "the explanation must name the contributing facts: {evidence}"
+    );
+}
+
+/// A test file's health facts describe the test, not the code under test, so
+/// they must never promote it above the production symbol it exercises.
+#[test]
+fn diagnose_never_promotes_a_test_file_on_health_evidence() {
+    let graph = build_failure_specificity_graph();
+    let health = HealthFactIndex::from_graph(&graph, true);
+
+    let report = diagnose_failure(
+        &graph,
+        "tests/test_rotation_providers.py:18: AssertionError\nbackend/os_account.py:54: RuntimeError: bad password",
+        Some("test"),
+        &[],
+        BundleMode::Compact,
+        Some(&health),
+    );
+
+    assert_eq!(
+        report.suspects.first().map(|item| item.symbol.as_str()),
+        Some("rotate_password"),
+        "the production symbol must lead: {:?}",
+        report
+            .suspects
+            .iter()
+            .map(|item| item.symbol.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// An index that measured nothing adds no evidence and imposes no order.
+#[test]
+fn diagnose_without_health_facts_keeps_the_trace_ranking_untouched() {
+    let graph = build_diagnose_health_tiebreak_graph();
+    let trace = "backend/calm.rs:42: panicked\nbackend/hot.rs:42: panicked";
+    let empty = HealthFactIndex::empty();
+
+    let run = || -> FailureDiagnosis {
+        diagnose_failure(
+            &graph,
+            trace,
+            Some("panic"),
+            &[],
+            BundleMode::Full,
+            Some(&empty),
+        )
+    };
+    let first = run();
+    let second = run();
+
+    let names = |report: &FailureDiagnosis| -> Vec<String> {
+        report
+            .suspects
+            .iter()
+            .map(|item| item.symbol.clone())
+            .collect()
+    };
+    assert_eq!(names(&first), names(&second), "ordering must be stable");
+    for suspect in &first.suspects {
+        assert!(
+            !suspect
+                .evidence
+                .iter()
+                .any(|line| line.starts_with("defect risk ")),
+            "an unmeasured file must gain no health evidence: {:?}",
+            suspect.evidence
+        );
+    }
 }
