@@ -5,8 +5,6 @@
 //! with its publication freshness; every consumer then applies the same
 //! completeness gate before exposing history-derived behavior.
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::git_intelligence::{
@@ -17,8 +15,6 @@ use crate::git_intelligence::{
 pub const MAX_MISSING_CO_CHANGE_PARTNERS: usize = 10;
 /// A co-change advisory needs at least this many distinct commits.
 pub const MIN_CO_CHANGE_PARTNER_COMMITS: u32 = 2;
-/// Maximum number of files included in one non-blocking hotspot warning.
-pub const MAX_HOTSPOT_WARNINGS: usize = 5;
 const PER_MILLE_SCALE: u64 = 1_000;
 
 /// Whether a history snapshot may affect a consumer response.
@@ -248,62 +244,6 @@ where
             .collect(),
         metadata,
     }
-}
-
-/// One top-decile hotspot warning safe for a non-blocking hook response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HotspotWarning {
-    pub path: String,
-    pub hotspot_score: u32,
-    pub window_commits: u32,
-    pub head_commit_id: Option<String>,
-}
-
-/// Selects at most five unique edited paths at or above the file top-decile.
-///
-/// The caller is responsible for passing only successful, workspace-scoped edit
-/// paths. This function performs no filesystem access and suppresses warnings
-/// for unavailable, stale, degraded, empty, or corrupt history.
-pub fn select_hotspot_warnings<I, S>(view: GitIntelligenceView<'_>, paths: I) -> Vec<HotspotWarning>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let Some(snapshot) = view.usable_snapshot() else {
-        return Vec::new();
-    };
-    let Some(window_commits) = window_commits(snapshot) else {
-        return Vec::new();
-    };
-    let Some(cutoff) = snapshot.top_decile_hotspot_cutoff() else {
-        return Vec::new();
-    };
-
-    let mut warnings = BTreeSet::new();
-    for path in paths {
-        let Some(file) = snapshot.file(path.as_ref()) else {
-            continue;
-        };
-        if file.hotspot_score <= window_commits && file.hotspot_score >= cutoff {
-            warnings.insert((file.path.clone(), file.hotspot_score));
-        }
-    }
-    let mut warnings: Vec<_> = warnings.into_iter().collect();
-    warnings.sort_unstable_by(|(left_path, left_score), (right_path, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_path.cmp(right_path))
-    });
-    warnings.truncate(MAX_HOTSPOT_WARNINGS);
-    warnings
-        .into_iter()
-        .map(|(path, hotspot_score)| HotspotWarning {
-            path,
-            hotspot_score,
-            window_commits,
-            head_commit_id: snapshot.head_commit_id().map(str::to_owned),
-        })
-        .collect()
 }
 
 fn window_commits(snapshot: &GitIntelligenceSnapshot) -> Option<u32> {
@@ -596,29 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn warnings_are_top_decile_deduplicated_and_never_emitted_from_degraded_history() {
-        let history = snapshot();
-        let warnings = select_hotspot_warnings(
-            GitIntelligenceView::from_snapshot(&history, true),
-            ["src/b.rs", "src/a.rs", "src/a.rs", "src/c.rs"],
-        );
-        assert_eq!(
-            warnings
-                .into_iter()
-                .map(|warning| warning.path)
-                .collect::<Vec<_>>(),
-            vec!["src/a.rs"]
-        );
-        let mut degraded = history.clone();
-        degraded.report.co_changes_complete = false;
-        assert!(select_hotspot_warnings(
-            GitIntelligenceView::from_snapshot(&degraded, true),
-            ["src/a.rs"]
-        )
-        .is_empty());
-    }
-
-    #[test]
     fn consumer_output_limits_are_hard_caps() {
         let mut history = snapshot();
         history.files = (0..12)
@@ -628,11 +545,6 @@ mod tests {
             .map(|index| co_change("src/file-00.rs", &format!("src/partner-{index:02}.rs"), 2))
             .collect();
         let view = GitIntelligenceView::from_snapshot(&history, true);
-        let paths: Vec<_> = history.files.iter().map(|file| file.path.clone()).collect();
-        assert_eq!(
-            select_hotspot_warnings(view, paths).len(),
-            MAX_HOTSPOT_WARNINGS
-        );
         let advisory = missing_cochange_partners(view, ["src/file-00.rs"]);
         assert_eq!(
             advisory.missing_cochange_partners.len(),

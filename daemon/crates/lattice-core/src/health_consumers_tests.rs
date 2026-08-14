@@ -403,6 +403,120 @@ fn diagnose_ranking_only_permutes_the_candidates_the_trace_selected() {
     assert!(!paths.contains(&"src/core.rs"));
 }
 
+/// A population with a real spread: `f00` depends on every other file and `f14`
+/// on none, so the files hold fifteen distinct fan-in/fan-out ranks and the
+/// decile cutoff means something. `f00` is the riskiest because fan-out carries
+/// the heavier measured weight of the two.
+fn warning_fixture_index() -> HealthFactIndex {
+    const FILES: usize = 15;
+    let mut graph = CodeGraph::new();
+    let ids: Vec<_> = (0..FILES)
+        .map(|index| symbol(&format!("src/f{index:02}.rs"), &format!("f{index:02}")))
+        .collect();
+    for id in &ids {
+        add_symbol(&mut graph, id, true, 10);
+    }
+    for target in 0..FILES {
+        for source in 0..target {
+            add_edge(&mut graph, &ids[source], &ids[target], EdgeKind::Calls);
+        }
+    }
+    HealthFactIndex::from_graph(&graph, true)
+}
+
+/// The riskiest file in the fixture population.
+const RISKIEST_FIXTURE_FILE: &str = "src/f00.rs";
+
+#[test]
+fn an_edited_file_in_the_riskiest_decile_earns_one_warning_citing_its_top_fact() {
+    let index = warning_fixture_index();
+    let warnings = select_health_warnings(Some(&index), [RISKIEST_FIXTURE_FILE]);
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    assert_eq!(warning.path, RISKIEST_FIXTURE_FILE);
+    assert!(!warning.band.is_empty());
+    assert!(
+        warning.top_fact.contains("fan-in") || warning.top_fact.contains("fan-out"),
+        "the warning must cite the fact that drove it, not a bare count: {}",
+        warning.top_fact
+    );
+    assert!(warning.top_fact.contains("(p"), "{}", warning.top_fact);
+    assert_eq!(warning.population, 15);
+}
+
+#[test]
+fn a_file_outside_the_riskiest_decile_earns_no_warning() {
+    let index = warning_fixture_index();
+    assert!(
+        select_health_warnings(Some(&index), ["src/f14.rs"]).is_empty(),
+        "a low-ranked file must stay silent"
+    );
+}
+
+#[test]
+fn warnings_are_deduplicated_and_capped_at_five_files() {
+    let index = warning_fixture_index();
+    // Every path in the fixture, twice over.
+    let mut paths: Vec<String> = index.paths().map(str::to_string).collect();
+    paths.extend(paths.clone());
+
+    let warnings = select_health_warnings(Some(&index), &paths);
+    assert!(warnings.len() <= MAX_HEALTH_WARNINGS, "{warnings:?}");
+
+    let mut seen: Vec<&str> = warnings.iter().map(|w| w.path.as_str()).collect();
+    let before = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), before, "warnings must be deduplicated");
+
+    // Heaviest first.
+    for pair in warnings.windows(2) {
+        assert!(pair[0].score_per_mille >= pair[1].score_per_mille);
+    }
+}
+
+#[test]
+fn the_warning_is_silent_whenever_the_evidence_is_missing() {
+    let index = warning_fixture_index();
+
+    assert!(
+        select_health_warnings(None, [RISKIEST_FIXTURE_FILE]).is_empty(),
+        "no index means no warning"
+    );
+    assert!(
+        select_health_warnings(Some(&HealthFactIndex::empty()), [RISKIEST_FIXTURE_FILE]).is_empty(),
+        "an index with no facts means no warning"
+    );
+    assert!(
+        select_health_warnings(Some(&index), ["src/never-indexed.rs"]).is_empty(),
+        "an unmeasured path is unknown, not risky"
+    );
+    assert!(
+        select_health_warnings(Some(&index), Vec::<String>::new()).is_empty(),
+        "no edits means no warning"
+    );
+    // A population too small to have a meaningful decile stays silent rather
+    // than warning about the least-good file in a handful.
+    assert!(
+        select_health_warnings(Some(&full_index()), ["src/core.rs"]).is_empty(),
+        "a tiny population has no decile worth reporting"
+    );
+}
+
+#[test]
+fn warning_selection_is_deterministic() {
+    let index = warning_fixture_index();
+    let paths: Vec<String> = index.paths().map(str::to_string).collect();
+    let mut reversed = paths.clone();
+    reversed.reverse();
+
+    assert_eq!(
+        select_health_warnings(Some(&index), &paths),
+        select_health_warnings(Some(&index), &reversed)
+    );
+}
+
 fn healthy_status_inputs() -> HealthStatusInputs {
     HealthStatusInputs {
         index_complete: true,

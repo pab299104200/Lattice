@@ -464,6 +464,108 @@ where
     entries
 }
 
+/// Files named in one non-blocking PostToolUse warning.
+///
+/// The same bound the superseded hotspot warning carried: a warning that names
+/// six files is not a warning.
+pub const MAX_HEALTH_WARNINGS: usize = 5;
+
+/// The population share above which an edited file earns a warning.
+///
+/// Top decile, exactly as the hotspot warning used, so the upgrade changes what
+/// the warning *says* and not how often it fires.
+pub const HEALTH_WARNING_PERCENTILE_PER_MILLE: u32 = 900;
+
+/// A non-blocking warning that an edited file ranks in the repository's
+/// riskiest decile (spec H4.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthWarning {
+    /// Workspace-relative path that was edited.
+    pub path: String,
+    /// The `defect_risk` band, or a range when inputs were missing.
+    pub band: String,
+    /// The score, per-mille.
+    pub score_per_mille: u16,
+    /// The heaviest contributing fact, as a reader should see it.
+    pub top_fact: String,
+    /// How complete the facts behind the score were.
+    pub availability: String,
+    /// Files the cutoff was computed against.
+    pub population: usize,
+}
+
+/// Selects at most five edited paths in the repository's riskiest decile.
+///
+/// Replaces the hotspot-count warning: it cites the `defect_risk` band and the
+/// fact that drove it rather than a raw commit count, which a reader could not
+/// act on without knowing the window.
+///
+/// Best-effort and silent by construction. No index, an index with too small a
+/// population to have a meaningful decile, a path with no facts, or a score the
+/// engine could not compute all yield no warning rather than a guess. The
+/// caller is responsible for passing only successful, workspace-scoped edit
+/// paths, and this function performs no I/O.
+pub fn select_health_warnings<I, S>(health: Option<&HealthFactIndex>, paths: I) -> Vec<HealthWarning>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let Some(health) = health else {
+        return Vec::new();
+    };
+
+    // The cutoff is a rank within this repository's own population, so a
+    // repository with almost nothing indexed has no decile worth reporting.
+    let mut population: Vec<u16> = health
+        .paths()
+        .map(|path| health.score(path, Axis::DefectRisk))
+        .filter(|score| score.availability != FactAvailability::Unavailable)
+        .map(|score| score.score_per_mille)
+        .collect();
+    if population.len() < MAX_HEALTH_WARNINGS * 2 {
+        return Vec::new();
+    }
+    population.sort_unstable();
+    let index = (population.len() as u64 * u64::from(HEALTH_WARNING_PERCENTILE_PER_MILLE) / 1000)
+        .min(population.len() as u64 - 1) as usize;
+    let cutoff = population[index];
+
+    let mut warnings: Vec<HealthWarning> = Vec::new();
+    for path in paths {
+        let path = path.as_ref();
+        if warnings.iter().any(|warning| warning.path == path) {
+            continue;
+        }
+        if health.facts(path).is_none() {
+            continue;
+        }
+        let score = health.score(path, Axis::DefectRisk);
+        if score.availability == FactAvailability::Unavailable || score.score_per_mille < cutoff {
+            continue;
+        }
+        let Some(top) = score.top_facts(1).first() else {
+            continue;
+        };
+        warnings.push(HealthWarning {
+            path: path.to_string(),
+            band: score.band_label(),
+            score_per_mille: score.score_per_mille,
+            top_fact: top.describe(),
+            availability: score.availability.as_str().to_string(),
+            population: population.len(),
+        });
+    }
+
+    warnings.sort_by(|left, right| {
+        right
+            .score_per_mille
+            .cmp(&left.score_per_mille)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    warnings.truncate(MAX_HEALTH_WARNINGS);
+    warnings
+}
+
 /// The committed report the `defect_risk` weights were derived from.
 ///
 /// Echoed in `status` so an agent can read the evidence, and its limits,

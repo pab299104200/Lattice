@@ -17,8 +17,7 @@ use lattice_core::events::{
 };
 use lattice_core::git_intelligence::GitIntelligenceSnapshot;
 use lattice_core::git_intelligence_consumers::{
-    missing_cochange_partners, secondary_ranking_evidence, select_hotspot_warnings,
-    GitIntelligenceView,
+    missing_cochange_partners, secondary_ranking_evidence, GitIntelligenceView,
 };
 use lattice_core::graph::model::CodeGraph;
 use lattice_core::health::dead_symbol_facts::{DeadSymbolExclusionInputs, DeadSymbolFactProducer};
@@ -26,8 +25,8 @@ use lattice_core::health::graph_facts::GraphFactProducer;
 use lattice_core::health::scoring::HealthFactIndex;
 use lattice_core::health::test_proximity_facts::TestProximityFactProducer;
 use lattice_core::health_consumers::{
-    health_section, health_status, order_impact_within_tier_by_defect_risk, untested_changes,
-    HealthImpactCandidate, HealthStatusInputs, MAX_HEALTH_SECTION_FILES,
+    health_section, health_status, order_impact_within_tier_by_defect_risk, select_health_warnings,
+    untested_changes, HealthImpactCandidate, HealthStatusInputs, MAX_HEALTH_SECTION_FILES,
 };
 use lattice_core::identity::MemoryId;
 use lattice_core::indexer::Indexer;
@@ -7986,20 +7985,29 @@ fn enrich_impact_tool_result_with_git_intelligence(
 ) {
     let view = git_intelligence_view(snapshot);
     let advisory = missing_cochange_partners(view, changed_paths);
-    let hotspot_warnings = select_hotspot_warnings(view, changed_paths);
     let mut payload = unwrap_tool_text_json(result).unwrap_or_else(|| result.clone());
-    let mut presentation = json!({
-        "generation": snapshot.map(|published| published.generation),
-        "impact_advisory": advisory,
-    });
-    if !hotspot_warnings.is_empty() {
-        presentation
-            .as_object_mut()
-            .expect("Git-intelligence presentation is an object")
-            .insert("hotspot_warnings".to_string(), json!(hotspot_warnings));
-    }
-    attach_git_intelligence_presentation(&mut payload, presentation);
+    attach_git_intelligence_presentation(
+        &mut payload,
+        json!({
+            "generation": snapshot.map(|published| published.generation),
+            "impact_advisory": advisory,
+        }),
+    );
     attach_impact_health_presentation(&mut payload, health, changed_paths);
+    // The non-blocking edit warning. Same bounds as the hotspot warning it
+    // supersedes -- top decile, at most five files, silent whenever the
+    // evidence is missing -- but it cites the band and the fact that drove it
+    // rather than a commit count a reader cannot act on without the window.
+    let warnings = select_health_warnings(health, changed_paths);
+    if !warnings.is_empty() {
+        if let Some(section) = payload
+            .as_object_mut()
+            .and_then(|object| object.get_mut("health"))
+            .and_then(Value::as_object_mut)
+        {
+            section.insert("warnings".to_string(), json!(warnings));
+        }
+    }
     *result = wrap_tool_result(payload);
 }
 
@@ -14703,90 +14711,138 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
             .is_empty());
     }
 
+    /// A population with a real spread of ranks, so the decile cutoff means
+    /// something. `f00` depends on every other file and is the riskiest.
+    fn health_warning_index() -> lattice_core::health::scoring::HealthFactIndex {
+        use lattice_core::graph::model::EdgeKind;
+        use lattice_core::symbols::{Language, SymbolId, SymbolKind};
+
+        const FILES: usize = 15;
+        let mut graph = CodeGraph::new();
+        let ids: Vec<SymbolId> = (0..FILES)
+            .map(|index| SymbolId {
+                file: format!("src/f{index:02}.rs"),
+                name: format!("f{index:02}"),
+                byte_offset: 0,
+            })
+            .collect();
+        for id in &ids {
+            graph.add_node(
+                id.clone(),
+                SymbolKind::Function,
+                id.name.clone(),
+                format!("fn {}()", id.name),
+                "",
+                id.file.clone(),
+                1,
+                5,
+                true,
+                Language::Rust,
+            );
+        }
+        for target in 0..FILES {
+            for source in 0..target {
+                graph.add_edge(&ids[source], &ids[target], EdgeKind::Calls);
+            }
+        }
+        super::health_fact_index(&graph, None, true)
+    }
+
+    /// Spec H4.6: the PostToolUse warning cites the `defect_risk` band and its
+    /// top fact rather than a raw hotspot count.
     #[test]
-    fn file_impact_presentation_surfaces_bounded_hotspot_warnings_and_stable_summary_marker() {
-        let stored = git_presentation_snapshot();
-        let published = super::McpGitIntelligenceSnapshot {
-            generation: stored.generation,
-            snapshot: Arc::new(stored.snapshot),
-            is_fresh: true,
-        };
-        let mut result = super::wrap_tool_result(json!({ "file": "src/hot.rs" }));
+    fn edit_warning_cites_the_defect_risk_band_and_its_top_fact() {
+        let health = health_warning_index();
+        let mut result = super::wrap_tool_result(json!({ "file": "src/f00.rs" }));
 
         super::enrich_impact_tool_result_with_git_intelligence(
             &mut result,
-            Some(&published),
             None,
-            &["src/hot.rs".to_string()],
+            Some(&health),
+            &["src/f00.rs".to_string()],
         );
 
         let payload = super::unwrap_tool_text_json(&result).expect("file-impact payload");
-        assert_eq!(
-            payload["git_intelligence"]["hotspot_warnings"],
-            json!([{
-                "path": "src/hot.rs",
-                "hotspot_score": 3,
-                "window_commits": 4,
-                "head_commit_id": "head",
-            }])
-        );
+        let warnings = payload["health"]["warnings"]
+            .as_array()
+            .expect("health warnings");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["path"], "src/f00.rs");
+        assert!(warnings[0]["band"].as_str().is_some_and(|band| !band.is_empty()));
+        assert!(warnings[0]["top_fact"]
+            .as_str()
+            .is_some_and(|fact| fact.contains("fan-out") || fact.contains("fan-in")));
+
         let summary = super::build_tool_result_summary(&payload).expect("impact summary");
-        assert!(summary.contains(
-            "- Hotspot warning: `src/hot.rs` changed in 3/4 sampled commits; head `head`."
-        ));
+        assert!(
+            summary.contains("- Health warning: `src/f00.rs` is in this repository's riskiest decile — defect risk "),
+            "{summary}"
+        );
+        assert!(summary.contains("/1000)"), "{summary}");
+        // The old count-based marker is gone, not merely supplemented.
+        assert!(!summary.contains("Hotspot warning:"), "{summary}");
+        assert!(
+            payload["git_intelligence"].get("hotspot_warnings").is_none(),
+            "{payload:?}"
+        );
     }
 
+    /// The warning keeps its predecessor's silence rules exactly.
     #[test]
-    fn file_impact_omits_hotspot_warnings_for_unavailable_stale_and_degraded_history() {
-        let cases = [
-            (None, "unavailable"),
-            (
-                Some(super::McpGitIntelligenceSnapshot {
-                    generation: 7,
-                    snapshot: Arc::new(git_presentation_snapshot().snapshot),
-                    is_fresh: false,
-                }),
-                "stale",
-            ),
-            (
-                {
-                    let mut stored = git_presentation_snapshot();
-                    stored.snapshot.report.invalid_path_entries = 1;
-                    Some(super::McpGitIntelligenceSnapshot {
-                        generation: stored.generation,
-                        snapshot: Arc::new(stored.snapshot),
-                        is_fresh: true,
-                    })
-                },
-                "degraded",
-            ),
+    fn edit_warning_stays_silent_without_evidence_and_outside_the_top_decile() {
+        let health = health_warning_index();
+        let cases: Vec<(&str, Option<&lattice_core::health::scoring::HealthFactIndex>, &str)> = vec![
+            ("no facts at all", None, "src/f00.rs"),
+            ("outside the top decile", Some(&health), "src/f14.rs"),
+            ("path never indexed", Some(&health), "src/not-indexed.rs"),
         ];
 
-        for (snapshot, availability) in cases {
-            let mut result = super::wrap_tool_result(json!({ "file": "src/hot.rs" }));
+        for (case, index, path) in cases {
+            let mut result = super::wrap_tool_result(json!({ "file": path }));
             super::enrich_impact_tool_result_with_git_intelligence(
                 &mut result,
-                snapshot.as_ref(),
                 None,
-                &["src/hot.rs".to_string()],
+                index,
+                &[path.to_string()],
             );
 
             let payload = super::unwrap_tool_text_json(&result).expect("file-impact payload");
-            let git = &payload["git_intelligence"];
-            assert_eq!(
-                git["impact_advisory"]["metadata"]["availability"],
-                availability
-            );
             assert!(
-                git.get("hotspot_warnings").is_none(),
-                "{availability} history must not expose hotspot warnings: {git:?}"
+                payload["health"].get("warnings").is_none(),
+                "{case} must emit no warning: {payload:?}"
             );
             let summary = super::build_tool_result_summary(&payload).expect("impact summary");
             assert!(
-                !summary.contains("Hotspot warning:"),
-                "{availability} history must not expose hotspot summary marker: {summary}"
+                !summary.contains("- Health warning:"),
+                "{case} must emit no warning marker: {summary}"
             );
         }
+    }
+
+    /// A warning is a bounded advisory, never a blocker: the enricher always
+    /// returns a well-formed result and never fails.
+    #[test]
+    fn edit_warning_is_bounded_and_never_fails_the_tool_result() {
+        let health = health_warning_index();
+        let paths: Vec<String> = (0..15).map(|index| format!("src/f{index:02}.rs")).collect();
+        let mut result = super::wrap_tool_result(json!({ "files": paths }));
+
+        super::enrich_impact_tool_result_with_git_intelligence(
+            &mut result,
+            None,
+            Some(&health),
+            &paths,
+        );
+
+        let payload = super::unwrap_tool_text_json(&result).expect("file-impact payload");
+        let warnings = payload["health"]["warnings"]
+            .as_array()
+            .expect("health warnings");
+        assert!(
+            warnings.len() <= lattice_core::health_consumers::MAX_HEALTH_WARNINGS,
+            "{warnings:?}"
+        );
+        assert!(super::build_tool_result_summary(&payload).is_some());
     }
 
     #[test]
@@ -15505,7 +15561,6 @@ fn build_tool_result_summary(value: &Value) -> Option<String> {
         lines.push(format!("- Git history: {git_summary}"));
     }
 
-    lines.extend(git_intelligence_hotspot_warning_summary(object));
     lines.extend(health_summary_lines(object));
 
     if let Some(contract) =
@@ -15562,37 +15617,6 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
     Some(format!("available across {window} commit(s); {detail}."))
 }
 
-fn git_intelligence_hotspot_warning_summary(
-    object: &serde_json::Map<String, Value>,
-) -> Vec<String> {
-    let Some(warnings) = git_intelligence_presentation(object)
-        .and_then(|git| git.get("hotspot_warnings"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    warnings
-        .iter()
-        .filter_map(|warning| {
-            let path = warning.get("path")?.as_str()?.trim();
-            let hotspot_score = warning.get("hotspot_score")?.as_u64()?;
-            let window_commits = warning.get("window_commits")?.as_u64()?;
-            if path.is_empty() || window_commits == 0 {
-                return None;
-            }
-            let head = warning
-                .get("head_commit_id")
-                .and_then(Value::as_str)
-                .map(|head| format!("; head `{head}`"))
-                .unwrap_or_default();
-            Some(format!(
-                "- Hotspot warning: `{path}` changed in {hotspot_score}/{window_commits} sampled commits{head}."
-            ))
-        })
-        .collect()
-}
-
 /// Markdown lines for the `health` section, bounded to what a reader can act
 /// on: the ranked files with their evidence, then the untested changed files.
 ///
@@ -15645,6 +15669,26 @@ fn health_summary_lines(object: &serde_json::Map<String, Value>) -> Vec<String> 
             if let Some(reason) = health.get("unavailable_reason").and_then(Value::as_str) {
                 lines.push(format!("- Health: {reason}."));
             }
+        }
+    }
+
+    // The PostToolUse edit warning, first: it is the line the reader is meant
+    // to act on. Bounds are enforced at selection, so this only renders.
+    if let Some(warnings) = health.get("warnings").and_then(Value::as_array) {
+        for warning in warnings {
+            let (Some(path), Some(band), Some(top_fact)) = (
+                warning.get("path").and_then(Value::as_str),
+                warning.get("band").and_then(Value::as_str),
+                warning.get("top_fact").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(score) = warning.get("score_per_mille").and_then(Value::as_u64) else {
+                continue;
+            };
+            lines.push(format!(
+                "- Health warning: `{path}` is in this repository's riskiest decile — defect risk {band} ({score}/1000), {top_fact}."
+            ));
         }
     }
 
