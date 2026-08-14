@@ -1,7 +1,94 @@
 use tree_sitter::{Node, Parser};
 
 use crate::error::LatticeError;
+use crate::parser::complexity_profile::{
+    GuardedKind, LanguageComplexityProfile, ProfileApplicability, UnitIdentity,
+};
 use crate::symbols::{ImportInfo, Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+
+/// Rust complexity vocabulary, verified against `tree_sitter_rust::LANGUAGE`.
+///
+/// Decision points: `if` (including `if let`, and each `else if` as its own
+/// `if_expression`), `while`/`while let`, `for`, `loop`, every non-wildcard
+/// `match` arm, each `match` arm guard, the `?` operator, and each `&&`/`||`.
+/// A bare `else` and a `_ =>` arm are the structural default and do not count.
+static RUST_COMPLEXITY_PROFILE: LanguageComplexityProfile = LanguageComplexityProfile {
+    language: Language::Rust,
+    applicability: ProfileApplicability::Supported,
+    function_kinds: &["function_item"],
+    branch_kinds: &[
+        "if_expression",
+        "while_expression",
+        "for_expression",
+        "loop_expression",
+        "match_arm",
+        "try_expression",
+    ],
+    boolean_operator_parent_kinds: &["binary_expression"],
+    boolean_operator_kinds: &["&&", "||"],
+    guarded_kinds: &[GuardedKind {
+        kind: "match_pattern",
+        field: "condition",
+    }],
+    nesting_kinds: &[
+        "if_expression",
+        "while_expression",
+        "for_expression",
+        "loop_expression",
+        "match_expression",
+    ],
+    nesting_transparent_parent_kinds: &["else_clause"],
+    nesting_transparent_fields: &["alternative"],
+    parameter_list_field: "parameters",
+    // `self_parameter` is deliberately absent: a receiver is not a declared
+    // parameter, matching the Go receiver exclusion.
+    parameter_kinds: &["parameter"],
+    is_default_branch: Some(is_wildcard_match_arm),
+    count_parameters: None,
+    unit_identity: Some(rust_unit_identity),
+};
+
+/// The Rust complexity profile contributed by this parser.
+pub fn complexity_profile() -> &'static LanguageComplexityProfile {
+    &RUST_COMPLEXITY_PROFILE
+}
+
+/// `_ => …` is the structural default of a `match` and is not a decision point.
+fn is_wildcard_match_arm(node: Node, source: &[u8]) -> bool {
+    if node.kind() != "match_arm" {
+        return false;
+    }
+    node.child_by_field_name("pattern")
+        .map(|pattern| node_text(pattern, source).trim() == "_")
+        .unwrap_or(false)
+}
+
+/// Name methods `Type.method`, exactly as [`extract_impl`] names them, and key
+/// every unit at the byte offset the symbol extractor uses.
+fn rust_unit_identity(node: Node, source: &[u8]) -> Option<UnitIdentity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source);
+
+    let mut qualified = name;
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "impl_item" {
+            if let Some(type_node) = parent.child_by_field_name("type") {
+                qualified = format!("{}.{}", node_text(type_node, source), qualified);
+            }
+            break;
+        }
+        if parent.kind() == "function_item" {
+            break;
+        }
+        ancestor = parent.parent();
+    }
+
+    Some(UnitIdentity {
+        name: qualified,
+        byte_offset: node.start_byte(),
+    })
+}
 
 /// Parse a Rust source file and extract symbols.
 pub fn parse(file_path: &str, source: &str) -> Result<ParsedFile, LatticeError> {

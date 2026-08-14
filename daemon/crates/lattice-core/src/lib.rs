@@ -8,6 +8,7 @@ pub mod embeddings;
 pub mod error;
 pub mod events;
 pub mod graph;
+pub mod health;
 pub mod identity;
 pub mod indexer;
 pub mod intelligence;
