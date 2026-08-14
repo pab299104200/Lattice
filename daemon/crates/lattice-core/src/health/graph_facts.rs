@@ -18,6 +18,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use petgraph::algo::tarjan_scc;
+use petgraph::graph::DiGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::git_intelligence::canonical_repository_path;
@@ -151,6 +153,17 @@ pub struct FileGraphFacts {
     pub fan_in: u32,
     /// Distinct other files this file depends on (efferent coupling, Ce).
     pub fan_out: u32,
+    /// Identifier of this file's strongly connected component.
+    ///
+    /// Ids are assigned by ascending lexical order of each component's smallest
+    /// member path, so they are stable for a given graph but carry no meaning
+    /// across generations. Every file has one; a file outside any cycle is the
+    /// sole member of its own component.
+    pub scc_id: u32,
+    /// Number of files in this file's strongly connected component (>= 1).
+    pub scc_size: u32,
+    /// True when this file participates in a dependency cycle (`scc_size > 1`).
+    pub cycle_member: bool,
 }
 
 /// Graph facts for one exported symbol, keyed by `<path>::<name>`.
@@ -338,15 +351,26 @@ impl GraphFactProducer {
         let file_overflow = files.len() > limits.max_files;
         let symbol_overflow = symbols.len() > limits.max_symbols;
 
-        let file_facts: Vec<FileGraphFacts> = files
+        // Components are computed over every observed file, before any row
+        // truncation, so a retained file never reports a cycle smaller than the
+        // one it is actually in.
+        let ordered_files: Vec<String> = files.into_iter().collect();
+        let components = file_components(&ordered_files, &file_coupling);
+
+        let file_facts: Vec<FileGraphFacts> = ordered_files
             .into_iter()
+            .enumerate()
             .take(limits.max_files)
-            .map(|path| {
+            .map(|(position, path)| {
                 let coupling = file_coupling.get(&path);
+                let component = components[position];
                 FileGraphFacts {
                     fan_in: coupling.map_or(0, |value| saturating_u32(value.dependents.len())),
                     fan_out: coupling.map_or(0, |value| saturating_u32(value.dependencies.len())),
                     path,
+                    scc_id: component.id,
+                    scc_size: component.size,
+                    cycle_member: component.size > 1,
                 }
             })
             .collect();
@@ -382,6 +406,69 @@ impl GraphFactProducer {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComponentMembership {
+    id: u32,
+    size: u32,
+}
+
+/// Assigns each file its strongly connected component over the file-level
+/// dependency condensation, using Tarjan's algorithm.
+///
+/// `ordered_files` must be lexically sorted and unique; the returned vector is
+/// parallel to it. Component ids are derived from the smallest member position
+/// rather than from Tarjan's discovery order, because discovery order depends
+/// on traversal start points and would not be a stable persisted value.
+fn file_components(
+    ordered_files: &[String],
+    coupling: &BTreeMap<String, FileCoupling>,
+) -> Vec<ComponentMembership> {
+    let positions: BTreeMap<&str, usize> = ordered_files
+        .iter()
+        .enumerate()
+        .map(|(position, path)| (path.as_str(), position))
+        .collect();
+
+    let mut condensation: DiGraph<(), ()> = DiGraph::with_capacity(ordered_files.len(), 0);
+    let nodes: Vec<_> = ordered_files
+        .iter()
+        .map(|_| condensation.add_node(()))
+        .collect();
+    for (path, edges) in coupling {
+        let Some(&from) = positions.get(path.as_str()) else {
+            continue;
+        };
+        for dependency in &edges.dependencies {
+            let Some(&to) = positions.get(dependency.as_str()) else {
+                continue;
+            };
+            condensation.add_edge(nodes[from], nodes[to], ());
+        }
+    }
+
+    let mut components: Vec<Vec<usize>> = tarjan_scc(&condensation)
+        .into_iter()
+        .map(|component| {
+            let mut members: Vec<usize> = component.into_iter().map(|node| node.index()).collect();
+            members.sort_unstable();
+            members
+        })
+        .collect();
+    components.sort_unstable_by_key(|members| members.first().copied().unwrap_or(usize::MAX));
+
+    let mut memberships = vec![ComponentMembership { id: 0, size: 1 }; ordered_files.len()];
+    for (id, members) in components.iter().enumerate() {
+        let membership = ComponentMembership {
+            id: saturating_u32(id),
+            size: saturating_u32(members.len()),
+        };
+        for &member in members {
+            memberships[member] = membership;
+        }
+    }
+    memberships
 }
 
 #[derive(Debug, Default)]
@@ -632,6 +719,108 @@ mod tests {
             serde_json::to_string(&forward).unwrap(),
             serde_json::to_string(&backward).unwrap()
         );
+    }
+
+    /// Three-file cycle `cyc/a -> cyc/b -> cyc/c -> cyc/a`, an acyclic entry
+    /// point `app/main.rs -> cyc/a`, and a leaf `util/leaf.rs` the cycle uses.
+    fn cyclic_graph() -> CodeGraph {
+        let mut graph = CodeGraph::new();
+        let a = symbol("cyc/a.rs", "a_fn");
+        let b = symbol("cyc/b.rs", "b_fn");
+        let c = symbol("cyc/c.rs", "c_fn");
+        let main = symbol("app/main.rs", "main");
+        let leaf = symbol("util/leaf.rs", "leaf");
+        for id in [&a, &b, &c, &main, &leaf] {
+            add_symbol(&mut graph, id, true, 1);
+        }
+        add_edge(&mut graph, &a, &b, EdgeKind::Calls);
+        add_edge(&mut graph, &b, &c, EdgeKind::Calls);
+        add_edge(&mut graph, &c, &a, EdgeKind::Calls);
+        add_edge(&mut graph, &main, &a, EdgeKind::Imports);
+        add_edge(&mut graph, &b, &leaf, EdgeKind::TypeRef);
+        graph
+    }
+
+    #[test]
+    fn tarjan_identifies_the_cycle_and_leaves_acyclic_files_alone() {
+        let snapshot = GraphFactProducer::default().produce(&cyclic_graph(), true);
+
+        let cycle: Vec<&FileGraphFacts> = snapshot
+            .files
+            .iter()
+            .filter(|file| file.cycle_member)
+            .collect();
+        let cycle_paths: Vec<&str> = cycle.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(cycle_paths, ["cyc/a.rs", "cyc/b.rs", "cyc/c.rs"]);
+        assert!(cycle.iter().all(|file| file.scc_size == 3));
+        let ids: BTreeSet<u32> = cycle.iter().map(|file| file.scc_id).collect();
+        assert_eq!(ids.len(), 1, "cycle members share one component id");
+
+        for path in ["app/main.rs", "util/leaf.rs"] {
+            let facts = snapshot.file(path).unwrap();
+            assert_eq!(facts.scc_size, 1);
+            assert!(!facts.cycle_member);
+        }
+        // Four components: {app/main.rs}, {cyc/a,b,c}, {util/leaf.rs}.
+        let components: BTreeSet<u32> = snapshot.files.iter().map(|file| file.scc_id).collect();
+        assert_eq!(components.len(), 3);
+    }
+
+    #[test]
+    fn component_ids_follow_lexical_order_of_smallest_member() {
+        let snapshot = GraphFactProducer::default().produce(&cyclic_graph(), true);
+        assert_eq!(snapshot.file("app/main.rs").unwrap().scc_id, 0);
+        assert_eq!(snapshot.file("cyc/a.rs").unwrap().scc_id, 1);
+        assert_eq!(snapshot.file("util/leaf.rs").unwrap().scc_id, 2);
+    }
+
+    #[test]
+    fn mutual_file_dependency_is_a_two_file_cycle() {
+        let mut graph = CodeGraph::new();
+        let left = symbol("src/left.rs", "left");
+        let right = symbol("src/right.rs", "right");
+        add_symbol(&mut graph, &left, true, 1);
+        add_symbol(&mut graph, &right, true, 1);
+        add_edge(&mut graph, &left, &right, EdgeKind::Calls);
+        add_edge(&mut graph, &right, &left, EdgeKind::Imports);
+
+        let snapshot = GraphFactProducer::default().produce(&graph, true);
+        for path in ["src/left.rs", "src/right.rs"] {
+            let facts = snapshot.file(path).unwrap();
+            assert_eq!(facts.scc_size, 2);
+            assert!(facts.cycle_member);
+            assert_eq!(facts.scc_id, 0);
+        }
+    }
+
+    #[test]
+    fn intra_file_symbol_cycle_is_not_a_file_cycle() {
+        let mut graph = CodeGraph::new();
+        let first = symbol_at("src/only.rs", "ping", 0);
+        let second = symbol_at("src/only.rs", "pong", 200);
+        add_symbol(&mut graph, &first, true, 1);
+        add_symbol(&mut graph, &second, true, 20);
+        add_edge(&mut graph, &first, &second, EdgeKind::Calls);
+        add_edge(&mut graph, &second, &first, EdgeKind::Calls);
+
+        let snapshot = GraphFactProducer::default().produce(&graph, true);
+        let facts = snapshot.file("src/only.rs").unwrap();
+        assert!(!facts.cycle_member);
+        assert_eq!(facts.scc_size, 1);
+        assert_eq!((facts.fan_in, facts.fan_out), (0, 0));
+    }
+
+    #[test]
+    fn truncated_snapshots_still_report_the_full_component_size() {
+        let producer = GraphFactProducer::new(GraphFactLimits {
+            max_files: 2,
+            max_symbols: MAX_SYMBOL_FACTS,
+        });
+        let snapshot = producer.produce(&cyclic_graph(), true);
+        assert_eq!(snapshot.files.len(), 2);
+        // app/main.rs and cyc/a.rs survive; cyc/a.rs still knows its cycle is 3.
+        assert_eq!(snapshot.file("cyc/a.rs").unwrap().scc_size, 3);
+        assert!(snapshot.report.file_overflow);
     }
 
     #[test]
