@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use lattice_core::storage::{managed_sqlite::ManagedSqlite, SecureDir};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +16,24 @@ const MAX_SUGGESTED_FILES: usize = 32;
 const SECS_PER_DAY: u64 = 86_400;
 const MAX_CAPTURE_SCHEMA_VERSION: u32 = 64;
 const MAX_CAPTURE_EXTRACTOR_VERSION: u32 = 64;
+const DATABASE_FILE: &str = "adoption_metrics.sqlite3";
+const LEGACY_LEDGER_FILE: &str = "adoption_metrics.jsonl";
+const MIGRATION_MARKER: &str = "legacy_jsonl_import_v1";
+const MIGRATION_CURSOR: &str = "legacy_jsonl_cursor_v2";
+const CAPTURE_AGGREGATE_MARKER: &str = "capture_outcome_daily_v1";
+const CAPTURE_AGGREGATE_CURSOR: &str = "capture_outcome_daily_cursor_v1";
+const CAPTURE_AGGREGATE_PAGE_ROWS: usize = 1024;
+const CAPTURE_EVENT_JSON_BYTES: usize = 4096;
+const LEGACY_PAGE_RECORDS: usize = 1024;
+const LEGACY_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+const LEGACY_RECORD_BYTES: u64 = 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct LegacyImportCursor {
+    signature: String,
+    offset: u64,
+    lines: u64,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallSource {
@@ -106,7 +124,7 @@ pub(crate) enum CaptureOutcome {
 }
 
 impl CaptureOutcome {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Captured => "captured",
             Self::PartiallyCaptured => "partially_captured",
@@ -153,12 +171,11 @@ impl CaptureHealth {
 #[derive(Debug)]
 pub(crate) struct AdoptionMetricsStore {
     path: PathBuf,
-    lock: Mutex<StoreState>,
-}
-
-#[derive(Debug, Default)]
-struct StoreState {
-    last_compaction_day: Option<u64>,
+    legacy_path: PathBuf,
+    home: std::result::Result<SecureDir, String>,
+    // Serializes setup and migration for instances in this process. SQLite's
+    // BEGIN IMMEDIATE transaction serializes independent instances/processes.
+    lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,12 +332,57 @@ struct PendingMemoryInjection {
 
 impl AdoptionMetricsStore {
     pub(crate) fn new(workspace_root: &Path) -> Self {
-        Self {
-            path: workspace_root
-                .join(".lattice")
-                .join("adoption_metrics.jsonl"),
-            lock: Mutex::new(StoreState::default()),
+        let resolved = Self::resolve_home(workspace_root, true)
+            .and_then(|home| home.context("repository telemetry home absent after creation"));
+        Self::from_home(workspace_root, resolved)
+    }
+
+    fn resolve_home(workspace_root: &Path, create: bool) -> Result<Option<SecureDir>> {
+        let identity = crate::workspace_identity::WorkspaceIdentity::resolve(workspace_root)?;
+        let parent = identity
+            .repository_lattice_dir
+            .parent()
+            .context("repository telemetry home has no parent")?;
+        let leaf = identity
+            .repository_lattice_dir
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .context("repository telemetry home is not UTF-8")?;
+        let parent =
+            SecureDir::open(parent).context("failed to pin repository telemetry parent")?;
+        if create {
+            return parent
+                .create_dir(leaf)
+                .map(Some)
+                .context("failed to pin repository telemetry home");
         }
+        match parent.open_dir(Path::new(leaf)) {
+            Ok(home) => Ok(Some(home)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("failed to pin existing repository telemetry home"),
+        }
+    }
+
+    fn from_home(workspace_root: &Path, resolved: Result<SecureDir>) -> Self {
+        // These fallback paths are diagnostic only. No I/O is allowed until
+        // home() succeeds; an invalid Git identity never becomes standalone.
+        let display_home = resolved
+            .as_ref()
+            .map(|home| home.path().to_path_buf())
+            .unwrap_or_else(|_| workspace_root.join(".lattice"));
+        Self {
+            path: display_home.join(DATABASE_FILE),
+            legacy_path: display_home.join(LEGACY_LEDGER_FILE),
+            home: resolved
+                .map_err(|error| format!("repository telemetry authority unavailable: {error:#}")),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn home(&self) -> Result<&SecureDir> {
+        self.home
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))
     }
 
     pub(crate) fn record(&self, record: ToolCallRecord) -> Result<()> {
@@ -377,7 +439,7 @@ impl AdoptionMetricsStore {
     /// recovered retry of the same event returns false.
     ///
     /// The id lookup and append occur under both the in-process mutex and a
-    /// workspace-local advisory file lock. The event is synced before return,
+    /// repository-owned SQLite immediate transaction. The event is synced before return,
     /// so a process crash after the append is safe to retry.
     pub(crate) fn record_memory_retrieval_once(
         &self,
@@ -547,200 +609,516 @@ impl AdoptionMetricsStore {
     }
 
     fn capture_health(&self) -> Result<CaptureHealth> {
-        let ledger = self.read_ledger()?;
-        Ok(CaptureHealth {
-            total_attempts: ledger.capture.total_attempts,
-            outcomes: ledger.capture.outcomes,
-        })
+        let _guard = self.lock_state()?;
+        let mut connection = self.open_connection()?;
+        let transaction = begin_write(&mut connection)?;
+        prune_expired(&transaction)?;
+        if !reconcile_capture_aggregate(&transaction)? {
+            transaction.commit()?;
+            anyhow::bail!("capture health aggregation migration is in progress; retry")
+        }
+        prune_capture_days(&transaction)?;
+        let start_day = capture_health_start_day();
+        let mut statement = transaction.prepare(
+            "SELECT outcome,SUM(total) FROM capture_outcome_daily WHERE day_utc>=?1
+             GROUP BY outcome ORDER BY outcome",
+        )?;
+        let rows = statement
+            .query_map([start_day], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        transaction.commit()?;
+        let mut health = CaptureHealth::default();
+        for (outcome, count) in rows {
+            health.total_attempts = health.total_attempts.saturating_add(count);
+            health.outcomes.insert(outcome, count);
+        }
+        Ok(health)
     }
 
     fn append_event(&self, event: AdoptionEvent) -> Result<()> {
-        let mut state = self.lock_state()?;
-        self.ensure_parent_dir()?;
-        let _file_lock = self.acquire_file_lock()?;
-        self.compact_if_due(&mut state)?;
-        self.append_event_unlocked(&event)
+        let _guard = self.lock_state()?;
+        let mut connection = self.open_connection()?;
+        let transaction = begin_write(&mut connection)?;
+        prune_expired(&transaction)?;
+        insert_event(&transaction, &event)?;
+        transaction
+            .commit()
+            .context("failed to commit adoption metric")
     }
 
     fn append_event_once(&self, metric_id: String, event: AdoptionEvent) -> Result<bool> {
-        let mut state = self.lock_state()?;
-        self.ensure_parent_dir()?;
-        let _file_lock = self.acquire_file_lock()?;
-        self.compact_if_due(&mut state)?;
-        let events = self.read_events_unlocked()?;
-        if let Some(existing) = events
-            .iter()
-            .find(|existing| event_metric_id(existing) == Some(metric_id.as_str()))
-        {
-            if metric_event_matches(existing, &event) {
+        let _guard = self.lock_state()?;
+        let mut connection = self.open_connection()?;
+        let transaction = begin_write(&mut connection)?;
+        prune_expired(&transaction)?;
+        if let Some(existing) = event_for_metric_id(&transaction, &metric_id)? {
+            if metric_event_matches(&existing, &event) {
+                transaction
+                    .commit()
+                    .context("failed to commit metric retry")?;
                 return Ok(false);
             }
             return Err(anyhow::anyhow!(
                 "adoption metric id already exists with different payload"
             ));
         }
-        self.append_event_unlocked(&event)?;
+        insert_event(&transaction, &event)?;
+        transaction
+            .commit()
+            .context("failed to commit adoption metric")?;
         Ok(true)
     }
 
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StoreState>> {
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.lock
             .lock()
             .map_err(|_| anyhow::anyhow!("adoption metrics lock poisoned"))
     }
 
-    fn append_event_unlocked(&self, event: &AdoptionEvent) -> Result<()> {
-        let mut line = serde_json::to_string(&event)?;
-        line.push('\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        // Keep an event and its delimiter in one append operation. O_APPEND,
-        // combined with the sidecar lock, keeps records from interleaving;
-        // sync_data makes an acknowledged metric durable before retry logic
-        // can treat its id as consumed.
-        let written = file.write(line.as_bytes())?;
-        if written != line.len() {
-            return Err(anyhow::anyhow!(
-                "short append to {}: wrote {written} of {} bytes",
-                self.path.display(),
-                line.len()
-            ));
-        }
-        file.sync_data()
-            .with_context(|| format!("failed to sync appended {}", self.path.display()))
-    }
-
     fn read_ledger(&self) -> Result<AdoptionLedger> {
-        let mut state = self.lock_state()?;
-        self.ensure_parent_dir()?;
-        let _file_lock = self.acquire_file_lock()?;
-        self.compact_if_due(&mut state)?;
-        let events = self.read_events_unlocked()?;
+        let _guard = self.lock_state()?;
+        let mut connection = self.open_connection()?;
+        let transaction = begin_write(&mut connection)?;
+        prune_expired(&transaction)?;
+        let events = read_events(&transaction)?;
+        transaction
+            .commit()
+            .context("failed to commit retention cleanup")?;
         Ok(ledger_from_events(&events))
     }
 
+    #[cfg(test)]
     fn ensure_parent_dir(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        self.home()?;
         Ok(())
     }
 
-    fn acquire_file_lock(&self) -> Result<File> {
-        let lock_path = self.path.with_extension("jsonl.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| {
-                format!(
-                    "failed to open adoption metrics lock {}",
-                    lock_path.display()
-                )
-            })?;
-        lock_file_exclusive(&file).with_context(|| {
-            format!(
-                "failed to acquire adoption metrics lock {}",
-                lock_path.display()
-            )
-        })?;
-        Ok(file)
+    fn open_connection(&self) -> Result<ManagedSqlite> {
+        let mut connection = ManagedSqlite::open(
+            self.home()?,
+            DATABASE_FILE,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .with_context(|| format!("failed to open {}", self.path.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .context("failed to configure adoption metrics SQLite busy timeout")?;
+        initialize_schema(&connection)?;
+        self.import_legacy_if_needed(&mut connection)?;
+        Ok(connection)
     }
 
-    fn compact_if_due(&self, state: &mut StoreState) -> Result<()> {
-        let today = current_epoch_day();
-        if state.last_compaction_day == Some(today) {
+    /// Imports bounded pages of the retired ledger. Each page and its offset
+    /// commit atomically; normal writes wait for the completion marker so they
+    /// cannot race an as-yet unread historical metric ID.
+    fn import_legacy_if_needed(&self, connection: &mut Connection) -> Result<()> {
+        let transaction = begin_write(connection)?;
+        let imported: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM adoption_metric_metadata WHERE key = ?1",
+                [MIGRATION_MARKER],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if imported.is_some() {
+            transaction.commit()?;
             return Ok(());
         }
-        if !self.path.exists() {
-            state.last_compaction_day = Some(today);
-            return Ok(());
+        let cursor: Option<String> = transaction.query_row(
+            "SELECT CASE WHEN length(CAST(value AS BLOB)) <= 4096 THEN value ELSE 'oversized migration cursor' END FROM adoption_metric_metadata WHERE key=?1",
+            [MIGRATION_CURSOR], |row| row.get(0),
+        ).optional()?;
+        let file = match self.home()?.open_file(LEGACY_LEDGER_FILE, false) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && cursor.is_none() => None,
+            Err(error) => return Err(error).context("legacy telemetry source unavailable during migration; preserve the source and retry"),
+        };
+        if let Some(mut file) = file {
+            let signature = legacy_signature(&file)?;
+            let mut cursor = match cursor {
+                Some(value) => serde_json::from_str::<LegacyImportCursor>(&value)
+                    .context("invalid legacy telemetry migration cursor")?,
+                None => LegacyImportCursor {
+                    signature: signature.clone(),
+                    offset: 0,
+                    lines: 0,
+                },
+            };
+            if cursor.signature != signature || cursor.offset > file.metadata()?.len() {
+                anyhow::bail!("legacy telemetry source changed during migration; restore the original source before retrying");
+            }
+            file.seek(SeekFrom::Start(cursor.offset))?;
+            let initial_offset = cursor.offset;
+            let mut reader = BufReader::new(file);
+            let mut complete = false;
+            for _ in 0..LEGACY_PAGE_RECORDS {
+                if cursor.offset != initial_offset
+                    && LEGACY_PAGE_BYTES.saturating_sub(cursor.offset - initial_offset)
+                        < LEGACY_RECORD_BYTES + 1
+                {
+                    break;
+                }
+                let mut line = Vec::new();
+                let read = Read::by_ref(&mut reader)
+                    .take(LEGACY_RECORD_BYTES + 1)
+                    .read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    complete = true;
+                    break;
+                }
+                if read as u64 > LEGACY_RECORD_BYTES {
+                    anyhow::bail!("legacy telemetry line {} exceeds the 1 MiB migration record limit; source preserved", cursor.lines + 1);
+                }
+                cursor.offset = cursor
+                    .offset
+                    .checked_add(read as u64)
+                    .context("legacy telemetry byte cursor overflow")?;
+                cursor.lines = cursor
+                    .lines
+                    .checked_add(1)
+                    .context("legacy telemetry line cursor overflow")?;
+                let terminated = line.ends_with(b"\n");
+                let text = std::str::from_utf8(&line)
+                    .context("legacy telemetry contains invalid UTF-8")?;
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let event: AdoptionEvent = match serde_json::from_str(text) {
+                    Ok(event) => event,
+                    Err(_) if !terminated => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to parse legacy adoption metrics {} line {}",
+                                self.legacy_path.display(),
+                                cursor.lines
+                            )
+                        })
+                    }
+                };
+                if let Some(metric_id) = event_metric_id(&event) {
+                    if let Some(existing) = event_for_metric_id(&transaction, metric_id)? {
+                        if !metric_event_matches(&existing, &event) {
+                            anyhow::bail!("legacy adoption metric id {metric_id:?} conflicts with existing SQLite event");
+                        }
+                        continue;
+                    }
+                }
+                insert_event(&transaction, &event)?;
+            }
+            if legacy_signature(reader.get_ref())? != signature {
+                anyhow::bail!("legacy telemetry source changed while importing; page rolled back");
+            }
+            if !complete && cursor.offset == reader.get_ref().metadata()?.len() {
+                complete = true;
+            }
+            if !complete {
+                transaction.execute("INSERT INTO adoption_metric_metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![MIGRATION_CURSOR, serde_json::to_string(&cursor)?])?;
+                transaction
+                    .commit()
+                    .context("failed to commit legacy telemetry migration page")?;
+                anyhow::bail!("legacy telemetry migration in progress at byte {}; retry to advance the next bounded page", cursor.offset);
+            }
         }
+        transaction.execute(
+            "DELETE FROM adoption_metric_metadata WHERE key=?1",
+            [MIGRATION_CURSOR],
+        )?;
+        prune_expired(&transaction)?;
+        transaction.execute(
+            "INSERT INTO adoption_metric_metadata(key, value) VALUES(?1, ?2)",
+            params![MIGRATION_MARKER, "complete"],
+        )?;
+        transaction
+            .commit()
+            .context("failed to commit legacy adoption metrics import")
+    }
+}
 
-        let cutoff = now_secs().saturating_sub(RETENTION_DAYS * SECS_PER_DAY);
-        let retained = self
-            .read_events_unlocked()?
-            .into_iter()
-            .filter(|event| event_timestamp(event) >= cutoff)
-            .collect::<Vec<_>>();
-        let temp = self.path.with_extension("jsonl.compacting");
-        let mut file = fs::File::create(&temp)
-            .with_context(|| format!("failed to create {}", temp.display()))?;
-        for event in retained {
-            serde_json::to_writer(&mut file, &event)?;
-            file.write_all(b"\n")?;
+fn initialize_schema(connection: &Connection) -> Result<()> {
+    const SCHEMA: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;
+        CREATE TABLE IF NOT EXISTS adoption_metric_events (
+          sequence INTEGER PRIMARY KEY,
+          timestamp_secs INTEGER NOT NULL,
+          metric_id TEXT UNIQUE,
+          event_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS adoption_metric_events_timestamp
+          ON adoption_metric_events(timestamp_secs);
+        CREATE TABLE IF NOT EXISTS adoption_metric_metadata (
+          key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS capture_outcome_daily (
+          day_utc TEXT NOT NULL,
+          outcome TEXT NOT NULL CHECK(outcome IN ('captured','partially_captured','rejected','daemon_unavailable','store_unavailable','queued','skipped')),
+          total INTEGER NOT NULL CHECK(total >= 0),
+          PRIMARY KEY(day_utc,outcome)
+        );
+        CREATE TABLE IF NOT EXISTS capture_outcome_accounted (
+          sequence INTEGER PRIMARY KEY REFERENCES adoption_metric_events(sequence) ON DELETE CASCADE
+        );";
+
+    // The first two independent stores can race to set WAL mode. SQLite does
+    // not apply the connection busy handler to that mode transition on every
+    // platform, so retry only that bounded initialization window.
+    let mut last_error = None;
+    for _ in 0..100 {
+        match connection.execute_batch(SCHEMA) {
+            Ok(()) => return Ok(()),
+            Err(error) if sqlite_lock_error(&error) => {
+                last_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error).context("failed to initialize adoption metrics SQLite schema")
+            }
         }
-        file.sync_all()?;
-        fs::rename(&temp, &self.path).with_context(|| {
-            format!(
-                "failed to replace adoption metrics {} with compacted ledger",
-                self.path.display()
+    }
+    Err(anyhow::anyhow!(
+        "failed to initialize adoption metrics SQLite schema after waiting for a concurrent store: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown SQLite lock error".to_string())
+    ))
+}
+
+fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             )
-        })?;
-        sync_parent_directory(&self.path)?;
-        state.last_compaction_day = Some(today);
-        Ok(())
-    }
+    )
+}
 
-    fn read_events_unlocked(&self) -> Result<Vec<AdoptionEvent>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let mut text = fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read {}", self.path.display()))?;
-        if !text.is_empty() && !text.ends_with('\n') {
-            let final_line_start = text.rfind('\n').map_or(0, |index| index + 1);
-            let final_line = &text[final_line_start..];
-            if serde_json::from_str::<AdoptionEvent>(final_line).is_ok() {
-                self.append_delimiter_unlocked()?;
-                text.push('\n');
-            } else {
-                self.discard_torn_tail_unlocked(final_line_start)?;
-                text.truncate(final_line_start);
-            }
-        }
-        let mut events = Vec::new();
-        for (line_number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event = serde_json::from_str(line).with_context(|| {
-                format!(
-                    "failed to parse adoption metrics {} line {}",
-                    self.path.display(),
-                    line_number + 1
-                )
-            })?;
-            events.push(event);
-        }
-        Ok(events)
-    }
+fn begin_write(connection: &mut Connection) -> Result<Transaction<'_>> {
+    connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("failed to begin adoption metrics SQLite write transaction")
+}
 
-    fn append_delimiter_unlocked(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        file.write_all(b"\n")?;
-        file.sync_data()
-            .with_context(|| format!("failed to sync repaired {}", self.path.display()))
+fn insert_event(transaction: &Transaction<'_>, event: &AdoptionEvent) -> Result<()> {
+    let metric_id = event_metric_id(event);
+    transaction
+        .execute(
+            "INSERT INTO adoption_metric_events(timestamp_secs, metric_id, event_json)
+             VALUES(?1, ?2, ?3)",
+            params![
+                event_timestamp(event) as i64,
+                metric_id,
+                serde_json::to_string(event)?
+            ],
+        )
+        .context("failed to insert adoption metric event")?;
+    if matches!(event, AdoptionEvent::CaptureOutcome { .. }) {
+        account_capture_event(transaction, transaction.last_insert_rowid(), event)?;
     }
+    Ok(())
+}
 
-    fn discard_torn_tail_unlocked(&self, retained_len: usize) -> Result<()> {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        file.set_len(retained_len as u64)
-            .with_context(|| format!("failed to discard torn tail from {}", self.path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync repaired {}", self.path.display()))
+fn account_capture_event(
+    transaction: &Transaction<'_>,
+    sequence: i64,
+    event: &AdoptionEvent,
+) -> Result<()> {
+    let AdoptionEvent::CaptureOutcome {
+        timestamp_secs,
+        outcome,
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO capture_outcome_accounted(sequence) VALUES(?1)",
+        [sequence],
+    )?;
+    if inserted == 1 {
+        transaction.execute(
+            "INSERT INTO capture_outcome_daily(day_utc,outcome,total) VALUES(?1,?2,1)
+             ON CONFLICT(day_utc,outcome) DO UPDATE SET total=total+1",
+            params![
+                date_key_from_epoch_day(*timestamp_secs / SECS_PER_DAY),
+                outcome.label()
+            ],
+        )?;
     }
+    Ok(())
+}
+
+fn reconcile_capture_aggregate(transaction: &Transaction<'_>) -> Result<bool> {
+    let complete: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM adoption_metric_metadata WHERE key=?1)",
+        [CAPTURE_AGGREGATE_MARKER],
+        |row| row.get(0),
+    )?;
+    if complete {
+        return Ok(true);
+    }
+    let cursor: i64 = transaction.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM adoption_metric_metadata WHERE key=?1),0)",
+        [CAPTURE_AGGREGATE_CURSOR], |row| row.get(0),
+    )?;
+    let page_end: Option<i64> = transaction.query_row(
+        "SELECT MAX(sequence) FROM (SELECT sequence FROM adoption_metric_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2)",
+        params![cursor, CAPTURE_AGGREGATE_PAGE_ROWS as i64], |row| row.get(0),
+    )?;
+    let Some(page_end) = page_end else {
+        transaction.execute(
+            "INSERT OR REPLACE INTO adoption_metric_metadata(key,value) VALUES(?1,'complete')",
+            [CAPTURE_AGGREGATE_MARKER],
+        )?;
+        transaction.execute(
+            "DELETE FROM adoption_metric_metadata WHERE key=?1",
+            [CAPTURE_AGGREGATE_CURSOR],
+        )?;
+        return Ok(true);
+    };
+    let oversized: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM adoption_metric_events
+         WHERE sequence>?1 AND sequence<=?2
+           AND instr(substr(event_json,1,64),'\"kind\":\"capture_outcome\"')>0
+           AND length(event_json)>?3)",
+        params![cursor, page_end, CAPTURE_EVENT_JSON_BYTES as i64],
+        |row| row.get(0),
+    )?;
+    if oversized {
+        anyhow::bail!("stored capture telemetry row exceeds aggregation limit")
+    }
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT sequence,event_json FROM adoption_metric_events
+             WHERE sequence>?1 AND sequence<=?2
+               AND instr(substr(event_json,1,64),'\"kind\":\"capture_outcome\"')>0
+             ORDER BY sequence",
+        )?;
+        let rows = statement
+            .query_map(params![cursor, page_end], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (sequence, json) in candidates {
+        let event: AdoptionEvent =
+            serde_json::from_str(&json).context("stored capture telemetry row is invalid")?;
+        if !matches!(event, AdoptionEvent::CaptureOutcome { .. }) {
+            anyhow::bail!("capture aggregation candidate has the wrong event kind")
+        }
+        account_capture_event(transaction, sequence, &event)?;
+    }
+    let remaining: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM adoption_metric_events WHERE sequence>?1)",
+        [page_end],
+        |row| row.get(0),
+    )?;
+    if remaining {
+        transaction.execute(
+            "INSERT INTO adoption_metric_metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![CAPTURE_AGGREGATE_CURSOR,page_end.to_string()],
+        )?;
+        Ok(false)
+    } else {
+        transaction.execute(
+            "INSERT OR REPLACE INTO adoption_metric_metadata(key,value) VALUES(?1,'complete')",
+            [CAPTURE_AGGREGATE_MARKER],
+        )?;
+        transaction.execute(
+            "DELETE FROM adoption_metric_metadata WHERE key=?1",
+            [CAPTURE_AGGREGATE_CURSOR],
+        )?;
+        Ok(true)
+    }
+}
+
+fn capture_health_start_day() -> String {
+    date_key_from_epoch_day(current_epoch_day().saturating_sub(RETENTION_DAYS - 1))
+}
+
+fn prune_capture_days(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM capture_outcome_daily WHERE day_utc<?1",
+        [capture_health_start_day()],
+    )?;
+    Ok(())
+}
+
+fn event_for_metric_id(
+    transaction: &Transaction<'_>,
+    metric_id: &str,
+) -> Result<Option<AdoptionEvent>> {
+    transaction
+        .query_row(
+            "SELECT event_json FROM adoption_metric_events WHERE metric_id = ?1 AND timestamp_secs >= ?2",
+            params![metric_id, now_secs().saturating_sub(RETENTION_DAYS * SECS_PER_DAY) as i64],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| {
+            serde_json::from_str(&json).context("stored adoption metric event is not valid JSON")
+        })
+        .transpose()
+}
+
+fn read_events(transaction: &Transaction<'_>) -> Result<Vec<AdoptionEvent>> {
+    let mut statement = transaction.prepare(
+        "SELECT event_json FROM adoption_metric_events WHERE timestamp_secs >= ?1
+         ORDER BY timestamp_secs ASC, sequence ASC",
+    )?;
+    let events = statement
+        .query_map(
+            [now_secs().saturating_sub(RETENTION_DAYS * SECS_PER_DAY) as i64],
+            |row| row.get::<_, String>(0),
+        )?
+        .map(|row| {
+            let json = row?;
+            serde_json::from_str(&json).context("stored adoption metric event is not valid JSON")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(events)
+}
+
+/// Bound reclamation latency on a delivery write even after a long idle period.
+/// Expired rows are excluded from reads while successive calls drain the backlog.
+fn prune_expired(transaction: &Transaction<'_>) -> Result<()> {
+    let cutoff = now_secs().saturating_sub(RETENTION_DAYS * SECS_PER_DAY) as i64;
+    transaction
+        .execute(
+            "DELETE FROM adoption_metric_events WHERE sequence IN (SELECT sequence FROM adoption_metric_events WHERE timestamp_secs < ?1 ORDER BY timestamp_secs,sequence LIMIT 1024)",
+            [cutoff],
+        )
+        .context("failed to prune expired adoption metric events")?;
+    Ok(())
+}
+
+/// Metadata is checked before and after each page. A retired source must stay
+/// unchanged until migration completes; this is an integrity fence, not proof
+/// against a writer deliberately restoring identical filesystem metadata.
+fn legacy_signature(file: &fs::File) -> Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!("legacy telemetry source must be a regular file");
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}:{}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = format!("{:?}", metadata.created()?);
+    Ok(format!(
+        "{identity}:{}:{:?}",
+        metadata.len(),
+        metadata.modified()?
+    ))
 }
 
 fn stable_metric_id(metric_id: &str) -> Result<String> {
@@ -854,41 +1232,6 @@ fn metric_event_matches(existing: &AdoptionEvent, candidate: &AdoptionEvent) -> 
     }
 }
 
-#[cfg(unix)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
-    // SAFETY: flock only reads the valid file descriptor and retains no pointer state.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_file_exclusive(_file: &File) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "adoption metric deduplication requires Unix flock",
-    ))
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("adoption metrics path has no parent"))?;
-    File::open(parent)
-        .with_context(|| format!("failed to open {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to sync {}", parent.display()))
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 pub(crate) fn source_from_arguments(
     args: &serde_json::Value,
     default_client: &str,
@@ -944,8 +1287,12 @@ pub(crate) fn render_metrics_for_workspace(
 /// Loads the content-free capture aggregate for operational health checks.
 /// The returned value never exposes per-delivery identity or capture content.
 pub(crate) fn capture_health_for_workspace(workspace: &Path) -> Result<CaptureHealth> {
-    let store = AdoptionMetricsStore::new(workspace);
-    if !store.path.exists() {
+    let Some(home) = AdoptionMetricsStore::resolve_home(workspace, false)? else {
+        return Ok(CaptureHealth::default());
+    };
+    let store = AdoptionMetricsStore::from_home(workspace, Ok(home));
+    let home = store.home()?;
+    if home.metadata(DATABASE_FILE)?.is_none() && home.metadata(LEGACY_LEDGER_FILE)?.is_none() {
         return Ok(CaptureHealth::default());
     }
     store.capture_health()
@@ -1447,6 +1794,125 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     #[test]
+    fn telemetry_linked_checkout_uses_repository_home_and_preserves_old_local_audit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=Telemetry Fixture",
+            "-c",
+            "user.email=fixture@invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ]);
+        let linked = temporary.path().join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ]);
+        fs::create_dir(linked.join(".lattice")).unwrap();
+        let historical = linked.join(".lattice").join(LEGACY_LEDGER_FILE);
+        fs::write(&historical, b"unproven historical audit\n").unwrap();
+        let primary = AdoptionMetricsStore::new(&root);
+        let secondary = AdoptionMetricsStore::new(&linked);
+        assert_eq!(primary.path, secondary.path);
+        primary
+            .record(call_record("primary", "context", &[]))
+            .unwrap();
+        secondary
+            .record(call_record("linked", "recall", &[]))
+            .unwrap();
+        assert_eq!(database_events(&primary).len(), 2);
+        assert_eq!(
+            fs::read(&historical).unwrap(),
+            b"unproven historical audit\n"
+        );
+        assert!(!linked.join(".lattice").join(DATABASE_FILE).exists());
+    }
+
+    #[test]
+    fn telemetry_invalid_git_authority_does_not_fall_back_to_local_storage() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join(".git"), "gitdir: missing\n").unwrap();
+        let store = AdoptionMetricsStore::new(temporary.path());
+        assert!(store
+            .record(call_record("session", "context", &[]))
+            .is_err());
+        assert!(capture_health_for_workspace(temporary.path()).is_err());
+        assert!(!temporary.path().join(".lattice").exists());
+    }
+
+    #[test]
+    fn telemetry_home_replacement_keeps_database_and_import_on_pinned_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = AdoptionMetricsStore::new(temporary.path());
+        let home = temporary.path().join(".lattice");
+        let old = temporary.path().join("pinned-original");
+        fs::rename(&home, &old).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join(LEGACY_LEDGER_FILE), "foreign invalid payload\n").unwrap();
+        store
+            .record(call_record("session", "context", &[]))
+            .unwrap();
+        assert_eq!(database_events(&store).len(), 1);
+        assert!(old.join(DATABASE_FILE).exists());
+        assert!(!home.join(DATABASE_FILE).exists());
+        assert_eq!(
+            fs::read(home.join(LEGACY_LEDGER_FILE)).unwrap(),
+            b"foreign invalid payload\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_rejects_symlink_homes_databases_and_legacy_sources() {
+        for leaf in [".lattice", DATABASE_FILE, LEGACY_LEDGER_FILE] {
+            let temporary = tempfile::tempdir().unwrap();
+            let workspace = temporary.path().join("workspace");
+            let outside = temporary.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let marker = outside.join("preserve");
+            fs::write(&marker, b"foreign data").unwrap();
+            if leaf == ".lattice" {
+                std::os::unix::fs::symlink(&outside, workspace.join(leaf)).unwrap();
+            } else {
+                fs::create_dir(workspace.join(".lattice")).unwrap();
+                std::os::unix::fs::symlink(&marker, workspace.join(".lattice").join(leaf)).unwrap();
+            }
+            let store = AdoptionMetricsStore::new(&workspace);
+            assert!(
+                store
+                    .record(call_record("session", "context", &[]))
+                    .is_err(),
+                "{leaf}"
+            );
+            assert_eq!(fs::read(&marker).unwrap(), b"foreign data");
+            assert!(!outside.join(DATABASE_FILE).exists());
+        }
+    }
+
+    #[test]
     fn watcher_edit_credits_only_same_session_and_suggested_file() {
         let events = vec![
             call(10, "session-a", "context", &["src/auth.rs"]),
@@ -1497,7 +1963,11 @@ mod tests {
             // Right session, wrong file.
             edit(12, "session-a", "src/elsewhere.rs"),
             // Right session and file, outside the window.
-            edit(10 + FOLLOW_THROUGH_WINDOW_SECS + 1, "session-a", "src/hot.rs"),
+            edit(
+                10 + FOLLOW_THROUGH_WINDOW_SECS + 1,
+                "session-a",
+                "src/hot.rs",
+            ),
         ];
         let counter = today_tools(&ledger_from_events(&events))["health"].clone();
 
@@ -1538,8 +2008,14 @@ mod tests {
             first.health_evidence_followed, 1,
             "a single injection is credited once however many edits follow"
         );
-        assert_eq!(first.health_evidence_followed, second.health_evidence_followed);
-        assert_eq!(first.health_evidence_injections, second.health_evidence_injections);
+        assert_eq!(
+            first.health_evidence_followed,
+            second.health_evidence_followed
+        );
+        assert_eq!(
+            first.health_evidence_injections,
+            second.health_evidence_injections
+        );
     }
 
     #[test]
@@ -1557,6 +2033,54 @@ mod tests {
     }
 
     #[test]
+    fn expired_backlog_reclamation_is_bounded_and_hidden_from_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdoptionMetricsStore::new(root.path());
+        let mut connection = store.open_connection().unwrap();
+        let tx = begin_write(&mut connection).unwrap();
+        for index in 0..2500 {
+            insert_event(
+                &tx,
+                &AdoptionEvent::ObservedEdit {
+                    timestamp_secs: now_secs().saturating_sub((RETENTION_DAYS + 1) * SECS_PER_DAY),
+                    session_id: format!("expired-{index}"),
+                    file: "old.rs".into(),
+                },
+            )
+            .unwrap();
+        }
+        prune_expired(&tx).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM adoption_metric_events", [], |r| r
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+            1476
+        );
+        assert!(read_events(&tx).unwrap().is_empty());
+        prune_expired(&tx).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM adoption_metric_events", [], |r| r
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+            452
+        );
+        prune_expired(&tx).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM adoption_metric_events", [], |r| r
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
     fn append_only_records_and_compacts_entries_past_retention() {
         let root = unique_root("retention");
         let store = AdoptionMetricsStore::new(&root);
@@ -1567,7 +2091,7 @@ mod tests {
         };
         store.ensure_parent_dir().expect("metrics parent");
         fs::write(
-            &store.path,
+            &store.legacy_path,
             format!("{}\n", serde_json::to_string(&old).unwrap()),
         )
         .expect("seed old event");
@@ -1575,13 +2099,9 @@ mod tests {
             .record(call_record("session-a", "context", &["src/auth.rs"]))
             .expect("append event");
 
-        let contents = fs::read_to_string(&store.path).expect("read log");
-        assert_eq!(
-            contents.lines().count(),
-            1,
-            "old record should be compacted"
-        );
-        assert!(contents.contains("tool_call"));
+        let events = database_events(&store);
+        assert_eq!(events.len(), 1, "old record should be pruned");
+        assert!(matches!(events[0], AdoptionEvent::ToolCall { .. }));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1647,7 +2167,7 @@ mod tests {
         );
         store.ensure_parent_dir().expect("metrics parent");
         fs::write(
-            &store.path,
+            &store.legacy_path,
             format!("{}\n", serde_json::to_string(&old).unwrap()),
         )
         .expect("seed old event");
@@ -1661,9 +2181,12 @@ mod tests {
             })
             .expect("append memory retrieval");
 
-        let contents = fs::read_to_string(&store.path).expect("read log");
-        assert_eq!(contents.lines().count(), 1);
-        assert!(contents.contains("retrieval-current"));
+        let events = database_events(&store);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AdoptionEvent::MemoryRetrieval { retrieval_id, .. } if retrieval_id == "retrieval-current"
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1699,9 +2222,9 @@ mod tests {
             "same id with a different payload must fail"
         );
 
-        let contents = fs::read_to_string(&store.path).expect("read log");
-        assert_eq!(contents.lines().count(), 1);
-        assert!(contents.contains("\"metric_id\":\"retrieval:retrieval-a\""));
+        let events = database_events(&store);
+        assert_eq!(events.len(), 1);
+        assert_eq!(event_metric_id(&events[0]), Some("retrieval:retrieval-a"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1739,8 +2262,7 @@ mod tests {
 
         assert_eq!(inserted, 1);
         let store = AdoptionMetricsStore::new(&root);
-        let contents = fs::read_to_string(&store.path).expect("read log");
-        assert_eq!(contents.lines().count(), 1);
+        assert_eq!(database_events(&store).len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1770,7 +2292,7 @@ mod tests {
                 },
             )
             .is_err());
-        assert_eq!(fs::read_to_string(&store.path).unwrap().lines().count(), 1);
+        assert_eq!(database_events(&store).len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1794,11 +2316,10 @@ mod tests {
         assert!(store
             .record_memory_injection_action_once("action:injection-a", record.clone())
             .expect("first action append"));
-        store.lock.lock().unwrap().last_compaction_day = None;
         assert!(!store
             .record_memory_injection_action_once("action:injection-a", record)
             .expect("replayed action after compaction"));
-        assert_eq!(fs::read_to_string(&store.path).unwrap().lines().count(), 2);
+        assert_eq!(database_events(&store).len(), 2);
         let ledger = store.read_json().expect("replay compacted ledger");
         assert_eq!(ledger["days"].as_object().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
@@ -1881,7 +2402,7 @@ mod tests {
             CaptureOutcome::Rejected,
         );
         fs::write(
-            &store.path,
+            &store.legacy_path,
             format!("{}\n", serde_json::to_string(&old).unwrap()),
         )
         .expect("seed old capture event");
@@ -1898,9 +2419,15 @@ mod tests {
             )
             .expect("append current capture event");
 
-        let contents = fs::read_to_string(&store.path).expect("read log");
-        assert_eq!(contents.lines().count(), 1);
-        assert!(contents.contains("captured"));
+        let events = database_events(&store);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            AdoptionEvent::CaptureOutcome {
+                outcome: CaptureOutcome::Captured,
+                ..
+            }
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1917,6 +2444,125 @@ mod tests {
     }
 
     #[test]
+    fn capture_health_skips_large_unrelated_event_payloads() {
+        let root = unique_root("capture-health-unrelated");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().unwrap();
+        let connection = Connection::open(&store.path).unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO adoption_metric_events(timestamp_secs,event_json) VALUES(?1,?2)",
+                params![now_secs() as i64, "x".repeat(2 * CAPTURE_EVENT_JSON_BYTES)],
+            )
+            .unwrap();
+        let event = capture(now_secs(), "codex", 1, 1, CaptureOutcome::Rejected);
+        connection
+            .execute(
+                "INSERT INTO adoption_metric_events(timestamp_secs,event_json) VALUES(?1,?2)",
+                params![
+                    event_timestamp(&event) as i64,
+                    serde_json::to_string(&event).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let health = store.capture_health().unwrap();
+        assert_eq!(health.total_attempts, 1);
+        assert_eq!(health.outcomes["rejected"], 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_health_migration_is_bounded_restartable_and_never_partial() {
+        let root = unique_root("capture-health-paged");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().unwrap();
+        let mut connection = Connection::open(&store.path).unwrap();
+        initialize_schema(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for _ in 0..CAPTURE_AGGREGATE_PAGE_ROWS {
+            transaction
+                .execute(
+                    "INSERT INTO adoption_metric_events(timestamp_secs,event_json) VALUES(?1,'{}')",
+                    [now_secs() as i64],
+                )
+                .unwrap();
+        }
+        let event = capture(now_secs(), "codex", 1, 1, CaptureOutcome::Captured);
+        transaction
+            .execute(
+                "INSERT INTO adoption_metric_events(timestamp_secs,event_json) VALUES(?1,?2)",
+                params![
+                    event_timestamp(&event) as i64,
+                    serde_json::to_string(&event).unwrap()
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        assert!(store
+            .capture_health()
+            .unwrap_err()
+            .to_string()
+            .contains("in progress"));
+        let restarted = AdoptionMetricsStore::new(&root);
+        let health = restarted.capture_health().unwrap();
+        assert_eq!(health.total_attempts, 1);
+        assert_eq!(health.outcomes["captured"], 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_health_uses_ninety_utc_calendar_days() {
+        let root = unique_root("capture-health-calendar-retention");
+        let store = AdoptionMetricsStore::new(&root);
+        let mut connection = store.open_connection().unwrap();
+        let transaction = begin_write(&mut connection).unwrap();
+        insert_event(
+            &transaction,
+            &capture(
+                current_epoch_day().saturating_sub(RETENTION_DAYS) * SECS_PER_DAY,
+                "codex",
+                1,
+                1,
+                CaptureOutcome::Rejected,
+            ),
+        )
+        .unwrap();
+        insert_event(
+            &transaction,
+            &capture(
+                current_epoch_day().saturating_sub(RETENTION_DAYS - 1) * SECS_PER_DAY,
+                "codex",
+                1,
+                1,
+                CaptureOutcome::Captured,
+            ),
+        )
+        .unwrap();
+        insert_event(
+            &transaction,
+            &capture(
+                current_epoch_day() * SECS_PER_DAY,
+                "codex",
+                1,
+                1,
+                CaptureOutcome::Captured,
+            ),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let health = store.capture_health().unwrap();
+        assert_eq!(health.total_attempts, 2);
+        assert_eq!(health.outcomes["captured"], 2);
+        assert!(!health.outcomes.contains_key("rejected"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stable_metric_append_discards_a_torn_final_jsonl_record_before_deduping() {
         let root = unique_root("torn-metric-id-append");
         let store = AdoptionMetricsStore::new(&root);
@@ -1927,7 +2573,7 @@ mod tests {
         };
         store.ensure_parent_dir().expect("metrics parent");
         fs::write(
-            &store.path,
+            &store.legacy_path,
             format!(
                 "{}\n{{\"kind\":\"memory_retrieval\",\"timestamp_secs\":",
                 serde_json::to_string(&durable).expect("serialize durable event")
@@ -1948,11 +2594,189 @@ mod tests {
             )
             .expect("recover torn log and append"));
 
-        let contents = fs::read_to_string(&store.path).expect("read repaired log");
-        assert_eq!(contents.lines().count(), 2);
-        assert!(contents
-            .lines()
-            .all(|line| serde_json::from_str::<AdoptionEvent>(line).is_ok()));
+        let events = database_events(&store);
+        assert_eq!(events.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_import_pages_resume_without_duplicate_unkeyed_events() {
+        let root = unique_root("legacy-paged");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().unwrap();
+        let record =
+            serde_json::to_string(&call(now_secs(), "session-a", "context", &[])).unwrap() + "\n";
+        fs::write(&store.legacy_path, record.repeat(LEGACY_PAGE_RECORDS + 7)).unwrap();
+        assert!(store
+            .open_connection()
+            .unwrap_err()
+            .to_string()
+            .contains("in progress"));
+        let database = Connection::open(&store.path).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM adoption_metric_events", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            LEGACY_PAGE_RECORDS
+        );
+        drop(database);
+        let reopened = AdoptionMetricsStore::new(&root);
+        drop(reopened.open_connection().unwrap());
+        drop(reopened.open_connection().unwrap());
+        assert_eq!(database_events(&reopened).len(), LEGACY_PAGE_RECORDS + 7);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_rejects_source_replacement_and_oversized_records() {
+        let root = unique_root("legacy-page-source");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().unwrap();
+        let record =
+            serde_json::to_string(&call(now_secs(), "session-a", "context", &[])).unwrap() + "\n";
+        fs::write(&store.legacy_path, record.repeat(LEGACY_PAGE_RECORDS + 1)).unwrap();
+        assert!(store.open_connection().is_err());
+        fs::write(&store.legacy_path, "changed\n").unwrap();
+        assert!(store
+            .open_connection()
+            .unwrap_err()
+            .to_string()
+            .contains("source changed"));
+        fs::remove_dir_all(root).unwrap();
+
+        let root = unique_root("legacy-record-budget");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().unwrap();
+        fs::write(
+            &store.legacy_path,
+            vec![b'x'; LEGACY_RECORD_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(store
+            .open_connection()
+            .unwrap_err()
+            .to_string()
+            .contains("record limit"));
+        let database = Connection::open(&store.path).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM adoption_metric_events", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM adoption_metric_metadata WHERE key=?1",
+                    [MIGRATION_MARKER],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_is_once_only_across_store_restarts() {
+        let root = unique_root("legacy-import-restart");
+        let first = AdoptionMetricsStore::new(&root);
+        first.ensure_parent_dir().expect("metrics parent");
+        let now = now_secs();
+        fs::write(
+            &first.legacy_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&call(now, "session-a", "context", &[])).unwrap()
+            ),
+        )
+        .expect("seed legacy ledger");
+        assert_eq!(database_events(&first).len(), 1);
+
+        // A later edit to the preserved legacy file must not be imported after
+        // the transactional marker has committed.
+        fs::write(
+            &first.legacy_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&call(now, "session-a", "context", &[])).unwrap(),
+                serde_json::to_string(&call(now + 1, "session-a", "impact", &[])).unwrap()
+            ),
+        )
+        .expect("modify preserved legacy ledger");
+        let restarted = AdoptionMetricsStore::new(&root);
+        assert_eq!(database_events(&restarted).len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_legacy_import_rejects_metric_id_conflicts_without_marker() {
+        let root = unique_root("legacy-import-conflict");
+        let store = AdoptionMetricsStore::new(&root);
+        store.ensure_parent_dir().expect("metrics parent");
+        let legacy = AdoptionEvent::MemoryUse {
+            timestamp_secs: now_secs(),
+            metric_id: Some("use:conflict".to_string()),
+            retrieval_id: "legacy-retrieval".to_string(),
+            used_count: 1,
+        };
+        fs::write(
+            &store.legacy_path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .expect("seed legacy ledger");
+
+        let connection = Connection::open(&store.path).expect("create partial database");
+        connection
+            .execute_batch(
+                "CREATE TABLE adoption_metric_events (
+                   sequence INTEGER PRIMARY KEY,
+                   timestamp_secs INTEGER NOT NULL,
+                   metric_id TEXT UNIQUE,
+                   event_json TEXT NOT NULL
+                 );
+                 CREATE INDEX adoption_metric_events_timestamp
+                   ON adoption_metric_events(timestamp_secs);
+                 CREATE TABLE adoption_metric_metadata (
+                   key TEXT PRIMARY KEY, value TEXT NOT NULL
+                 );",
+            )
+            .expect("create schema");
+        let conflicting = AdoptionEvent::MemoryUse {
+            timestamp_secs: now_secs(),
+            metric_id: Some("use:conflict".to_string()),
+            retrieval_id: "different-retrieval".to_string(),
+            used_count: 1,
+        };
+        connection
+            .execute(
+                "INSERT INTO adoption_metric_events(timestamp_secs, metric_id, event_json)
+                 VALUES(?1, ?2, ?3)",
+                params![
+                    event_timestamp(&conflicting) as i64,
+                    "use:conflict",
+                    serde_json::to_string(&conflicting).unwrap()
+                ],
+            )
+            .expect("seed conflicting partial import");
+        drop(connection);
+
+        assert!(store
+            .record(call_record("session-a", "context", &[]))
+            .is_err());
+        let connection = Connection::open(&store.path).expect("inspect partial database");
+        let marker: Option<String> = connection
+            .query_row(
+                "SELECT value FROM adoption_metric_metadata WHERE key = ?1",
+                [MIGRATION_MARKER],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("read marker");
+        assert!(marker.is_none(), "failed migration must remain restartable");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2068,12 +2892,23 @@ mod tests {
     }
 
     fn unique_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "lattice-adoption-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ))
+        ));
+        fs::create_dir(&root).expect("create existing telemetry workspace");
+        root
+    }
+
+    fn database_events(store: &AdoptionMetricsStore) -> Vec<AdoptionEvent> {
+        let _guard = store.lock_state().expect("store lock");
+        let mut connection = store.open_connection().expect("open database");
+        let transaction = begin_write(&mut connection).expect("read transaction");
+        let events = read_events(&transaction).expect("read events");
+        transaction.commit().expect("commit read transaction");
+        events
     }
 }

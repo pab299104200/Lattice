@@ -96,6 +96,42 @@ fn workspace_mismatch_is_rejected() {
 }
 
 #[test]
+fn stable_event_identity_is_idempotent_and_rejects_payload_collision() {
+    let store = Arc::new(EventStore::open_in_memory().expect("event store opens"));
+    let writer = EventWriter::new(store.clone(), "workspace-main".to_string(), 4096);
+    let envelope = base_envelope(assistant_task_payload());
+    let stable_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    writer
+        .append_idempotent(stable_id, 42, envelope.clone())
+        .unwrap();
+    writer.append_idempotent(stable_id, 42, envelope).unwrap();
+    assert_eq!(store.row_id_for_event_uuid(stable_id).unwrap(), Some(1));
+    assert_eq!(
+        store.with_connection(|conn| conn
+            .query_row(
+                "SELECT schema_version FROM events WHERE event_uuid=?1",
+                [stable_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()),
+        3
+    );
+
+    let mut collision = base_envelope(assistant_task_payload());
+    collision.summary = CompactSummary::new("different summary").unwrap();
+    assert!(writer.append_idempotent(stable_id, 42, collision).is_err());
+    assert!(writer
+        .append_idempotent("invalid", 42, base_envelope(assistant_task_payload()))
+        .is_err());
+    assert_eq!(
+        store.with_connection(|conn| conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+            .unwrap()),
+        1
+    );
+}
+
+#[test]
 fn concurrent_appends_preserve_monotonic_row_ids() {
     let store = Arc::new(EventStore::open_in_memory().expect("event store opens"));
     let writer = Arc::new(

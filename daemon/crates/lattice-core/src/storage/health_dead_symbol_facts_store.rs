@@ -197,9 +197,7 @@ impl HealthDeadSymbolFactsStore {
                 [repository_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|error| {
-                storage_error("read dead-symbol-fact repository generation", error)
-            })?;
+            .map_err(|error| storage_error("read dead-symbol-fact repository generation", error))?;
         let following_generation = next_generation.checked_add(1).ok_or_else(|| {
             LatticeError::Storage(format!(
                 "Dead-symbol-fact generation exhausted for repository {repository_id}"
@@ -534,7 +532,10 @@ fn load_candidates(
                 rusqlite::Error::FromSqlConversionFailure(
                     7,
                     rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message)),
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    )),
                 )
             })?;
             Ok(DeadSymbolCandidate {
@@ -746,7 +747,11 @@ mod tests {
             let leaf = symbol(path, "leaf_fn");
             add_symbol(&mut graph, &leaf, true, 1);
         }
-        DeadSymbolFactProducer::default().produce(&graph, &DeadSymbolExclusionInputs::default(), true)
+        DeadSymbolFactProducer::default().produce(
+            &graph,
+            &DeadSymbolExclusionInputs::default(),
+            true,
+        )
     }
 
     fn count(store: &HealthDeadSymbolFactsStore, sql: &str) -> i64 {
@@ -784,8 +789,12 @@ mod tests {
     fn republishing_an_identical_candidate_is_idempotent() {
         let store = HealthDeadSymbolFactsStore::open_in_memory().unwrap();
         let expected = snapshot(None);
-        let first = store.publish("repo-a", Some("rev-1"), 1, &expected).unwrap();
-        let second = store.publish("repo-a", Some("rev-1"), 2, &expected).unwrap();
+        let first = store
+            .publish("repo-a", Some("rev-1"), 1, &expected)
+            .unwrap();
+        let second = store
+            .publish("repo-a", Some("rev-1"), 2, &expected)
+            .unwrap();
 
         assert_eq!(first.generation, second.generation);
         let loaded = store.load_active("repo-a").unwrap().unwrap();
@@ -876,7 +885,9 @@ mod tests {
     fn load_active_recovering_rebuilds_on_corrupt_digest() {
         let store = HealthDeadSymbolFactsStore::open_in_memory().unwrap();
         let expected = snapshot(None);
-        store.publish("repo-a", Some("rev-1"), 1, &expected).unwrap();
+        store
+            .publish("repo-a", Some("rev-1"), 1, &expected)
+            .unwrap();
 
         store
             .conn
@@ -898,7 +909,10 @@ mod tests {
         let store = HealthDeadSymbolFactsStore::open_in_memory().unwrap();
         assert!(store.load_active("unknown-repo").unwrap().is_none());
         assert!(store.load_prior("unknown-repo").unwrap().is_none());
-        assert!(store.candidate_delta_since_prior("unknown-repo").unwrap().is_none());
+        assert!(store
+            .candidate_delta_since_prior("unknown-repo")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -908,7 +922,10 @@ mod tests {
         store.publish("repo-a", None, 1, &empty).unwrap();
         let loaded = store.load_active("repo-a").unwrap().unwrap();
         assert!(loaded.snapshot.candidates.is_empty());
-        assert_eq!(loaded.snapshot.availability(), FactAvailability::Unavailable);
+        assert_eq!(
+            loaded.snapshot.availability(),
+            FactAvailability::Unavailable
+        );
     }
 
     #[test]
@@ -919,8 +936,11 @@ mod tests {
         // SymbolKind round trip and a multi-reason exclusion round trip.
         let odd = symbol("tests/support.rs", "Fixture.fmt");
         add_symbol_kind(&mut graph, &odd, SymbolKind::Method, true, 1);
-        let snapshot =
-            DeadSymbolFactProducer::default().produce(&graph, &DeadSymbolExclusionInputs::default(), true);
+        let snapshot = DeadSymbolFactProducer::default().produce(
+            &graph,
+            &DeadSymbolExclusionInputs::default(),
+            true,
+        );
 
         store.publish("repo-a", None, 1, &snapshot).unwrap();
         let loaded = store.load_active("repo-a").unwrap().unwrap();

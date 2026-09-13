@@ -475,7 +475,7 @@ fn memory_highlight(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let memory_id =
-        string_field(object, &["id", "memory_id"]).unwrap_or_else(|| format!("memory-{index}"));
+        string_field(object, &["memory_id", "id"]).unwrap_or_else(|| format!("memory-{index}"));
     let status_kind = MemoryVerificationStatus::from_str(&status);
     let stale_label = stale_label(status_kind, is_stale);
     let evidence_is_empty = object
@@ -492,8 +492,10 @@ fn memory_highlight(
     let risk_domains = memory_risk_domains(object, &content);
     let (requires_reverification, reverification_reason) =
         requires_reverification(status_kind, is_stale, evidence_is_empty, &risk_domains);
+    let memory_workspace_id = string_field(object, &["workspace_id", "workspace"])
+        .unwrap_or_else(|| workspace_id.to_string());
     Some(MemoryHighlight {
-        memory_id: memory_identity(workspace_id, &memory_id),
+        memory_id: memory_identity(&memory_workspace_id, &memory_id),
         content,
         memory_type: string_field(object, &["memory_type", "type"])
             .unwrap_or_else(|| "observation".to_string()),
@@ -908,7 +910,7 @@ fn shell_safe_pattern(value: &str) -> String {
 
 fn evidence_strength(object: &serde_json::Map<String, Value>) -> String {
     object
-        .get("confidence")
+        .get("evidence_strength")
         .and_then(Value::as_f64)
         .map(|score| {
             if score >= 0.8 {
@@ -921,6 +923,62 @@ fn evidence_strength(object: &serde_json::Map<String, Value>) -> String {
         })
         .unwrap_or("unverified")
         .to_string()
+}
+
+#[cfg(test)]
+mod memory_trust_tests {
+    use super::memory_highlights;
+    use serde_json::json;
+
+    #[test]
+    fn high_confidence_without_evidence_is_not_presented_as_strong_evidence() {
+        let memories = memory_highlights(
+            "repo-test",
+            &[json!({
+                "id": "unsupported-claim",
+                "content": "A confident assertion without supporting evidence.",
+                "confidence": 1.0,
+                "evidence": [],
+                "verification_status": "unverified"
+            })],
+            "matched workflow query",
+        );
+
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].evidence_strength, "unverified");
+        assert_eq!(memories[0].trust_status, "advisory");
+    }
+
+    #[test]
+    fn serialized_evidence_strength_is_preserved_independently_of_confidence() {
+        let memories = memory_highlights(
+            "repo-test",
+            &[
+                json!({
+                    "id": "weak-evidence",
+                    "content": "A high-confidence claim with weak supporting evidence.",
+                    "confidence": 1.0,
+                    "evidence_strength": 0.18,
+                    "evidence": [],
+                    "verification_status": "unverified"
+                }),
+                json!({
+                    "id": "supported-evidence",
+                    "content": "A claim supported by current evidence.",
+                    "confidence": 0.2,
+                    "evidence_strength": 0.91,
+                    "evidence": [{"kind": "test", "reference": "tests/unit.rs"}],
+                    "verification_status": "verified"
+                }),
+            ],
+            "matched workflow query",
+        );
+
+        assert_eq!(memories[0].evidence_strength, "weak");
+        assert_eq!(memories[0].trust_status, "advisory");
+        assert_eq!(memories[1].evidence_strength, "strong");
+        assert_eq!(memories[1].trust_status, "trusted");
+    }
 }
 
 fn stale_label(status: MemoryVerificationStatus, is_stale: bool) -> Option<String> {

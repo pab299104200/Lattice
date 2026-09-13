@@ -55,6 +55,18 @@ request and must continue to work after the daemon default changes.
   own tests; it is not the B2 default.
 - All modes preserve the existing MCP envelope (`content[0].type=text`),
   bounded summary behavior, handles, budget metadata, and error semantics.
+- Payload limits apply to the text delivered in `content[0].text`, after
+  workflow-v2 shaping, budget metadata, memory delivery receipts, optional
+  dense keys, and rendering. Internal Rust report serialization is not a wire
+  payload measurement.
+- When a strict budget cannot retain both duplicate supporting projections and
+  the ranked public answer, audit/event projections and the duplicated
+  `structured_payload` yield first. The authority-scoped context handle retains
+  the seed for focused expansion; workflow audit records remain in the event
+  store. Expansion does not reproduce the original complete audit payload.
+  A matching memory that fits the
+  selected budget retains its complete rendered lesson and receipt; a removed
+  lesson cannot produce a delivery receipt.
 
 ### Next action
 
@@ -91,6 +103,24 @@ Workflow metadata is telemetry, not user response content:
 
 ## Migration sequence
 
+Context-handle persistence stores only ordered authority-qualified memory
+references. Memory expansion resolves the selected reference against current
+lifecycle and scope, then atomically compares the complete memory and trust
+snapshot while recording its delivery receipt. A missing, purged,
+retention-stale, superseded, foreign, or changed reference cannot fall back to
+cached lesson text or another slot. Navigation expansion continues from the
+cached graph seed. Loading an older handle file rewrites it without embedded
+lesson payloads.
+
+Ranking diagnostics use a separate typed `relevance:<key>` cache projection.
+It contains only the candidate kind and key, total score, and numeric signal
+columns. It contains no labels, lesson prose, or inclusion explanations. A
+memory ranking snapshot revalidates its referenced memory before returning,
+but does not deliver the lesson, create a receipt, or renew memory retention.
+Successful diagnostic expansion renews only the navigation handle lifetime.
+Its static explanation identifies the numbers as retrieval-time ranking rather
+than current verification.
+
 1. Change all public schema defaults and parser fallback to `markdown`; remove
    `hybrid` from schemas and enum parsing.
 2. Make `wrap_workflow_tool_result` implement only the Markdown and JSON
@@ -110,3 +140,21 @@ This change does not alter ranking, handle lifetime, token-budget selection,
 tool payload schemas unrelated to rendering, or the metrics definitions. It
 only changes the public render default, removes duplicate payload output, and
 separates telemetry from presentation.
+
+## Canonical workflow memory delivery
+
+Before final response shaping, workflows reload each selected memory under the
+current repository or configured organization authority, checkout, branch,
+session, and lifecycle constraints. Candidate snippets and trust labels are
+replaced with complete canonical content and metadata. Candidate-derived prose
+summaries are discarded because they may describe an older memory snapshot.
+Only query-ranking fields and the exact selected identity survive this rebuild.
+
+Standard JSON, dense JSON, and Markdown deliver complete lessons when the final
+response budget also accommodates their receipts. A bounded group of at most 64
+memories is checked against full memory/structured-field digests in one immediate
+transaction before its receipt is inserted. Mutation or eligibility failure
+withholds the content and proof; a canonical storage failure preserves the graph
+result with actionable degraded memory metadata. Different authorities use
+separate databases: a later group failure can leave an unreturned attempt in an
+earlier database, but no proof is returned and no retention is renewed.

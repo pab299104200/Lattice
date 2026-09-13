@@ -14,12 +14,13 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tracing::{field, info_span};
 
 use super::{
-    empty_state, now_unix_micros, ConsolidationConfig, ConsolidationJobMode,
-    ConsolidationJobRuntime, ConsolidationJobSpec, EnqueueOutcome, EpisodeError, EpisodeOutcome,
-    EpisodeTemplate, PendingProposalSpec, ProposalKind,
+    now_unix_micros, ConsolidationConfig, ConsolidationJobMode, ConsolidationJobRuntime,
+    ConsolidationJobSpec, EnqueueOutcome, EpisodeError, EpisodeOutcome, EpisodeTemplate,
+    PendingProposalSpec, ProposalKind,
 };
 use crate::events::{EventQuery, EventReader, EventStore, QueryOrder, StableRef, TaskId};
 use crate::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
@@ -97,13 +98,13 @@ impl SessionConsolidator {
 
     pub fn on_task_complete(
         &mut self,
-        workspace_id: &str,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
         task_id: &TaskId,
         outcome: EpisodeOutcome,
     ) -> Result<SessionConsolidationOutcome, EpisodeError> {
         let span = info_span!(
             "session_consolidation",
-            workspace_id = workspace_id,
+            workspace_id = authority.repository_id,
             task_id = task_id.value.as_str(),
             slice_len = field::Empty,
             elapsed_us = field::Empty,
@@ -111,7 +112,7 @@ impl SessionConsolidator {
         );
         let _entered = span.enter();
         let started = Instant::now();
-        let slice = self.read_task_slice(workspace_id, task_id)?;
+        let slice = self.read_task_slice(authority.repository_id, task_id)?;
         span.record("slice_len", slice.len() as i64);
 
         let result = if slice.is_empty() {
@@ -120,7 +121,7 @@ impl SessionConsolidator {
             })
         } else if slice.len() > self.config.synchronous_max_events {
             let (job_id, enqueue) =
-                self.enqueue_background_redirect(workspace_id, task_id, slice.len())?;
+                self.enqueue_background_redirect(authority.repository_id, task_id, slice.len())?;
             Ok(SessionConsolidationOutcome::RedirectedToBackground {
                 job_id,
                 slice_len: slice.len(),
@@ -136,7 +137,7 @@ impl SessionConsolidator {
                     "session consolidation outcome mismatch; using event-derived outcome"
                 );
             }
-            self.emit_synchronous_proposal(workspace_id, &template)
+            self.emit_synchronous_proposal(authority, &template)
         };
 
         let elapsed = started.elapsed();
@@ -202,39 +203,41 @@ impl SessionConsolidator {
 
     fn emit_synchronous_proposal(
         &mut self,
-        workspace_id: &str,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
         template: &EpisodeTemplate,
     ) -> Result<SessionConsolidationOutcome, EpisodeError> {
         let refresh_key = episode_refresh_key(template);
         let existing = self
             .memory_store
-            .find_by_refresh_key(&refresh_key, Some(workspace_id), None)
+            .find_by_refresh_key(&refresh_key, Some(authority.repository_id), None)
             .map_err(|error| EpisodeError::StoreUnavailable(error.to_string()))?;
         let proposal_kind = if existing.is_some() {
             ProposalKind::UpdateMemory
         } else {
             ProposalKind::CreateMemory
         };
-        let prior_state = existing
-            .as_ref()
-            .map(memory_with_episode_metadata)
-            .unwrap_or_else(empty_state);
-        let proposed_memory =
-            build_episode_memory(existing.as_ref(), template, &refresh_key, workspace_id);
-        let proposed_state = memory_state_with_episode(&proposed_memory, template);
+        let proposed_memory = build_episode_memory(
+            existing.as_ref(),
+            template,
+            &refresh_key,
+            authority.repository_id,
+        );
+        let (prior_state, proposed_state) =
+            super::episode_memory_states(&self.memory_store, existing.as_ref(), proposed_memory)
+                .map_err(|error| EpisodeError::StoreUnavailable(error.to_string()))?;
         let proposal_id = format!(
             "episode-proposal-{}-{}",
-            task_id_slug(&template.task_id.value),
+            episode_task_key(&template.task_id.value),
             template.event_window.end.ulid
         );
         let job_id = format!(
             "session-consolidation-{}-{}",
-            task_id_slug(&template.task_id.value),
+            episode_task_key(&template.task_id.value),
             template.event_window.end.ulid
         );
         let job = ConsolidationJobSpec {
             job_id: job_id.clone(),
-            workspace_id: workspace_id.to_string(),
+            workspace_id: authority.repository_id.to_string(),
             kind: format!("session_consolidation:{}", template.task_id.value),
             mode: ConsolidationJobMode::SynchronousPostTask,
             proposal: Some(PendingProposalSpec {
@@ -249,7 +252,7 @@ impl SessionConsolidator {
         };
         let (_, proposal) = self
             .runtime
-            .submit_inline(job)
+            .submit_inline(job, &self.memory_store, authority)
             .map_err(|error| EpisodeError::StoreUnavailable(error.to_string()))?;
         let proposal = proposal.ok_or_else(|| {
             EpisodeError::StoreUnavailable(
@@ -274,7 +277,7 @@ fn build_episode_memory(
         id: existing.map(|memory| memory.id.clone()).unwrap_or_else(|| {
             format!(
                 "episode-{}-{}",
-                task_id_slug(&template.task_id.value),
+                episode_task_key(&template.task_id.value),
                 template.event_window.end.ulid
             )
         }),
@@ -325,39 +328,6 @@ fn build_episode_memory(
     }
 }
 
-fn memory_state_with_episode(memory: &Memory, template: &EpisodeTemplate) -> Value {
-    let mut state = serde_json::to_value(memory).expect("memory serializes");
-    if let Some(object) = state.as_object_mut() {
-        object.insert("episode_task_id".to_string(), json!(template.task_id));
-        object.insert("episode_session_id".to_string(), json!(template.session_id));
-        object.insert(
-            "episode_outcome".to_string(),
-            json!(template.outcome.as_str()),
-        );
-        object.insert(
-            "event_window".to_string(),
-            json!({
-                "start": template.event_window.start,
-                "end": template.event_window.end,
-            }),
-        );
-        object.insert(
-            "salient_anchors".to_string(),
-            serde_json::to_value(&template.salient_anchors).expect("anchors serialize"),
-        );
-        object.insert(
-            "tools_used".to_string(),
-            serde_json::to_value(&template.tools_used).expect("tools serialize"),
-        );
-        object.insert("summary_text".to_string(), json!(template.summary_text));
-    }
-    state
-}
-
-fn memory_with_episode_metadata(memory: &Memory) -> Value {
-    serde_json::to_value(memory).expect("memory serializes")
-}
-
 fn episode_evidence(template: &EpisodeTemplate) -> Value {
     json!({
         "task_id": template.task_id.value,
@@ -386,17 +356,24 @@ fn episode_refresh_key(template: &EpisodeTemplate) -> String {
 fn redirect_job_id(task_id: &TaskId) -> String {
     format!(
         "session-consolidation-background-{}-{}",
-        task_id_slug(&task_id.value),
+        episode_task_key(&task_id.value),
         now_unix_micros()
     )
 }
 
-fn task_id_slug(task_id: &str) -> String {
-    task_id
+pub fn episode_task_key(task_id: &str) -> String {
+    let readable: String = task_id
         .chars()
         .map(|character| match character {
             'a'..='z' | 'A'..='Z' | '0'..='9' => character,
             _ => '-',
         })
-        .collect()
+        .take(24)
+        .collect();
+    let digest = Sha256::digest(task_id.as_bytes());
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{readable}-{suffix}")
 }

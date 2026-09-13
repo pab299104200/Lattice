@@ -37,7 +37,7 @@ pub enum MemoryIdInput {
 }
 
 impl MemoryIdInput {
-    fn into_memory_id(self, fallback: &str) -> MemoryId {
+    pub(crate) fn into_memory_id(self, fallback: &str) -> MemoryId {
         match self {
             Self::Structured(value) => value,
             Self::Legacy(value) => MemoryId {
@@ -83,6 +83,10 @@ pub struct VerifyExplainArgs {
     /// Structured response detail level.
     #[serde(default = "default_render_mode")]
     pub render_mode: VerifyExplainRenderMode,
+    /// Explicit repository-declared check identifier. Its absence guarantees
+    /// that verification performs no external command execution.
+    #[serde(default)]
+    pub run_check: Option<String>,
 }
 
 /// Per-check outcome emitted by the unified tool.
@@ -194,6 +198,10 @@ pub fn tool_definition() -> Value {
                     "type": "string",
                     "enum": ["compact", "full", "diagnostic"],
                     "default": "full"
+                },
+                "run_check": {
+                    "type": "string",
+                    "description": "Explicitly run this repository-declared check before verification. Omit to execute no commands."
                 }
             },
             "required": ["memory_id"]
@@ -206,7 +214,8 @@ pub fn parse_args(args: &Value) -> Result<VerifyExplainArgs, String> {
         .map_err(|error| format!("Invalid verify_explain_memory arguments: {error}"))
 }
 
-pub fn execute(
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_behavioral_validations(
     store: &MemoryStore,
     indexer: &Indexer,
     graph_store: &GraphStore,
@@ -214,13 +223,20 @@ pub fn execute(
     scope_filter: &ScopeFilter,
     reports: &mut HashMap<String, ExplainReport>,
     args: VerifyExplainArgs,
+    validations: &[lattice_core::memory::BehavioralValidationRecord],
+    repository_id: Option<&str>,
+    checkout_id: Option<&str>,
+    revision: Option<&str>,
+    commit_binding: Option<&lattice_core::memory::store::VerificationCommitBinding>,
 ) -> Result<VerifyExplainExecution, String> {
     let memory_id = args
         .memory_id
         .clone()
         .into_memory_id(&scope_filter.workspace_id);
     match args.mode {
-        VerifyExplainMode::Explain => explain_only(store, scope_filter, reports, memory_id),
+        VerifyExplainMode::Explain => {
+            explain_only(store, scope_filter, reports, memory_id, checkout_id)
+        }
         VerifyExplainMode::Verify | VerifyExplainMode::VerifyAndExplain => verify_and_cache(
             store,
             indexer,
@@ -229,6 +245,11 @@ pub fn execute(
             scope_filter,
             reports,
             memory_id,
+            validations,
+            repository_id,
+            checkout_id,
+            revision,
+            commit_binding,
         ),
     }
 }
@@ -261,8 +282,9 @@ fn explain_only(
     scope_filter: &ScopeFilter,
     reports: &HashMap<String, ExplainReport>,
     memory_id: MemoryId,
+    checkout_id: Option<&str>,
 ) -> Result<VerifyExplainExecution, String> {
-    let memory = load_memory(store, scope_filter, &memory_id)?;
+    let memory = load_memory(store, scope_filter, &memory_id, checkout_id)?;
     let report = reports.get(&memory.id).cloned().ok_or_else(|| {
         format!(
             "No persisted explain report exists for memory `{}`",
@@ -286,14 +308,78 @@ fn verify_and_cache(
     scope_filter: &ScopeFilter,
     reports: &mut HashMap<String, ExplainReport>,
     memory_id: MemoryId,
+    validations: &[lattice_core::memory::BehavioralValidationRecord],
+    repository_id: Option<&str>,
+    checkout_id: Option<&str>,
+    revision: Option<&str>,
+    commit_binding: Option<&lattice_core::memory::store::VerificationCommitBinding>,
 ) -> Result<VerifyExplainExecution, String> {
-    let memory = load_memory(store, scope_filter, &memory_id)?;
+    let repository_id = repository_id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("Verification requires explicit repository authority")?;
+    let checkout_id = checkout_id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("Verification requires explicit checkout authority")?;
+    if repository_id != scope_filter.workspace_id {
+        return Err(
+            "Verification repository authority does not match the active scope".to_string(),
+        );
+    }
+    let applicable = store.with_connection(|conn| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND workspace_id=?2 AND is_invalidated=0 AND (applicable_checkout_id IS NULL OR applicable_checkout_id=?3))",
+            rusqlite::params![memory_id.ulid, repository_id, checkout_id], |row| row.get::<_,bool>(0),
+        ).map_err(|e| lattice_core::LatticeError::Storage(e.to_string()))
+    }).map_err(|e| format!("Failed to validate verification checkout: {e}"))?;
+    if !applicable {
+        return Err("Memory is missing or outside the active verification checkout".to_string());
+    }
+    let memory = load_memory(store, scope_filter, &memory_id, Some(checkout_id))?;
     let mut fields = store
         .get_structured_fields(&memory.id)
         .map_err(|error| format!("Failed to load structured fields: {error}"))?
         .unwrap_or_default();
     let prior_status = memory_status_to_phase7(fields.verification_status);
-    let phase7_status = run_phase7_verifier(store, indexer, graph_store, workspace_root, &memory)?;
+    let owned_binding;
+    let commit_binding = match commit_binding {
+        Some(binding) => binding,
+        None => {
+            let authority = repository_id;
+            owned_binding = lattice_core::memory::store::VerificationCommitBinding {
+                repository_id: authority.to_owned(),
+                checkout_id: checkout_id.to_owned(),
+                branch: scope_filter
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                target_digest: lattice_core::memory::MemoryStore::verification_target_digest_for(
+                    &memory, &fields, authority,
+                )
+                .map_err(|error| format!("Failed to bind verification target: {error}"))?,
+                observations: store
+                    .trusted_check_observations(&memory.id)
+                    .map_err(|error| format!("Failed to bind trusted observations: {error}"))?,
+            };
+            &owned_binding
+        }
+    };
+    let phase7_status = run_phase7_verifier(
+        store,
+        indexer,
+        graph_store,
+        workspace_root,
+        &memory,
+        validations,
+        repository_id,
+        checkout_id,
+        scope_filter
+            .branch
+            .as_ref()
+            .map(|branch| branch.name.as_str())
+            .unwrap_or("unknown"),
+        revision,
+    )?;
     let report = build_report(
         store,
         indexer,
@@ -305,7 +391,7 @@ fn verify_and_cache(
         prior_status,
         phase7_status,
     )?;
-    persist_status(store, indexer, &memory, &fields, &report)?;
+    persist_status(store, indexer, &memory, &fields, &report, commit_binding)?;
     reports.insert(memory.id.clone(), report.clone());
     Ok(VerifyExplainExecution {
         report,
@@ -713,20 +799,20 @@ fn persist_status(
     memory: &Memory,
     fields: &MemoryStructuredFields,
     report: &ExplainReport,
+    binding: &lattice_core::memory::store::VerificationCommitBinding,
 ) -> Result<(), String> {
     let stale_reason = report.summary_lines.first().cloned();
     let is_stale = matches!(report.status, VerificationStatus::Stale);
     store
-        .update_structured_fields(&memory.id, fields)
-        .map_err(|error| format!("Failed to persist structured verification status: {error}"))?;
-    store
-        .set_verification_state(
+        .persist_verification_result(
             &memory.id,
+            fields,
             phase7_to_memory_status(report.status),
             is_stale,
             stale_reason.as_deref(),
             now_unix_secs(),
             Some(indexer.graph_snapshot_id()),
+            binding,
         )
         .map_err(|error| format!("Failed to persist memory verification status: {error}"))
 }
@@ -735,11 +821,16 @@ fn load_memory(
     store: &MemoryStore,
     scope_filter: &ScopeFilter,
     memory_id: &MemoryId,
+    checkout_id: Option<&str>,
 ) -> Result<Memory, String> {
-    if let Some(memory) = store
-        .get_by_id_scoped(&memory_id.ulid, scope_filter)
-        .map_err(|error| format!("Failed to load scoped memory: {error}"))?
-    {
+    let memory = match checkout_id {
+        Some(checkout) => {
+            store.get_by_id_scoped_for_checkout(&memory_id.ulid, scope_filter, checkout)
+        }
+        None => store.get_by_id_scoped(&memory_id.ulid, scope_filter),
+    }
+    .map_err(|error| format!("Failed to load scoped memory: {error}"))?;
+    if let Some(memory) = memory {
         return Ok(memory);
     }
     let exists_out_of_scope = store
@@ -761,6 +852,11 @@ fn run_phase7_verifier(
     graph_store: &GraphStore,
     workspace_root: &Path,
     memory: &Memory,
+    validations: &[lattice_core::memory::BehavioralValidationRecord],
+    repository_id: &str,
+    checkout_id: &str,
+    branch: &str,
+    revision: Option<&str>,
 ) -> Result<VerificationStatus, String> {
     let conn = rusqlite::Connection::open_in_memory()
         .map_err(|error| format!("Failed to open verifier runtime database: {error}"))?;
@@ -770,10 +866,15 @@ fn run_phase7_verifier(
         .load_file_index()
         .map_err(|error| format!("Failed to load file index: {error}"))?;
     let reader = WorkspaceFileReader::new(workspace_root.to_path_buf());
-    let workspace_id = memory
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| "workspace-main".to_string());
+    if repository_id.trim().is_empty() || memory.workspace_id.as_deref() != Some(repository_id) {
+        return Err("Verification requires matching active repository authority".to_string());
+    }
+    let workspace_id = repository_id;
+    let authority = lattice_core::consolidation::EvolutionAuthority {
+        repository_id,
+        checkout_id,
+        branch,
+    };
     let mut verifier = VerifierCore::new(
         store,
         &mut runtime,
@@ -781,11 +882,21 @@ fn run_phase7_verifier(
         &file_index,
         indexer.parsed_files(),
         &reader,
-        &workspace_id,
+        workspace_id,
+        &authority,
+    );
+    verifier = verifier.with_behavioral_validations(
+        validations,
+        repository_id,
+        checkout_id,
+        revision,
+        Some(indexer.graph_snapshot_id()),
+        now_unix_secs(),
+        24 * 60 * 60,
     );
     verifier
-        .verify_memory(&memory.id)
-        .map(|verdict| verdict.status)
+        .evaluate_memory(&memory.id)
+        .map(|outcome| outcome.verdict.status)
         .map_err(|error| {
             format!(
                 "Phase 7 verifier failed for memory `{}`: {error}",

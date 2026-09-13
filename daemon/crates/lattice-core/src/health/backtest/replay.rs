@@ -583,12 +583,13 @@ fn replay_cut_point(
     let mut candidates = Vec::new();
     for offset in (0..index).rev() {
         let descendant = &spine[offset];
-        let commit = repository
-            .find_commit(descendant.oid)
-            .map_err(|source| ReplayError::Walk {
-                path: path_label.to_owned(),
-                source,
-            })?;
+        let commit =
+            repository
+                .find_commit(descendant.oid)
+                .map_err(|source| ReplayError::Walk {
+                    path: path_label.to_owned(),
+                    source,
+                })?;
         let descendant_id = descendant.oid.to_string();
         let changes = commit_changes(repository, &commit, &descendant_id, limits.git)
             .map_err(|source| ReplayError::history(path_label, source))?;
@@ -600,11 +601,7 @@ fn replay_cut_point(
             path_overflow: changes.len() > limits.git.paths_per_commit,
         });
     }
-    let selection = select_horizon(
-        cut_point.committed_at_seconds,
-        candidates,
-        limits.horizon,
-    );
+    let selection = select_horizon(cut_point.committed_at_seconds, candidates, limits.horizon);
     let labels = label_defects(&selection);
 
     let observations = build_observations(&git, &graph_snapshot, &complexity, &labels);

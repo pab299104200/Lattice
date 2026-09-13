@@ -131,7 +131,10 @@ fn an_unbacktested_fact_is_marked_as_such_in_the_bundle() {
         .expect("untested_change contributes to defect risk");
 
     assert!(!untested.backtested);
-    assert_eq!(untested.weight_per_mille, super::PROVISIONAL_WEIGHT_PER_MILLE);
+    assert_eq!(
+        untested.weight_per_mille,
+        super::PROVISIONAL_WEIGHT_PER_MILLE
+    );
 }
 
 #[test]
@@ -188,18 +191,11 @@ fn a_graph_only_summary_names_the_inputs_it_lacked() {
 
 #[test]
 fn identical_facts_serialize_byte_identically() {
-    let first = serde_json::to_string(&score_axis(
-        &hot_cyclic_file(),
-        Axis::DefectRisk,
-        weights(),
-    ))
-    .expect("serializes");
-    let second = serde_json::to_string(&score_axis(
-        &hot_cyclic_file(),
-        Axis::DefectRisk,
-        weights(),
-    ))
-    .expect("serializes");
+    let first = serde_json::to_string(&score_axis(&hot_cyclic_file(), Axis::DefectRisk, weights()))
+        .expect("serializes");
+    let second =
+        serde_json::to_string(&score_axis(&hot_cyclic_file(), Axis::DefectRisk, weights()))
+            .expect("serializes");
 
     assert_eq!(first, second);
     assert!(first.contains("\"axis\":\"defect_risk\""));

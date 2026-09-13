@@ -274,13 +274,14 @@ fn assert_thresholds(metrics: &BenchmarkMetrics) {
 }
 
 fn write_metrics_snapshot(metrics: &BenchmarkMetrics) {
-    let path = baseline_path();
-    fs::create_dir_all(path.parent().expect("baseline parent")).expect("create baseline dir");
+    let path = benchmark_output_path();
+    fs::create_dir_all(path.parent().expect("benchmark output parent"))
+        .expect("create benchmark output dir");
     let json = serde_json::to_string_pretty(metrics).expect("serialize metrics");
     fs::write(&path, format!("{json}\n")).expect("write metrics snapshot");
 }
 
-fn baseline_path() -> PathBuf {
+fn benchmark_output_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../docs/plans/2026-05-16-cognitive-workspace-fork-build/baselines/retrieval_v1_metrics.json")
+        .join("../../target/benchmark-results/retrieval_v1_metrics.json")
 }

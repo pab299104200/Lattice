@@ -62,7 +62,13 @@ impl ProcedureExtractionJob {
             complete_structured_with_provenance(ctx, services, kind, prompt, PROCEDURE_SCHEMA)?;
         let candidate = completion.value;
         let refresh_key = format!("llm_procedure::{workflow_id}");
-        let proposed = proposed_procedure_state(ctx, workflow_id, refresh_key, &candidate)?;
+        let proposed = proposed_procedure_state(
+            ctx,
+            services.authority.branch,
+            workflow_id,
+            refresh_key,
+            &candidate,
+        )?;
         submit_memory_proposal(
             ctx,
             services,
@@ -79,6 +85,7 @@ impl ProcedureExtractionJob {
 
 fn proposed_procedure_state(
     ctx: &LlmJobContext,
+    branch: &str,
     workflow_id: &str,
     refresh_key: String,
     candidate: &ProcedureMemoryCandidate,
@@ -92,6 +99,7 @@ fn proposed_procedure_state(
     );
     let mut memory = create_memory(
         ctx,
+        branch,
         content,
         MemoryType::Pattern,
         refresh_key,

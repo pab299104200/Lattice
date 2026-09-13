@@ -167,8 +167,12 @@ fn decode_event(payload: &str) -> Result<EventId, IdentityDecodeError> {
 }
 
 fn decode_memory(payload: &str) -> Result<MemoryId, IdentityDecodeError> {
-    let (workspace_id, ulid) = decode_workspace_ulid(payload)?;
-    Ok(MemoryId { workspace_id, ulid })
+    let (workspace_payload, local_id) = split_once(payload, '/', "workspace memory id")?;
+    validate_memory_local_id(local_id)?;
+    Ok(MemoryId {
+        workspace_id: unescape(workspace_payload, "workspace_id")?,
+        ulid: local_id.to_string(),
+    })
 }
 
 fn decode_context_handle(payload: &str) -> Result<ContextHandleId, IdentityDecodeError> {
@@ -267,6 +271,20 @@ fn validate_ulid(value: &str) -> Result<(), IdentityDecodeError> {
         return Ok(());
     }
     malformed("ulid", "expected canonical Crockford base32 ULID")
+}
+
+fn validate_memory_local_id(value: &str) -> Result<(), IdentityDecodeError> {
+    let is_valid = (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if is_valid {
+        return Ok(());
+    }
+    malformed(
+        "memory_id",
+        "expected 1 to 128 ASCII letters, digits, hyphens, or underscores",
+    )
 }
 
 fn escape(value: &str) -> String {

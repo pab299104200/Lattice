@@ -10,10 +10,9 @@ use std::path::PathBuf;
 
 use super::health_backtest::{
     committed_baseline, committed_per_mille, corpus_mismatch_reason, floor_per_mille,
-    per_mille_to_ratio, signals_from_report, COMMITTED_CORPUS,
-    COMMITTED_FAMILY_UPLIFT_PER_MILLE, COMMITTED_GRAPH_ONLY_ROC_AUC_PER_MILLE,
-    COMMITTED_LABEL_ENRICHMENT_PER_MILLE, COMMITTED_PR_AUC_PER_MILLE,
-    COMMITTED_ROC_AUC_PER_MILLE,
+    per_mille_to_ratio, signals_from_report, COMMITTED_CORPUS, COMMITTED_FAMILY_UPLIFT_PER_MILLE,
+    COMMITTED_GRAPH_ONLY_ROC_AUC_PER_MILLE, COMMITTED_LABEL_ENRICHMENT_PER_MILLE,
+    COMMITTED_PR_AUC_PER_MILLE, COMMITTED_ROC_AUC_PER_MILLE,
 };
 use super::report::{
     report_exit_code, RegressionReport, ReportInput, ReportRowStatus, SuccessCriteriaThresholds,
@@ -22,10 +21,8 @@ use super::{MetricScope, MetricScopeKind, MetricSignal, MetricSource, MetricValu
 use crate::health::backtest::audit::{AuditVerdict, LabelAudit};
 use crate::health::backtest::features::{FamilySet, FeatureWeights};
 use crate::health::backtest::metrics::Evaluation;
-use crate::health::backtest::report::{
-    BacktestReport, FamilyResult, RepositoryReport, Weighting,
-};
 use crate::health::backtest::replay::{ReplayLimits, ReplayReport};
+use crate::health::backtest::report::{BacktestReport, FamilyResult, RepositoryReport, Weighting};
 use crate::{DateTime, Utc};
 
 /// A fixed instant, so no assertion depends on wall-clock time.
@@ -116,7 +113,10 @@ fn report(
     BacktestReport {
         harness_version: 1,
         health_config_version: 1,
-        repositories: COMMITTED_CORPUS.iter().map(|name| repository(name)).collect(),
+        repositories: COMMITTED_CORPUS
+            .iter()
+            .map(|name| repository(name))
+            .collect(),
         pooled_observations: 82_742,
         pooled_positives: 2_100,
         pooled_cut_points: 30,
@@ -190,7 +190,10 @@ fn the_uplift_baseline_is_the_difference_the_report_records() {
 fn no_health_signal_is_scored_by_the_metrics_collector() {
     for signal in MetricSignal::HEALTH {
         assert!(signal.is_health());
-        assert_eq!(super::report::benchmark_source(signal), MetricSource::HealthBacktest);
+        assert_eq!(
+            super::report::benchmark_source(signal),
+            MetricSource::HealthBacktest
+        );
     }
 }
 
@@ -255,9 +258,7 @@ fn a_degraded_pr_auc_fails_and_sets_a_non_zero_exit_code() {
         ReportRowStatus::Pass
     );
     assert_eq!(report_exit_code(&report, true), 1);
-    assert!(report
-        .render_ci_summary()
-        .contains("health_defect_pr_auc"));
+    assert!(report.render_ci_summary().contains("health_defect_pr_auc"));
 }
 
 #[test]
@@ -306,9 +307,15 @@ fn an_uncorroborated_fix_classifier_fails_the_label_audit_signal() {
 #[test]
 fn a_rerun_over_a_different_corpus_reports_missing_data_rather_than_a_verdict() {
     let mut narrowed = committed_report();
-    narrowed.repositories.retain(|repository| repository.name == "lattice");
-    let reason = corpus_mismatch_reason(&narrowed).expect("a one-repo corpus is not the committed one");
-    assert!(reason.contains("keystone"), "reason should name what is missing: {reason}");
+    narrowed
+        .repositories
+        .retain(|repository| repository.name == "lattice");
+    let reason =
+        corpus_mismatch_reason(&narrowed).expect("a one-repo corpus is not the committed one");
+    assert!(
+        reason.contains("keystone"),
+        "reason should name what is missing: {reason}"
+    );
 
     let current = signals_from_report(&narrowed, at());
     for value in &current {
@@ -349,10 +356,7 @@ fn an_unmeasurable_family_reports_its_own_reason() {
         .find(|value| value.signal == MetricSignal::HealthDefectPrAuc)
         .expect("pr-auc is produced");
     assert!(pr_auc.value.is_none());
-    assert_eq!(
-        pr_auc.reason_if_null.as_deref(),
-        Some("no positive labels")
-    );
+    assert_eq!(pr_auc.reason_if_null.as_deref(), Some("no positive labels"));
 
     let report = build(current);
     assert_eq!(

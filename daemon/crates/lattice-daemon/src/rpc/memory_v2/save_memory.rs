@@ -282,7 +282,7 @@ pub fn build_response(
         "save_memory".to_string(),
         None,
         &WorkingMemoryState::default(),
-        vec![(memory, "saved by save_memory".to_string(), 0)],
+        vec![(memory, "saved by remember".to_string(), 0)],
     )?;
     Ok(SaveMemoryResponse {
         memory_id: memory_id.to_string(),

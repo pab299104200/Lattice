@@ -199,6 +199,8 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
                 "arguments": {
                     "input": "thread panicked at src/auth.ts:12: loginUser failed",
                     "kind": "test",
+                    "budget": "full",
+                    "max_tokens": 4000,
                     "render": "json"
                 }
             }),
@@ -219,6 +221,8 @@ async fn diagnose_failure_and_prepare_change_reuse_failure_anchors() {
                     "query": "Fix the login failure",
                     "entry_files": [anchor_file],
                     "entry_symbols": ["loginUser"],
+                    "budget": "full",
+                    "max_tokens": 4000,
                     "render": "json"
                 }
             }),
@@ -569,7 +573,7 @@ fn build_handler(
         .with_flush_policy(FlushPolicy::Sync),
     );
     let handler = McpHandler::new(
-        Arc::new(Mutex::new(QueryEngine::new(build_graph(), None, None))),
+        Arc::new(Mutex::new(QueryEngine::new(build_graph(), None))),
         indexer.clone(),
         memory_store.clone(),
         graph_store.clone(),

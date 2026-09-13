@@ -10,6 +10,24 @@ use crate::intelligence::{
 use crate::query::{CapsuleStats, ContextCapsule, ContextNode, PivotNode, QueryIntent};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 
+use super::agent::compress_memory_values;
+
+#[test]
+fn compressed_memories_preserve_their_own_qualified_identity_without_positional_inference() {
+    let compressed = compress_memory_values(
+        &[
+            json!({"id":"malformed-predecessor","memory_id":"organization:cadres:wrong","content":""}),
+            json!({"id":"local-collision","memory_id":"organization:cadres:correct","content":"complete organization lesson"}),
+        ],
+        2,
+    );
+    assert_eq!(compressed.len(), 2);
+    assert_eq!(compressed[0]["memory_id"], "organization:cadres:wrong");
+    assert_eq!(compressed[1]["id"], "local-collision");
+    assert_eq!(compressed[1]["memory_id"], "organization:cadres:correct");
+    assert_eq!(compressed[1]["content"], "complete organization lesson");
+}
+
 fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
     SymbolId {
         file: file.to_string(),
@@ -331,6 +349,7 @@ fn build_capsule() -> ContextCapsule {
             score: 0.62,
         }],
         memories: vec![json!({
+            "memory_id": "fixture-auth-coverage",
             "content": "Auth bugs often need route and session coverage",
             "type": "pattern"
         })],
@@ -719,6 +738,10 @@ fn test_prepare_change_prioritizes_primary_files_and_tests() {
     );
     assert!(bundle.memories.is_empty());
     assert_eq!(bundle.memory_highlights.len(), 1);
+    assert_eq!(
+        bundle.memory_highlights[0].memory_id,
+        "fixture-auth-coverage"
+    );
     assert!(!bundle.overview.is_empty());
     assert!(
         bundle.overview.contains("prior session pattern"),
@@ -833,7 +856,15 @@ fn test_prepare_change_uses_repo_name_query_as_scope_hint() {
         "keystone/.codex-home/.tmp/plugins/plugin-eval/src/core/workflow-guide.js".to_string(),
     ]);
 
-    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact, None);
+    let bundle = prepare_change(
+        &graph,
+        &capsule,
+        &[],
+        &[],
+        &rules,
+        BundleMode::Compact,
+        None,
+    );
 
     assert_eq!(
         bundle.primary_files.first().map(|item| item.file.as_str()),
@@ -945,7 +976,15 @@ fn test_prepare_change_promotes_specific_file_stem_over_broad_path_match() {
         "backend/tests/test_agent_version_drift.py".to_string(),
     ]);
 
-    let bundle = prepare_change(&graph, &capsule, &[], &[], &rules, BundleMode::Compact, None);
+    let bundle = prepare_change(
+        &graph,
+        &capsule,
+        &[],
+        &[],
+        &rules,
+        BundleMode::Compact,
+        None,
+    );
 
     assert_eq!(
         bundle.primary_files.first().map(|item| item.file.as_str()),
@@ -1585,6 +1624,7 @@ fn test_summarize_subsystem_compresses_key_files_symbols_and_tests() {
         "tests/session.test.ts".to_string(),
     ]);
     let memories = vec![json!({
+        "memory_id": "fixture-auth-route-order",
         "content": "Auth routes call loginUser before session creation.",
         "type": "pattern",
         "scope": "repo",
@@ -1757,6 +1797,7 @@ fn test_get_repo_playbook_surfaces_key_files_symbols_and_patterns() {
         "tests/session.test.ts".to_string(),
     ]);
     let memories = vec![json!({
+        "memory_id": "fixture-auth-entrypoints",
         "content": "Auth entrypoints live under src/routes before delegating to src/auth.ts.",
         "type": "pattern",
         "scope": "repo",
@@ -2670,7 +2711,6 @@ fn test_trace_scenario_surfaces_guard_failure_and_relevant_tests_docs() {
         login_confidence
     );
 }
-
 
 /// Two production files named by one stack trace, tied on trace proximity.
 /// `backend/hot.rs` is central and cyclic; `backend/calm.rs` is a leaf, so

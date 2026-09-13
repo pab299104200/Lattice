@@ -187,7 +187,10 @@ impl AxisScore {
     /// not conclude").
     pub fn summary(&self, fact_limit: usize) -> String {
         if self.availability == FactAvailability::Unavailable {
-            return format!("{} unknown: no facts available", self.axis.as_str().replace('_', " "));
+            return format!(
+                "{} unknown: no facts available",
+                self.axis.as_str().replace('_', " ")
+            );
         }
 
         let evidence: Vec<String> = self
@@ -252,7 +255,10 @@ pub fn score_axis(facts: &FileFacts, axis: Axis, weights: &WeightTable) -> AxisS
     let score = round_div(weighted_sum, available_weight) as u16;
     let missing_weight = u128::from(total_weight).saturating_sub(available_weight);
     let floor = round_div(weighted_sum, u128::from(total_weight)) as u16;
-    let ceiling = round_div(weighted_sum + missing_weight * 1000, u128::from(total_weight)) as u16;
+    let ceiling = round_div(
+        weighted_sum + missing_weight * 1000,
+        u128::from(total_weight),
+    ) as u16;
 
     let mut facts_out: Vec<FactContribution> = contributions
         .into_iter()

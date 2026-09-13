@@ -9,7 +9,6 @@ use super::{
     QueryOrder, SessionId, Snapshot, TaskId,
 };
 use crate::graph::{CodeGraph, EdgeKind};
-use crate::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 
 #[test]
@@ -90,9 +89,8 @@ fn bootstrap_snapshot_plus_tail_matches_full_state_for_state_neutral_events() {
         .expect("seed event appends");
 
     let graph = sample_graph();
-    let memory = sample_memory_store();
     let snapshot_path = fixture.tempdir.path().join("snapshot-1-1.bin");
-    Snapshot::write(&snapshot_path, &graph, &memory, 1).expect("snapshot writes");
+    Snapshot::write(&snapshot_path, &graph, 1).expect("snapshot writes");
 
     writer
         .append(event_envelope(
@@ -105,7 +103,7 @@ fn bootstrap_snapshot_plus_tail_matches_full_state_for_state_neutral_events() {
         .expect("tail event appends");
 
     let bootstrapped = Bootstrap::load(&snapshot_path, &fixture.store).expect("bootstrap loads");
-    let full_replay_state = Snapshot::capture(&graph, &memory, 2).expect("full state captures");
+    let full_replay_state = Snapshot::capture(&graph, 2).expect("full state captures");
 
     assert_eq!(bootstrapped.replayed_event_rows, 1);
     assert_eq!(
@@ -333,36 +331,6 @@ fn sample_graph() -> CodeGraph {
     );
     graph.add_edge(&left, &right, EdgeKind::Calls);
     graph
-}
-
-fn sample_memory_store() -> MemoryStore {
-    let store = MemoryStore::open_in_memory().expect("memory store opens");
-    store.store(sample_memory()).expect("memory stores");
-    store
-}
-
-fn sample_memory() -> Memory {
-    Memory {
-        id: "memory-a".to_string(),
-        session_id: "session-a".to_string(),
-        content: "Replay preserves graph and memory snapshots.".to_string(),
-        memory_type: MemoryType::Observation,
-        scope: MemoryScope::Repo,
-        confidence: 0.9,
-        linked_symbols: vec!["helper".to_string()],
-        linked_files: vec!["src/lib.rs".to_string()],
-        workspace_id: Some("workspace-main".to_string()),
-        branch: Some("main".to_string()),
-        scope_organization_id: None,
-        refresh_key: Some("replay-test".to_string()),
-        source_query: None,
-        created_at: 1,
-        last_accessed: 1,
-        access_count: 0,
-        is_stale: false,
-        stale_reason: None,
-        verification_status: crate::memory::MemoryVerificationStatus::Unverified,
-    }
 }
 
 fn symbol_id(file: &str, name: &str, byte_offset: usize) -> SymbolId {

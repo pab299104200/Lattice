@@ -194,12 +194,7 @@ pub fn defect_risk_evidence(
     health: Option<&HealthFactIndex>,
     path: &str,
 ) -> Option<HealthEvidence> {
-    axis_evidence(
-        health,
-        path,
-        Axis::DefectRisk,
-        HEALTH_EVIDENCE_FACT_LIMIT,
-    )
+    axis_evidence(health, path, Axis::DefectRisk, HEALTH_EVIDENCE_FACT_LIMIT)
 }
 
 /// A graph-derived impact candidate plus the stable keys required to order it.
@@ -260,7 +255,11 @@ pub fn order_impact_within_tier_by_defect_risk<T>(
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         }
-        .then_with(|| candidates[left].stable_key.cmp(&candidates[right].stable_key))
+        .then_with(|| {
+            candidates[left]
+                .stable_key
+                .cmp(&candidates[right].stable_key)
+        })
     });
 
     apply_permutation(candidates, order);
@@ -426,7 +425,10 @@ pub struct UntestedChangeEntry {
 /// Only files the producer actually measured appear: a file with no
 /// test-proximity fact is unknown, and reporting it as untested would be
 /// exactly the "unknown scored as zero" this engine forbids.
-pub fn untested_changes<I, S>(health: Option<&HealthFactIndex>, paths: I) -> Vec<UntestedChangeEntry>
+pub fn untested_changes<I, S>(
+    health: Option<&HealthFactIndex>,
+    paths: I,
+) -> Vec<UntestedChangeEntry>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -453,10 +455,7 @@ where
             path: path.to_string(),
             linked_test_count: 0,
             availability: value.availability.as_str().to_string(),
-            detail: format!(
-                "{} has no edge-linked tests in the published index",
-                path
-            ),
+            detail: format!("{} has no edge-linked tests in the published index", path),
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -505,7 +504,10 @@ pub struct HealthWarning {
 /// engine could not compute all yield no warning rather than a guess. The
 /// caller is responsible for passing only successful, workspace-scoped edit
 /// paths, and this function performs no I/O.
-pub fn select_health_warnings<I, S>(health: Option<&HealthFactIndex>, paths: I) -> Vec<HealthWarning>
+pub fn select_health_warnings<I, S>(
+    health: Option<&HealthFactIndex>,
+    paths: I,
+) -> Vec<HealthWarning>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,

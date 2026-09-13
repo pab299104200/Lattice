@@ -184,7 +184,10 @@ pub const COMMITTED_POOLED_OBSERVATIONS: u64 = 82_742;
 /// the replayed corpus is not the committed one — comes back as `None` with a
 /// truthful `reason_if_null` rather than as a number that would be compared
 /// against a baseline it does not belong to.
-pub fn signals_from_report(report: &BacktestReport, computed_at: DateTime<Utc>) -> Vec<MetricValue> {
+pub fn signals_from_report(
+    report: &BacktestReport,
+    computed_at: DateTime<Utc>,
+) -> Vec<MetricValue> {
     let corpus_mismatch = corpus_mismatch_reason(report);
     MetricSignal::HEALTH
         .iter()
@@ -211,16 +214,14 @@ pub fn signals_from_report(report: &BacktestReport, computed_at: DateTime<Utc>) 
 /// Read one signal's per-mille value out of a report.
 fn measure(report: &BacktestReport, signal: MetricSignal) -> (Option<u32>, Option<String>) {
     match signal {
-        MetricSignal::HealthDefectPrAuc => {
-            held_out(report, FamilySet::All, |evaluation| evaluation.pr_auc_per_mille)
-        }
-        MetricSignal::HealthDefectRocAuc => {
-            held_out(report, FamilySet::All, |evaluation| evaluation.roc_auc_per_mille)
-        }
+        MetricSignal::HealthDefectPrAuc => held_out(report, FamilySet::All, |evaluation| {
+            evaluation.pr_auc_per_mille
+        }),
+        MetricSignal::HealthDefectRocAuc => held_out(report, FamilySet::All, |evaluation| {
+            evaluation.roc_auc_per_mille
+        }),
         MetricSignal::HealthDefectFamilyUplift => family_uplift(report),
-        MetricSignal::HealthLabelAuditEnrichment => {
-            (Some(report.audit.enrichment_per_mille), None)
-        }
+        MetricSignal::HealthLabelAuditEnrichment => (Some(report.audit.enrichment_per_mille), None),
         _ => (
             None,
             Some("signal is not produced by the health backtest".to_string()),
@@ -269,12 +270,14 @@ fn held_out(
     };
     match &result.evaluation {
         Some(evaluation) => (Some(read(evaluation)), None),
-        None => (
-            None,
-            Some(result.unavailable.clone().unwrap_or_else(|| {
-                format!("family `{}` could not be evaluated", family.as_str())
-            })),
-        ),
+        None => {
+            (
+                None,
+                Some(result.unavailable.clone().unwrap_or_else(|| {
+                    format!("family `{}` could not be evaluated", family.as_str())
+                })),
+            )
+        }
     }
 }
 

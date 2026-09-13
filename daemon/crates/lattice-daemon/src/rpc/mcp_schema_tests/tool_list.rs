@@ -96,6 +96,28 @@ async fn every_advertised_tool_carries_name_description_and_input_schema() {
 }
 
 #[tokio::test]
+async fn recall_advertises_explicit_retention_stale_discovery() {
+    let fixture = SchemaFixture::new("recall-retention-stale-schema");
+    let response = fixture
+        .handler
+        .handle("tools/list", json!({}))
+        .await
+        .expect("tools/list succeeds");
+    let recall = response["tools"]
+        .as_array()
+        .expect("tools/list returned tools array")
+        .iter()
+        .find(|tool| tool["name"] == "recall")
+        .expect("recall is advertised");
+    let property = &recall["inputSchema"]["properties"]["include_retention_stale"];
+    assert_eq!(property["type"], "boolean");
+    assert_eq!(property["default"], false);
+    assert!(property["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("explicit lifecycle inspection")));
+}
+
+#[tokio::test]
 async fn advertised_defaults_match_dispatcher_defaults() {
     let fixture = SchemaFixture::new("schema-defaults");
     let response = fixture
@@ -158,7 +180,7 @@ async fn advertised_status_scopes_match_the_dispatcher() {
 
     assert_eq!(
         scopes,
-        vec!["index", "docs", "memory", "conflicts", "health"],
+        vec!["index", "docs", "memory", "conflicts", "health", "storage"],
         "the advertised scope list is the agent-facing contract"
     );
     assert!(scopes.contains(&AGENT_STATUS_SCOPE_DEFAULT.to_string()));
@@ -192,14 +214,16 @@ async fn health_status_scope_reports_provenance_and_incomplete_analysis() {
     let fixture = SchemaFixture::new("schema-status-health");
     let response = fixture
         .handler
-        .handle("tools/call", call_args("status", json!({ "scope": "health" })))
+        .handle(
+            "tools/call",
+            call_args("status", json!({ "scope": "health" })),
+        )
         .await
         .expect("health status succeeds");
     let payload = parse_tool_payload(&response);
 
     assert_eq!(
-        payload["backtest_report"],
-        "docs/reports/health-backtest/2026-08-14.md",
+        payload["backtest_report"], "docs/reports/health-backtest/2026-08-14.md",
         "the weights must cite the report they came from"
     );
     assert!(payload["weights_version"].is_u64());

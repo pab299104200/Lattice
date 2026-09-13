@@ -20,7 +20,8 @@ use tracing::info_span;
 use crate::consolidation::llm::LlmProvenance;
 use crate::consolidation::proposal::{load_row, ConsolidationProposalRow};
 use crate::consolidation::{
-    ApplyOutcome, ConsolidationProposal, ProposalDecision, ProposalKind, RejectOutcome,
+    drain_event_outbox, ApplyOutcome, ConsolidationProposal, EvolutionAuthority, ProposalDecision,
+    ProposalKind, RejectOutcome,
 };
 use crate::error::LatticeError;
 use crate::events::EventWriter;
@@ -115,10 +116,11 @@ impl<'a> ReviewQueue<'a> {
         filter: &ReviewQueueFilter,
     ) -> Result<Vec<ReviewItem>, ReviewQueueError> {
         let requested_workspace = filter.workspace_id.as_deref().unwrap_or(workspace_id);
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT p.proposal_id,
+        self.memory_store
+            .with_connection(|conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT p.proposal_id,
                     p.job_id,
                     j.workspace_id,
                     j.enqueued_at,
@@ -137,49 +139,56 @@ impl<'a> ReviewQueue<'a> {
              WHERE p.decision = 'pending'
                AND j.workspace_id = ?1
              ORDER BY j.enqueued_at ASC",
-            )
-            .map_err(storage_error)?;
-        let rows = statement
-            .query_map(params![requested_workspace], map_review_row)
-            .map_err(storage_error)?;
-        let mut items = Vec::new();
-        for row in rows {
-            let item = ReviewItem::try_from(row.map_err(storage_error)?)?;
-            if !is_manual_review_scope(item.scope) {
-                continue;
-            }
-            if let Some(scope) = filter.scope {
-                if item.scope != scope {
-                    continue;
+                    )
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                let rows = statement
+                    .query_map(params![requested_workspace], map_review_row)
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                let mut items = Vec::new();
+                for row in rows {
+                    let row = row.map_err(|error| LatticeError::Storage(error.to_string()))?;
+                    let item = ReviewItem::try_from(row)
+                        .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                    if !is_manual_review_scope(item.scope) {
+                        continue;
+                    }
+                    if let Some(scope) = filter.scope {
+                        if item.scope != scope {
+                            continue;
+                        }
+                    }
+                    if let Some(kind) = filter.kind {
+                        if item.kind != kind {
+                            continue;
+                        }
+                    }
+                    if let Some(older_than) = filter.older_than {
+                        if item.enqueued_at > older_than {
+                            continue;
+                        }
+                    }
+                    items.push(item);
                 }
-            }
-            if let Some(kind) = filter.kind {
-                if item.kind != kind {
-                    continue;
-                }
-            }
-            if let Some(older_than) = filter.older_than {
-                if item.enqueued_at > older_than {
-                    continue;
-                }
-            }
-            items.push(item);
-        }
-        Ok(items)
+                Ok(items)
+            })
+            .map_err(ReviewQueueError::Storage)
     }
 
     pub fn pending_count(&self, workspace_id: &str) -> Result<usize, ReviewQueueError> {
-        pending_manual_review_count(self.conn, workspace_id).map_err(Into::into)
+        self.memory_store
+            .with_connection(|conn| pending_manual_review_count_up_to(conn, workspace_id, 4096))
+            .map_err(ReviewQueueError::Storage)
     }
 
     /// Internal review-queue API for the Phase 10 memory inbox described in
     /// `## 10. Human Review Surface` "Required operator views".
     pub fn inspect(&self, proposal_id: &str) -> Result<ReviewItem, ReviewQueueError> {
-        let row = load_row(self.conn, proposal_id)?.ok_or_else(|| {
-            ReviewQueueError::ProposalNotFound {
+        let row = self
+            .memory_store
+            .with_connection(|conn| load_row(conn, proposal_id))?
+            .ok_or_else(|| ReviewQueueError::ProposalNotFound {
                 proposal_id: proposal_id.to_string(),
-            }
-        })?;
+            })?;
         let item = ReviewItem::try_from(row)?;
         if !is_manual_review_scope(item.scope) {
             return Err(ReviewQueueError::ScopeMismatch {
@@ -196,8 +205,22 @@ impl<'a> ReviewQueue<'a> {
         decision: ProposalDecision,
         decided_by: &OperatorId,
         reason: Option<String>,
+        authority: &EvolutionAuthority<'_>,
     ) -> Result<ReviewDecisionOutcome, ReviewQueueError> {
-        let item = self.inspect(proposal_id)?;
+        let item = self.memory_store.with_connection(|conn| {
+            let row = load_row(conn, proposal_id)?.ok_or_else(|| {
+                LatticeError::Storage(format!(
+                    "Review proposal '{proposal_id}' was not found in the canonical memory store"
+                ))
+            })?;
+            ReviewItem::try_from(row).map_err(|e| LatticeError::Storage(e.to_string()))
+        })?;
+        if !is_manual_review_scope(item.scope) {
+            return Err(ReviewQueueError::ScopeMismatch {
+                proposal_id: proposal_id.to_string(),
+                scope: item.scope.as_str().to_string(),
+            });
+        }
         let span = info_span!(
             "manual_review_decision",
             proposal_id = item.proposal_id.as_str(),
@@ -211,67 +234,84 @@ impl<'a> ReviewQueue<'a> {
                 decision: item.decision,
             });
         }
-        let proposal = ConsolidationProposal::load(self.conn, proposal_id)?.ok_or_else(|| {
-            ReviewQueueError::ProposalNotFound {
-                proposal_id: proposal_id.to_string(),
-            }
-        })?;
         let reason_ref = reason.as_deref();
-        match decision {
-            ProposalDecision::Applied => {
-                let outcome = proposal.apply(
-                    self.conn,
-                    self.memory_store,
-                    self.event_writer,
-                    decided_by.value.as_str(),
-                    reason_ref,
-                )?;
-                Ok(ReviewDecisionOutcome::Applied { outcome })
-            }
-            ProposalDecision::Rejected => {
-                let outcome = proposal.reject(
-                    self.conn,
-                    self.event_writer,
-                    decided_by.value.as_str(),
-                    reason_ref,
-                )?;
-                Ok(ReviewDecisionOutcome::Rejected { outcome })
-            }
-            ProposalDecision::Pending | ProposalDecision::Reverted => {
-                Ok(ReviewDecisionOutcome::AlreadyDecided { decision })
-            }
+        if authority.repository_id != self.event_writer.workspace_id() {
+            return Err(ReviewQueueError::Storage(LatticeError::Storage(
+                "review authority repository does not match event writer".into(),
+            )));
         }
+        let outcome = self.memory_store.with_connection(|conn| {
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                LatticeError::Storage(format!("Failed to begin review decision transaction: {e}"))
+            })?;
+            let proposal = ConsolidationProposal::load(&tx, proposal_id)?.ok_or_else(|| {
+                LatticeError::Storage(format!(
+                    "Review proposal '{proposal_id}' was not found in the canonical memory store"
+                ))
+            })?;
+            let outcome = match decision {
+                ProposalDecision::Applied => ReviewDecisionOutcome::Applied {
+                    outcome: proposal.apply_transactional(
+                        &tx,
+                        self.memory_store,
+                        authority,
+                        &decided_by.value,
+                        reason_ref,
+                    )?,
+                },
+                ProposalDecision::Rejected => ReviewDecisionOutcome::Rejected {
+                    outcome: proposal.reject_transactional(
+                        &tx,
+                        authority,
+                        &decided_by.value,
+                        reason_ref,
+                    )?,
+                },
+                ProposalDecision::Pending | ProposalDecision::Reverted => {
+                    ReviewDecisionOutcome::AlreadyDecided { decision }
+                }
+            };
+            tx.commit().map_err(|e| {
+                LatticeError::Storage(format!("Failed to commit review decision: {e}"))
+            })?;
+            Ok(outcome)
+        })?;
+        drain_event_outbox(self.memory_store, self.event_writer, 64)?;
+        Ok(outcome)
     }
 }
 
-pub(crate) fn pending_manual_review_count(
+pub(crate) fn pending_manual_review_count_up_to(
     conn: &Connection,
     workspace_id: &str,
+    limit: usize,
 ) -> Result<usize, LatticeError> {
-    let count = conn
-        .query_row(
-            "SELECT COUNT(*)
-             FROM consolidation_proposals p
-             INNER JOIN consolidation_jobs j ON j.job_id = p.job_id
-             WHERE p.decision = 'pending'
-               AND j.workspace_id = ?1
-               AND lower(COALESCE(
-                    json_extract(p.proposed_state, '$.memory.scope'),
-                    json_extract(p.proposed_state, '$.scope'),
-                    json_extract(p.prior_state, '$.memory.scope'),
-                    json_extract(p.prior_state, '$.scope')
-               )) IN ('repo', 'organization')",
-            params![workspace_id],
-            |row| row.get::<_, i64>(0),
-        )
+    let limit = limit.min(4096);
+    let ready:bool=conn.query_row("SELECT complete=1 AND blocked_proposal_id IS NULL FROM consolidation_proposal_ref_backfill WHERE id=1",[],|row|row.get(0))
+        .map_err(|error|LatticeError::Storage(format!("Failed to inspect manual-review admission readiness: {error}")))?;
+    if !ready {
+        return Err(LatticeError::Storage(
+            "manual-review admission is blocked until bounded proposal migration completes".into(),
+        ));
+    }
+    let mut statement=conn.prepare("SELECT a.proposal_id FROM consolidation_proposal_admission a INDEXED BY idx_consolidation_proposal_admission_workspace JOIN consolidation_proposals p ON p.proposal_id=a.proposal_id WHERE a.workspace_id=?1 AND a.manual_review=1 AND p.decision='pending' ORDER BY a.proposal_id LIMIT ?2")
+        .map_err(|error|LatticeError::Storage(format!("Failed to prepare bounded manual-review admission: {error}")))?;
+    let rows = statement
+        .query_map(params![workspace_id, limit.saturating_add(1)], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| {
             LatticeError::Storage(format!(
-                "Failed to count pending manual-review proposals: {error}"
+                "Failed to query bounded manual-review admission: {error}"
             ))
         })?;
-    usize::try_from(count).map_err(|_| {
-        LatticeError::Storage("pending manual-review proposal count overflowed".to_string())
-    })
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.len())
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to decode bounded manual-review admission: {error}"
+            ))
+        })
 }
 
 fn storage_error(error: rusqlite::Error) -> ReviewQueueError {

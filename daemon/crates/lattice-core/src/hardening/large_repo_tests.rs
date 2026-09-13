@@ -30,7 +30,6 @@ use crate::intelligence::{
     diagnose_failure, expand_context, find_relevant_tests, impact_from_diff, prepare_change,
     BundleMode, ExpandContextSeed, ProjectRule, RulesDetector,
 };
-use crate::memory::MemoryStore;
 use crate::query::QueryEngine;
 use crate::storage::graph_store::{
     FileIndexEntry, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
@@ -44,8 +43,7 @@ const WARMUP_ITERATIONS: usize = 100;
 const IDENTITY_BUDGET_US: u64 = 2_000;
 const EVENT_WRITE_BUDGET_US: u64 = 10_000;
 const FULL_COMPACTION_EVENTS: usize = 1_000_000;
-const REPORT_PATH: &str =
-    "docs/plans/2026-05-16-cognitive-workspace-fork-build/baselines/large_repo_results.json";
+const REPORT_PATH: &str = "daemon/target/benchmark-results/large_repo_results.json";
 const REQUESTED_FIXTURE_ROOT: &str =
     "docs/plans/2026-05-16-cognitive-workspace-fork-build/fixtures/large_repos";
 const T66_FIXTURE_ROOT: &str = "daemon/crates/lattice-core/benches/fixtures";
@@ -95,9 +93,6 @@ fn test_event_log_compaction_keeps_hot_path_p99_within_5ms_budget() {
         store,
         writer.clone(),
         Arc::new(Mutex::new(Arc::new(CodeGraph::new()))),
-        Arc::new(Mutex::new(
-            MemoryStore::open_in_memory().expect("memory store opens"),
-        )),
         compaction_config(),
     );
     let started = Instant::now();
@@ -413,7 +408,7 @@ fn detect_rules(graph: &CodeGraph) -> Vec<ProjectRule> {
 }
 
 fn context_capsule(graph: &CodeGraph, query: &str) -> crate::query::ContextCapsule {
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     engine.query(query, None, false)
 }
 

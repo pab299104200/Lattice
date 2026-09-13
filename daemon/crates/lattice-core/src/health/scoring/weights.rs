@@ -61,9 +61,7 @@ pub const PROVISIONAL_WEIGHT_PER_MILLE: u32 = 50;
 /// Two axes, not three: `performance_risk` is rejected by spec design decision
 /// 1 because static graph, git, and complexity facts do not measure runtime
 /// behaviour.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Axis {
     /// How this file ranks on evidence associated with later fix-shaped
@@ -143,27 +141,27 @@ pub fn derive_weight_per_mille(roc_auc_per_mille: u32) -> u32 {
 /// at the floor. `unstable_dependencies` and `dead_exported_symbols` are
 /// maintainability evidence and carry no weight here at all.
 pub const DEFECT_RISK_WEIGHTS: [u32; FACT_COUNT] = [
-    270, // fan_in                     roc 0.635
-    550, // fan_out                    roc 0.775
-    62,  // scc_size                   roc 0.531
-    62,  // cycle_member               roc 0.531
-    154, // instability                roc 0.577
-    600, // hotspot_score              roc 0.800
-    532, // bug_fix_commits            roc 0.766
-    578, // bug_fix_density            roc 0.789
-    524, // line_churn                 roc 0.762
-    50,  // author_count               roc 0.525
-    96,  // top_author_share           roc 0.548
-    104, // bus_factor                 roc 0.552
-    206, // max_cyclomatic_complexity  roc 0.603
-    144, // p90_cyclomatic_complexity  roc 0.572
-    192, // max_function_length        roc 0.596
-    152, // max_nesting_depth          roc 0.576
-    110, // over_threshold_share       roc 0.555
-    284, // function_count             roc 0.642
-    0,   // unstable_dependencies      not a defect-risk input
+    270,                          // fan_in                     roc 0.635
+    550,                          // fan_out                    roc 0.775
+    62,                           // scc_size                   roc 0.531
+    62,                           // cycle_member               roc 0.531
+    154,                          // instability                roc 0.577
+    600,                          // hotspot_score              roc 0.800
+    532,                          // bug_fix_commits            roc 0.766
+    578,                          // bug_fix_density            roc 0.789
+    524,                          // line_churn                 roc 0.762
+    50,                           // author_count               roc 0.525
+    96,                           // top_author_share           roc 0.548
+    104,                          // bus_factor                 roc 0.552
+    206,                          // max_cyclomatic_complexity  roc 0.603
+    144,                          // p90_cyclomatic_complexity  roc 0.572
+    192,                          // max_function_length        roc 0.596
+    152,                          // max_nesting_depth          roc 0.576
+    110,                          // over_threshold_share       roc 0.555
+    284,                          // function_count             roc 0.642
+    0,                            // unstable_dependencies      not a defect-risk input
     PROVISIONAL_WEIGHT_PER_MILLE, // untested_change  provisional, unmeasured
-    0,   // dead_exported_symbols      not a defect-risk input
+    0,                            // dead_exported_symbols      not a defect-risk input
 ];
 
 /// `maintainability` weights, per-mille, indexed by [`FactKind::index`].

@@ -1,0 +1,54 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/pete/Cadres/lattice/integrations/codex/hooks/post-tool-use.sh",
+            "statusMessage": "Checking Lattice edit impact",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "apply_patch|Edit|Write"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/pete/Cadres/lattice/integrations/codex/hooks/session-end.sh",
+            "statusMessage": "Finalizing protected Lattice session capture",
+            "timeout": 3,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/pete/Cadres/lattice/integrations/codex/hooks/session-start.sh",
+            "statusMessage": "Loading Lattice session context",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "startup|resume|clear|compact"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/pete/Cadres/lattice/integrations/codex/hooks/user-prompt-submit.sh",
+            "statusMessage": "Loading Lattice prompt context",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

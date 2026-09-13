@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "lattice": {
-      "type": "stdio",
-      "command": "/absolute/path/to/Lattice/daemon/target/release/lattice",
-      "args": ["--stdio", "--workspace", "/absolute/path/to/your/project"]
-    }
-  }
-}

@@ -21,6 +21,7 @@ fn session_scope_proposal_is_not_gated_and_auto_applies() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
 
@@ -43,6 +44,7 @@ fn branch_scope_proposal_is_not_gated_and_auto_applies() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
 
@@ -64,6 +66,7 @@ fn repo_scope_proposal_is_gated_and_stays_pending() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
 
@@ -91,6 +94,7 @@ fn organization_scope_proposal_is_gated_and_stays_pending() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
 
@@ -111,6 +115,7 @@ fn decide_apply_routes_through_proposal_apply_and_records_operator() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
     let queue = fixture.review_queue();
@@ -121,6 +126,7 @@ fn decide_apply_routes_through_proposal_apply_and_records_operator() {
             ProposalDecision::Applied,
             &fixture.operator("reviewer-1"),
             Some("promote durable fact".to_string()),
+            &test_authority(),
         )
         .unwrap();
 
@@ -167,6 +173,7 @@ fn decide_reject_leaves_memory_unchanged_and_records_rejection() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
     let queue = fixture.review_queue();
@@ -177,6 +184,7 @@ fn decide_reject_leaves_memory_unchanged_and_records_rejection() {
             ProposalDecision::Rejected,
             &fixture.operator("reviewer-2"),
             Some("insufficient evidence".to_string()),
+            &test_authority(),
         )
         .unwrap();
 
@@ -208,6 +216,7 @@ fn list_pending_returns_oldest_first_and_honors_filters() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
     fixture.set_enqueued_at("job-repo", 10);
@@ -256,6 +265,7 @@ fn second_decision_is_idempotent() {
             &fixture.memory_store,
             &fixture.event_writer,
             &fixture.operator("auto-policy"),
+            &test_authority(),
         )
         .unwrap();
     let queue = fixture.review_queue();
@@ -265,6 +275,7 @@ fn second_decision_is_idempotent() {
             ProposalDecision::Applied,
             &fixture.operator("reviewer-1"),
             Some("accept".to_string()),
+            &test_authority(),
         )
         .unwrap();
 
@@ -274,6 +285,7 @@ fn second_decision_is_idempotent() {
             ProposalDecision::Applied,
             &fixture.operator("reviewer-1"),
             Some("duplicate".to_string()),
+            &test_authority(),
         )
         .unwrap();
 
@@ -342,7 +354,7 @@ impl Fixture {
         let db_path = dir.path().join("consolidation.sqlite");
         let event_store = Arc::new(EventStore::open_in_memory().unwrap());
         Self {
-            memory_store: MemoryStore::open(&dir.path().join("memory.sqlite")).unwrap(),
+            memory_store: MemoryStore::open(&db_path).unwrap(),
             event_store: event_store.clone(),
             event_writer: EventWriter::new(event_store, "workspace-main".to_string(), 4096),
             db_path,

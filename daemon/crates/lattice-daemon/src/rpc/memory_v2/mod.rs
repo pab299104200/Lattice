@@ -29,6 +29,7 @@ pub mod list_memory_conflicts;
 pub mod propose_memory_evolution;
 pub mod save_memory;
 pub mod save_quick_memory;
+pub(crate) mod verification_queue;
 pub mod verify_explain_memory;
 
 #[cfg(test)]

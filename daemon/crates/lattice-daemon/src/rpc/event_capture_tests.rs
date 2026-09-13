@@ -219,7 +219,7 @@ impl CaptureFixture {
             .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
         );
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),

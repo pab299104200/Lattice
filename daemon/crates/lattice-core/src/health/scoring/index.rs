@@ -272,7 +272,10 @@ impl HealthFactIndexBuilder {
     }
 
     /// Add already-shared published test-proximity facts (H2.4).
-    pub fn with_shared_test_proximity_facts(mut self, snapshot: Arc<TestProximitySnapshot>) -> Self {
+    pub fn with_shared_test_proximity_facts(
+        mut self,
+        snapshot: Arc<TestProximitySnapshot>,
+    ) -> Self {
         self.test_proximity = Some(snapshot);
         self
     }
@@ -283,10 +286,7 @@ impl HealthFactIndexBuilder {
     }
 
     /// Add already-shared published dead-symbol facts (H2.3).
-    pub fn with_shared_dead_symbol_facts(
-        mut self,
-        snapshot: Arc<DeadSymbolFactsSnapshot>,
-    ) -> Self {
+    pub fn with_shared_dead_symbol_facts(mut self, snapshot: Arc<DeadSymbolFactsSnapshot>) -> Self {
         self.dead_symbols = Some(snapshot);
         self
     }
@@ -490,7 +490,6 @@ impl HealthFactIndexBuilder {
                 push(FactKind::BusFactor, u64::from(bus_factor));
             }
         }
-
     }
 
     /// A file the git window never touched: counts are zero *for this window*,
@@ -509,10 +508,7 @@ impl HealthFactIndexBuilder {
             head_commit: snapshot.head_commit_id().map(str::to_string),
         };
         for facts in raw.values_mut() {
-            if facts
-                .iter()
-                .any(|fact| fact.kind == FactKind::HotspotScore)
-            {
+            if facts.iter().any(|fact| fact.kind == FactKind::HotspotScore) {
                 continue;
             }
             for kind in [
@@ -607,18 +603,16 @@ impl HealthFactIndexBuilder {
         let availability: FactAvailability = snapshot.availability().into();
         let mut counts: BTreeMap<&str, (u64, FactSourceRange)> = BTreeMap::new();
         for candidate in snapshot.flagged() {
-            let entry = counts
-                .entry(candidate.path.as_str())
-                .or_insert_with(|| {
-                    (
-                        0,
-                        FactSourceRange::new(
-                            candidate.path.clone(),
-                            candidate.source_line,
-                            candidate.source_end_line,
-                        ),
-                    )
-                });
+            let entry = counts.entry(candidate.path.as_str()).or_insert_with(|| {
+                (
+                    0,
+                    FactSourceRange::new(
+                        candidate.path.clone(),
+                        candidate.source_line,
+                        candidate.source_end_line,
+                    ),
+                )
+            });
             entry.0 += 1;
         }
 
@@ -668,16 +662,13 @@ fn extremum_range(
     facts: &FileComplexityFacts,
     metric: impl Fn(&crate::health::complexity_facts::SymbolComplexityFacts) -> u32,
 ) -> Option<FactSourceRange> {
-    let best = facts
-        .symbols
-        .iter()
-        .max_by(|left, right| {
-            metric(left)
-                .cmp(&metric(right))
-                // Ties resolve to the earliest symbol, which is stable across
-                // runs because the producer orders symbols by byte offset.
-                .then(right.byte_offset.cmp(&left.byte_offset))
-        })?;
+    let best = facts.symbols.iter().max_by(|left, right| {
+        metric(left)
+            .cmp(&metric(right))
+            // Ties resolve to the earliest symbol, which is stable across
+            // runs because the producer orders symbols by byte offset.
+            .then(right.byte_offset.cmp(&left.byte_offset))
+    })?;
     Some(FactSourceRange::new(
         path.to_string(),
         best.line as u32,

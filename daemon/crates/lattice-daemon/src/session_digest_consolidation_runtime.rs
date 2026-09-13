@@ -699,6 +699,8 @@ impl SessionCaptureRetentionWorker {
 
 struct RuntimeWorker {
     repository_id: String,
+    checkout_id: String,
+    workspace_root: PathBuf,
     memory_path: PathBuf,
     state_path: PathBuf,
     owner: String,
@@ -713,8 +715,13 @@ impl RuntimeWorker {
         let Some(watermark) = lease else {
             return Ok(RunOutcome::Idle);
         };
-        let result = self.run_consolidator();
+        let result = self.run_consolidator(&watermark);
         match result {
+            Ok(SessionDigestConsolidationOutcome::Skipped { reason, .. })
+                if reason != lattice_core::consolidation::ConsolidationSkipReason::NoEligibleCaptureFacts => {
+                self.finish_failure()?;
+                Ok(RunOutcome::Skipped)
+            }
             Ok(outcome) => {
                 self.finish_success(&watermark)?;
                 Ok(match outcome {
@@ -741,7 +748,10 @@ impl RuntimeWorker {
         }
     }
 
-    fn run_consolidator(&self) -> Result<SessionDigestConsolidationOutcome, WorkerRunError> {
+    fn run_consolidator(
+        &self,
+        watermark: &CaptureWatermark,
+    ) -> Result<SessionDigestConsolidationOutcome, WorkerRunError> {
         let memory_store =
             MemoryStore::open(&self.memory_path).map_err(|error| WorkerRunError::retry(error))?;
         let connection =
@@ -754,19 +764,26 @@ impl RuntimeWorker {
             },
         )
         .map_err(WorkerRunError::retry)?;
+        let authority = lattice_core::consolidation::EvolutionAuthority {
+            repository_id: &self.repository_id,
+            checkout_id: &self.checkout_id,
+            branch: &watermark.branch,
+        };
         let mut services = LlmJobServices {
+            authority: &authority,
             driver: self.driver.as_ref(),
             runtime: &mut runtime,
             memory_store: &memory_store,
             event_writer: self.event_writer.as_ref(),
         };
-        SessionDigestLlmConsolidator::run(
+        SessionDigestLlmConsolidator::run_for_capture(
             &self
                 .config
                 .core_config()
                 .map_err(WorkerRunError::Retryable)?,
             &self.repository_id,
             &mut services,
+            &watermark.delivery_keys[0],
         )
         .map_err(|error| match &error {
             lattice_core::consolidation::llm::LlmJobError::DriverError(LlmDriverError::Failed(
@@ -791,15 +808,15 @@ impl RuntimeWorker {
                     lease_owner TEXT,
                     lease_expires_at INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                    next_eligible_at INTEGER NOT NULL DEFAULT 0,
-                    watermark_created_at INTEGER NOT NULL DEFAULT -1,
-                    watermark_delivery_key TEXT NOT NULL DEFAULT ''
+                    next_eligible_at INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT OR IGNORE INTO runtime_state(singleton) VALUES (1);
-                 CREATE TABLE IF NOT EXISTS watermark_capture_keys (
-                    delivery_key TEXT PRIMARY KEY,
-                    created_at INTEGER NOT NULL
-                 );",
+                 CREATE TABLE IF NOT EXISTS capture_scan_cursor (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    repository_id TEXT NOT NULL, checkout_id TEXT NOT NULL, branch TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, delivery_key TEXT NOT NULL
+                 );
+                 INSERT OR IGNORE INTO capture_scan_cursor VALUES(1,'','','',-1,'');",
             )
             .map_err(|error| error.to_string())?;
         let memory_path = self
@@ -831,33 +848,62 @@ impl RuntimeWorker {
         if state.2 > now {
             return Ok(None);
         }
-        let oldest = transaction
+        let branch = crate::repo_state::resolve_repo_state(&self.workspace_root)
+            .and_then(|snapshot| snapshot.head_ref)
+            .and_then(|head| head.strip_prefix("refs/heads/").map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        transaction.execute(
+            "UPDATE capture_scan_cursor SET repository_id=?1,checkout_id=?2,branch=?3,created_at=-1,delivery_key=''
+             WHERE singleton=1 AND (repository_id!=?1 OR checkout_id!=?2 OR branch!=?3)",
+            params![self.repository_id,self.checkout_id,branch],
+        ).map_err(|error|error.to_string())?;
+        let mut cursor: (i64, String) = transaction
             .query_row(
-                "SELECT d.created_at, d.delivery_key
-                 FROM memory.session_digest_deliveries d
-                 CROSS JOIN runtime_state s
-                 WHERE d.repository_id = ?1
-                   AND d.committed_count = d.candidate_count
-                   AND (
-                       d.created_at > s.watermark_created_at
-                       OR (d.created_at = s.watermark_created_at
-                           AND NOT EXISTS (
-                               SELECT 1 FROM watermark_capture_keys w
-                               WHERE w.delivery_key = d.delivery_key
-                           ))
-                   )
-                 ORDER BY d.created_at ASC, d.delivery_key ASC
-                 LIMIT 1",
-                params![self.repository_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                "SELECT created_at,delivery_key FROM capture_scan_cursor WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()
             .map_err(|error| error.to_string())?;
-        let Some((created_at, delivery_key)) = oldest else {
+        let mut selected = None;
+        // At most two indexed pages are examined: one forward and one wrap.
+        // Completion and incomplete-transport filters cannot make SQL scan past
+        // the fixed 256-row candidate window.
+        for _ in 0..2 {
+            let rows:Vec<(i64,String,bool,bool)>=transaction.prepare(
+                "SELECT d.created_at,d.delivery_key,d.committed_count=d.candidate_count,
+                        EXISTS(SELECT 1 FROM memory.consolidation_capture_receipts p WHERE p.delivery_key=d.delivery_key)
+                 FROM memory.session_digest_deliveries d INDEXED BY idx_session_digest_consolidation_scan
+                 WHERE d.repository_id=?1 AND d.checkout_id=?2 AND COALESCE(d.branch,'unknown')=?3
+                   AND (d.created_at,d.delivery_key)>(?4,?5)
+                 ORDER BY d.created_at,d.delivery_key LIMIT 256",
+            ).map_err(|error|error.to_string())?.query_map(
+                params![self.repository_id,self.checkout_id,branch,cursor.0,cursor.1],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).map_err(|error|error.to_string())?.collect::<Result<_,_>>().map_err(|error|error.to_string())?;
+            if let Some((created, key, _, _)) = rows
+                .iter()
+                .find(|(_, _, committed, processed)| *committed && !*processed)
+            {
+                selected = Some((*created, key.clone()));
+                break;
+            }
+            cursor = rows
+                .last()
+                .map(|(created, key, _, _)| (*created, key.clone()))
+                .unwrap_or((-1, String::new()));
+            transaction.execute("UPDATE capture_scan_cursor SET created_at=?1,delivery_key=?2 WHERE singleton=1",params![cursor.0,cursor.1])
+                .map_err(|error|error.to_string())?;
+            if !rows.is_empty() {
+                break;
+            }
+        }
+        let Some((created_at, delivery_key)) = selected else {
+            transaction.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
         let watermark = CaptureWatermark {
             created_at,
+            branch,
             delivery_keys: vec![delivery_key],
         };
         let lease_seconds = self
@@ -878,56 +924,55 @@ impl RuntimeWorker {
 
     fn finish_success(&self, watermark: &CaptureWatermark) -> Result<(), String> {
         let mut connection = self.open_state()?;
+        let before: (Option<String>, i64) = connection
+            .query_row(
+                "SELECT lease_owner,lease_expires_at FROM runtime_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if before.0.as_deref() != Some(self.owner.as_str()) || before.1 <= now_seconds() {
+            return Err("session-digest consolidation lease is no longer held".into());
+        }
+        // Canonical completion commits first; runtime WAL progress is separate.
+        let store = MemoryStore::open(&self.memory_path).map_err(|error| error.to_string())?;
+        let authority = lattice_core::consolidation::EvolutionAuthority {
+            repository_id: &self.repository_id,
+            checkout_id: &self.checkout_id,
+            branch: &watermark.branch,
+        };
+        for delivery_key in &watermark.delivery_keys {
+            SessionDigestLlmConsolidator::complete_capture_without_proposals(
+                &store,
+                &authority,
+                delivery_key,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        drop(store);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let current_watermark = transaction
+        let lease: (Option<String>, i64) = transaction
             .query_row(
-                "SELECT lease_owner, lease_expires_at, watermark_created_at
-                 FROM runtime_state WHERE singleton = 1",
+                "SELECT lease_owner, lease_expires_at FROM runtime_state WHERE singleton=1",
                 [],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
-        if current_watermark.0.as_deref() != Some(self.owner.as_str())
-            || current_watermark.1 <= now_seconds()
-        {
+        if lease.0.as_deref() != Some(self.owner.as_str()) || lease.1 <= now_seconds() {
             return Err("session-digest consolidation lease is no longer held".to_string());
-        }
-        if watermark.created_at > current_watermark.2 {
-            transaction
-                .execute("DELETE FROM watermark_capture_keys", [])
-                .map_err(|error| error.to_string())?;
-        }
-        for delivery_key in &watermark.delivery_keys {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO watermark_capture_keys(delivery_key, created_at)
-                     VALUES (?1, ?2)",
-                    params![delivery_key, watermark.created_at],
-                )
-                .map_err(|error| error.to_string())?;
         }
         transaction
             .execute(
-                "UPDATE runtime_state
-                 SET lease_owner = NULL, lease_expires_at = 0,
-                     consecutive_failures = 0, next_eligible_at = 0,
-                     watermark_created_at = ?1, watermark_delivery_key = ?2
-                 WHERE singleton = 1 AND lease_owner = ?3",
-                params![
-                    watermark.created_at,
-                    watermark.delivery_keys.last().cloned().unwrap_or_default(),
-                    self.owner
-                ],
+                "UPDATE capture_scan_cursor SET created_at=?1,delivery_key=?2 WHERE singleton=1",
+                params![watermark.created_at, watermark.delivery_keys[0]],
             )
             .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "UPDATE runtime_state SET lease_owner=NULL,lease_expires_at=0,consecutive_failures=0,next_eligible_at=0 WHERE singleton=1 AND lease_owner=?1",
+            [&self.owner],
+        ).map_err(|error|error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -987,6 +1032,7 @@ impl WorkerRunError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CaptureWatermark {
     created_at: i64,
+    branch: String,
     delivery_keys: Vec<String>,
 }
 
@@ -1069,6 +1115,8 @@ fn spawn_capture_retention_worker(
 
 pub(crate) fn start(
     repository_id: String,
+    checkout_id: String,
+    workspace_root: PathBuf,
     memory_path: PathBuf,
     event_writer: Arc<EventWriter>,
 ) -> Option<SessionDigestConsolidationHandle> {
@@ -1092,6 +1140,8 @@ pub(crate) fn start(
     };
     Some(spawn_worker(
         repository_id,
+        checkout_id,
+        workspace_root,
         memory_path,
         event_writer,
         config,
@@ -1101,6 +1151,8 @@ pub(crate) fn start(
 
 fn spawn_worker(
     repository_id: String,
+    checkout_id: String,
+    workspace_root: PathBuf,
     memory_path: PathBuf,
     event_writer: Arc<EventWriter>,
     config: SessionDigestRuntimeConfig,
@@ -1112,6 +1164,8 @@ fn spawn_worker(
         .join("session_digest_consolidation_runtime.db");
     let worker = Arc::new(RuntimeWorker {
         repository_id,
+        checkout_id,
+        workspace_root,
         memory_path,
         state_path,
         owner: format!("{}-{}", std::process::id(), now_micros()),
@@ -1179,7 +1233,7 @@ mod tests {
     use lattice_core::consolidation::{ProposalDecision, ReviewQueue, ReviewQueueFilter};
     use lattice_core::events::{EventStore, FlushPolicy};
     use lattice_core::memory::{
-        extract_default_session_digest_candidates, CheckOutcome, MemoryQueryAuthority,
+        extract_default_session_digest_candidates, CheckOutcome, ErrorStatus, MemoryQueryAuthority,
         MemoryStoreRouter, SessionDigest, SessionDigestObservation,
     };
     use lattice_core::{DateTime, Utc};
@@ -1191,6 +1245,8 @@ mod tests {
     #[derive(Default)]
     struct MockDriver {
         calls: AtomicUsize,
+        prompts: Mutex<Vec<String>>,
+        before_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         responses: Mutex<VecDeque<Result<String, LlmDriverError>>>,
     }
 
@@ -1204,8 +1260,12 @@ mod tests {
     }
 
     impl LlmDriver for MockDriver {
-        fn complete(&self, _: LlmRequest) -> Result<LlmResponse, LlmDriverError> {
+        fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmDriverError> {
+            self.prompts.lock().unwrap().push(request.prompt);
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(callback) = self.before_response.lock().unwrap().take() {
+                callback();
+            }
             self.responses
                 .lock()
                 .unwrap()
@@ -1228,6 +1288,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let dir = tempdir().unwrap();
+            let mut git_options = git2::RepositoryInitOptions::new();
+            git_options.initial_head("main");
+            git2::Repository::init_opts(dir.path(), &git_options).unwrap();
             let memory_path = dir.path().join("memories.db");
             MemoryStore::open(&memory_path).unwrap();
             let events = Arc::new(EventStore::open_in_memory().unwrap());
@@ -1243,11 +1306,15 @@ mod tests {
         }
 
         fn capture(&self, session: &str) {
+            self.capture_on_branch(session, "main");
+        }
+
+        fn capture_on_branch(&self, session: &str, branch: &str) {
             let store = MemoryStore::open(&self.memory_path).unwrap();
             let authority = MemoryQueryAuthority::new(
                 REPOSITORY.to_string(),
                 "checkout-main".to_string(),
-                Some("main".to_string()),
+                Some(branch.to_string()),
                 session.to_string(),
                 None,
             )
@@ -1259,23 +1326,46 @@ mod tests {
                 session_id: session.to_string(),
                 repository_id: REPOSITORY.to_string(),
                 checkout_id: Some("checkout-main".to_string()),
-                branch: Some("main".to_string()),
+                branch: Some(branch.to_string()),
                 revision: format!("revision-{session}"),
                 segment: 0,
                 ended_at: now,
                 received_at: now,
                 edited_paths: vec!["daemon/src/main.rs".to_string()],
-                final_summary: Some("Kept consolidation review gated".to_string()),
-                observations: vec![SessionDigestObservation::Check {
-                    label: "runtime test".to_string(),
-                    outcome: CheckOutcome::Passed,
-                }],
+                final_summary: Some(
+                    "Added the missing capture-state transaction before sealing.".to_string(),
+                ),
+                observations: vec![
+                    SessionDigestObservation::Error {
+                        category: "storage".to_string(),
+                        fingerprint: "capture-state-not-atomic".to_string(),
+                        status: ErrorStatus::Observed,
+                        summary: Some("seal could follow a partial capture write".to_string()),
+                    },
+                    SessionDigestObservation::Error {
+                        category: "storage".to_string(),
+                        fingerprint: "capture-state-not-atomic".to_string(),
+                        status: ErrorStatus::Resolved,
+                        summary: Some(
+                            "capture state is committed atomically before sealing".to_string(),
+                        ),
+                    },
+                    SessionDigestObservation::Check {
+                        label: "capture transaction regression".to_string(),
+                        outcome: CheckOutcome::Passed,
+                    },
+                ],
                 payload_hash:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_string(),
                 dropped_observation_count: 0,
             };
             let candidates = extract_default_session_digest_candidates(&digest);
+            assert_eq!(
+                candidates.len(),
+                1,
+                "fixture must exercise a validated resolved-failure lesson"
+            );
             router
                 .capture_session_digest_candidate_batch(&digest, &candidates)
                 .unwrap();
@@ -1299,6 +1389,8 @@ mod tests {
             );
             RuntimeWorker {
                 repository_id: REPOSITORY.to_string(),
+                checkout_id: "checkout-main".to_string(),
+                workspace_root: self._dir.path().to_path_buf(),
                 state_path: self._dir.path().join("runtime.db"),
                 memory_path: self.memory_path.clone(),
                 owner: format!("test-{}", now_micros()),
@@ -1372,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_worker_prunes_by_repository_router_and_records_tombstones() {
+    fn retention_owner_prunes_capture_transport_but_preserves_lessons() {
         let fixture = Fixture::new();
         fixture.capture_at("expired-capture", now_seconds().saturating_sub(10));
         fixture.capture_at("newest-capture", now_seconds());
@@ -1382,22 +1474,76 @@ mod tests {
             1,
         ));
         let memory_count_before = table_count(&fixture.memory_path, "memories");
+        // The fixture is a resolved failure with a correction and passing
+        // check, so this exercises retention of an actual derived lesson.
+        assert!(memory_count_before > 0);
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let recalled_id: String = connection
+            .query_row(
+                "SELECT id FROM memories ORDER BY created_at,id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memories SET access_count=1,last_accessed=?1 WHERE id=?2",
+                params![now_seconds(), recalled_id],
+            )
+            .unwrap();
+        let linked_id: String = connection
+            .query_row(
+                "SELECT id FROM memories WHERE id<>?1 ORDER BY created_at,id LIMIT 1",
+                params![recalled_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute("INSERT INTO memory_evidence(evidence_id,memory_id,kind,reference,detail,captured_at) VALUES('retention-evidence',?1,'test','tests/retention.rs','passed',1)", params![recalled_id]).unwrap();
+        connection.execute("INSERT INTO memory_links(link_id,source_memory_id,target_memory_id,link_type,reason,created_at,verification_status) VALUES('retention-link',?1,?2,'supports','capture evidence',1,'verified')", params![recalled_id, linked_id]).unwrap();
+        connection.execute("INSERT INTO verification_jobs(job_id,workspace_id,target_memory_id,check_kind,status,queued_at) VALUES('retention-job',?1,?2,'existence','queued',1)", params![REPOSITORY, recalled_id]).unwrap();
+        let dependency_counts_before = (
+            table_count(&fixture.memory_path, "memory_evidence"),
+            table_count(&fixture.memory_path, "memory_links"),
+            table_count(&fixture.memory_path, "verification_jobs"),
+        );
 
         let result = worker.run_once().unwrap();
 
         assert_eq!(result.deleted_capture_ids.len(), 1);
-        assert!(result.deleted_memory_count > 0);
+        assert_eq!(result.deleted_memory_count, 0);
+        assert_eq!(result.retained_derived_memory_count, 0);
         assert_eq!(
             table_count(&fixture.memory_path, "session_digest_deliveries"),
             1
         );
         assert_eq!(
             table_count(&fixture.memory_path, "memories"),
-            memory_count_before - result.deleted_memory_count as i64
+            memory_count_before
+        );
+        assert_eq!(
+            Connection::open(&fixture.memory_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE access_count=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "capture transport retention preserves both recalled and never-recalled lessons"
         );
         assert_eq!(
             table_count(&fixture.memory_path, "session_capture_tombstones"),
             1
+        );
+        assert_eq!(
+            (
+                table_count(&fixture.memory_path, "memory_evidence"),
+                table_count(&fixture.memory_path, "memory_links"),
+                table_count(&fixture.memory_path, "verification_jobs"),
+            ),
+            dependency_counts_before,
+            "transport retirement preserves lesson evidence, links, and queued verification"
         );
         let tombstone: (String, String) = Connection::open(&fixture.memory_path)
             .unwrap()
@@ -1529,7 +1675,13 @@ mod tests {
     #[test]
     fn enabled_worker_runs_committed_capture_once_and_creates_only_pending_review_proposals() {
         let fixture = Fixture::new();
-        fixture.capture("session-one");
+        let mut git_options = git2::RepositoryInitOptions::new();
+        git_options.initial_head("feature/session-lessons");
+        git2::Repository::init_opts(fixture._dir.path(), &git_options)
+            .unwrap()
+            .set_head("refs/heads/feature/session-lessons")
+            .unwrap();
+        fixture.capture_on_branch("session-one", "feature/session-lessons");
         let driver = Arc::new(MockDriver::default());
         driver.push(Ok(RESPONSE));
         let worker = fixture.worker(driver.clone());
@@ -1553,6 +1705,17 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].decision, ProposalDecision::Pending);
         assert!(items[0].target_memory_id.is_none());
+        let evidence: String = connection
+            .query_row(
+                "SELECT evidence FROM consolidation_proposals WHERE proposal_id=?1",
+                [&items[0].proposal_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(evidence["repository_id"], REPOSITORY);
+        assert_eq!(evidence["checkout_id"], "checkout-main");
+        assert_eq!(evidence["branch"], "feature/session-lessons");
     }
 
     #[test]
@@ -1630,15 +1793,14 @@ mod tests {
             "session-digest consolidation lease is no longer held"
         );
         let connection = worker.open_state().unwrap();
-        let checkpoint: (i64, String) = connection
+        let processed: i64 = connection
             .query_row(
-                "SELECT watermark_created_at, watermark_delivery_key
-                 FROM runtime_state WHERE singleton = 1",
+                "SELECT count(*) FROM memory.consolidation_capture_receipts",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(checkpoint, (-1, String::new()));
+        assert_eq!(processed, 0);
     }
 
     #[test]
@@ -1712,6 +1874,307 @@ mod tests {
 
         assert_eq!(claimed, expected);
         assert!(worker.claim_due_captures().unwrap().is_none());
+    }
+
+    #[test]
+    fn actual_runs_process_exact_oldest_capture_and_preserve_other_branch_work() {
+        let fixture = Fixture::new();
+        for index in 0..3 {
+            fixture.capture_at(&format!("exact-main-{index}"), now_seconds() - 10 + index);
+        }
+        fixture.capture_on_branch("exact-feature", "feature/later");
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let sources: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT d.delivery_key,c.memory_id FROM session_digest_deliveries d
+             JOIN session_digest_capture_commits c USING(delivery_key)
+             WHERE d.branch='main' ORDER BY d.created_at,d.delivery_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sources.len(), 3);
+        let driver = Arc::new(MockDriver::default());
+        let mut worker = fixture.worker(driver.clone());
+        worker.config.max_source_facts = 1;
+        for (index, (capture_id, memory_id)) in sources.iter().enumerate() {
+            driver.push(Ok(RESPONSE));
+            assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
+            let prompts = driver.prompts.lock().unwrap();
+            assert!(prompts[index].contains(memory_id));
+            for (_, other_id) in sources.iter().filter(|(_, id)| id != memory_id) {
+                assert!(!prompts[index].contains(other_id));
+            }
+            let evidence_count: i64 = connection.query_row(
+                "SELECT count(*) FROM consolidation_proposals WHERE json_extract(evidence,'$.source_capture_ids[0]')=?1",
+                [capture_id], |row|row.get(0),
+            ).unwrap();
+            assert_eq!(evidence_count, 1);
+        }
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Idle);
+        git2::Repository::open(fixture._dir.path())
+            .unwrap()
+            .set_head("refs/heads/feature/later")
+            .unwrap();
+        driver.push(Ok(RESPONSE));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn committed_capture_survives_restart_before_runtime_lease_release() {
+        let fixture = Fixture::new();
+        fixture.capture("commit-before-release");
+        let driver = Arc::new(MockDriver::default());
+        driver.push(Ok(RESPONSE));
+        let worker = fixture.worker(driver.clone());
+        let claim = worker.claim_due_captures().unwrap().unwrap();
+        assert!(matches!(
+            worker.run_consolidator(&claim).unwrap(),
+            SessionDigestConsolidationOutcome::Proposed { .. }
+        ));
+        // Simulate process loss after canonical commit, before runtime completion.
+        worker
+            .open_state()
+            .unwrap()
+            .execute("UPDATE runtime_state SET lease_expires_at=0", [])
+            .unwrap();
+        drop(worker);
+        let restarted = fixture.worker(driver.clone());
+        assert_eq!(restarted.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let counts:(i64,i64)=connection.query_row(
+            "SELECT (SELECT count(*) FROM consolidation_proposals),(SELECT count(*) FROM consolidation_capture_receipts)",
+            [],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[test]
+    fn capture_receipt_failure_rolls_back_entire_proposal_batch_and_retries() {
+        let fixture = Fixture::new();
+        fixture.capture("atomic-batch");
+        let response=serde_json::json!({"proposals":[
+            {"memory_class":"decision","content":"First distinct decision.","evidence_summary":"Committed evidence.","uncertainty":"One session.","confidence":0.8},
+            {"memory_class":"decision","content":"Second distinct decision.","evidence_summary":"Committed evidence.","uncertainty":"One session.","confidence":0.8}
+        ]}).to_string();
+        let driver = Arc::new(MockDriver::default());
+        driver.push(Ok(&response));
+        let worker = fixture.worker(driver.clone());
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_capture_receipt BEFORE INSERT ON consolidation_capture_receipts BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        assert!(worker
+            .run_once()
+            .unwrap_err()
+            .contains("injected receipt failure"));
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM consolidation_proposals", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no partial proposal prefix may survive failed receipt"
+        );
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM consolidation_jobs WHERE status='proposed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        connection
+            .execute_batch("DROP TRIGGER fail_capture_receipt")
+            .unwrap();
+        worker
+            .open_state()
+            .unwrap()
+            .execute("UPDATE runtime_state SET next_eligible_at=0", [])
+            .unwrap();
+        driver.push(Ok(&response));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(2));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Idle);
+    }
+
+    #[test]
+    fn full_review_capacity_keeps_capture_pending_until_capacity_returns() {
+        let fixture = Fixture::new();
+        fixture.capture("capacity-first");
+        let driver = Arc::new(MockDriver::default());
+        driver.push(Ok(RESPONSE));
+        let mut worker = fixture.worker(driver.clone());
+        worker.config.max_pending_proposals = 1;
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
+        fixture.capture("capacity-second");
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Skipped);
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM consolidation_capture_receipts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        connection
+            .execute("UPDATE consolidation_proposals SET decision='rejected'", [])
+            .unwrap();
+        worker
+            .open_state()
+            .unwrap()
+            .execute("UPDATE runtime_state SET next_eligible_at=0", [])
+            .unwrap();
+        driver.push(Ok(RESPONSE));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Idle);
+    }
+
+    #[test]
+    fn capture_scan_pages_past_incomplete_rows_without_unbounded_filtering() {
+        let fixture = Fixture::new();
+        fixture.capture("eligible-after-incomplete-backlog");
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        connection.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+             INSERT INTO session_digest_deliveries(delivery_key,repository_id,checkout_id,session_id,branch,revision,segment,schema_version,payload_hash,extractor_version,normalized_fingerprint,candidate_count,committed_count,dropped_observation_count,created_at)
+             SELECT printf('incomplete-%04d',x),'repo-runtime-test','checkout-main',printf('incomplete-%04d',x),'main','revision',0,1,'hash','fixture','fingerprint',1,0,0,x FROM n;"
+        ).unwrap();
+        let worker = fixture.worker(Arc::new(MockDriver::default()));
+        for page in 1..=4 {
+            assert!(worker.claim_due_captures().unwrap().is_none());
+            let cursor: i64 = worker
+                .open_state()
+                .unwrap()
+                .query_row(
+                    "SELECT created_at FROM capture_scan_cursor WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, page * 256);
+        }
+        let claim = worker.claim_due_captures().unwrap().unwrap();
+        assert!(!claim.delivery_keys[0].starts_with("incomplete-"));
+        worker.finish_success(&claim).unwrap();
+        // A previously incomplete older capture remains discoverable on wrap.
+        connection.execute("UPDATE session_digest_deliveries SET committed_count=1 WHERE delivery_key='incomplete-0001'",[]).unwrap();
+        let claim = worker.claim_due_captures().unwrap().unwrap();
+        assert_eq!(claim.delivery_keys, vec!["incomplete-0001"]);
+    }
+
+    #[test]
+    fn source_drift_during_provider_call_cannot_commit_proposals_or_completion() {
+        for mutation in [
+            "UPDATE memories SET content='changed source' WHERE source_query='automatic_session_digest'",
+            "UPDATE memories SET is_invalidated=1 WHERE source_query='automatic_session_digest'",
+            "UPDATE memories SET applicable_checkout_id='foreign' WHERE source_query='automatic_session_digest'",
+            "UPDATE memory_evidence SET detail=json_set(detail,'$.revision','changed') WHERE kind='session_digest'",
+            "DELETE FROM session_digest_capture_commits",
+        ] {
+            let fixture=Fixture::new();
+            fixture.capture("drift-during-provider");
+            let driver=Arc::new(MockDriver::default());
+            driver.push(Ok(RESPONSE));
+            let path=fixture.memory_path.clone();
+            *driver.before_response.lock().unwrap()=Some(Box::new(move|| {
+                Connection::open(path).unwrap().execute_batch(mutation).unwrap();
+            }));
+            let worker=fixture.worker(driver.clone());
+            assert!(worker.run_once().is_err(),"{mutation}");
+            let connection=Connection::open(&fixture.memory_path).unwrap();
+            let counts:(i64,i64)=connection.query_row(
+                "SELECT (SELECT count(*) FROM consolidation_proposals),(SELECT count(*) FROM consolidation_capture_receipts)",
+                [],|row|Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!(counts,(0,0),"{mutation}");
+        }
+    }
+
+    #[test]
+    fn terminal_completion_commits_before_failing_runtime_progress_write() {
+        let fixture = Fixture::new();
+        fixture.capture("terminal-before-runtime-write");
+        let driver = Arc::new(MockDriver::default());
+        driver.push(Err(LlmDriverError::Failed(
+            "provider returned non_retryable HTTP status 401".into(),
+        )));
+        let worker = fixture.worker(driver.clone());
+        let state = worker.open_state().unwrap();
+        state.execute_batch("CREATE TRIGGER fail_runtime_completion BEFORE UPDATE ON runtime_state WHEN NEW.lease_owner IS NULL BEGIN SELECT RAISE(ABORT,'injected runtime completion failure'); END;").unwrap();
+        assert!(worker
+            .run_once()
+            .unwrap_err()
+            .contains("injected runtime completion failure"));
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM consolidation_capture_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "canonical receipt must survive runtime transaction rollback"
+        );
+        state.execute_batch("DROP TRIGGER fail_runtime_completion; UPDATE runtime_state SET lease_expires_at=0;").unwrap();
+        drop(worker);
+        let restarted = fixture.worker(driver.clone());
+        assert_eq!(restarted.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_review_admission_cannot_overfill_capacity_or_consume_capture() {
+        let fixture = Fixture::new();
+        fixture.capture("capacity-seed");
+        let driver = Arc::new(MockDriver::default());
+        driver.push(Ok(RESPONSE));
+        let mut worker = fixture.worker(driver.clone());
+        worker.config.max_pending_proposals = 2;
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
+        fixture.capture("capacity-race");
+        let path = fixture.memory_path.clone();
+        *driver.before_response.lock().unwrap() = Some(Box::new(move || {
+            Connection::open(path).unwrap().execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO consolidation_jobs(job_id,workspace_id,kind,mode,status,enqueued_at)
+                 SELECT 'concurrent-job',workspace_id,kind,mode,'proposed',enqueued_at FROM consolidation_jobs WHERE status='proposed' LIMIT 1;
+                 INSERT INTO consolidation_proposals(proposal_id,job_id,target_memory_id,proposal_kind,prior_state,proposed_state,evidence,decision)
+                 SELECT 'concurrent-proposal','concurrent-job',target_memory_id,proposal_kind,prior_state,proposed_state,evidence,'pending' FROM consolidation_proposals LIMIT 1;
+                 COMMIT;"
+            ).unwrap();
+        }));
+        driver.push(Ok(RESPONSE));
+        assert!(worker
+            .run_once()
+            .unwrap_err()
+            .contains("review capacity changed"));
+        let connection = Connection::open(&fixture.memory_path).unwrap();
+        let counts:(i64,i64)=connection.query_row(
+            "SELECT (SELECT count(*) FROM consolidation_proposals),(SELECT count(*) FROM consolidation_capture_receipts)",
+            [],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (2, 1));
+        connection
+            .execute(
+                "DELETE FROM consolidation_proposals WHERE proposal_id='concurrent-proposal'",
+                [],
+            )
+            .unwrap();
+        worker
+            .open_state()
+            .unwrap()
+            .execute("UPDATE runtime_state SET next_eligible_at=0", [])
+            .unwrap();
+        driver.push(Ok(RESPONSE));
+        assert_eq!(worker.run_once().unwrap(), RunOutcome::Proposed(1));
     }
 
     #[test]

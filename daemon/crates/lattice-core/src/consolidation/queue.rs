@@ -182,7 +182,15 @@ impl BoundedJobQueue {
         job: ConsolidationJobSpec,
         event_writer: &EventWriter,
         model_name: &str,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
     ) -> Result<EnqueueOutcome, LatticeError> {
+        if job.workspace_id != authority.repository_id
+            || event_writer.workspace_id() != authority.repository_id
+        {
+            return Err(LatticeError::Storage(
+                "LLM queue job authority does not match its repository or event writer".to_string(),
+            ));
+        }
         if let Some(max_depth) = self.per_kind_max_depth {
             let current_depth = self.kind_depth(&job.kind);
             if current_depth >= max_depth {
@@ -194,7 +202,14 @@ impl BoundedJobQueue {
                     max_depth,
                     "LLM consolidation queue slice full; dropping job"
                 );
-                emit_queue_full(event_writer, &job, model_name, current_depth, max_depth)?;
+                emit_queue_full(
+                    event_writer,
+                    &job,
+                    model_name,
+                    current_depth,
+                    max_depth,
+                    authority.branch,
+                )?;
                 return Ok(EnqueueOutcome::Dropped {
                     reason: format!(
                         "LLM consolidation queue slice {} reached for kind {}",
@@ -286,6 +301,7 @@ fn emit_queue_full(
     model_name: &str,
     current_depth: usize,
     max_depth: usize,
+    branch: &str,
 ) -> Result<(), LatticeError> {
     let payload = ConsolidationFailedPayload {
         job_id: job.job_id.clone(),
@@ -302,7 +318,7 @@ fn emit_queue_full(
         .append(PartialEnvelope {
             workspace_id: Some(job.workspace_id.clone()),
             branch: BranchRef {
-                name: "main".to_string(),
+                name: branch.to_string(),
             },
             session_id: SessionId {
                 value: "llm-consolidation".to_string(),

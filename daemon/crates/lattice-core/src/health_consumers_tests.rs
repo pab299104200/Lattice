@@ -181,10 +181,7 @@ fn impact_ordering_ranks_by_defect_risk_within_the_supplied_tier() {
 
     // Stable keys are deliberately in the opposite order, so alphabetical
     // ordering alone cannot produce the expected result.
-    let mut candidates = vec![
-        candidate("src/leaf.rs", "a"),
-        candidate("src/core.rs", "z"),
-    ];
+    let mut candidates = vec![candidate("src/leaf.rs", "a"), candidate("src/core.rs", "z")];
     order_impact_within_tier_by_defect_risk(Some(&index), &mut candidates);
 
     assert_eq!(ordered(&candidates), vec!["src/core.rs", "src/leaf.rs"]);
@@ -581,7 +578,11 @@ fn health_status_reports_coverage_bands_and_provenance() {
     let defect_risk = &report.axes[0];
     assert_eq!(defect_risk.bands.len(), 4);
     assert_eq!(
-        defect_risk.bands.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+        defect_risk
+            .bands
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
         vec!["low", "moderate", "high", "critical"]
     );
     let banded: usize = defect_risk.bands.iter().map(|(_, count)| count).sum();
@@ -610,13 +611,25 @@ fn health_status_names_every_missing_input_in_plain_words() {
     );
 
     let stated = report.incomplete_analysis.join(" | ");
-    assert!(stated.contains("index behind these facts was incomplete"), "{stated}");
+    assert!(
+        stated.contains("index behind these facts was incomplete"),
+        "{stated}"
+    );
     assert!(stated.contains("3 file(s) failed to parse"), "{stated}");
     assert!(stated.contains("history is stale"), "{stated}");
     // The families that produced nothing are each named.
-    assert!(stated.contains("no git facts reached the index"), "{stated}");
-    assert!(stated.contains("no complexity facts reached the index"), "{stated}");
-    assert!(stated.contains("no test_proximity facts reached the index"), "{stated}");
+    assert!(
+        stated.contains("no git facts reached the index"),
+        "{stated}"
+    );
+    assert!(
+        stated.contains("no complexity facts reached the index"),
+        "{stated}"
+    );
+    assert!(
+        stated.contains("no test_proximity facts reached the index"),
+        "{stated}"
+    );
 
     let git = report
         .families

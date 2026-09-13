@@ -168,7 +168,7 @@ fn test_is_excluded_dir() {
     assert!(filter.is_excluded_dir("target"));
     assert!(filter.is_excluded_dir("__pycache__"));
     assert!(!filter.is_excluded_dir("src"));
-    assert!(filter.is_excluded_dir("lib"));
+    assert!(!filter.is_excluded_dir("lib"));
     assert!(filter.is_excluded_dir("vendor"));
     assert!(!filter.is_excluded_dir("helpers"));
 }
@@ -197,4 +197,105 @@ fn test_gitignore_integration() {
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn nested_ignore_policy_matches_traversal_and_direct_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/generated")).unwrap();
+    std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+    std::fs::write(dir.path().join("src/.gitignore"), "hidden.rs\ngenerated/\n").unwrap();
+    std::fs::write(dir.path().join("src/.latticeignore"), "custom.rs\n").unwrap();
+    for name in ["src/hidden.rs", "src/custom.rs", "src/ok.rs", "lib/real.rs"] {
+        std::fs::write(dir.path().join(name), "fn real() {}\n").unwrap();
+    }
+    std::fs::write(
+        dir.path().join("src/generated/code.rs"),
+        "fn generated() {}\n",
+    )
+    .unwrap();
+    let paths = workspace::collect_sources(dir.path()).unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(workspace::read_source(dir.path(), Path::new("src/hidden.rs")).is_err());
+    assert!(workspace::read_source(dir.path(), Path::new("src/custom.rs")).is_err());
+    assert!(workspace::read_source(dir.path(), Path::new("src/generated/code.rs")).is_err());
+    assert!(workspace::read_source(dir.path(), Path::new("lib/real.rs")).is_ok());
+    assert!(workspace::read_source(dir.path(), Path::new("../outside.rs")).is_err());
+    assert!(workspace::read_source(dir.path(), &dir.path().join("src/ok.rs")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_targets_and_cycles_are_never_source() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.rs"), "private").unwrap();
+    symlink(outside.path(), dir.path().join("external")).unwrap();
+    symlink(dir.path(), dir.path().join("cycle")).unwrap();
+    symlink(
+        outside.path().join("secret.rs"),
+        dir.path().join("source.rs"),
+    )
+    .unwrap();
+    assert!(workspace::collect_sources(dir.path()).unwrap().is_empty());
+    for name in ["external/secret.rs", "source.rs", "cycle/source.rs"] {
+        assert!(
+            workspace::read_source(dir.path(), Path::new(name)).is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_ignore_policy_is_a_coverage_error() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/visible.rs"), "fn visible() {}\n").unwrap();
+    std::fs::write(outside.path().join("rules"), "visible.rs\n").unwrap();
+    symlink(
+        outside.path().join("rules"),
+        root.path().join("src/.gitignore"),
+    )
+    .unwrap();
+
+    assert!(workspace::collect_sources(root.path()).is_err());
+    assert!(workspace::read_source(root.path(), Path::new("src/visible.rs")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn component_safe_open_never_reads_renamed_external_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    std::fs::write(&source, "safe").unwrap();
+    let secret = outside.path().join("secret.rs");
+    std::fs::write(&secret, "external-secret").unwrap();
+    let root_path = root.path().to_path_buf();
+    let secret_path = secret.clone();
+    let mutator = std::thread::spawn(move || {
+        for index in 0..300 {
+            let candidate = root_path.join(format!("candidate-{index}"));
+            if index % 2 == 0 {
+                symlink(&secret_path, &candidate).unwrap();
+            } else {
+                std::fs::write(&candidate, "safe").unwrap();
+            }
+            std::fs::rename(candidate, root_path.join("source.rs")).unwrap();
+        }
+    });
+    for _ in 0..600 {
+        if let Ok(content) = workspace::read_source(root.path(), Path::new("source.rs")) {
+            assert_eq!(content, "safe");
+        }
+    }
+    mutator.join().unwrap();
 }

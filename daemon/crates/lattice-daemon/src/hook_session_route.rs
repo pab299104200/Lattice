@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use lattice_core::memory::{
     parse_session_capture_close, parse_session_capture_event, reduce_session_capture,
-    DaemonSessionCaptureEvent, MemoryClass, MemoryQueryAuthority, MemoryRecallResult,
-    MemoryRecallTier, MemoryStore, MemoryStoreRouter, SessionCaptureFact, SessionDigestAuthority,
-    SESSION_CAPTURE_SCHEMA_VERSION,
+    DaemonSessionCaptureEvent, DeliveryBinding, MemoryClass, MemoryQueryAuthority,
+    MemoryRecallResult, MemoryRecallTier, MemoryStore, MemoryStoreRouter, MemoryVerificationStatus,
+    SessionCaptureFact, SessionDigestAuthority, SESSION_CAPTURE_SCHEMA_VERSION,
 };
 use lattice_core::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -108,6 +108,8 @@ struct HookPresentationParams {
     path: Option<String>,
     #[serde(default)]
     acted_on_injection_id: Option<String>,
+    #[serde(default)]
+    acknowledge_delivery: Option<HookMemoryDeliveryReceipt>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -154,6 +156,21 @@ struct HookSessionOpenResult {
 struct HookPresentationResult {
     injection_id: String,
     context: String,
+    memory_deliveries: Vec<HookMemoryDeliveryReceipt>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HookMemoryDeliveryReceipt {
+    authority: String,
+    delivery_id: String,
+    payload_hash: String,
+    #[serde(skip_deserializing, default = "ack_required")]
+    ack_required: bool,
+}
+
+fn ack_required() -> bool {
+    true
 }
 
 impl HookSessionRoute {
@@ -525,7 +542,7 @@ fn record_capture_metric(
     // The ledger deliberately receives no binding, delivery, session,
     // capability, path, hash, payload, or error value. Metrics are
     // best-effort: a ledger outage must not change capture acknowledgement.
-    let _ = AdoptionMetricsStore::new(&identity.repository_root).record_capture_outcome(
+    if let Err(error) = AdoptionMetricsStore::new(&identity.repository_root).record_capture_outcome(
         CaptureMetricRecord {
             integration: context.integration.to_string(),
             schema_version: context.schema_version,
@@ -533,7 +550,13 @@ fn record_capture_metric(
             outcome,
         },
         idempotent_replay,
-    );
+    ) {
+        tracing::warn!(
+            %error,
+            outcome = outcome.label(),
+            "failed to record content-free hook capture telemetry"
+        );
+    }
 }
 
 fn capture_metric_integration(integration: &str) -> &'static str {
@@ -560,6 +583,7 @@ struct HookMemoryStores {
     organization_id: Option<String>,
 }
 
+#[derive(Clone)]
 struct RankedHookMemory {
     result: MemoryRecallResult,
     class: MemoryClass,
@@ -592,15 +616,19 @@ fn present_hook_memory(
             "hook-action-v1:{}:{}:{}",
             session_id, request.request_id, injection_id
         );
-        metrics
-            .record_memory_injection_action_once(
-                &action_metric_id,
-                MemoryInjectionActionRecord {
-                    injection_id: injection_id.to_string(),
-                    acted_count: 1,
-                },
-            )
-            .map_err(|_| HookSessionRouteError::Unavailable)?;
+        if let Err(error) = metrics.record_memory_injection_action_once(
+            &action_metric_id,
+            MemoryInjectionActionRecord {
+                injection_id: injection_id.to_string(),
+                acted_count: 1,
+            },
+        ) {
+            // Telemetry is observational. The authenticated action claim and
+            // memory presentation remain valid even when its metric cannot be
+            // persisted; do not turn an acknowledged claim into a false
+            // delivery failure.
+            tracing::warn!(%error, "failed to record hook memory action telemetry");
+        }
     }
 
     let repository_state = resolve_repository_state(&identity.checkout_root)?;
@@ -615,14 +643,23 @@ fn present_hook_memory(
     .map_err(|_| HookSessionRouteError::Unavailable)?;
     let router = MemoryStoreRouter::new(&stores.repository, stores.shared.as_ref(), authority)
         .map_err(|_| HookSessionRouteError::Unavailable)?;
-    let candidates = router
-        .recall(None, PRESENTATION_CANDIDATE_LIMIT)
-        .map_err(|_| HookSessionRouteError::Unavailable)?;
-    let classes = stores.memory_classes(&candidates)?;
+    if let Some(receipt) = request.acknowledge_delivery.as_ref() {
+        acknowledge_hook_delivery(&stores, &router, &session_id, receipt)?;
+    }
     let dirty_files = match request.kind {
         HookPresentationKind::SessionStart => dirty_working_set(&identity.checkout_root)?,
         _ => Vec::new(),
     };
+    // Scope, checkout and lifecycle filtering happen in the router before the
+    // bounded candidate set. Never start from an unfiltered recent-memory scan.
+    let retrieval_query = presentation_query(&request, &dirty_files);
+    let candidates = match retrieval_query.as_deref() {
+        Some(query) => router
+            .recall(Some(query), PRESENTATION_CANDIDATE_LIMIT)
+            .map_err(|_| HookSessionRouteError::Unavailable)?,
+        None => Vec::new(),
+    };
+    let classes = stores.memory_classes(&candidates)?;
     let mut ranked = Vec::new();
     for result in candidates {
         let class = classes.class_for(&result)?;
@@ -677,27 +714,168 @@ fn present_hook_memory(
         return Ok(None);
     }
     let injection_id = stable_injection_id(outcome, &request, &ranked);
-    let (context, shown_count) =
+    let (context, shown_ids) =
         render_hook_presentation(request.kind, &injection_id, &ranked, budget_tokens);
+    let shown_count = shown_ids.len();
     if shown_count == 0 {
         return Ok(None);
     }
-    metrics
-        .record_memory_injection_once(
-            &format!("hook-injection-v1:{injection_id}"),
-            MemoryInjectionRecord {
-                session_id,
-                client: client.to_string(),
-                channel: channel.to_string(),
-                injection_id: injection_id.clone(),
-                shown_count: shown_count as u64,
-            },
-        )
-        .map_err(|_| HookSessionRouteError::Unavailable)?;
+    if let Err(error) = metrics.record_memory_injection_once(
+        &format!("hook-injection-v1:{injection_id}"),
+        MemoryInjectionRecord {
+            session_id: session_id.clone(),
+            client: client.to_string(),
+            channel: channel.to_string(),
+            injection_id: injection_id.clone(),
+            shown_count: shown_count as u64,
+        },
+    ) {
+        // A rendered briefing remains true regardless of telemetry storage.
+        // The stable injection id still binds retries to the same presentation.
+        tracing::warn!(%error, injection_id = %injection_id, "failed to record hook memory injection telemetry");
+    }
+    // Rendering is prefix-preserving. Bind receipts only to that rendered
+    // prefix; candidates clipped by the token budget were never delivered.
+    let shown = ranked
+        .iter()
+        .filter(|entry| shown_ids.contains(&entry.result.memory_id.encoded()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let memory_deliveries =
+        attempt_hook_deliveries(&stores, &router, &session_id, &injection_id, &shown)?;
     Ok(Some(HookPresentationResult {
         injection_id,
         context,
+        memory_deliveries,
     }))
+}
+
+fn attempt_hook_deliveries(
+    stores: &HookMemoryStores,
+    router: &MemoryStoreRouter<'_>,
+    session_id: &str,
+    injection_id: &str,
+    ranked: &[RankedHookMemory],
+) -> Result<Vec<HookMemoryDeliveryReceipt>, HookSessionRouteError> {
+    let owners = [
+        (
+            MemoryRecallTier::Repository,
+            &stores.repository,
+            format!("repository:{}", router.authority().repository_id),
+        ),
+        (
+            MemoryRecallTier::Organization,
+            stores.shared.as_ref().unwrap_or(&stores.repository),
+            router
+                .authority()
+                .organization_id
+                .as_ref()
+                .map(|id| format!("organization:{id}"))
+                .unwrap_or_default(),
+        ),
+    ];
+    owners
+        .into_iter()
+        .filter_map(|(tier, store, authority)| {
+            if authority.is_empty() {
+                return None;
+            }
+            let selected = ranked
+                .iter()
+                .filter(|entry| entry.result.source_tier == tier)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return None;
+            }
+            let projection = selected.iter().map(|entry| serde_json::json!({
+            "id": entry.result.memory_id.encoded(), "content": entry.result.memory.content,
+        })).collect::<Vec<_>>();
+            let payload_hash = format!(
+                "sha256:{}",
+                encode_hex(&sha256(
+                    &serde_json::to_vec(&projection).unwrap_or_default()
+                ))
+            );
+            let delivery_id = format!(
+                "hdel_{}",
+                encode_hex(&sha256(format!("{injection_id}\0{authority}").as_bytes())[..16])
+            );
+            let ids = selected
+                .iter()
+                .map(|entry| entry.result.memory.id.clone())
+                .collect::<Vec<_>>();
+            let binding = DeliveryBinding {
+                delivery_id: &delivery_id,
+                repository_id: &authority,
+                session_id,
+                payload_hash: &payload_hash,
+            };
+            Some(
+                match store.attempt_memory_delivery(&binding, &ids, now_epoch_seconds()) {
+                    Ok(()) => Ok(HookMemoryDeliveryReceipt {
+                        authority,
+                        delivery_id,
+                        payload_hash,
+                        ack_required: true,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to record attempted hook memory delivery");
+                        Err(HookSessionRouteError::Unavailable)
+                    }
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn acknowledge_hook_delivery(
+    stores: &HookMemoryStores,
+    router: &MemoryStoreRouter<'_>,
+    session_id: &str,
+    receipt: &HookMemoryDeliveryReceipt,
+) -> Result<(), HookSessionRouteError> {
+    let repository_authority = format!("repository:{}", router.authority().repository_id);
+    let organization_authority = router
+        .authority()
+        .organization_id
+        .as_ref()
+        .map(|id| format!("organization:{id}"));
+    let store = if receipt.authority == repository_authority {
+        &stores.repository
+    } else if organization_authority.as_deref() == Some(receipt.authority.as_str()) {
+        stores
+            .shared
+            .as_ref()
+            .ok_or(HookSessionRouteError::Unavailable)?
+    } else {
+        return Err(HookSessionRouteError::InvalidRequest);
+    };
+    let binding = DeliveryBinding {
+        delivery_id: &receipt.delivery_id,
+        repository_id: &receipt.authority,
+        session_id,
+        payload_hash: &receipt.payload_hash,
+    };
+    let now = now_epoch_seconds();
+    let acknowledged = store
+        .acknowledge_memory_delivery(&binding, now)
+        .map_err(|_| HookSessionRouteError::InvalidRequest)?;
+    if acknowledged == 0
+        && !store
+            .memory_delivery_acknowledgement_was_recorded(&binding, now)
+            .map_err(|_| HookSessionRouteError::InvalidRequest)?
+    {
+        return Err(HookSessionRouteError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn now_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
 impl HookMemoryStores {
@@ -937,27 +1115,32 @@ fn render_hook_presentation(
     injection_id: &str,
     ranked: &[RankedHookMemory],
     budget_tokens: usize,
-) -> (String, usize) {
+) -> (String, Vec<String>) {
     let char_budget = budget_tokens.saturating_mul(4);
     if matches!(kind, HookPresentationKind::PostToolUse) {
         let memory = &ranked[0];
         let prefix = format!(
-            "Lattice memory warning [injection_id={injection_id}] [{}] ({}): ",
+            "Lattice memory warning [injection_id={injection_id}] [{}] ({}; {}): ",
             memory.result.memory_id.encoded(),
-            memory.class.as_str()
+            memory.class.as_str(),
+            presentation_trust_note(&memory.result),
         );
         let available = char_budget.saturating_sub(prefix.chars().count());
         let content = clipped_one_line(&memory.result.memory.content, available);
-        return (clipped_text(&format!("{prefix}{content}"), char_budget), 1);
+        return (
+            clipped_text(&format!("{prefix}{content}"), char_budget),
+            vec![memory.result.memory_id.encoded()],
+        );
     }
 
     let mut output = format!("Lattice memory context [injection_id={injection_id}]:");
-    let mut shown_count = 0;
+    let mut shown_ids = Vec::new();
     for memory in ranked {
         let prefix = format!(
-            "\n- [{}] {}: ",
+            "\n- [{}] {} ({}) : ",
             memory.result.memory_id.encoded(),
-            memory.class.as_str()
+            memory.class.as_str(),
+            presentation_trust_note(&memory.result),
         );
         let used = output.chars().count() + prefix.chars().count();
         if used >= char_budget {
@@ -969,9 +1152,36 @@ fn render_hook_presentation(
         }
         output.push_str(&prefix);
         output.push_str(&content);
-        shown_count += 1;
+        shown_ids.push(memory.result.memory_id.encoded());
     }
-    (clipped_text(&output, char_budget), shown_count)
+    (clipped_text(&output, char_budget), shown_ids)
+}
+
+fn presentation_query(request: &HookPresentationParams, dirty_files: &[String]) -> Option<String> {
+    let value = match request.kind {
+        HookPresentationKind::UserPromptSubmit => {
+            request.prompt.as_deref().unwrap_or_default().to_string()
+        }
+        HookPresentationKind::PostToolUse => {
+            request.path.as_deref().unwrap_or_default().to_string()
+        }
+        HookPresentationKind::SessionStart => dirty_files.join(" "),
+    };
+    let terms = query_terms(&value);
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+fn presentation_trust_note(result: &MemoryRecallResult) -> String {
+    let status = result.effective_verification_status.as_str();
+    if result.cross_repo {
+        format!("advisory {status}; {}", result.trust_reason)
+    } else if result.memory.verification_status == MemoryVerificationStatus::Contradicted {
+        "conflicts with current evidence; verify before use".to_string()
+    } else if result.memory.verification_status == MemoryVerificationStatus::Unverified {
+        "hypothesis; validate with a focused check".to_string()
+    } else {
+        format!("{status}; {}", result.trust_reason)
+    }
 }
 
 fn clipped_text(value: &str, max_chars: usize) -> String {
@@ -1981,6 +2191,62 @@ fn hex_nibble(byte: u8) -> Result<u8, HookSessionRouteError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hook_delivery_acknowledges_only_the_exact_presented_receipt() {
+        let stores = HookMemoryStores {
+            repository: MemoryStore::open_in_memory().expect("repository store"),
+            shared: None,
+            organization_id: None,
+        };
+        stores
+            .repository
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO memories(id,content,memory_type,created_at,last_accessed,retention_grace_until) VALUES('m','hook delivery','fact',1,1,0)",
+                        [],
+                    )
+                    .map(|_| ())
+                    .map_err(|error| lattice_core::error::LatticeError::Storage(error.to_string()))
+            })
+            .expect("seed memory");
+        let authority = MemoryQueryAuthority::new(
+            "repo".to_string(),
+            "checkout".to_string(),
+            None,
+            "hook-session".to_string(),
+            None,
+        )
+        .expect("authority");
+        let router = MemoryStoreRouter::new(&stores.repository, None, authority).expect("router");
+        let receipt = HookMemoryDeliveryReceipt {
+            authority: "repository:repo".to_string(),
+            delivery_id: "hdel_receipt".to_string(),
+            payload_hash: "sha256:payload".to_string(),
+            ack_required: true,
+        };
+        let binding = DeliveryBinding {
+            delivery_id: &receipt.delivery_id,
+            repository_id: &receipt.authority,
+            session_id: "hook-session",
+            payload_hash: &receipt.payload_hash,
+        };
+        stores
+            .repository
+            .attempt_memory_delivery(&binding, &["m".to_string()], now_epoch_seconds())
+            .expect("record final hook delivery");
+        let mut wrong = receipt.clone();
+        wrong.payload_hash = "sha256:wrong".to_string();
+        assert!(matches!(
+            acknowledge_hook_delivery(&stores, &router, "hook-session", &wrong),
+            Err(HookSessionRouteError::InvalidRequest)
+        ));
+        acknowledge_hook_delivery(&stores, &router, "hook-session", &receipt)
+            .expect("exact hook acknowledgement");
+        acknowledge_hook_delivery(&stores, &router, "hook-session", &receipt)
+            .expect("idempotent hook acknowledgement replay");
+    }
+
     #[cfg(unix)]
     #[test]
     fn durable_route_reuses_key_and_rejects_unsafe_state() {
@@ -2043,6 +2309,57 @@ mod tests {
         assert!(passes_presentation_gate(MIN_PRESENTATION_RELEVANCE_BPS));
         assert_eq!(clipped_text("abcdef", 5), "abcd…");
         assert_eq!(clipped_text("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn hook_render_reports_only_ids_that_fit_the_final_budget() {
+        let ranked = (0..2)
+            .map(|ordinal| RankedHookMemory {
+                result: MemoryRecallResult {
+                    memory: lattice_core::memory::Memory {
+                        id: format!("m{ordinal}"),
+                        session_id: "prior".into(),
+                        content: "x".repeat(200),
+                        memory_type: lattice_core::memory::MemoryType::Pattern,
+                        scope: lattice_core::memory::MemoryScope::Repo,
+                        confidence: 1.0,
+                        linked_symbols: vec![],
+                        linked_files: vec![],
+                        workspace_id: Some("repo".into()),
+                        branch: None,
+                        scope_organization_id: None,
+                        refresh_key: None,
+                        source_query: None,
+                        created_at: 1,
+                        last_accessed: 1,
+                        access_count: 0,
+                        is_stale: false,
+                        stale_reason: None,
+                        verification_status: MemoryVerificationStatus::Verified,
+                    },
+                    memory_id: lattice_core::memory::AuthorityQualifiedMemoryId {
+                        authority: lattice_core::memory::MemoryAuthority::Repository("repo".into()),
+                        local_id: format!("m{ordinal}"),
+                    },
+                    source_tier: MemoryRecallTier::Repository,
+                    assertion_key: format!("a{ordinal}"),
+                    origin_repository_id: Some("repo".into()),
+                    origin_checkout_id: Some("checkout".into()),
+                    cross_repo: false,
+                    origin_verification_status: MemoryVerificationStatus::Verified,
+                    effective_verification_status: MemoryVerificationStatus::Verified,
+                    trust_reason: "verified".into(),
+                    retention_stale: false,
+                },
+                class: MemoryClass::Decision,
+                relevance_bps: 10_000,
+            })
+            .collect::<Vec<_>>();
+        let (rendered, shown_ids) =
+            render_hook_presentation(HookPresentationKind::SessionStart, "hinj", &ranked, 70);
+        assert!(rendered.contains("m0"));
+        assert!(!rendered.contains("m1"));
+        assert_eq!(shown_ids, vec![ranked[0].result.memory_id.encoded()]);
     }
 
     #[test]
@@ -2242,7 +2559,10 @@ mod tests {
         let memory_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
             .unwrap();
-        assert!(memory_count > 0);
+        assert_eq!(
+            memory_count, 0,
+            "edits and a generic summary are navigation facts, not a demonstrated lesson"
+        );
 
         let next_generation = route
             .handle_open(
@@ -2283,10 +2603,10 @@ mod tests {
         // duplicate capture metric.
         assert_eq!(capture_health.outcomes.values().sum::<u64>(), 8);
 
-        let metrics = std::fs::read_to_string(
-            identity
-                .repository_lattice_dir
-                .join("adoption_metrics.jsonl"),
+        let metrics = crate::adoption_metrics::render_metrics_for_workspace(
+            &identity.repository_root,
+            90,
+            true,
         )
         .expect("read content-free capture metrics");
         for forbidden in [
@@ -2304,6 +2624,71 @@ mod tests {
             );
         }
 
+        drop(route);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    #[test]
+    fn sealed_resolved_error_and_passing_check_capture_one_lesson_across_replay() {
+        let directory = test_directory("lesson-capture-state");
+        let checkout = committed_repository("lesson-capture-checkout");
+        let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+        let hello = ProxyRequest {
+            workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        let route = HookSessionRoute::open_at(&directory).unwrap();
+        let opened = route
+            .handle_open(
+                &hello,
+                serde_json::json!({
+                    "integration":"codex/v1", "host_session_id":"lesson-capture-session"
+                }),
+            )
+            .unwrap();
+        let fingerprint = format!("sha256:{}", "6".repeat(64));
+        let events = [
+            serde_json::json!({"schema_version":1,"kind":"edited_path","path":"fixture.txt"}),
+            serde_json::json!({"schema_version":1,"kind":"error","category":"storage","fingerprint":fingerprint,"status":"observed","summary":"Partial publication left the persisted file without its required header."}),
+            serde_json::json!({"schema_version":1,"kind":"error","category":"storage","fingerprint":fingerprint,"status":"resolved","summary":"Write the header and payload in one atomic transaction before publication."}),
+            serde_json::json!({"schema_version":1,"kind":"check","label":"atomic_publication_regression","outcome":"passed"}),
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let result = route
+                .handle_event(
+                    &hello,
+                    serde_json::json!({
+                        "binding_id":opened["binding_id"],"capability":opened["capability"],
+                        "integration":"codex/v1","delivery_id":format!("{:032x}", index+1),
+                        "sequence":index+1,"event":event
+                    }),
+                )
+                .unwrap();
+            assert_eq!(result["status"], "reduced");
+        }
+        let close = serde_json::json!({
+            "binding_id":opened["binding_id"],"capability":opened["capability"],
+            "integration":"codex/v1","delivery_id":format!("{:032x}", 5),
+            "sequence":5,"event":{"schema_version":1,"final_summary":"Publish header and payload together in one atomic transaction. The regression check passed."}
+        });
+        assert_eq!(
+            route.handle_close(&hello, close.clone()).unwrap()["replayed"],
+            false
+        );
+        assert_eq!(route.handle_close(&hello, close).unwrap()["replayed"], true);
+        let connection = Connection::open(identity.memories_path()).unwrap();
+        let (count, content): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(content),'') FROM memories",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "sealed correction captures exactly once");
+        assert!(content.contains("atomic transaction"));
+        drop(connection);
         drop(route);
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(checkout).unwrap();
@@ -2336,7 +2721,7 @@ mod tests {
                 linked_symbols: Vec::new(),
                 linked_files: vec!["fixture.txt".to_string()],
                 workspace_id: Some(identity.repository_id.clone()),
-                branch: Some("other-branch".to_string()),
+                branch: Some("main".to_string()),
                 scope_organization_id: None,
                 refresh_key: None,
                 source_query: None,
@@ -2345,11 +2730,12 @@ mod tests {
                 access_count: 0,
                 is_stale: false,
                 stale_reason: None,
-                verification_status: MemoryVerificationStatus::Unverified,
+                verification_status: MemoryVerificationStatus::Verified,
             })
             .unwrap();
         let mut fields = MemoryStructuredFields::default();
         fields.memory_class = MemoryClass::Constraint;
+        fields.verification_status = MemoryVerificationStatus::Verified;
         store
             .update_structured_fields(&constraint_id, &fields)
             .unwrap();
@@ -2440,13 +2826,11 @@ mod tests {
 
         // An unrelated authenticated request causes no inferred action. The
         // exact prior id must be supplied explicitly on a later request.
-        let before_action = std::fs::read_to_string(
-            identity
-                .repository_root
-                .join(".lattice/adoption_metrics.jsonl"),
-        )
-        .unwrap();
-        assert!(!before_action.contains("memory_injection_action"));
+        let before_action = AdoptionMetricsStore::new(&identity.repository_root)
+            .read_json()
+            .expect("read telemetry");
+        let before_actions = telemetry_memory_counter(&before_action, "memory_injection_actions");
+        assert_eq!(before_actions, 0);
         route
             .handle_open(
                 &hello,
@@ -2460,11 +2844,11 @@ mod tests {
                 ),
             )
             .unwrap();
-        let metrics_path = identity
-            .repository_root
-            .join(".lattice/adoption_metrics.jsonl");
-        let after_action = std::fs::read_to_string(&metrics_path).unwrap();
-        assert_eq!(after_action.matches("memory_injection_action").count(), 1);
+        let after_action = AdoptionMetricsStore::new(&identity.repository_root)
+            .read_json()
+            .expect("read telemetry");
+        let action_count = telemetry_memory_counter(&after_action, "memory_injection_actions");
+        assert_eq!(action_count, 1);
         route
             .handle_open(
                 &hello,
@@ -2478,18 +2862,97 @@ mod tests {
                 ),
             )
             .unwrap();
-        let replayed_metrics = std::fs::read_to_string(metrics_path).unwrap();
+        let replayed_metrics = AdoptionMetricsStore::new(&identity.repository_root)
+            .read_json()
+            .expect("read replayed telemetry");
         assert_eq!(
-            replayed_metrics.matches("memory_injection_action").count(),
+            telemetry_memory_counter(&replayed_metrics, "memory_injection_actions"),
             1
         );
         assert_eq!(
-            replayed_metrics
-                .matches("\"kind\":\"memory_injection\"")
-                .count(),
+            telemetry_memory_counter(&replayed_metrics, "memory_injections"),
             3,
             "start replay must not duplicate its metric; only start, prompt, and edit present"
         );
+
+        drop(route);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    #[test]
+    fn presentation_remains_valid_when_telemetry_storage_is_unavailable() {
+        use lattice_core::memory::{
+            Memory, MemoryScope, MemoryStructuredFields, MemoryType, MemoryVerificationStatus,
+        };
+
+        let directory = test_directory("presentation-telemetry-unavailable");
+        let checkout = committed_repository("presentation-telemetry-unavailable-checkout");
+        let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+        let hello = ProxyRequest {
+            workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        std::fs::create_dir_all(&identity.repository_lattice_dir).unwrap();
+        let store = MemoryStore::open(&identity.memories_path()).unwrap();
+        let memory_id = store
+            .store(Memory {
+                id: "telemetry-unavailable-constraint".to_string(),
+                session_id: "prior-session".to_string(),
+                content: "Keep fixture writes atomic; partial writes corrupt recovery.".to_string(),
+                memory_type: MemoryType::Observation,
+                scope: MemoryScope::Repo,
+                confidence: 0.92,
+                linked_symbols: Vec::new(),
+                linked_files: vec!["fixture.txt".to_string()],
+                workspace_id: Some(identity.repository_id.clone()),
+                branch: Some("other-branch".to_string()),
+                scope_organization_id: None,
+                refresh_key: None,
+                source_query: None,
+                created_at: 1,
+                last_accessed: 1,
+                access_count: 0,
+                is_stale: false,
+                stale_reason: None,
+                verification_status: MemoryVerificationStatus::Unverified,
+            })
+            .unwrap();
+        let mut fields = MemoryStructuredFields::default();
+        fields.memory_class = MemoryClass::Constraint;
+        store.update_structured_fields(&memory_id, &fields).unwrap();
+        std::fs::write(checkout.join("fixture.txt"), "dirty working set\n").unwrap();
+        // SQLite cannot open a directory as the telemetry database. This only
+        // affects observation; the authenticated presentation must still work.
+        std::fs::create_dir(
+            identity
+                .repository_lattice_dir
+                .join("adoption_metrics.sqlite3"),
+        )
+        .unwrap();
+
+        let route = HookSessionRoute::open_at(&directory).unwrap();
+        let opened = route
+            .handle_open(
+                &hello,
+                serde_json::json!({
+                    "integration": "codex-hooks/v1",
+                    "host_session_id": "telemetry-unavailable-session",
+                    "presentation": {
+                        "kind": "session-start",
+                        "request_id": "start-1"
+                    }
+                }),
+            )
+            .expect("telemetry failure must not suppress a valid briefing");
+        let presentation = opened["presentation"].as_object().expect("presentation");
+        assert!(presentation["context"]
+            .as_str()
+            .expect("presentation context")
+            .contains("telemetry-unavailable-constraint"));
+        assert!(presentation["injection_id"].as_str().is_some());
 
         drop(route);
         drop(store);
@@ -2663,5 +3126,21 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn telemetry_memory_counter(ledger: &Value, field: &str) -> u64 {
+        ledger["days"]
+            .as_object()
+            .into_iter()
+            .flat_map(|days| days.values())
+            .filter_map(Value::as_object)
+            .flat_map(|clients| clients.values())
+            .filter_map(Value::as_object)
+            .flat_map(|channels| channels.values())
+            .filter_map(Value::as_object)
+            .filter_map(|tools| tools.get("memory"))
+            .filter_map(|memory| memory.get(field))
+            .filter_map(Value::as_u64)
+            .sum()
     }
 }

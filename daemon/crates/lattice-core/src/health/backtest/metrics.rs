@@ -137,12 +137,17 @@ const OPERATING_THRESHOLDS: [u32; 9] = [900, 800, 700, 600, 500, 400, 300, 200, 
 /// never affects the result. Within a tie group the observations are ordered by
 /// `key` purely so that any derived listing is stable — the metrics themselves
 /// treat the group as one unit.
-pub fn evaluate(mut observations: Vec<ScoredObservation>) -> Result<Evaluation, EvaluationUnavailable> {
+pub fn evaluate(
+    mut observations: Vec<ScoredObservation>,
+) -> Result<Evaluation, EvaluationUnavailable> {
     if observations.is_empty() {
         return Err(EvaluationUnavailable::NoObservations);
     }
     let total = observations.len() as u64;
-    let positives = observations.iter().filter(|observation| observation.label).count() as u64;
+    let positives = observations
+        .iter()
+        .filter(|observation| observation.label)
+        .count() as u64;
     if positives == 0 {
         return Err(EvaluationUnavailable::NoPositiveLabels);
     }
@@ -166,7 +171,9 @@ pub fn evaluate(mut observations: Vec<ScoredObservation>) -> Result<Evaluation, 
 
     let operating_points = OPERATING_THRESHOLDS
         .iter()
-        .map(|threshold| operating_point(&observations, positives, prevalence_per_mille, *threshold))
+        .map(|threshold| {
+            operating_point(&observations, positives, prevalence_per_mille, *threshold)
+        })
         .collect();
 
     Ok(Evaluation {
@@ -241,8 +248,7 @@ fn roc_auc(sorted: &[ScoredObservation], positives: u64, negatives: u64) -> u32 
         // `sorted` is descending, so the element at position `p` has ascending
         // rank `total - p`. The group spans ascending ranks
         // [total - index + 1, total - group_start], whose mean, doubled, is:
-        let doubled_mean_rank =
-            (total - index as u64 + 1) + (total - group_start as u64);
+        let doubled_mean_rank = (total - index as u64 + 1) + (total - group_start as u64);
         let group_positives = sorted[group_start..index]
             .iter()
             .filter(|observation| observation.label)
@@ -309,7 +315,11 @@ fn calibration(sorted: &[ScoredObservation]) -> Vec<CalibrationBucket> {
         .map(|decile| CalibrationBucket {
             lower_per_mille: decile * 100,
             // The top decile absorbs a perfect 1000.
-            upper_per_mille: if decile == 9 { 1001 } else { (decile + 1) * 100 },
+            upper_per_mille: if decile == 9 {
+                1001
+            } else {
+                (decile + 1) * 100
+            },
             observations: 0,
             positives: 0,
             observed_rate_per_mille: 0,

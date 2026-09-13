@@ -130,12 +130,14 @@ producer. A checkout may declare at most 64 checks in
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "checks": [
     {
       "id": "core-tests",
       "label": "lattice core tests",
-      "argv": ["cargo", "test", "-p", "lattice-core"],
+      "argv": ["/absolute/path/to/test-program", "--workspace"],
+      "timeout_ms": 120000,
+      "env": {"CI": "true"},
       "error": {
         "category": "test",
         "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -144,6 +146,20 @@ producer. A checkout may declare at most 64 checks in
   ]
 }
 ```
+
+Version 2 is the sole accepted verification-checks schema. Each declaration
+requires `id`, `label`, `argv`, and a positive `timeout_ms`; `env`,
+`evidence_reference`, and `error` are optional. The executable must be an
+absolute path or an explicit `./` checkout-relative path, and execution clears
+the environment before applying declared values. Shell executables are
+rejected. On Windows, the runner creates the process suspended with only the
+three standard-stream handles inheritable, assigns it to a kill-on-close Job
+Object, and resumes it only after assignment succeeds. Timeout, output-limit,
+wait, and resume failures terminate the whole job; normal primary-process exit
+also closes the job before output readers are joined, removing descendants.
+The Windows implementation is isolated-target compiled in CI-compatible source
+validation, but native Windows runtime execution remains required before
+claiming host-level validation.
 
 The manifest is local execution authority and therefore requires deliberate
 operator creation; installation never creates or enables it. The private
@@ -253,14 +269,20 @@ records and pending deliveries are pruned without logging their content. The
 registry primitive likewise retains only opaque authority/receipt metadata and
 must prune expired bindings and receipts after its configured
 audit/idempotency windows; it stores no digest content. Session-digest records
-use an explicit repository-local age-and-count retention policy. That policy
-must transactionally remove
-dependent evidence, links, and queued jobs, while preserving review proposals
-or durable records derived from a digest with content-free provenance and
-deletion time. The current daemon capture journal and registry receipt window
-is seven days. Operator deletion by repository-scoped session ID uses the same
-transactional path and audits no content; it cannot widen authority to an
-organization store or another checkout.
+use an explicit repository-local age-and-count transport-retention policy. It
+transactionally removes delivery and candidate-commit rows while preserving
+source lessons, their evidence, links, and verification work. Those lessons
+expire only through the separate recall-based repository memory lifecycle. A
+bounded content-free tombstone prevents replay while the digest could still
+pass replay admission; expired retention tombstones are then removed. One
+maintenance pass retires at most 256 combined transport and tombstone rows and
+reserves progress for expired tombstones under sustained capture load. The
+current daemon capture journal and registry receipt window is seven days.
+Explicit operator deletion by repository-scoped session ID is a separate,
+deliberate knowledge-deletion mode. It removes selected source lessons and
+their dependencies while preserving content-free provenance for derived
+records and audits. It cannot widen authority to an organization store or
+another checkout.
 
 ## Required verification
 

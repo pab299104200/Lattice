@@ -32,7 +32,11 @@ struct CommitSpec {
 }
 
 impl CommitSpec {
-    const fn new(day: i64, subject: &'static str, files: &'static [(&'static str, &'static str)]) -> Self {
+    const fn new(
+        day: i64,
+        subject: &'static str,
+        files: &'static [(&'static str, &'static str)],
+    ) -> Self {
         Self {
             subject,
             files,
@@ -140,16 +144,48 @@ const LEAKAGE_HISTORY: &[CommitSpec] = &[
             ("src/steady.rs", BUSY_BODY),
         ],
     ),
-    CommitSpec::new(10, "fix: correct the early defect", &[("src/early_fix.rs", "pub fn early() -> u32 {\n    1\n}\n")]),
-    CommitSpec::new(20, "feat: extend steady", &[("src/steady.rs", "pub fn steady() -> u32 {\n    2\n}\n")]),
-    CommitSpec::new(30, "fix: correct the early defect again", &[("src/early_fix.rs", "pub fn early() -> u32 {\n    3\n}\n")]),
-    CommitSpec::new(40, "feat: extend steady further", &[("src/steady.rs", "pub fn steady() -> u32 {\n    4\n}\n")]),
+    CommitSpec::new(
+        10,
+        "fix: correct the early defect",
+        &[("src/early_fix.rs", "pub fn early() -> u32 {\n    1\n}\n")],
+    ),
+    CommitSpec::new(
+        20,
+        "feat: extend steady",
+        &[("src/steady.rs", "pub fn steady() -> u32 {\n    2\n}\n")],
+    ),
+    CommitSpec::new(
+        30,
+        "fix: correct the early defect again",
+        &[("src/early_fix.rs", "pub fn early() -> u32 {\n    3\n}\n")],
+    ),
+    CommitSpec::new(
+        40,
+        "feat: extend steady further",
+        &[("src/steady.rs", "pub fn steady() -> u32 {\n    4\n}\n")],
+    ),
     // --- cut point: index 5, day 50 -------------------------------------
-    CommitSpec::new(50, "chore: the cut point", &[("src/steady.rs", "pub fn steady() -> u32 {\n    5\n}\n")]),
+    CommitSpec::new(
+        50,
+        "chore: the cut point",
+        &[("src/steady.rs", "pub fn steady() -> u32 {\n    5\n}\n")],
+    ),
     // --- horizon --------------------------------------------------------
-    CommitSpec::new(60, "fix: the late break surfaces", &[("src/late_break.rs", "pub fn quiet() -> u32 {\n    60\n}\n")]),
-    CommitSpec::new(70, "fix: the late break again", &[("src/late_break.rs", "pub fn quiet() -> u32 {\n    70\n}\n")]),
-    CommitSpec::new(80, "feat: unrelated work", &[("src/steady.rs", "pub fn steady() -> u32 {\n    8\n}\n")]),
+    CommitSpec::new(
+        60,
+        "fix: the late break surfaces",
+        &[("src/late_break.rs", "pub fn quiet() -> u32 {\n    60\n}\n")],
+    ),
+    CommitSpec::new(
+        70,
+        "fix: the late break again",
+        &[("src/late_break.rs", "pub fn quiet() -> u32 {\n    70\n}\n")],
+    ),
+    CommitSpec::new(
+        80,
+        "feat: unrelated work",
+        &[("src/steady.rs", "pub fn steady() -> u32 {\n    8\n}\n")],
+    ),
 ];
 
 /// Index of the cut point in [`LEAKAGE_HISTORY`].
@@ -300,12 +336,33 @@ fn no_post_cut_point_commit_can_reach_the_facts() {
 #[test]
 fn the_tree_read_at_the_cut_point_ignores_later_content() {
     const HISTORY: &[CommitSpec] = &[
-        CommitSpec::new(0, "Initial implementation", &[("src/original.rs", QUIET_BODY)]),
-        CommitSpec::new(10, "feat: still here later", &[("src/doomed.rs", QUIET_BODY)]),
+        CommitSpec::new(
+            0,
+            "Initial implementation",
+            &[("src/original.rs", QUIET_BODY)],
+        ),
+        CommitSpec::new(
+            10,
+            "feat: still here later",
+            &[("src/doomed.rs", QUIET_BODY)],
+        ),
         // --- cut point: index 2 ------------------------------------------
-        CommitSpec::new(20, "chore: the cut point", &[("src/original.rs", BUSY_BODY)]),
-        CommitSpec::new(30, "feat: added after the cut point", &[("src/newcomer.rs", QUIET_BODY)]),
-        CommitSpec::removing(40, "chore: delete after the cut point", &[], &["src/doomed.rs"]),
+        CommitSpec::new(
+            20,
+            "chore: the cut point",
+            &[("src/original.rs", BUSY_BODY)],
+        ),
+        CommitSpec::new(
+            30,
+            "feat: added after the cut point",
+            &[("src/newcomer.rs", QUIET_BODY)],
+        ),
+        CommitSpec::removing(
+            40,
+            "chore: delete after the cut point",
+            &[],
+            &["src/doomed.rs"],
+        ),
     ];
     let (directory, commits) = fixture(HISTORY);
     let replay = replay_at_commit(directory.path(), &commits[2].to_string(), test_limits())
@@ -332,11 +389,7 @@ fn replaying_never_touches_the_callers_checkout() {
     let repository = Repository::open(directory.path()).expect("open fixture");
     let head_before = repository.head().unwrap().target().unwrap();
     let files_before = working_tree_listing(directory.path());
-    let dirty_before = repository
-        .statuses(None)
-        .expect("statuses")
-        .iter()
-        .count();
+    let dirty_before = repository.statuses(None).expect("statuses").iter().count();
 
     replay_at_commit(
         directory.path(),
@@ -363,7 +416,10 @@ fn working_tree_listing(root: &Path) -> Vec<String> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             if name == ".git" {
                 continue;
             }
@@ -428,7 +484,11 @@ fn observations_are_ordered_by_path_so_output_is_stable() {
 fn the_horizon_commit_cap_cuts_a_real_history_at_the_documented_edge() {
     // Two commits after the cut point; a cap of one admits only the nearer.
     const HISTORY: &[CommitSpec] = &[
-        CommitSpec::new(0, "Initial implementation", &[("src/a.rs", QUIET_BODY), ("src/b.rs", QUIET_BODY)]),
+        CommitSpec::new(
+            0,
+            "Initial implementation",
+            &[("src/a.rs", QUIET_BODY), ("src/b.rs", QUIET_BODY)],
+        ),
         CommitSpec::new(10, "chore: the cut point", &[("src/a.rs", BUSY_BODY)]),
         CommitSpec::new(20, "fix: inside the cap", &[("src/a.rs", QUIET_BODY)]),
         CommitSpec::new(30, "fix: outside the cap", &[("src/b.rs", BUSY_BODY)]),
@@ -456,14 +516,26 @@ fn the_horizon_commit_cap_cuts_a_real_history_at_the_documented_edge() {
 fn the_horizon_day_cap_cuts_a_real_history_at_the_documented_edge() {
     // The fix lands 91 days after the cut point, one day past the bound.
     const HISTORY: &[CommitSpec] = &[
-        CommitSpec::new(0, "Initial implementation", &[("src/a.rs", QUIET_BODY), ("src/b.rs", QUIET_BODY)]),
+        CommitSpec::new(
+            0,
+            "Initial implementation",
+            &[("src/a.rs", QUIET_BODY), ("src/b.rs", QUIET_BODY)],
+        ),
         CommitSpec::new(10, "chore: the cut point", &[("src/a.rs", BUSY_BODY)]),
-        CommitSpec::new(100, "fix: exactly on the ninety day bound", &[("src/a.rs", QUIET_BODY)]),
-        CommitSpec::new(101, "fix: one day past the bound", &[("src/b.rs", BUSY_BODY)]),
+        CommitSpec::new(
+            100,
+            "fix: exactly on the ninety day bound",
+            &[("src/a.rs", QUIET_BODY)],
+        ),
+        CommitSpec::new(
+            101,
+            "fix: one day past the bound",
+            &[("src/b.rs", BUSY_BODY)],
+        ),
     ];
     let (directory, commits) = fixture(HISTORY);
-    let replay = replay_at_commit(directory.path(), &commits[1].to_string(), test_limits())
-        .expect("replay");
+    let replay =
+        replay_at_commit(directory.path(), &commits[1].to_string(), test_limits()).expect("replay");
 
     assert_eq!(replay.labels.report.selected_commits, 1);
     assert!(replay.labels.report.truncated_by_day_cap);
@@ -507,7 +579,10 @@ fn multiple_cut_points_are_placed_across_a_real_history() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(indices, sorted);
-    assert_eq!(replay.name, directory.path().file_name().unwrap().to_str().unwrap());
+    assert_eq!(
+        replay.name,
+        directory.path().file_name().unwrap().to_str().unwrap()
+    );
 }
 
 #[test]
@@ -527,7 +602,10 @@ fn a_history_too_short_to_place_a_cut_point_is_refused_rather_than_guessed() {
         },
     )
     .expect_err("a one-commit history cannot host a cut point");
-    assert!(matches!(error, ReplayError::HistoryTooShort { .. }), "{error}");
+    assert!(
+        matches!(error, ReplayError::HistoryTooShort { .. }),
+        "{error}"
+    );
 }
 
 #[test]
@@ -544,9 +622,7 @@ fn a_commit_off_the_first_parent_spine_is_refused() {
     let (directory, commits) = fixture(LEAKAGE_HISTORY);
     let repository = Repository::open(directory.path()).expect("open fixture");
     // A commit on a side branch, never merged, so it is not on the spine.
-    let parent = repository
-        .find_commit(commits[0])
-        .expect("root commit");
+    let parent = repository.find_commit(commits[0]).expect("root commit");
     let signature = Signature::new(
         "Fixture Author",
         "fixture@example.test",
@@ -566,7 +642,10 @@ fn a_commit_off_the_first_parent_spine_is_refused() {
 
     let error = replay_at_commit(directory.path(), &side.to_string(), test_limits())
         .expect_err("a commit off the spine has no well-defined horizon");
-    assert!(matches!(error, ReplayError::CutPointOffSpine { .. }), "{error}");
+    assert!(
+        matches!(error, ReplayError::CutPointOffSpine { .. }),
+        "{error}"
+    );
 }
 
 #[test]

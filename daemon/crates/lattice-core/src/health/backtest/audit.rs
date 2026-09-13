@@ -196,7 +196,15 @@ pub struct LabelAudit {
 /// labeling: changing the ground-truth definition would change every number in
 /// the report that measures it.
 const FIX_VOCABULARY: [&str; 9] = [
-    "fix", "fixes", "fixed", "bugfix", "hotfix", "bug", "regression", "revert", "reverts",
+    "fix",
+    "fixes",
+    "fixed",
+    "bugfix",
+    "hotfix",
+    "bug",
+    "regression",
+    "revert",
+    "reverts",
 ];
 
 /// Whether a subject mentions repair work anywhere, as a whole word.
@@ -359,10 +367,7 @@ fn cohen_kappa_per_mille(both: u64, fix_only: u64, signal_only: u64, neither: u6
 /// Selection is evenly spaced across each class's commits in commit-id order,
 /// so the sample spans the population rather than clustering, and is identical
 /// on every run.
-fn build_sample(
-    classified: &[(&AuditInput, bool, bool)],
-    sample_size: usize,
-) -> Vec<AuditSample> {
+fn build_sample(classified: &[(&AuditInput, bool, bool)], sample_size: usize) -> Vec<AuditSample> {
     let wanted_per_class = sample_size / 2;
     let mut sample = Vec::new();
     for class in [true, false] {

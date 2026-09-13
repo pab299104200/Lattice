@@ -45,9 +45,8 @@ pub fn hot_cyclic_file() -> FileFacts {
         .with(fact(FactKind::TopAuthorShare, 610, 400).with_window(window()))
         .with(fact(FactKind::BusFactor, 2, 300).with_window(window()))
         .with(
-            fact(FactKind::MaxCyclomaticComplexity, 34, 930).with_source_range(
-                FactSourceRange::new("daemon/src/orchestrator.rs", 118, 332),
-            ),
+            fact(FactKind::MaxCyclomaticComplexity, 34, 930)
+                .with_source_range(FactSourceRange::new("daemon/src/orchestrator.rs", 118, 332)),
         )
         .with(fact(FactKind::P90CyclomaticComplexity, 12, 810))
         .with(
@@ -60,9 +59,13 @@ pub fn hot_cyclic_file() -> FileFacts {
         .with(fact(FactKind::MaxNestingDepth, 7, 900))
         .with(fact(FactKind::OverThresholdShare, 320, 860))
         .with(fact(FactKind::FunctionCount, 41, 910))
-        .with(fact(FactKind::UnstableDependencies, 3, 890).with_source_range(
-            FactSourceRange::new("daemon/src/orchestrator.rs", 12, 12),
-        ))
+        .with(
+            fact(FactKind::UnstableDependencies, 3, 890).with_source_range(FactSourceRange::new(
+                "daemon/src/orchestrator.rs",
+                12,
+                12,
+            )),
+        )
         .with(fact(FactKind::UntestedChange, 1, 700))
         .with(fact(FactKind::DeadExportedSymbols, 2, 880))
 }
@@ -122,4 +125,3 @@ pub fn degraded_graph_only_file() -> FileFacts {
 pub fn weights() -> &'static WeightTable {
     super::weights::active_weights()
 }
-

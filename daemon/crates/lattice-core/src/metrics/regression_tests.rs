@@ -175,7 +175,7 @@ impl MetricsTestHarness {
         rules: &[ProjectRule],
         task: &GoldenTask,
     ) -> Result<TaskReport, String> {
-        let mut engine = QueryEngine::new(graph.clone(), None, None);
+        let mut engine = QueryEngine::new(graph.clone(), None);
         let capsule = engine.query(&task.task_prompt, None, false);
         let files = expected_files(task);
         let symbols = expected_symbols(task);

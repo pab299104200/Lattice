@@ -29,6 +29,8 @@ pub struct Indexer {
 pub enum IndexFailureKind {
     ParseError,
     WorkerPanic,
+    TraversalError,
+    ReadError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,40 +545,14 @@ impl Indexer {
         &self,
         dir: &std::path::Path,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let mut files = Vec::new();
-        self.scan_files(dir, dir, &mut files)?;
-        Ok(files)
-    }
-
-    fn scan_files(
-        &self,
-        base: &std::path::Path,
-        dir: &std::path::Path,
-        files: &mut Vec<(String, String)>,
-    ) -> anyhow::Result<()> {
-        let entries = std::fs::read_dir(dir)?;
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !crate::watcher::is_excluded_dir(dir_name) {
-                    self.scan_files(base, &path, files)?;
-                }
-            } else if path.is_file() {
-                let rel_path = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if crate::watcher::should_index_file(&rel_path) {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        files.push((rel_path, content));
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::security::workspace::collect_sources(dir)?
+            .into_iter()
+            .map(|path| {
+                let relative = path.strip_prefix(dir)?;
+                let content = crate::security::workspace::read_source(dir, relative)?;
+                Ok((relative.to_string_lossy().replace('\\', "/"), content))
+            })
+            .collect()
     }
 
     /// Re-index a file and return the list of changed symbols.
@@ -633,11 +609,12 @@ impl Indexer {
         &mut self,
         rel_path: &str,
         content: &str,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
         stale_marker: Option<&mut crate::consolidation::StaleMarker<'_>>,
     ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
         let changes = self.index_file_content_with_diff(rel_path, content)?;
         if let Some(marker) = stale_marker {
-            let _ = marker.on_graph_change(vec![rel_path.to_string()]);
+            let _ = marker.on_graph_change(authority, vec![rel_path.to_string()]);
         }
         Ok(changes)
     }
@@ -646,6 +623,7 @@ impl Indexer {
         &mut self,
         file_id: FileId,
         content: &str,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
         stale_marker: Option<&mut crate::consolidation::StaleMarker<'_>>,
         incremental_verifier: Option<&mut IncrementalVerifier<'_>>,
     ) -> Result<Vec<crate::diff::SymbolChange>, LatticeError> {
@@ -653,7 +631,7 @@ impl Indexer {
         let changes = self.index_file_content_with_diff(&file_id.repo_relative_path, content)?;
         let new_snapshot_id = self.graph_snapshot_id;
         if let Some(marker) = stale_marker {
-            let _ = marker.on_graph_change(vec![file_id.repo_relative_path.clone()]);
+            let _ = marker.on_graph_change(authority, vec![file_id.repo_relative_path.clone()]);
         }
         if let Some(verifier) = incremental_verifier {
             let _ = verifier.on_graph_delta(prior_snapshot_id, new_snapshot_id, vec![file_id]);

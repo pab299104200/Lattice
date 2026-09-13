@@ -6,10 +6,10 @@
 //! `## Verification Engine`, and
 //! `## MCP Tool Contract Principles`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use lattice_core::identity::{FileId, MemoryId, SectionId, SymbolId};
-use lattice_core::memory::{Memory, MemoryStore};
+use lattice_core::memory::{query_conflicts, ConflictAnchorQuery, MemoryStore};
 use lattice_core::verification::{ScopeFilter, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -193,28 +193,50 @@ pub fn parse_args(args: &Value) -> Result<ListMemoryConflictsArgs, String> {
 pub fn execute(
     store: &MemoryStore,
     scope_filter: &ScopeFilter,
+    applicable_checkout_id: Option<&str>,
     args: ListMemoryConflictsArgs,
 ) -> Result<ListMemoryConflictsExecution, String> {
-    let anchor_memories = resolve_anchor_memories(store, scope_filter, &args.anchor)?;
+    validate_anchor_authority(scope_filter, &args.anchor)?;
     let anchor_label = anchor_label(&args.anchor);
-    let all_records = collect_conflicts(store, scope_filter, &anchor_memories)?;
     let start = args.cursor.unwrap_or(0);
-    let limit = args.limit.max(1);
-    let conflicts: Vec<ConflictRecord> = all_records
-        .iter()
-        .skip(start)
-        .take(limit)
-        .cloned()
+    let query_anchor = core_anchor(&args.anchor);
+    let page = store
+        .with_connection(|conn| {
+            query_conflicts(
+                conn,
+                scope_filter,
+                applicable_checkout_id,
+                &query_anchor,
+                start,
+                args.limit,
+            )
+        })
+        .map_err(|error| format!("Failed to inspect memory conflicts: {error}"))?;
+    let conflicts: Vec<ConflictRecord> = page
+        .records
+        .into_iter()
+        .map(|record| ConflictRecord {
+            source: memory_identity(&record.source_workspace_id, &record.source_memory_id),
+            target: memory_identity(&record.target_workspace_id, &record.target_memory_id),
+            link_type: record.link_type,
+            link_strength: record.link_strength,
+            created_by: record.created_by,
+            created_at: record.created_at,
+            link_verification_status: parse_status(&record.verification_status),
+            reason: record.reason,
+        })
         .collect();
-    let next_cursor =
-        (start + conflicts.len() < all_records.len()).then_some(start + conflicts.len());
+    let next_offset = start.checked_add(conflicts.len()).ok_or_else(|| {
+        "Memory conflict cursor plus returned page length overflows usize".to_string()
+    })?;
+    let next_cursor = (next_offset < page.total).then_some(next_offset);
     let summary_lines = summarize_conflicts(&conflicts, args.render_mode);
     let surfaced_memory_ids = surfaced_memory_ids(&conflicts);
     Ok(ListMemoryConflictsExecution {
         response: ListMemoryConflictsResponse {
             anchor: anchor_label,
             conflicts,
-            total: all_records.len(),
+            total: page.total,
             next_cursor,
             render_mode: args.render_mode,
             summary_lines,
@@ -223,281 +245,33 @@ pub fn execute(
     })
 }
 
-fn resolve_anchor_memories(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    anchor: &ConflictAnchor,
-) -> Result<Vec<Memory>, String> {
+fn core_anchor(anchor: &ConflictAnchor) -> ConflictAnchorQuery {
     match anchor {
-        ConflictAnchor::Memory(memory_id) => {
-            let scoped = store
-                .get_by_id_scoped(memory_id.ulid(), scope_filter)
-                .map_err(|error| format!("Failed to load scoped memory anchor: {error}"))?;
-            if let Some(memory) = scoped {
-                return Ok(vec![memory]);
-            }
-            let out_of_scope = store
-                .get_by_id(memory_id.ulid())
-                .map_err(|error| format!("Failed to inspect memory anchor scope: {error}"))?
-                .is_some();
-            if out_of_scope {
-                return Err(format!(
-                    "Memory `{}` is outside the active scope filter",
-                    memory_id.ulid()
-                ));
-            }
-            Err(format!("Memory `{}` was not found", memory_id.ulid()))
+        ConflictAnchor::Memory(memory) => ConflictAnchorQuery::Memory(memory.ulid().to_string()),
+        ConflictAnchor::File(file) => ConflictAnchorQuery::File(file.repo_relative_path.clone()),
+        ConflictAnchor::Symbol(symbol) => {
+            ConflictAnchorQuery::Symbol(symbol.qualified_name.clone())
         }
-        ConflictAnchor::File(file) => scoped_memories_matching(store, scope_filter, |memory| {
-            memory
-                .linked_files
-                .iter()
-                .any(|value| value == &file.repo_relative_path)
-        }),
-        ConflictAnchor::Symbol(symbol) => scoped_memories_matching(store, scope_filter, |memory| {
-            memory
-                .linked_symbols
-                .iter()
-                .any(|value| value == &symbol.qualified_name)
-        }),
-        ConflictAnchor::DocSection(section) => {
-            let doc_path = &section.doc.repo_relative_path;
-            let heading = section.heading_path.join(" > ");
-            scoped_memories_matching(store, scope_filter, |memory| {
-                store
-                    .get_structured_fields(&memory.id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|fields| {
-                        fields.linked_docs.iter().any(|value| {
-                            value == doc_path || value == &format!("{doc_path}#{heading}")
-                        })
-                    })
-            })
-        }
+        ConflictAnchor::DocSection(section) => ConflictAnchorQuery::Doc(format!(
+            "{}#{}",
+            section.doc.repo_relative_path,
+            section.heading_path.join(" > ")
+        )),
     }
 }
 
-fn scoped_memories_matching<F>(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    predicate: F,
-) -> Result<Vec<Memory>, String>
-where
-    F: Fn(&Memory) -> bool,
-{
-    let scoped = store
-        .list_all_scoped(scope_filter)
-        .map_err(|error| format!("Failed to list scoped memories: {error}"))?;
-    let matches: Vec<Memory> = scoped.into_iter().filter(predicate).collect();
-    if matches.is_empty() {
-        return Err("No in-scope memories matched the requested anchor".to_string());
-    }
-    Ok(matches)
-}
-
-fn collect_conflicts(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    anchor_memories: &[Memory],
-) -> Result<Vec<ConflictRecord>, String> {
-    let mut dedupe = BTreeSet::new();
-    let mut records = Vec::new();
-    for memory in anchor_memories {
-        collect_link_records(store, scope_filter, memory, &mut dedupe, &mut records)?;
-        collect_structured_conflicts(store, scope_filter, memory, &mut dedupe, &mut records)?;
-    }
-    records.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| left.source.cmp(&right.source))
-            .then_with(|| left.target.cmp(&right.target))
-    });
-    Ok(records)
-}
-
-fn collect_link_records(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    memory: &Memory,
-    dedupe: &mut BTreeSet<String>,
-    records: &mut Vec<ConflictRecord>,
-) -> Result<(), String> {
-    for link in store
-        .list_memory_links_from(&memory.id)
-        .map_err(|error| format!("Failed to load outbound memory links: {error}"))?
-        .into_iter()
-        .filter(is_conflict_link)
-    {
-        let target = load_conflict_memory(store, scope_filter, &link.target_memory_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(memory),
-                memory_identity(&target),
-                &link.link_type,
-                &link.reason,
-                link.created_at,
-                parse_status(&link.verification_status),
-            ),
-        );
-    }
-    for link in store
-        .list_memory_links_to(&memory.id)
-        .map_err(|error| format!("Failed to load inbound memory links: {error}"))?
-        .into_iter()
-        .filter(is_conflict_link)
-    {
-        let source = load_conflict_memory(store, scope_filter, &link.source_memory_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(&source),
-                memory_identity(memory),
-                &link.link_type,
-                &link.reason,
-                link.created_at,
-                parse_status(&link.verification_status),
-            ),
-        );
-    }
-    Ok(())
-}
-
-fn collect_structured_conflicts(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    memory: &Memory,
-    dedupe: &mut BTreeSet<String>,
-    records: &mut Vec<ConflictRecord>,
-) -> Result<(), String> {
-    let Some(fields) = store
-        .get_structured_fields(&memory.id)
-        .map_err(|error| format!("Failed to load structured conflict metadata: {error}"))?
-    else {
-        return Ok(());
+fn validate_anchor_authority(scope: &ScopeFilter, anchor: &ConflictAnchor) -> Result<(), String> {
+    let requested_workspace = match anchor {
+        ConflictAnchor::Memory(MemoryIdInput::Structured(memory)) => Some(&memory.workspace_id),
+        ConflictAnchor::Memory(MemoryIdInput::Legacy(_)) => None,
+        ConflictAnchor::File(file) => Some(&file.workspace_id),
+        ConflictAnchor::Symbol(symbol) => Some(&symbol.file.workspace_id),
+        ConflictAnchor::DocSection(section) => Some(&section.doc.workspace_id),
     };
-    for target_id in &fields.contradicted_by_memory_ids {
-        let target = load_conflict_memory(store, scope_filter, target_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(&target),
-                memory_identity(memory),
-                "contradicts",
-                "structured contradicted_by edge",
-                memory.created_at,
-                VerificationStatus::Contradicted,
-            ),
-        );
-    }
-    for target_id in &fields.contradicts_memory_ids {
-        let target = load_conflict_memory(store, scope_filter, target_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(memory),
-                memory_identity(&target),
-                "contradicts",
-                "structured contradicts edge",
-                memory.created_at,
-                VerificationStatus::Contradicted,
-            ),
-        );
-    }
-    if let Some(target_id) = fields.superseded_by_memory_id.as_deref() {
-        let target = load_conflict_memory(store, scope_filter, target_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(&target),
-                memory_identity(memory),
-                "supersedes",
-                "structured superseded_by edge",
-                memory.created_at,
-                VerificationStatus::Superseded,
-            ),
-        );
-    }
-    if let Some(target_id) = fields.supersedes_memory_id.as_deref() {
-        let target = load_conflict_memory(store, scope_filter, target_id)?;
-        insert_record(
-            dedupe,
-            records,
-            build_record(
-                memory_identity(memory),
-                memory_identity(&target),
-                "supersedes",
-                "structured supersedes edge",
-                memory.created_at,
-                VerificationStatus::Superseded,
-            ),
-        );
+    if requested_workspace.is_some_and(|workspace| workspace != &scope.workspace_id) {
+        return Err("Conflict anchor is outside the active workspace scope".into());
     }
     Ok(())
-}
-
-fn load_conflict_memory(
-    store: &MemoryStore,
-    scope_filter: &ScopeFilter,
-    memory_id: &str,
-) -> Result<Memory, String> {
-    if let Some(memory) = store
-        .get_by_id_scoped(memory_id, scope_filter)
-        .map_err(|error| format!("Failed to load scoped conflict memory: {error}"))?
-    {
-        return Ok(memory);
-    }
-    let out_of_scope = store
-        .get_by_id(memory_id)
-        .map_err(|error| format!("Failed to inspect conflict scope: {error}"))?
-        .is_some();
-    if out_of_scope {
-        return Err(format!(
-            "Conflict memory `{memory_id}` is outside the active scope filter"
-        ));
-    }
-    Err(format!("Conflict memory `{memory_id}` was not found"))
-}
-
-fn insert_record(
-    dedupe: &mut BTreeSet<String>,
-    records: &mut Vec<ConflictRecord>,
-    record: ConflictRecord,
-) {
-    let key = format!(
-        "{}:{}:{}:{}",
-        record.source, record.target, record.link_type, record.reason
-    );
-    if dedupe.insert(key) {
-        records.push(record);
-    }
-}
-
-fn build_record(
-    source: String,
-    target: String,
-    link_type: &str,
-    reason: &str,
-    created_at: u64,
-    status: VerificationStatus,
-) -> ConflictRecord {
-    ConflictRecord {
-        source,
-        target,
-        link_type: link_type.to_string(),
-        link_strength: 1.0,
-        created_by: "system".to_string(),
-        created_at,
-        link_verification_status: status,
-        reason: reason.to_string(),
-    }
 }
 
 fn summarize_conflicts(
@@ -544,15 +318,12 @@ fn parse_memory_identity(encoded: &str) -> MemoryId {
     }
 }
 
-fn memory_identity(memory: &Memory) -> String {
+fn memory_identity(workspace_id: &str, memory_id: &str) -> String {
     format!(
         "{}",
         MemoryId {
-            workspace_id: memory
-                .workspace_id
-                .clone()
-                .unwrap_or_else(|| "workspace-main".to_string()),
-            ulid: memory.id.clone(),
+            workspace_id: workspace_id.to_string(),
+            ulid: memory_id.to_string(),
         }
     )
 }
@@ -572,10 +343,6 @@ fn anchor_label(anchor: &ConflictAnchor) -> String {
             section.heading_path.join(" > ")
         ),
     }
-}
-
-fn is_conflict_link(link: &lattice_core::memory::MemoryLinkRecord) -> bool {
-    matches!(link.link_type.as_str(), "contradicts" | "supersedes")
 }
 
 fn parse_status(value: &str) -> VerificationStatus {

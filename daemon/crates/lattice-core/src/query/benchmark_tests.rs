@@ -219,7 +219,7 @@ fn is_eval_source_file(path: &Path) -> bool {
 }
 
 fn lattice_working_set(graph: &CodeGraph, query: &str) -> (Vec<String>, Vec<String>) {
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query(query, None, false);
     let mut capsule_files = capsule
         .pivots
@@ -543,7 +543,7 @@ fn bench_precision_auth() {
             return;
         }
     };
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query(
         "authentication system JWT login token generation password verification user auth flow",
         None,
@@ -605,7 +605,7 @@ fn bench_precision_patch() {
             return;
         }
     };
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("How does patch deployment work", None, false);
 
     let keywords = &[
@@ -641,7 +641,7 @@ fn bench_precision_host() {
             return;
         }
     };
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("host management and discovery", None, false);
 
     let keywords = &[
@@ -684,7 +684,7 @@ fn bench_precision_snmp() {
             return;
         }
     };
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("SNMP polling credential encryption", None, false);
 
     let keywords = &[
@@ -780,7 +780,7 @@ fn bench_precision_scorecard() {
 
     let mut all_pass = true;
     for q in &queries {
-        let mut engine = QueryEngine::new(graph.clone(), None, None);
+        let mut engine = QueryEngine::new(graph.clone(), None);
         let capsule = engine.query(q.query, None, false);
         let (precision, relevant, total) = measure_precision(&capsule, q.keywords);
         let pass = precision >= 0.90;
@@ -885,7 +885,7 @@ fn bench_precision_assistant_scorecard() {
 
     let mut all_pass = true;
     for q in &queries {
-        let mut engine = QueryEngine::new(graph.clone(), None, None);
+        let mut engine = QueryEngine::new(graph.clone(), None);
         let capsule = engine.query(q.query, None, false);
         let (precision, relevant, total) = measure_precision(&capsule, q.keywords);
         let pass = precision >= 0.90;

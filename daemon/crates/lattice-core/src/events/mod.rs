@@ -35,8 +35,10 @@ mod writer_tests;
 pub type DocSectionId = crate::identity::SectionId;
 
 pub use compaction::{
+    expire_managed_snapshots, expire_managed_snapshots_dir, expire_managed_snapshots_dir_page,
     Bootstrap, BootstrapError, BootstrappedState, CompactionConfig, CompactionError,
-    CompactionReport, Compactor, GraphHandle, MemoryHandle, SchedulerHandle,
+    CompactionReport, Compactor, GraphHandle, SchedulerHandle, SnapshotExpiryCursor,
+    SnapshotExpiryReport,
 };
 pub use envelope::{
     Actor, BranchRef, CompactSummary, EventEnvelope, EventModelError, PayloadLocation, SessionId,

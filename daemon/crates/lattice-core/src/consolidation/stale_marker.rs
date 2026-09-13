@@ -39,7 +39,16 @@ impl<'a> StaleMarker<'a> {
         }
     }
 
-    pub fn on_graph_change(&mut self, changed_files: Vec<String>) -> Result<ScanReport, ScanError> {
+    pub fn on_graph_change(
+        &mut self,
+        authority: &super::EvolutionAuthority<'_>,
+        changed_files: Vec<String>,
+    ) -> Result<ScanReport, ScanError> {
+        if authority.repository_id != self.workspace_id {
+            return Err(ScanError::Storage(crate::LatticeError::Storage(
+                "stale marker authority repository mismatch".into(),
+            )));
+        }
         let started = Instant::now();
         let span = info_span!(
             "consolidation.stale_marker.scan",
@@ -105,7 +114,7 @@ impl<'a> StaleMarker<'a> {
             proposals_enqueued += 1;
         }
 
-        let _ = self.runtime.run_due()?;
+        let _ = self.runtime.run_due(self.store, authority)?;
         Ok(ScanReport::from_counts(
             proposals_enqueued,
             skipped,

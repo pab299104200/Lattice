@@ -41,6 +41,7 @@ pub struct ExpiryScanner<'a> {
     runtime: &'a mut ConsolidationJobRuntime,
     event_writer: &'a EventWriter,
     decided_by: &'a OperatorId,
+    authority: &'a crate::consolidation::EvolutionAuthority<'a>,
 }
 
 impl<'a> ExpiryScanner<'a> {
@@ -49,12 +50,14 @@ impl<'a> ExpiryScanner<'a> {
         runtime: &'a mut ConsolidationJobRuntime,
         event_writer: &'a EventWriter,
         decided_by: &'a OperatorId,
+        authority: &'a crate::consolidation::EvolutionAuthority<'a>,
     ) -> Self {
         Self {
             store,
             runtime,
             event_writer,
             decided_by,
+            authority,
         }
     }
 
@@ -107,9 +110,8 @@ impl<'a> ExpiryScanner<'a> {
         let proposal_id = format!("expiry-proposal-{}-{}", memory_id, now_unix_micros());
         let proposed_state = expired_state(prior_state);
 
-        let _ = self
-            .runtime
-            .submit_inline(crate::consolidation::ConsolidationJobSpec {
+        let _ = self.runtime.submit_inline(
+            crate::consolidation::ConsolidationJobSpec {
                 job_id,
                 workspace_id: workspace_id.to_string(),
                 kind: "expire time-bound durable memory".to_string(),
@@ -130,7 +132,10 @@ impl<'a> ExpiryScanner<'a> {
                     }),
                     provenance: None,
                 }),
-            })?;
+            },
+            self.store,
+            self.authority,
+        )?;
 
         Ok(proposal_id)
     }
@@ -142,6 +147,7 @@ impl<'a> ExpiryScanner<'a> {
             self.store,
             self.event_writer,
             self.decided_by.value.as_str(),
+            self.authority,
         )?;
         Ok(())
     }

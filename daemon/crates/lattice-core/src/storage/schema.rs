@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     kind TEXT NOT NULL,
     signature TEXT NOT NULL,
     body TEXT NOT NULL,
+    body_hash TEXT,
     line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
     is_exported INTEGER NOT NULL,
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS file_index (
 
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file, from_name, from_offset);
 CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_file, to_name, to_offset);
+CREATE INDEX IF NOT EXISTS idx_edges_identity ON edges(from_file,from_name,from_offset,to_file,to_name,to_offset,kind);
 "#;
 
 pub const CREATE_NODE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file);";

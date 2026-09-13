@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 use super::{ExpiryScanner, IncrementalVerifier, VerificationObserver, WorkspaceFileReader};
-use crate::consolidation::{ConsolidationConfig, ConsolidationJobRuntime};
+use crate::consolidation::{ConsolidationConfig, ConsolidationJobRuntime, EvolutionAuthority};
 use crate::events::{EventStore, EventWriter, FlushPolicy};
 use crate::graph::CodeGraph;
 use crate::identity::{FileId, OperatorId};
@@ -46,6 +46,7 @@ fn graph_delta_reverifies_only_impacted_memories() {
 
     let mut runtime = fixture.runtime();
     let operator = operator();
+    let authority = fixture.authority();
     let mut verifier = IncrementalVerifier::new(
         &fixture.memory_store,
         &mut runtime,
@@ -55,6 +56,7 @@ fn graph_delta_reverifies_only_impacted_memories() {
         &reader,
         &fixture.event_writer,
         &operator,
+        &authority,
         "workspace-main",
         32,
     )
@@ -78,11 +80,13 @@ fn expiry_scanner_marks_expired_and_is_idempotent() {
         .expect("expiry stores");
     let operator = operator();
     let mut runtime = fixture.runtime();
+    let authority = fixture.authority();
     let mut scanner = ExpiryScanner::new(
         &fixture.memory_store,
         &mut runtime,
         &fixture.event_writer,
         &operator,
+        &authority,
     );
 
     let first = scanner
@@ -120,6 +124,7 @@ fn successful_verification_advances_last_verified_graph_snapshot_id() {
     );
     let mut runtime = fixture.runtime();
     let operator = operator();
+    let authority = fixture.authority();
     let mut verifier = IncrementalVerifier::new(
         &fixture.memory_store,
         &mut runtime,
@@ -129,6 +134,7 @@ fn successful_verification_advances_last_verified_graph_snapshot_id() {
         &reader,
         &fixture.event_writer,
         &operator,
+        &authority,
         "workspace-main",
         8,
     );
@@ -164,6 +170,7 @@ fn deleted_file_invalidates_verified_memory_on_next_delta() {
 
     let mut runtime = fixture.runtime();
     let operator = operator();
+    let authority = fixture.authority();
     let mut verifier = IncrementalVerifier::new(
         &fixture.memory_store,
         &mut runtime,
@@ -173,6 +180,7 @@ fn deleted_file_invalidates_verified_memory_on_next_delta() {
         &reader,
         &fixture.event_writer,
         &operator,
+        &authority,
         "workspace-main",
         8,
     );
@@ -212,6 +220,7 @@ fn bounded_work_budget_reenqueues_remaining_memories() {
 
     let mut runtime = fixture.runtime();
     let operator = operator();
+    let authority = fixture.authority();
     let mut verifier = IncrementalVerifier::new(
         &fixture.memory_store,
         &mut runtime,
@@ -221,6 +230,7 @@ fn bounded_work_budget_reenqueues_remaining_memories() {
         &reader,
         &fixture.event_writer,
         &operator,
+        &authority,
         "workspace-main",
         50,
     )
@@ -289,6 +299,14 @@ impl Fixture {
             ConsolidationConfig::default(),
         )
         .expect("runtime opens")
+    }
+
+    fn authority(&self) -> EvolutionAuthority<'static> {
+        EvolutionAuthority {
+            repository_id: "workspace-main",
+            checkout_id: "checkout-main",
+            branch: "main",
+        }
     }
 
     fn seed_memory(&self, id: &str, evidence: MemoryEvidence) -> String {

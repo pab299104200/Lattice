@@ -22,7 +22,16 @@ fn deterministic_job_emits_proposal_without_mutating_memory() {
         ))
         .expect("job enqueues");
 
-    let proposals = runtime.run_due().expect("job runs");
+    let proposals = runtime
+        .run_due(
+            &fixture.memory_store,
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
+        .expect("job runs");
 
     assert_eq!(proposals.len(), 1);
     assert_eq!(fixture.memory_store.list_all().unwrap().len(), 0);
@@ -33,7 +42,7 @@ fn deterministic_job_emits_proposal_without_mutating_memory() {
 }
 
 #[test]
-fn apply_materializes_memory_and_writes_consolidated_event_with_states() {
+fn apply_materializes_memory_and_writes_reference_only_consolidated_event() {
     let fixture = Fixture::new();
     let mut runtime = fixture.runtime(8);
     runtime
@@ -43,7 +52,16 @@ fn apply_materializes_memory_and_writes_consolidated_event_with_states() {
             "applied memory",
         ))
         .expect("job enqueues");
-    runtime.run_due().expect("job runs");
+    runtime
+        .run_due(
+            &fixture.memory_store,
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
+        .expect("job runs");
 
     let outcome = runtime
         .decide(
@@ -52,6 +70,11 @@ fn apply_materializes_memory_and_writes_consolidated_event_with_states() {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         )
         .expect("proposal applies");
 
@@ -66,11 +89,9 @@ fn apply_materializes_memory_and_writes_consolidated_event_with_states() {
     match event.payload {
         EventPayload::MemoryConsolidated(payload) => {
             assert_eq!(payload.proposal_id.as_deref(), Some("proposal-apply"));
-            assert!(payload.prior_state_json.unwrap().contains("{}"));
-            assert!(payload
-                .proposed_state_json
-                .unwrap()
-                .contains("applied memory"));
+            assert_eq!(payload.transition.as_deref(), Some("applied"));
+            assert!(payload.prior_state_json.is_none());
+            assert!(payload.proposed_state_json.is_none());
         }
         _ => panic!("expected memory_consolidated payload"),
     }
@@ -87,7 +108,16 @@ fn reject_leaves_memory_unchanged_and_records_decision() {
             "rejected memory",
         ))
         .expect("job enqueues");
-    runtime.run_due().expect("job runs");
+    runtime
+        .run_due(
+            &fixture.memory_store,
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
+        .expect("job runs");
 
     let outcome = runtime
         .decide(
@@ -96,6 +126,11 @@ fn reject_leaves_memory_unchanged_and_records_decision() {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         )
         .expect("proposal rejects");
 
@@ -118,7 +153,16 @@ fn double_apply_is_no_op_after_first_decision() {
             "single memory",
         ))
         .expect("job enqueues");
-    runtime.run_due().expect("job runs");
+    runtime
+        .run_due(
+            &fixture.memory_store,
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
+        .expect("job runs");
 
     runtime
         .decide(
@@ -127,6 +171,11 @@ fn double_apply_is_no_op_after_first_decision() {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         )
         .expect("first apply succeeds");
     let second = runtime
@@ -136,6 +185,11 @@ fn double_apply_is_no_op_after_first_decision() {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         )
         .expect("second apply is handled");
 
@@ -207,12 +261,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempdir().expect("tempdir");
-        let memory_store = MemoryStore::open(&dir.path().join("memory.sqlite")).unwrap();
+        let memory_path = dir.path().join("memory.sqlite");
+        let memory_store = MemoryStore::open(&memory_path).unwrap();
         let event_store = Arc::new(EventStore::open_in_memory().unwrap());
         let event_writer =
             EventWriter::new(event_store.clone(), "workspace-main".to_string(), 4096);
         Self {
-            consolidation_db: DbPath(dir.path().join("consolidation.sqlite")),
+            consolidation_db: DbPath(memory_path),
             _dir: dir,
             memory_store,
             event_store,

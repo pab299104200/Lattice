@@ -1,7 +1,8 @@
 use anyhow::Result;
-use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::embeddings::EmbeddingProvider;
 use lattice_core::graph::{CodeGraph, GraphNode};
 use lattice_core::storage::{VectorIndex, VectorScope};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
@@ -19,6 +20,7 @@ struct UpsertBatchStats {
     failed_nodes: usize,
     payload_chars_total: usize,
     payload_chars_max: usize,
+    memberships: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +80,14 @@ impl VectorSyncStats {
 
 pub(crate) fn sync_full_graph_embeddings(
     graph: &CodeGraph,
-    embedding_engine: &EmbeddingEngine,
+    embedding_engine: &dyn EmbeddingProvider,
     vector_index: &dyn VectorIndex,
 ) -> Result<VectorSyncStats> {
+    let _publication = embedding_engine.publication_lease()?;
+    let _vector_publication = vector_index.begin_publication()?;
+    if let Some(identity) = embedding_engine.storage_identity()? {
+        vector_index.bind_embedding_identity(&identity)?;
+    }
     let started = Instant::now();
     let graph_nodes = graph.node_count();
     vector_index.clear_all()?;
@@ -90,6 +97,7 @@ pub(crate) fn sync_full_graph_embeddings(
         vector_index,
     )?;
     vector_index.flush()?;
+    embedding_engine.publish_membership(&batch.memberships, true, &[])?;
     let stats = VectorSyncStats::from_upsert(
         "full",
         vector_index.implementation_name(),
@@ -120,9 +128,14 @@ pub(crate) fn sync_full_graph_embeddings(
 pub(crate) fn sync_changed_files_embeddings(
     graph: &CodeGraph,
     changed_files: &[String],
-    embedding_engine: &EmbeddingEngine,
+    embedding_engine: &dyn EmbeddingProvider,
     vector_index: &dyn VectorIndex,
 ) -> Result<VectorSyncStats> {
+    let _publication = embedding_engine.publication_lease()?;
+    let _vector_publication = vector_index.begin_publication()?;
+    if let Some(identity) = embedding_engine.storage_identity()? {
+        vector_index.bind_embedding_identity(&identity)?;
+    }
     let started = Instant::now();
     let graph_nodes = graph.node_count();
     let files_requested = changed_files.len();
@@ -152,6 +165,11 @@ pub(crate) fn sync_changed_files_embeddings(
         vector_index,
     )?;
     vector_index.flush()?;
+    let remove_prefixes: Vec<String> = changed
+        .iter()
+        .map(|file| membership_file_prefix(file))
+        .collect();
+    embedding_engine.publish_membership(&batch.memberships, false, &remove_prefixes)?;
     let stats = VectorSyncStats::from_upsert(
         "changed",
         vector_index.implementation_name(),
@@ -183,32 +201,25 @@ pub(crate) fn sync_changed_files_embeddings(
 
 fn upsert_graph_nodes<'a>(
     nodes: impl IntoIterator<Item = &'a GraphNode>,
-    embedding_engine: &EmbeddingEngine,
+    embedding_engine: &dyn EmbeddingProvider,
     vector_index: &dyn VectorIndex,
 ) -> Result<UpsertBatchStats> {
     let collected_nodes: Vec<&GraphNode> = nodes.into_iter().collect();
     let mut stats = UpsertBatchStats::default();
+    let mut targets: Vec<(String, String, String, usize, VectorScope)> = Vec::new();
     for node in &collected_nodes {
         let text = build_embedding_text(node);
         let payload_chars = text.chars().count();
         stats.nodes_considered += 1;
         stats.payload_chars_total += payload_chars;
         stats.payload_chars_max = stats.payload_chars_max.max(payload_chars);
-        match embedding_engine.embed(&text) {
-            Ok(vector) => {
-                vector_index.upsert_vector(&node.file, &node.name, node.id.byte_offset, &vector)?;
-                stats.embedded_nodes += 1;
-            }
-            Err(err) => {
-                stats.failed_nodes += 1;
-                tracing::warn!(
-                    "Failed to embed '{}' in '{}': {}",
-                    node.name,
-                    node.file,
-                    err
-                );
-            }
-        }
+        targets.push((
+            text,
+            node.file.clone(),
+            node.name.clone(),
+            node.id.byte_offset,
+            VectorScope::Symbol,
+        ));
     }
 
     let mut file_nodes: BTreeMap<&str, Vec<&GraphNode>> = BTreeMap::new();
@@ -230,24 +241,49 @@ fn upsert_graph_nodes<'a>(
         stats.nodes_considered += 1;
         stats.payload_chars_total += payload_chars;
         stats.payload_chars_max = stats.payload_chars_max.max(payload_chars);
-        match embedding_engine.embed(&text) {
-            Ok(vector) => {
-                vector_index.upsert_vector_in_scope(
-                    file,
-                    FILE_SUMMARY_VECTOR_NAME,
-                    FILE_SUMMARY_VECTOR_OFFSET,
-                    VectorScope::FileSummary,
-                    &vector,
-                )?;
+        targets.push((
+            text,
+            file.to_string(),
+            FILE_SUMMARY_VECTOR_NAME.to_string(),
+            FILE_SUMMARY_VECTOR_OFFSET,
+            VectorScope::FileSummary,
+        ));
+    }
+
+    let texts: Vec<&str> = targets.iter().map(|target| target.0.as_str()).collect();
+    match embedding_engine.embed_batch(&texts) {
+        Ok(vectors) if vectors.len() == targets.len() => {
+            for ((_, file, name, offset, scope), vector) in targets.iter().zip(vectors) {
+                vector_index.upsert_vector_in_scope(file, name, *offset, *scope, &vector)?;
                 stats.embedded_nodes += 1;
             }
-            Err(err) => {
-                stats.failed_nodes += 1;
-                tracing::warn!("Failed to embed file summary '{}' : {}", file, err);
+            for (text, file, name, offset, scope) in &targets {
+                if let Some(key) = embedding_engine.object_key(text)? {
+                    stats.memberships.insert(
+                        format!(
+                            "{}{:?}:{name}:{offset}",
+                            membership_file_prefix(file),
+                            scope
+                        ),
+                        key,
+                    );
+                }
             }
+        }
+        Ok(vectors) => {
+            stats.failed_nodes += targets.len();
+            tracing::warn!(expected = targets.len(), actual = vectors.len(), "Embedding provider returned an incomplete batch; semantic vectors were not published and lexical retrieval remains available");
+        }
+        Err(err) => {
+            stats.failed_nodes += targets.len();
+            tracing::warn!(error = %err, failed_nodes = targets.len(), "Embedding batch failed; lexical retrieval remains available");
         }
     }
     Ok(stats)
+}
+
+fn membership_file_prefix(file: &str) -> String {
+    format!("{:x}:", Sha256::digest(file.as_bytes()))
 }
 
 fn build_embedding_text(node: &GraphNode) -> String {

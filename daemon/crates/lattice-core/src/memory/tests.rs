@@ -374,56 +374,6 @@ fn test_invalidate_memory() {
 }
 
 #[test]
-fn test_memory_decay_and_pruning() {
-    let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
-
-    // Store a memory with old timestamp
-    store
-        .store(Memory {
-            id: "old-mem".to_string(),
-            session_id: String::new(),
-            content: "old observation".to_string(),
-            memory_type: MemoryType::Observation,
-            scope: MemoryScope::Session,
-            confidence: 0.5,
-            linked_symbols: vec![],
-            linked_files: vec![],
-            workspace_id: None,
-            branch: None,
-            scope_organization_id: None,
-            refresh_key: None,
-            source_query: None,
-            created_at: 1000,    // Very old
-            last_accessed: 1000, // Never accessed recently
-            access_count: 0,
-            is_stale: false,
-            stale_reason: None,
-            verification_status: crate::memory::MemoryVerificationStatus::Unverified,
-        })
-        .expect("Failed to store memory");
-
-    // Decay should reduce confidence
-    let decayed = store.decay_old_memories(0, 0.1).expect("Failed to decay");
-    assert!(decayed > 0);
-
-    let memories = store.list_all().expect("Failed to list memories");
-    assert!(
-        memories[0].confidence < 0.5,
-        "Confidence should have decayed"
-    );
-
-    // Prune should remove low-confidence old memories
-    let pruned = store.prune_old_memories(0.5, 0).expect("Failed to prune");
-    assert!(pruned > 0);
-
-    let remaining = store.list_all().expect("Failed to list remaining");
-    assert!(
-        remaining.is_empty(),
-        "Low confidence memory should be pruned"
-    );
-}
-
-#[test]
 fn test_session_id_stored_and_retrieved() {
     let store = MemoryStore::open_in_memory().expect("Failed to open in-memory store");
 
@@ -1351,4 +1301,284 @@ fn test_find_by_refresh_key_prefers_repo_workflow_outcome_over_newer_session_obs
 
     assert_eq!(recalled.id, stronger_id);
     assert_eq!(recalled.content, "Verified repo workflow");
+}
+
+#[test]
+fn exact_path_recall_survives_ten_thousand_newer_irrelevant_stale_and_wrong_branch_rows() {
+    let store = MemoryStore::open_in_memory().unwrap();
+    let mut lesson = make_memory("Apply integer rounding once", MemoryType::Decision, vec![]);
+    lesson.scope = MemoryScope::Repo;
+    lesson.workspace_id = Some("repository".into());
+    lesson.linked_files = vec!["src/invoice.rs".into()];
+    lesson.created_at = 1;
+    lesson.confidence = 0.5;
+    let id = store.store(lesson).unwrap();
+    store.with_connection(|conn| {
+        let mut stmt=conn.prepare("PRAGMA table_info(memories)").unwrap();
+        let columns=stmt.query_map([],|row|row.get::<_,String>(1)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let expressions:Vec<String>=columns.iter().map(|column|match column.as_str() {
+            "id"=>"'noise-'||n".into(),
+            "created_at"=>"2000000000+n".into(),
+            "confidence"=>"1.0".into(),
+            "content"=>"'Invoice investigation observation without a correction'".into(),
+            "scope"=>"CASE WHEN n%3=0 THEN 'branch' ELSE 'repo' END".into(),
+            "branch"=>"CASE WHEN n%3=0 THEN 'other' ELSE NULL END".into(),
+            "retention_stale"=>"CASE WHEN n%3=1 THEN 1 ELSE 0 END".into(),
+            "linked_files"=>"CASE WHEN n%3=2 THEN '[\"unrelated.rs\"]' ELSE '[\"src/invoice.rs\"]' END".into(),
+            _=>format!("memories.\"{column}\""),
+        }).collect();
+        conn.execute(&format!("WITH RECURSIVE noise(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM noise WHERE n<10000) INSERT INTO memories ({}) SELECT {} FROM memories CROSS JOIN noise WHERE memories.id=?1", columns.iter().map(|c|format!("\"{c}\"")).collect::<Vec<_>>().join(","),expressions.join(",")),[&id]).unwrap();
+        Ok(())
+    }).unwrap();
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+    let found = store
+        .recall_candidates(
+            Some("src/invoice.rs"),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, id);
+    let stale = store
+        .recall_candidates(
+            Some("src/invoice.rs"),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions {
+                include_retention_stale: true,
+            },
+        )
+        .unwrap();
+    assert!(stale[0].id.starts_with("noise-"));
+}
+
+#[test]
+fn natural_language_recall_ranks_lexical_coverage_before_confidence_and_filters_scope() {
+    let store = MemoryStore::open_in_memory().expect("open memory store");
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+
+    let mut lesson = make_memory(
+        "Keep fixture writes atomic; partial writes corrupt recovery.",
+        MemoryType::Decision,
+        vec![],
+    );
+    lesson.scope = MemoryScope::Repo;
+    lesson.workspace_id = Some("repository".to_string());
+    lesson.confidence = 0.2;
+    let lesson_id = store.store(lesson).expect("store relevant lesson");
+
+    for index in 0..8 {
+        let mut noise = make_memory(
+            "Fixture scratch note for a routine check.",
+            MemoryType::Observation,
+            vec![],
+        );
+        noise.scope = MemoryScope::Repo;
+        noise.workspace_id = Some("repository".to_string());
+        noise.confidence = 0.99;
+        noise.created_at = 10_000 + index;
+        store.store(noise).expect("store common-word noise");
+    }
+
+    let mut wrong_scope = make_memory(
+        "Keep fixture writes atomic; partial writes corrupt recovery.",
+        MemoryType::Decision,
+        vec![],
+    );
+    wrong_scope.scope = MemoryScope::Repo;
+    wrong_scope.workspace_id = Some("other-repository".to_string());
+    store.store(wrong_scope).expect("store wrong-scope lesson");
+
+    let mut stale = make_memory(
+        "Keep fixture writes atomic; partial writes corrupt recovery.",
+        MemoryType::Decision,
+        vec![],
+    );
+    stale.scope = MemoryScope::Repo;
+    stale.workspace_id = Some("repository".to_string());
+    stale.is_stale = true;
+    store.store(stale).expect("store stale lesson");
+
+    let recalled = store
+        .recall_candidates(
+            Some("How should fixture writes avoid corrupt recovery?"),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("natural-language indexed recall");
+    assert_eq!(
+        recalled.iter().map(|memory| &memory.id).collect::<Vec<_>>(),
+        vec![&lesson_id]
+    );
+
+    let safe = store
+        .recall_candidates(
+            Some("fixture \"writes\"; (avoid) recovery\\"),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("sanitized lexical terms must remain valid FTS syntax");
+    assert_eq!(safe[0].id, lesson_id);
+}
+
+#[test]
+fn recall_vm_budget_interrupts_without_poisoning_the_next_query() {
+    let store = MemoryStore::open_in_memory().expect("open memory store");
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+    for index in 0..512 {
+        let mut memory = make_memory(
+            &format!("highfrequency posting payload {index}"),
+            MemoryType::Observation,
+            vec![],
+        );
+        memory.scope = MemoryScope::Repo;
+        memory.workspace_id = Some("repository".to_string());
+        store.store(memory).expect("store posting fixture");
+    }
+    let mut unique = make_memory("needle-unique-boundary", MemoryType::Decision, vec![]);
+    unique.scope = MemoryScope::Repo;
+    unique.workspace_id = Some("repository".to_string());
+    let unique_id = store.store(unique).expect("store unique fixture");
+
+    let error = store
+        .recall_candidates_with_instruction_budget(
+            Some("highfrequency"),
+            128,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+            1,
+        )
+        .expect_err("low VM budget must interrupt posting expansion");
+    assert!(error.to_string().contains("bounded SQLite work allowance"));
+
+    let next = store
+        .recall_candidates(
+            Some("needle-unique-boundary"),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("RAII progress cleanup permits the next query");
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, unique_id);
+}
+
+#[test]
+fn recall_filters_invalid_tokens_before_the_usable_term_cap() {
+    let store = MemoryStore::open_in_memory().expect("open memory store");
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+    let mut memory = make_memory("lateusabletoken", MemoryType::Decision, vec![]);
+    memory.scope = MemoryScope::Repo;
+    memory.workspace_id = Some("repository".to_string());
+    let id = store.store(memory).expect("store lexical fixture");
+    let query = format!("{} lateusabletoken", "() ".repeat(64));
+
+    let recalled = store
+        .recall_candidates(
+            Some(&query),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("invalid noise is discarded before the term cap");
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].id, id);
+
+    let invalid_only = store
+        .recall_candidates(
+            Some("() ;;; ```"),
+            10,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("invalid-only query is a bounded empty search");
+    assert!(invalid_only.is_empty());
+}
+
+#[test]
+fn recall_deduplicates_groups_before_the_term_cap() {
+    let store = MemoryStore::open_in_memory().expect("open memory store");
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+    let mut relevant = make_memory("commonword rareboundaryterm", MemoryType::Decision, vec![]);
+    relevant.scope = MemoryScope::Repo;
+    relevant.workspace_id = Some("repository".to_string());
+    relevant.confidence = 0.1;
+    let relevant_id = store.store(relevant).expect("store relevant memory");
+    let mut noise = make_memory("commonword", MemoryType::Observation, vec![]);
+    noise.scope = MemoryScope::Repo;
+    noise.workspace_id = Some("repository".to_string());
+    noise.confidence = 1.0;
+    store.store(noise).expect("store common-term noise");
+
+    let query = format!("{} rareboundaryterm", "commonword ".repeat(64));
+    let recalled = store
+        .recall_candidates(
+            Some(&query),
+            1,
+            &scope,
+            Some("checkout"),
+            super::retrieval::RecallOptions::default(),
+        )
+        .expect("duplicate groups do not displace a later unique group");
+    assert_eq!(recalled[0].id, relevant_id);
+}
+
+#[test]
+fn recall_rejects_oversized_queries_and_terms_before_sql() {
+    let store = MemoryStore::open_in_memory().expect("open memory store");
+    let scope = crate::verification::ScopeFilter::new("repository", None, None);
+    let options = super::retrieval::RecallOptions::default();
+
+    let oversized_query = "q".repeat(32 * 1024 + 1);
+    let error = store
+        .recall_candidates(Some(&oversized_query), 1, &scope, Some("checkout"), options)
+        .expect_err("oversized query must be rejected");
+    assert!(error.to_string().contains("maximum is 32768"));
+
+    let oversized_term = "t".repeat(513);
+    let error = store
+        .recall_candidates(Some(&oversized_term), 1, &scope, Some("checkout"), options)
+        .expect_err("oversized term must be rejected");
+    assert!(error.to_string().contains("maximum is 512"));
+}
+
+#[test]
+fn recall_vm_budget_configuration_rejects_invalid_values() {
+    for invalid in ["0", "not-a-number", "1000000001"] {
+        let error = super::store::parse_recall_vm_instruction_budget(Some(invalid.into()))
+            .expect_err("invalid VM budget must fail instead of silently using the default");
+        assert!(error
+            .to_string()
+            .contains("LATTICE_MEMORY_RECALL_VM_INSTRUCTIONS"));
+    }
+
+    assert_eq!(
+        super::store::parse_recall_vm_instruction_budget(Some("5000".into())).unwrap(),
+        5000
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_vm_budget_configuration_rejects_non_unicode_values() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error =
+        super::store::parse_recall_vm_instruction_budget(Some(std::ffi::OsString::from_vec(vec![
+            0xff,
+        ])))
+        .expect_err("non-Unicode VM budget must fail instead of silently using the default");
+    assert!(error.to_string().contains("UTF-8 positive integer"));
 }

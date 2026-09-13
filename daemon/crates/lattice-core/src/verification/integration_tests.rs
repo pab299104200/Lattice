@@ -568,6 +568,7 @@ impl VerificationHarness {
         let mut runtime = self.runtime();
         let reader = WorkspaceFileReader::new(self.workspace_root.clone());
         let operator = operator();
+        let authority = crate::consolidation::test_authority();
         let mut verifier = IncrementalVerifier::new(
             &self.memory_store,
             &mut runtime,
@@ -577,6 +578,7 @@ impl VerificationHarness {
             &reader,
             &self.event_writer,
             &operator,
+            &authority,
             "workspace-main",
             512,
         );
@@ -591,11 +593,13 @@ impl VerificationHarness {
     fn scan_expiry(&self, now: DateTime<Utc>) {
         let mut runtime = self.runtime();
         let operator = operator();
+        let authority = crate::consolidation::test_authority();
         let mut scanner = ExpiryScanner::new(
             &self.memory_store,
             &mut runtime,
             &self.event_writer,
             &operator,
+            &authority,
         );
         let _ = scanner.scan("workspace-main", now).expect("expiry scan");
     }
@@ -618,6 +622,11 @@ impl VerificationHarness {
             runtime: &mut runtime,
             memory_store: &self.memory_store,
             event_writer: &self.event_writer,
+            authority: &crate::consolidation::EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         };
         let proposal = ContradictionDetectionJob::run(&ctx, &mut services, &pair)
             .expect("contradiction job succeeds")
@@ -629,6 +638,7 @@ impl VerificationHarness {
                 &self.memory_store,
                 &self.event_writer,
                 operator().value.as_str(),
+                &crate::consolidation::test_authority(),
             )
             .expect("proposal applies");
     }

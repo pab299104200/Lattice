@@ -953,7 +953,7 @@ fn benchmark_memory(
 }
 
 fn bench_prepare_change(graph: &CodeGraph) -> WorkflowResult {
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("fix memory recall for new session", None, false);
     let rules = project_rules(graph);
     let report = prepare_change(
@@ -1164,7 +1164,7 @@ fn bench_memory_recall() -> WorkflowResult {
 }
 
 fn bench_prepare_change_certificate_assistant(graph: &CodeGraph) -> WorkflowResult {
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query(
         "Why do cross-org certificate renewal requests return 403 instead of 404?",
         None,
@@ -1400,7 +1400,7 @@ fn bench_trace_scenario_login_refresh_case() -> (usize, bool, bool, bool, bool, 
     let strong_score = trace_path_score(&query_tokens, &strong_path_nodes);
     let alternative_score = trace_path_score(&query_tokens, &alternative_path_nodes);
 
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query(query, None, false);
     let entrypoint_hit =
         trace_entrypoint_candidate(&graph, &query_tokens).as_deref() == Some("loginRoute");
@@ -1866,11 +1866,14 @@ fn workflow_bench_scorecard() {
         bench_memory_recall(),
     ];
 
+    // These byte counts describe internal ranking reports. Public payload size
+    // is gated at the daemon `tools/call` boundary after workflow-v2 shaping,
+    // budget pruning, wire selection, and Markdown/JSON rendering.
     eprintln!(
         "\n┌──────────────────────────┬──────────────┬────────────┬────────────┬──────────┬────────────┬────────────┐"
     );
     eprintln!(
-        "│ Tool                     │ Payload (B)  │ Est Tokens │ Calls Saved│ Top3 Hit │ Target Hit │ Stale Prec │"
+        "│ Tool                     │ Report (B)   │ Est Tokens │ Calls Saved│ Top3 Hit │ Target Hit │ Stale Prec │"
     );
     eprintln!(
         "├──────────────────────────┼──────────────┼────────────┼────────────┼──────────┼────────────┼────────────┤"
@@ -1878,8 +1881,6 @@ fn workflow_bench_scorecard() {
 
     let mut top3_hits = 0usize;
     let mut target_hits = 0usize;
-    let mut payload_total = 0usize;
-    let mut token_total = 0usize;
     let mut calls_saved_total = 0usize;
     let mut stale_precision_total = 0.0f64;
     let mut stale_precision_count = 0usize;
@@ -1891,8 +1892,6 @@ fn workflow_bench_scorecard() {
         if result.target_hit {
             target_hits += 1;
         }
-        payload_total += result.payload_bytes;
-        token_total += result.estimated_tokens;
         calls_saved_total += result.calls_saved;
         if let Some(stale_precision) = result.stale_precision {
             stale_precision_total += stale_precision;
@@ -1916,8 +1915,6 @@ fn workflow_bench_scorecard() {
 
     let top3_hit_rate = top3_hits as f64 / results.len() as f64;
     let target_hit_rate = target_hits as f64 / results.len() as f64;
-    let average_payload = payload_total as f64 / results.len() as f64;
-    let average_tokens = token_total as f64 / results.len() as f64;
     let average_calls_saved = calls_saved_total as f64 / results.len() as f64;
     let average_stale_precision = if stale_precision_count == 0 {
         1.0
@@ -1929,11 +1926,9 @@ fn workflow_bench_scorecard() {
         "├──────────────────────────┴──────────────┴────────────┴────────────┴──────────┴────────────┴────────────┤"
     );
     eprintln!(
-        "  top3_hit_rate={:.0}% | target_hit_rate={:.0}% | avg_payload={:.0}B | avg_tokens={:.0} | avg_calls_saved={:.1} | stale_precision={:.0}%",
+        "  top3_hit_rate={:.0}% | target_hit_rate={:.0}% | avg_calls_saved={:.1} | stale_precision={:.0}%",
         top3_hit_rate * 100.0,
         target_hit_rate * 100.0,
-        average_payload,
-        average_tokens,
         average_calls_saved,
         average_stale_precision * 100.0,
     );
@@ -1952,16 +1947,6 @@ fn workflow_bench_scorecard() {
         average_stale_precision >= 0.80,
         "stale precision {:.0}% fell below 80%",
         average_stale_precision * 100.0
-    );
-    assert!(
-        average_payload <= 2000.0,
-        "average payload {:.0}B drifted above the ultra-compact target",
-        average_payload
-    );
-    assert!(
-        average_tokens <= 500.0,
-        "average tokens {:.0} drifted above the ultra-compact target",
-        average_tokens
     );
 }
 

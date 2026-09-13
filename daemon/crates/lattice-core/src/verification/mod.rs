@@ -36,6 +36,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LatticeError;
+use crate::memory::{BehavioralValidationStatus, EvidenceFreshnessStatus};
 
 pub mod existence;
 pub mod expiry;
@@ -156,6 +157,8 @@ impl FromStr for VerificationStatus {
 pub struct VerificationVerdict {
     pub status: VerificationStatus,
     pub reason: String,
+    pub evidence_freshness: EvidenceFreshnessStatus,
+    pub behavioral_validation: BehavioralValidationStatus,
 }
 
 impl VerificationVerdict {
@@ -163,6 +166,18 @@ impl VerificationVerdict {
         Self {
             status,
             reason: reason.into(),
+            evidence_freshness: EvidenceFreshnessStatus::Unknown,
+            behavioral_validation: BehavioralValidationStatus::NotRequired,
         }
+    }
+
+    pub fn with_trust_dimensions(
+        mut self,
+        evidence_freshness: EvidenceFreshnessStatus,
+        behavioral_validation: BehavioralValidationStatus,
+    ) -> Self {
+        self.evidence_freshness = evidence_freshness;
+        self.behavioral_validation = behavioral_validation;
+        self
     }
 }

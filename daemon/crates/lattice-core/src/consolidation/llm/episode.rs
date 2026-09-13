@@ -66,7 +66,13 @@ impl EpisodeSummaryJob {
             .map(|memory| existing_state(services.memory_store, memory))
             .transpose()?
             .unwrap_or_else(empty_state);
-        let proposed = proposed_episode_state(ctx, &candidate, &template, refresh_key)?;
+        let proposed = proposed_episode_state(
+            ctx,
+            services.authority.branch,
+            &candidate,
+            &template,
+            refresh_key,
+        )?;
         submit_memory_proposal(
             ctx,
             services,
@@ -83,12 +89,14 @@ impl EpisodeSummaryJob {
 
 fn proposed_episode_state(
     ctx: &LlmJobContext,
+    branch: &str,
     candidate: &EpisodeMemoryCandidate,
     template: &EpisodeTemplate,
     refresh_key: String,
 ) -> Result<serde_json::Value, LlmJobError> {
     let mut memory = create_memory(
         ctx,
+        branch,
         candidate.summary.clone(),
         MemoryType::Pattern,
         refresh_key,

@@ -65,9 +65,7 @@ impl SuccessCriteriaThresholds {
             health_defect_pr_auc: health_floor(MetricSignal::HealthDefectPrAuc),
             health_defect_roc_auc: health_floor(MetricSignal::HealthDefectRocAuc),
             health_defect_family_uplift: health_floor(MetricSignal::HealthDefectFamilyUplift),
-            health_label_audit_enrichment: health_floor(
-                MetricSignal::HealthLabelAuditEnrichment,
-            ),
+            health_label_audit_enrichment: health_floor(MetricSignal::HealthLabelAuditEnrichment),
         }
     }
 }

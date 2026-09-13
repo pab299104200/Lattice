@@ -15,6 +15,7 @@ extension/*.vsix
 # Assistant / local client config
 .claude/
 CLAUDE.md
+AGENTS.md
 .mcp.json
 
 # GitHub config (user-specific workflows and skills)
@@ -37,3 +38,10 @@ daemon/models/
 .env
 *.pem
 *.key
+
+# Producer-owned local run artifacts; reviewed manifests live under docs/reports.
+.local-artifacts/
+
+# Python harness bytecode caches
+__pycache__/
+*.py[cod]

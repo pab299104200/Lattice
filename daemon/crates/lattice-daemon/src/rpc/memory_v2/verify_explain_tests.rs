@@ -34,6 +34,7 @@ fn serde_round_trips_verify_and_conflict_requests_and_responses() {
         .expect("memory id"),
         mode: verify_explain_memory::VerifyExplainMode::VerifyAndExplain,
         render_mode: verify_explain_memory::VerifyExplainRenderMode::Diagnostic,
+        run_check: None,
     };
     round_trip(&verify_args);
 
@@ -163,6 +164,154 @@ async fn verify_explain_memory_uses_phase7_status_taxonomy_only() {
     let payload = parse_tool_payload(&response);
     let status = payload["status"].as_str().expect("status string");
     assert!(VerificationStatus::VALUES.contains(&status));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[test]
+fn declared_check_child() {
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+#[tokio::test]
+async fn explicit_run_check_executes_declared_binary_and_persists_bound_observation() {
+    let (handler, memory_store, _events, _indexer, _graph, workspace_root, context_cache_path) =
+        build_handler("explicit-check");
+    let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root).unwrap();
+    std::fs::create_dir_all(workspace_root.join(".lattice")).unwrap();
+    std::fs::write(workspace_root.join("source.rs"), "fn stable() {}\n").unwrap();
+    let executable = std::env::current_exe().unwrap();
+    std::fs::write(
+        workspace_root.join(".lattice/verification-checks.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 2,
+            "checks": [{
+                "id":"declared", "label":"declared adapter check",
+                "argv":[executable, "rpc::memory_v2::verify_explain_tests::declared_check_child", "--exact"],
+                "timeout_ms":5000, "evidence_reference":"tests:declared"
+            }]
+        })).unwrap(),
+    ).unwrap();
+    let handler = handler
+        .with_trusted_check_authority(identity.repository_id.clone(), identity.checkout_id.clone());
+    let memory_id = {
+        let store = memory_store.lock().await;
+        let id = store
+            .store(seed_memory(
+                "declared behavior",
+                MemoryScope::Repo,
+                &identity.repository_id,
+            ))
+            .unwrap();
+        let mut fields = MemoryStructuredFields::default();
+        fields.linked_tests.push("tests:declared".into());
+        fields.evidence.push(MemoryEvidence {
+            kind: "test".into(),
+            reference: Some("tests:declared".into()),
+            detail: None,
+            captured_at: Some(1),
+            span: None,
+            evidence_content_hash: None,
+        });
+        store.update_structured_fields(&id, &fields).unwrap();
+        id
+    };
+    handler
+        .handle(
+            "lattice/tool_call",
+            json!({"name":"verify_explain_memory","arguments":{
+                "memory_id":{"workspace_id":identity.repository_id,"ulid":memory_id},
+                "mode":"verify","run_check":"declared","render_mode":"full"
+            }}),
+        )
+        .await
+        .expect("explicit trusted check succeeds");
+    let observations = memory_store
+        .lock()
+        .await
+        .trusted_check_observations(&memory_id)
+        .unwrap();
+    assert_eq!(observations.len(), 1);
+    assert!(observations[0].passed);
+    assert_eq!(observations[0].source_fingerprint.len(), 32);
+    {
+        let store = memory_store.lock().await;
+        let mut failure = observations[0].clone();
+        failure.observation_id = None;
+        failure.passed = false;
+        failure.observed_at += 2;
+        store.record_trusted_check_observation(&failure).unwrap();
+        let mut late_inserted_older_pass = observations[0].clone();
+        late_inserted_older_pass.observation_id = None;
+        late_inserted_older_pass.observed_at += 1;
+        store
+            .record_trusted_check_observation(&late_inserted_older_pass)
+            .unwrap();
+    }
+    let response = handler.handle("lattice/tool_call", json!({"name":"verify_explain_memory","arguments":{
+        "memory_id":{"workspace_id":identity.repository_id,"ulid":memory_id}, "mode":"verify"
+    }})).await.expect("stored observations verify");
+    assert_ne!(
+        parse_tool_payload(&response)["status"],
+        "verified",
+        "newer failure must dominate a later-inserted older pass"
+    );
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn same_id_memory_mutation_while_check_runs_discards_observation() {
+    let (handler, memory_store, _events, _indexer, _graph, workspace_root, context_cache_path) =
+        build_handler("mutated-target");
+    let identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root).unwrap();
+    std::fs::create_dir_all(workspace_root.join(".lattice")).unwrap();
+    std::fs::write(workspace_root.join("source.rs"), "fn stable() {}\n").unwrap();
+    std::fs::write(workspace_root.join(".lattice/verification-checks.json"), serde_json::to_vec_pretty(&json!({
+        "schema_version":2,"checks":[{"id":"declared","label":"slow check","argv":[std::env::current_exe().unwrap(),"rpc::memory_v2::verify_explain_tests::declared_check_child","--exact"],"timeout_ms":5000,"evidence_reference":"tests:declared"}]
+    })).unwrap()).unwrap();
+    let handler =
+        handler.with_trusted_check_authority(identity.repository_id.clone(), identity.checkout_id);
+    let memory_id = {
+        let store = memory_store.lock().await;
+        let id = store
+            .store(seed_memory(
+                "original claim",
+                MemoryScope::Repo,
+                &identity.repository_id,
+            ))
+            .unwrap();
+        let mut fields = MemoryStructuredFields::default();
+        fields.linked_tests.push("tests:declared".into());
+        store.update_structured_fields(&id, &fields).unwrap();
+        id
+    };
+    let request = handler.handle("lattice/tool_call", json!({"name":"verify_explain_memory","arguments":{"memory_id":{"workspace_id":identity.repository_id,"ulid":memory_id},"mode":"verify","run_check":"declared"}}));
+    let mutate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        memory_store
+            .lock()
+            .await
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET content='replacement claim' WHERE id=?1",
+                        [&memory_id],
+                    )
+                    .map_err(|e| lattice_core::LatticeError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(request, mutate);
+    assert!(result
+        .unwrap_err()
+        .1
+        .contains("changed while the check ran"));
+    assert!(memory_store
+        .lock()
+        .await
+        .trusted_check_observations(&memory_id)
+        .unwrap()
+        .is_empty());
     cleanup_paths(&workspace_root, &context_cache_path);
 }
 
@@ -507,7 +656,7 @@ fn build_handler(
         .with_flush_policy(FlushPolicy::Sync),
     );
     let handler = McpHandler::new(
-        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
         indexer.clone(),
         memory_store.clone(),
         graph_store.clone(),

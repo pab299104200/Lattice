@@ -10,6 +10,9 @@
 
 #![cfg(test)]
 
+mod context_memory_lifecycle;
+mod context_relevance_lifecycle;
+mod payload_scorecard;
 mod render_modes;
 mod round_trip;
 pub(crate) mod tool_list;
@@ -65,7 +68,7 @@ impl SchemaFixture {
         );
         let session_id = format!("session-schema-{suffix}");
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             memory_store.clone(),
             Arc::new(Mutex::new(
@@ -91,6 +94,65 @@ impl SchemaFixture {
             context_cache_path,
             session_id,
         }
+    }
+
+    /// File-backed variant for cache/restart acceptance tests.  The caller
+    /// reopens the returned database path with a fresh handler after dropping
+    /// this fixture's handler.
+    pub fn new_disk_backed(suffix: &str) -> (Self, PathBuf) {
+        let workspace_root = unique_test_path(&format!("lattice-mcp-schema-{suffix}"));
+        std::fs::create_dir_all(&workspace_root).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join(".git")).expect("git dir");
+        std::fs::write(
+            workspace_root.join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("git head");
+        let context_cache_path = workspace_root.join("context_handles.json");
+        let memory_path = workspace_root.join("canonical-memory.sqlite");
+        let memory_store = Arc::new(Mutex::new(
+            MemoryStore::open(&memory_path).expect("memory store"),
+        ));
+        let event_store = Arc::new(EventStore::open_in_memory().expect("event store"));
+        let event_writer = Arc::new(
+            EventWriter::new(
+                event_store.clone(),
+                workspace_root.to_string_lossy().to_string(),
+                4096,
+            )
+            .with_flush_policy(FlushPolicy::Sync),
+        );
+        let session_id = format!("session-schema-{suffix}");
+        let handler = McpHandler::new(
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+            memory_store.clone(),
+            Arc::new(Mutex::new(
+                GraphStore::open_in_memory().expect("graph store"),
+            )),
+            Arc::new(std::sync::OnceLock::new()),
+            None,
+            workspace_root.clone(),
+            context_cache_path.clone(),
+            session_id.clone(),
+            None,
+            vec![workspace_root.clone()],
+            Arc::new(AtomicBool::new(false)),
+            Some(event_writer),
+            Vec::new(),
+            Vec::new(),
+        );
+        (
+            SchemaFixture {
+                handler,
+                memory_store,
+                event_store,
+                workspace_root,
+                context_cache_path,
+                session_id,
+            },
+            memory_path,
+        )
     }
 }
 

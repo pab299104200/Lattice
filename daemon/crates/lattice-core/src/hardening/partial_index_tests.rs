@@ -49,7 +49,7 @@ fn prepare_bundle(
     entry_file: &str,
 ) -> crate::intelligence::TaskBundle {
     let graph = indexer.graph().clone();
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query(query_text, None, false);
     let rules = RulesDetector::new().detect_rules(
         &graph
@@ -325,7 +325,7 @@ async fn test_partial_batch_report_keeps_cold_start_queries_bounded_and_explicit
         .expect("batch report returns");
 
     let graph = indexer.graph().clone();
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("login user", None, false);
     let tests = find_relevant_tests(
         &graph,

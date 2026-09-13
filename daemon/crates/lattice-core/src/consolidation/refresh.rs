@@ -39,7 +39,12 @@ impl<'a> RefreshScanner<'a> {
         }
     }
 
-    pub fn scan(&mut self, workspace_id: &str, now: u64) -> Result<ScanReport, ScanError> {
+    pub fn scan(
+        &mut self,
+        authority: &super::EvolutionAuthority<'_>,
+        now: u64,
+    ) -> Result<ScanReport, ScanError> {
+        let workspace_id = authority.repository_id;
         let started = Instant::now();
         let span = info_span!(
             "consolidation.refresh.scan",
@@ -111,7 +116,7 @@ impl<'a> RefreshScanner<'a> {
             proposals_enqueued += 1;
         }
 
-        let _ = self.runtime.run_due()?;
+        let _ = self.runtime.run_due(self.store, authority)?;
         Ok(ScanReport::from_counts(
             proposals_enqueued,
             skipped,

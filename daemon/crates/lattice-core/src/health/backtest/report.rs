@@ -39,8 +39,12 @@ use super::features::{
     normalize, score, FactFamily, FamilySet, FeatureKind, FeatureWeights, NormalizedFeatureVector,
     ALL_FAMILY_SETS, ALL_FEATURES, FEATURE_COUNT,
 };
-use super::metrics::{evaluate, CalibrationBucket, Evaluation, EvaluationUnavailable, ScoredObservation};
-use super::replay::{CutPointReplay, ReplayReport, ReplaySummary, RepositoryReplay, TreeReadReport};
+use super::metrics::{
+    evaluate, CalibrationBucket, Evaluation, EvaluationUnavailable, ScoredObservation,
+};
+use super::replay::{
+    CutPointReplay, ReplayReport, ReplaySummary, RepositoryReplay, TreeReadReport,
+};
 use super::BACKTEST_HARNESS_VERSION;
 
 /// How a family's features were weighted for one evaluation.
@@ -421,7 +425,6 @@ pub fn build_report(replays: &[RepositoryReplay]) -> BacktestReport {
     builder.finish()
 }
 
-
 /// Assemble the per-feature result rows from a univariate measurement.
 fn feature_results(
     univariate: &[Option<u32>; FEATURE_COUNT],
@@ -658,10 +661,7 @@ impl BacktestReport {
         out.push_str("This document contains no generation timestamp by design: nothing in it\ndepends on when it was produced, so rerunning the harness against the same\ncommits reproduces it byte for byte.\n\n");
         out.push_str("## Provenance\n\n");
         out.push_str("| Field | Value |\n| --- | --- |\n");
-        out.push_str(&format!(
-            "| Harness version | {} |\n",
-            self.harness_version
-        ));
+        out.push_str(&format!("| Harness version | {} |\n", self.harness_version));
         out.push_str(&format!(
             "| Health config version | {} |\n",
             self.health_config_version
@@ -969,7 +969,11 @@ impl BacktestReport {
                 out.push_str(&format!(
                     "| `{}` | {} | {} | {} |\n",
                     entry.commit,
-                    if entry.classified_fix { "fix" } else { "not fix" },
+                    if entry.classified_fix {
+                        "fix"
+                    } else {
+                        "not fix"
+                    },
                     if entry.touches_test_and_production {
                         "yes"
                     } else {

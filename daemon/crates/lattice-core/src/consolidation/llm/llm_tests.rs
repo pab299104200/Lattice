@@ -28,7 +28,7 @@ fn well_formed_episode_response_enqueues_proposal_without_mutating_memory() {
 
     assert!(proposal.is_some());
     assert_eq!(fixture.memory_store.list_all().unwrap().len(), 0);
-    assert_eq!(proposal_count(fixture.consolidation_db.path()), 1);
+    assert_eq!(proposal_count(&fixture.memory_store), 1);
     assert_eq!(fixture.driver.call_count(), 1);
 }
 
@@ -40,7 +40,7 @@ fn malformed_json_emits_failure_event_and_no_proposal_for_every_job() {
         let result = scenario.run(&mut fixture, background_ctx());
 
         assert!(matches!(result, Err(LlmJobError::MalformedResponse(_))));
-        assert_eq!(proposal_count(fixture.consolidation_db.path()), 0);
+        assert_eq!(proposal_count(&fixture.memory_store), 0);
         assert_eq!(failure_event_count(&fixture), 1);
     }
 }
@@ -55,7 +55,7 @@ fn driver_error_emits_failure_event_and_no_proposal_for_every_job() {
         let result = scenario.run(&mut fixture, background_ctx());
 
         assert!(matches!(result, Err(LlmJobError::DriverError(_))));
-        assert_eq!(proposal_count(fixture.consolidation_db.path()), 0);
+        assert_eq!(proposal_count(&fixture.memory_store), 0);
         assert_eq!(failure_event_count(&fixture), 1);
     }
 }
@@ -69,7 +69,7 @@ fn synchronous_post_task_mode_is_forbidden_before_driver_call_for_every_job() {
 
         assert!(matches!(result, Err(LlmJobError::ForbiddenOnHotPath(_))));
         assert_eq!(fixture.driver.call_count(), 0);
-        assert_eq!(proposal_count(fixture.consolidation_db.path()), 0);
+        assert_eq!(proposal_count(&fixture.memory_store), 0);
     }
 }
 
@@ -218,6 +218,11 @@ impl Fixture {
             runtime: &mut self.runtime,
             memory_store: &self.memory_store,
             event_writer: &self.event_writer,
+            authority: &crate::consolidation::EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         }
     }
 
@@ -431,11 +436,13 @@ fn memory(id: &str, content: &str) -> Memory {
     }
 }
 
-fn proposal_count(path: &std::path::Path) -> i64 {
-    Connection::open(path)
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM consolidation_proposals", [], |row| {
-            row.get(0)
+fn proposal_count(store: &MemoryStore) -> i64 {
+    store
+        .with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM consolidation_proposals", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| crate::LatticeError::Storage(error.to_string()))
         })
         .unwrap()
 }

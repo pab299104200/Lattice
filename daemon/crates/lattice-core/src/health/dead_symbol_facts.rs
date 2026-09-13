@@ -313,12 +313,12 @@ impl DeadSymbolFactsReport {
             FactAvailability::Available => {
                 format!("{NO_INDEXED_DEPENDENTS_PHRASE} (index complete)")
             }
-            FactAvailability::Degraded => format!(
-                "{NO_INDEXED_DEPENDENTS_PHRASE} (index degraded: absence not confirmed)"
-            ),
-            FactAvailability::Unavailable => format!(
-                "{NO_INDEXED_DEPENDENTS_PHRASE} (index unavailable: absence not confirmed)"
-            ),
+            FactAvailability::Degraded => {
+                format!("{NO_INDEXED_DEPENDENTS_PHRASE} (index degraded: absence not confirmed)")
+            }
+            FactAvailability::Unavailable => {
+                format!("{NO_INDEXED_DEPENDENTS_PHRASE} (index unavailable: absence not confirmed)")
+            }
         }
     }
 }
@@ -359,7 +359,11 @@ impl DeadSymbolCandidate {
     pub fn describe(&self, report: &DeadSymbolFactsReport) -> String {
         let caveat = report.dependents_caveat();
         if self.is_flagged() {
-            format!("{} ({} exported, {caveat})", self.key, self.kind.short_code())
+            format!(
+                "{} ({} exported, {caveat})",
+                self.key,
+                self.kind.short_code()
+            )
         } else {
             let reasons: Vec<&str> = self
                 .exclusion_reasons
@@ -421,7 +425,9 @@ impl DeadSymbolFactsSnapshot {
     /// Only the candidates actually flagged (no exclusion applies), ordered
     /// by key.
     pub fn flagged(&self) -> impl Iterator<Item = &DeadSymbolCandidate> {
-        self.candidates.iter().filter(|candidate| candidate.is_flagged())
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.is_flagged())
     }
 
     /// Which candidate keys moved between `previous` and this snapshot.
@@ -625,8 +631,7 @@ impl DeadSymbolFactProducer {
             .into_iter()
             .filter(|(_, accumulator)| !accumulator.has_dependent)
             .map(|(key, accumulator)| {
-                let exclusion_reasons =
-                    self.exclusion_reasons(&key, &accumulator, exclusions);
+                let exclusion_reasons = self.exclusion_reasons(&key, &accumulator, exclusions);
                 DeadSymbolCandidate {
                     key,
                     path: accumulator.path,
@@ -803,7 +808,9 @@ mod tests {
         assert!(candidate.is_flagged());
         assert!(candidate.exclusion_reasons.is_empty());
         assert_eq!(snapshot.flagged().count(), 1);
-        assert!(candidate.describe(&snapshot.report).contains(NO_INDEXED_DEPENDENTS_PHRASE));
+        assert!(candidate
+            .describe(&snapshot.report)
+            .contains(NO_INDEXED_DEPENDENTS_PHRASE));
     }
 
     #[test]
@@ -874,8 +881,7 @@ mod tests {
             .extra_entry_point_keys
             .insert(symbol_fact_key("src/bin/tool.rs", "run"));
 
-        let snapshot =
-            DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
+        let snapshot = DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
 
         let candidate = snapshot.candidate("src/bin/tool.rs::run").unwrap();
         assert_eq!(
@@ -896,7 +902,9 @@ mod tests {
             true,
         );
 
-        let candidate = snapshot.candidate("tests/support.rs::make_fixture").unwrap();
+        let candidate = snapshot
+            .candidate("tests/support.rs::make_fixture")
+            .unwrap();
         assert!(!candidate.is_flagged());
         assert_eq!(
             candidate.exclusion_reasons,
@@ -912,8 +920,7 @@ mod tests {
         let mut exclusions = DeadSymbolExclusionInputs::default();
         exclusions.reexported_names.insert("Widget".to_owned());
 
-        let snapshot =
-            DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
+        let snapshot = DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
 
         let candidate = snapshot
             .candidate("src/internal/widget.rs::Widget")
@@ -959,8 +966,7 @@ mod tests {
             .extra_trait_method_names
             .insert("on_custom_event".to_owned());
 
-        let snapshot =
-            DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
+        let snapshot = DeadSymbolFactProducer::default().produce(&graph, &exclusions, true);
 
         let candidate = snapshot
             .candidate("src/internal/widget.rs::Widget.on_custom_event")
@@ -1149,8 +1155,14 @@ mod tests {
         let later = producer.produce(&after, &exclusions, true);
 
         let delta = later.candidate_delta(&earlier);
-        assert_eq!(delta.added, vec!["src/caller.rs::caller_fn", "src/new.rs::added_fn"]);
-        assert_eq!(delta.removed, vec!["src/a.rs::stable_fn", "src/gone.rs::removed_fn"]);
+        assert_eq!(
+            delta.added,
+            vec!["src/caller.rs::caller_fn", "src/new.rs::added_fn"]
+        );
+        assert_eq!(
+            delta.removed,
+            vec!["src/a.rs::stable_fn", "src/gone.rs::removed_fn"]
+        );
         assert!(delta.updated.is_empty());
         assert!(!delta.is_empty());
     }

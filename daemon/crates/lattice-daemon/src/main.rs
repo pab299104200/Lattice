@@ -2,6 +2,7 @@
 
 mod adoption_metrics;
 mod cli;
+mod disk_budget;
 mod doctor;
 mod git_intelligence_runtime;
 mod health_facts_runtime;
@@ -13,23 +14,29 @@ mod hook_session_route;
 mod index_health;
 mod index_work;
 mod install;
+mod install_project;
 mod lifecycle_log;
 mod memory_attribution;
+mod memory_retention_runtime;
 mod proxy;
 mod repo_state;
+mod resource_budget;
 mod rpc;
 mod runtime_support;
 mod session_digest_consolidation_runtime;
 mod socket_server;
+mod storage_operator;
 mod transport;
 mod transport_credentials;
+mod trusted_check_runner;
 mod vector_sync;
 mod verification_producer;
 mod watcher;
 mod watcher_health;
 mod workspace_identity;
+mod worktree_base;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -39,33 +46,65 @@ use tracing_subscriber::EnvFilter;
 
 use index_health::IndexHealth;
 use index_work::{IndexReadiness, IndexWorkCoordinator};
-use lattice_core::embeddings::{verified_shared_embedding_model_path, EmbeddingEngine};
+use lattice_core::embeddings::{
+    verified_shared_embedding_model_path, CachedEmbeddingEngine, EmbeddingEngine,
+    EmbeddingObjectCache, EmbeddingProvider,
+};
+use lattice_core::error::LatticeError;
 use lattice_core::events::{
     CompactionConfig, Compactor, EventStore, EventWriter, FlushPolicy, SchedulerHandle,
 };
 use lattice_core::graph::CodeGraph;
 use lattice_core::indexer::Indexer;
-use lattice_core::memory::MemoryStore;
+use lattice_core::memory::identity_migration::migrate_identities;
+use lattice_core::memory::{MemoryStore, MemoryStoreFailureKind, RepositoryMemoryOwner};
 use lattice_core::memory_graph::MemoryMigrator;
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::{
-    GraphStore, IndexSnapshot, IndexSnapshotLoad, SharedVectorIndex, UsearchVectorIndex,
-    VectorIndex, VectorStore,
+    CachePolicy, CheckoutLease, GraphStore, IndexSnapshot, IndexSnapshotLoad, SharedVectorIndex,
+    StorageRegistry, UsearchVectorIndex, VectorIndex, VectorStore,
 };
 use lattice_core::workspace::WorkspaceManager;
-use rpc::mcp::{GitIntelligenceSnapshotHandle, HealthFactsSnapshotHandle};
 use rpc::mcp::McpHandler;
-use rpc::server::StdioServer;
+use rpc::mcp::{GitIntelligenceSnapshotHandle, HealthFactsSnapshotHandle};
+#[cfg(test)]
+use runtime_support::build_incremental_index_for_roots;
 use runtime_support::{
-    background_vector_sync_enabled, build_incremental_index_for_roots,
-    build_incremental_index_for_roots_with_cache, load_incremental_manifest, max_warm_graph_bytes,
-    max_warm_graph_files, persist_incremental_cache, IncrementalIndexResult, ParsedCacheRuntime,
+    background_vector_sync_enabled, build_incremental_index_for_roots_with_cache_budgeted_base,
+    load_incremental_manifest, max_warm_graph_bytes, max_warm_graph_files,
+    persist_incremental_cache, BaseReuseContext, IncrementalIndexResult, ParsedCacheRuntime,
     WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
 };
 use watcher_health::WatcherHealth;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn cached_embedding_provider(
+    engine: Arc<EmbeddingEngine>,
+    object_root: &Path,
+    checkout_id: &str,
+) -> Arc<dyn EmbeddingProvider> {
+    match EmbeddingObjectCache::open(object_root) {
+        Ok(cache) => Arc::new(CachedEmbeddingEngine::new(
+            engine,
+            cache,
+            checkout_id.to_string(),
+        )),
+        Err(error) => {
+            tracing::warn!(path = %object_root.display(), %error, "Shared embedding cache unavailable; continuing semantic inference without persisted reuse");
+            engine
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    lattice_core::storage::managed_sqlite::ManagedSqlite::initialize_process()
+        .context("Managed SQLite process initialization failed")?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -78,6 +117,10 @@ async fn main() -> Result<()> {
 
     if verification_producer::is_verification_producer_command() {
         std::process::exit(verification_producer::run_from_env().await);
+    }
+
+    if storage_operator::is_storage_command() {
+        std::process::exit(storage_operator::run_from_env()?);
     }
 
     if is_memory_migrate_command() {
@@ -169,386 +212,45 @@ async fn main() -> Result<()> {
         return result;
     }
 
-    if !has_arg("--daemon") && !has_arg("--stdio") {
-        std::process::exit(cli::run_usage_or_error());
-    }
-
-    tracing::info!("Lattice daemon starting...");
-
-    // ── Parse workspace roots ────────────────────────────────────────
-    let workspace_roots = parse_workspace_roots()?;
-    let workspace_root = workspace_roots[0].clone();
-    let default_focus = parse_focus_args(&workspace_root);
-    let is_multi_repo = workspace_roots.len() > 1;
-    if is_multi_repo {
-        tracing::info!("Multi-repo mode: {} workspaces", workspace_roots.len());
-        for r in &workspace_roots {
-            tracing::info!("  - {}", r.display());
-        }
-    }
-
-    let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
-    let lattice_dir = memory_identity.checkout_lattice_dir();
-    std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
-    std::fs::create_dir_all(&lattice_dir)?;
-    // The watcher and the MCP handler must share a runtime identity: watcher
-    // events are the authoritative source for adoption follow-through.
-    let session_id = generate_session_id();
-
-    // Repository memory is shared by Git worktrees; checkout-local graph and
-    // watcher state continue to use `lattice_dir` below.
-    let memories_path = memory_identity.memories_path();
-    let parsed_cache_runtime = ParsedCacheRuntime::open(&memory_identity.parsed_cache_path())?;
-    let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
-    let vector_index = open_vector_index(&lattice_dir);
-    let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
-    let event_writer = Arc::new(
-        EventWriter::new(
-            event_store.clone(),
-            workspace_root.to_string_lossy().to_string(),
-            4096,
-        )
-        .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
-    );
-
-    let index_work = IndexWorkCoordinator::from_env();
-    let graph_path = lattice_dir.join("graph.db");
-    let (graph_store, warm_graph) = open_graph_store_with_warm_graph(
-        graph_path,
-        workspace_root.clone(),
-        Arc::clone(&index_work),
-    )
-    .await?;
-    let (graph, engine) = build_warm_query_engine(
-        warm_graph,
-        vector_index.clone(),
-        Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
-    );
-    let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
-    let engine = Arc::new(Mutex::new(engine));
-    let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
-    let graph_store = Arc::new(Mutex::new(graph_store));
-    let compaction_scheduler = start_event_compaction_scheduler(
-        &lattice_dir,
-        memory_mode,
-        &memories_path,
-        Arc::clone(&event_store),
-        Arc::clone(&event_writer),
-        Arc::clone(&compaction_graph),
-    );
-
-    // Multi-repo workspace manager (only used when multiple workspaces)
-    let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
-
-    // OnceLock for EmbeddingEngine — populated in background once model loads
-    let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
-
-    // Shared indexing state flag
-    let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let index_readiness = Arc::new(IndexReadiness::default());
-    let watcher_health = Arc::new(WatcherHealth::default());
-    let index_health = Arc::new(IndexHealth::default());
-    let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
-        &workspace_root,
-    )));
-
-    // ── Spawn background indexing task ────────────────────────────────
-    {
-        let engine_bg = Arc::clone(&engine);
-        let indexer_bg = Arc::clone(&indexer);
-        let graph_store_bg = Arc::clone(&graph_store);
-        let compaction_graph_bg = Arc::clone(&compaction_graph);
-        let embedding_engine_bg = Arc::clone(&embedding_engine);
-        let indexing_bg = Arc::clone(&indexing);
-        let ws_roots_bg = workspace_roots.clone();
-        let ws_root = workspace_root.clone();
-        let lattice_dir_bg = lattice_dir.clone();
-        let vector_index_bg = vector_index.clone();
-        let index_work_bg = Arc::clone(&index_work);
-        let index_readiness_bg = Arc::clone(&index_readiness);
-        let index_health_bg = Arc::clone(&index_health);
-        let parsed_cache_bg = parsed_cache_runtime.clone();
-
-        tokio::spawn(async move {
-            tracing::info!("Background indexing starting...");
-            let _index_permit = index_work_bg
-                .acquire(ws_root.to_string_lossy().to_string(), "startup")
-                .await
-                .expect("index work coordinator remains open for the process lifetime");
-            let _ = std::fs::create_dir_all(&lattice_dir_bg);
-
-            let manifest = load_incremental_manifest(&graph_store_bg).await;
-            let roots = if is_multi_repo {
-                ws_roots_bg.clone()
-            } else {
-                vec![ws_root.clone()]
-            };
-            let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots_with_cache(
-                    &roots,
-                    Some(&manifest),
-                    HashMap::new(),
-                    &parsed_cache_bg,
-                )
-            })
-            .await
-            {
-                Ok(incremental) => incremental,
-                Err(error) => {
-                    tracing::error!(%error, "Incremental indexing worker failed; keeping the previously published graph");
-                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-                    index_readiness_bg.mark_ready();
-                    return;
-                }
-            };
-
-            let Some(incremental) = persist_incremental_cache(&graph_store_bg, incremental).await
-            else {
-                indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-                index_readiness_bg.mark_ready();
-                return;
-            };
-            let IncrementalIndexResult {
-                graph: incremental_graph,
-                parsed_files,
-                file_index,
-                changed_count,
-                removed_count,
-                index_report,
-                ..
-            } = incremental;
-            index_health_bg.replace_from_report(&index_report);
-            {
-                let mut idx = indexer_bg.lock().await;
-                idx.replace_shared_index(incremental_graph, parsed_files);
-            }
-            tracing::info!(
-                "Incremental indexing: {} current files, {} parsed/updated, {} removed",
-                file_index.len(),
-                changed_count,
-                removed_count
-            );
-            let files_indexed = changed_count;
-            tracing::info!("Indexed {} files total", files_indexed);
-
-            // Final save to graph store
-            {
-                let new_graph = {
-                    let idx = indexer_bg.lock().await;
-                    idx.graph_arc()
-                };
-
-                let stats = new_graph.stats();
-                tracing::info!(
-                    "Graph ready: {} nodes, {} edges, {} files",
-                    stats.node_count,
-                    stats.edge_count,
-                    stats.file_count
-                );
-
-                if let Ok(mut graph) = compaction_graph_bg.lock() {
-                    *graph = Arc::clone(&new_graph);
-                } else {
-                    tracing::warn!("Failed to refresh compaction graph snapshot handle");
-                }
-
-                let mut eng = engine_bg.lock().await;
-                eng.update_graph_arc(new_graph);
-            }
-
-            // Try to load ONNX embedding model
-            if let Some(model_path) = verified_shared_embedding_model_path() {
-                match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
-                    Ok(emb_engine) => {
-                        tracing::info!("ONNX embedding model loaded");
-                        let emb = emb_engine;
-                        let _ = embedding_engine_bg.set(Arc::clone(&emb));
-
-                        if background_vector_sync_enabled() {
-                            let graph_snapshot = {
-                                let eng = engine_bg.lock().await;
-                                eng.graph().clone()
-                            };
-                            if let Some(index) = vector_index_bg.as_ref() {
-                                match crate::vector_sync::sync_full_graph_embeddings(
-                                    &graph_snapshot,
-                                    emb.as_ref(),
-                                    index.as_ref(),
-                                ) {
-                                    Ok(stats) => {
-                                        tracing::info!(
-                                            mode = stats.mode,
-                                            implementation = stats.implementation,
-                                            graph_nodes = stats.graph_nodes,
-                                            nodes_considered = stats.nodes_considered,
-                                            embedded_nodes = stats.embedded_nodes,
-                                            failed_nodes = stats.failed_nodes,
-                                            payload_chars_total = stats.payload_chars_total,
-                                            payload_chars_avg = stats.payload_chars_avg,
-                                            payload_chars_max = stats.payload_chars_max,
-                                            elapsed_ms = stats.elapsed_ms as u64,
-                                            throughput_nodes_per_sec =
-                                                stats.throughput_nodes_per_sec(),
-                                            "Background semantic sync complete"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to sync semantic index: {}", e);
-                                    }
-                                }
-                            } else {
-                                tracing::info!(
-                                    "No vector index configured, semantic search disabled"
-                                );
-                            }
-                        } else {
-                            tracing::info!(
-                                "Background semantic sync disabled; set LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC=1 to enable"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Semantic retrieval unavailable; continuing with lexical retrieval"
-                        );
-                    }
-                }
-            } else {
-                tracing::info!(
-                    "No valid shared embedding model installed; semantic search disabled and lexical recall remains available"
-                );
-            }
-
-            indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-            index_readiness_bg.mark_ready();
-            tracing::info!("Background indexing complete");
-        });
-    }
-
-    // ── Start file watcher(s) entirely in background ────────────────
-    // For multi-repo, we merge all watcher events into a single channel.
-    {
-        let engine = Arc::clone(&engine);
-        let indexer = Arc::clone(&indexer);
-        let graph_store = Arc::clone(&graph_store);
-        let workspace_manager = workspace_manager.clone();
-        let workspace_roots = workspace_roots.clone();
-        let embedding_engine = Arc::clone(&embedding_engine);
-        let vector_index = vector_index.clone();
-        let repo_state = Arc::clone(&repo_state);
-        let indexing_state = Arc::clone(&indexing);
-        let index_work_for_watchers = Arc::clone(&index_work);
-        let index_readiness_for_watchers = Arc::clone(&index_readiness);
-        let watcher_health = Arc::clone(&watcher_health);
-        let index_health = Arc::clone(&index_health);
-        let watcher_session_id = session_id.clone();
-        let parsed_cache_for_watchers = parsed_cache_runtime.clone();
-
-        tokio::spawn(async move {
-            for root in workspace_roots {
-                let watcher = crate::watcher::FileWatcher::new(
-                    root.clone(),
-                    is_multi_repo.then(|| repo_name_for_root(&root)),
-                    Some(Arc::clone(&indexer)),
-                    workspace_manager.clone(),
-                    Arc::clone(&graph_store),
-                    Arc::clone(&engine),
-                    Arc::clone(&embedding_engine),
-                    vector_index.clone(),
-                    Arc::clone(&repo_state),
-                    Arc::clone(&indexing_state),
-                    Arc::clone(&index_work_for_watchers),
-                    Arc::clone(&index_readiness_for_watchers),
-                    Arc::clone(&watcher_health),
-                    Arc::clone(&index_health),
-                    None,
-                    None,
-                    watcher_session_id.clone(),
-                )
-                .with_parsed_cache(parsed_cache_for_watchers.clone());
-
-                tokio::spawn(async move {
-                    if let Err(e) = watcher.run().await {
-                        tracing::error!("File watcher failed for {:?}: {}", root, e);
-                    }
-                });
-            }
-        });
-    }
-
-    // ── Periodic memory decay / prune ─────────────────────────────────
-    {
-        let memory_store_decay = Arc::clone(&memory_store);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                interval.tick().await;
-                let ms = memory_store_decay.lock().await;
-                let decayed = ms.decay_old_memories(7, 0.1).unwrap_or(0);
-                let pruned = ms.prune_old_memories(0.2, 30).unwrap_or(0);
-                if decayed > 0 || pruned > 0 {
-                    tracing::info!("Memory maintenance: decayed {}, pruned {}", decayed, pruned);
-                }
-            }
-        });
-    }
-
-    // ── Create McpHandler and start StdioServer ──────────────────────
-    let context_cache_path = lattice_dir.join("context_handles.json");
-    tracing::info!("Creating MCP handler (session: {})", session_id);
-    let handler = Arc::new(
-        McpHandler::new_with_shared_repo_state(
-            engine,
-            indexer,
-            memory_store,
-            graph_store,
-            embedding_engine,
-            vector_index,
-            workspace_root,
-            memory_identity.repository_id,
-            memories_path.clone(),
-            context_cache_path,
-            session_id,
-            workspace_manager,
-            workspace_roots,
-            indexing,
-            Some(event_writer),
-            default_focus.files,
-            default_focus.dirs,
-            repo_state,
-            index_work,
-            watcher_health,
-            index_health,
-        )
-        .with_checkout_storage(memory_identity.checkout_id, parsed_cache_runtime),
-    );
-    tracing::info!("Starting stdio server");
-    let server = StdioServer::new(handler);
-    server.run().await?;
-    if let Some(scheduler) = compaction_scheduler {
-        scheduler.shutdown().await;
-    }
-    tracing::info!("Stdio server exited");
-
-    Ok(())
+    std::process::exit(cli::run_usage_or_error());
 }
 
 pub(crate) struct WorkspaceRuntime {
     pub(crate) handler: Arc<McpHandler>,
     background_tasks: Vec<JoinHandle<()>>,
+    completion_tasks: Vec<JoinHandle<()>>,
     compaction_scheduler: Option<SchedulerHandle>,
     session_capture_retention:
         Option<session_digest_consolidation_runtime::SessionCaptureRetentionHandle>,
     session_digest_consolidation:
         Option<session_digest_consolidation_runtime::SessionDigestConsolidationHandle>,
+    periodic_maintenance: Option<PeriodicMaintenanceHandle>,
+    runtime_work: Arc<crate::index_work::RuntimeWorkTracker>,
+    _checkout_lease: CheckoutLease,
+    storage_heartbeat: Option<StorageHeartbeat>,
 }
 
 impl WorkspaceRuntime {
+    pub(crate) fn begin_work(&self) -> crate::index_work::RuntimeWorkGuard {
+        self.runtime_work.begin()
+    }
+
     pub(crate) async fn shutdown(mut self) {
         self.handler.auto_flush_session_state().await;
-        for task in self.background_tasks.drain(..) {
+        if let Some(heartbeat) = self.storage_heartbeat.take() {
+            heartbeat.shutdown().await;
+        }
+        for task in &self.background_tasks {
             task.abort();
+        }
+        for task in self.background_tasks.drain(..) {
+            let _ = task.await;
+        }
+        // Startup publication is finite and may be inside an uninterruptible
+        // blocking SQLite/filesystem operation. Join it cooperatively instead
+        // of detaching that writer with `abort`.
+        for task in self.completion_tasks.drain(..) {
+            let _ = task.await;
         }
         if let Some(scheduler) = self.compaction_scheduler.take() {
             scheduler.shutdown().await;
@@ -559,6 +261,13 @@ impl WorkspaceRuntime {
         if let Some(runtime) = self.session_digest_consolidation.take() {
             runtime.shutdown().await;
         }
+        if let Some(runtime) = self.periodic_maintenance.take() {
+            runtime.shutdown().await;
+        }
+        // `spawn_blocking` work is not cancelled when its async wrapper is
+        // aborted. Keep the checkout lease and its GC exclusion alive until
+        // every runtime-owned writer has really returned.
+        self.runtime_work.wait_idle().await;
     }
 }
 
@@ -582,50 +291,62 @@ pub(crate) async fn build_workspace_runtime(
 
     let memory_identity = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)?;
     let lattice_dir = memory_identity.checkout_lattice_dir();
+    let cache_dir = memory_identity.checkout_cache_dir();
     std::fs::create_dir_all(&memory_identity.repository_lattice_dir)?;
     std::fs::create_dir_all(&lattice_dir)?;
+    let mut storage_registry = StorageRegistry::open(
+        &memory_identity.repository_lattice_dir,
+        &memory_identity.repository_id,
+    )?;
+    let checkout_lease = storage_registry.register_and_lease(
+        &memory_identity.checkout_id,
+        &memory_identity.checkout_root,
+        now_epoch_secs(),
+    )?;
+    if let Err(error) = maintain_checkout_caches(&mut storage_registry) {
+        tracing::warn!(%error, "Repository maintenance deferred; indexing remains available");
+    }
     // Keep watcher attribution scoped to the handler session for this runtime.
     let session_id = generate_session_id();
 
     let memories_path = memory_identity.memories_path();
     let parsed_cache_runtime = ParsedCacheRuntime::open(&memory_identity.parsed_cache_path())?;
-    let (memory_store, ms_for_engine, memory_mode) = open_memory_stores(&memories_path);
-    let vector_index = open_vector_index(&lattice_dir);
+    let migration = memory_identity.is_git_repository.then_some((
+        memory_identity.repository_id.as_str(),
+        &memory_identity.proven_repository_identities,
+    ));
+    let (memory_store, memory_mode) = open_memory_store(&memories_path, migration)?;
+    if memory_mode == MemoryStoreMode::Persistent {
+        memory_retention_runtime::register(&memories_path)?;
+    }
+    let vector_index = open_vector_index(&cache_dir);
     let event_store = Arc::new(EventStore::open(&lattice_dir.join("events.db"))?);
     let event_writer = Arc::new(
         EventWriter::new(
             event_store.clone(),
-            workspace_root.to_string_lossy().to_string(),
+            memory_identity.repository_id.clone(),
             4096,
         )
         .with_flush_policy(FlushPolicy::Batched { interval_ms: 250 }),
     );
 
-    let graph_path = lattice_dir.join("graph.db");
+    let graph_path = cache_dir.join("graph.db");
     let (graph_store, warm_graph) = open_graph_store_with_warm_graph(
         graph_path.clone(),
+        memory_identity.repository_lattice_dir.join("symbol-bodies"),
+        memory_identity.checkout_id.clone(),
         workspace_root.clone(),
         Arc::clone(&index_work),
     )
     .await?;
-    let (graph, engine) = build_warm_query_engine(
-        warm_graph,
-        vector_index.clone(),
-        Some(Arc::new(std::sync::Mutex::new(ms_for_engine))),
-    );
+    let (graph, engine) = build_warm_query_engine(warm_graph, vector_index.clone());
     let compaction_graph = Arc::new(std::sync::Mutex::new(Arc::clone(&graph)));
     let engine = Arc::new(Mutex::new(engine));
     let indexer = Arc::new(Mutex::new(Indexer::new(workspace_root.clone())));
     let graph_store = Arc::new(Mutex::new(graph_store));
-    let compaction_scheduler = start_event_compaction_scheduler(
-        &lattice_dir,
-        memory_mode,
-        &memories_path,
-        Arc::clone(&event_store),
-        Arc::clone(&event_writer),
-        Arc::clone(&compaction_graph),
-    );
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut completion_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let runtime_work = Arc::new(crate::index_work::RuntimeWorkTracker::default());
 
     // Validate every Git store before spawning its worker. A failed schema or
     // active-generation audit must fail workspace construction, not surface
@@ -634,35 +355,73 @@ pub(crate) async fn build_workspace_runtime(
     let mut health_refresh_handles = HashMap::new();
     let git_intelligence_snapshots = GitIntelligenceSnapshotHandle::default();
     let health_fact_snapshots = HealthFactsSnapshotHandle::default();
+    let mut validated_runtimes = Vec::with_capacity(workspace_roots.len());
     for root in &workspace_roots {
         let identity = crate::workspace_identity::WorkspaceIdentity::resolve(root)?;
-        let (handle, runtime) = crate::git_intelligence_runtime::GitIntelligenceRuntime::open(
-            root.clone(),
-            &graph_path,
-            identity.repository_id.clone(),
-            Arc::clone(&index_work),
-            git_intelligence_snapshots.clone(),
-        )?;
-        git_refresh_handles.insert(root.clone(), handle);
-        background_tasks.push(runtime.spawn());
-
+        let (git_handle, git_runtime) =
+            crate::git_intelligence_runtime::GitIntelligenceRuntime::open(
+                root.clone(),
+                &graph_path,
+                &identity
+                    .repository_lattice_dir
+                    .join("history-object-cache.db"),
+                identity.repository_id.clone(),
+                Arc::clone(&index_work),
+                git_intelligence_snapshots.clone(),
+            )?;
         // Same admission control and the same fail-at-construction rule: an
         // unreadable health-fact generation must fail workspace construction
         // rather than surface later as a detached background error.
-        let (handle, runtime) = crate::health_facts_runtime::HealthFactsRuntime::open(
+        let (health_handle, health_runtime) =
+            crate::health_facts_runtime::HealthFactsRuntime::open(
+                root.clone(),
+                &graph_path,
+                identity.repository_id,
+                Arc::clone(&engine),
+                Arc::clone(&index_work),
+                health_fact_snapshots.clone(),
+            )?;
+        validated_runtimes.push((
             root.clone(),
-            &graph_path,
-            identity.repository_id,
-            Arc::clone(&engine),
-            Arc::clone(&index_work),
-            health_fact_snapshots.clone(),
-        )?;
-        health_refresh_handles.insert(root.clone(), handle);
-        background_tasks.push(runtime.spawn());
+            git_handle,
+            git_runtime,
+            health_handle,
+            health_runtime,
+        ));
     }
 
+    // No worker is spawned until every repository root and every persistence
+    // surface has passed validation. A failure on a later root therefore drops
+    // only inert runtime values and cannot detach earlier-root writers.
+    for (root, git_handle, git_runtime, health_handle, health_runtime) in validated_runtimes {
+        git_refresh_handles.insert(root.clone(), git_handle);
+        background_tasks.push(
+            git_runtime
+                .with_runtime_work_tracker(Arc::clone(&runtime_work))
+                .spawn(),
+        );
+        health_refresh_handles.insert(root, health_handle);
+        background_tasks.push(
+            health_runtime
+                .with_runtime_work_tracker(Arc::clone(&runtime_work))
+                .spawn(),
+        );
+    }
+    let compaction_scheduler = start_event_compaction_scheduler(
+        &lattice_dir,
+        Arc::clone(&event_store),
+        Arc::clone(&event_writer),
+        Arc::clone(&compaction_graph),
+    );
+    let storage_heartbeat =
+        spawn_storage_heartbeat(storage_registry, memory_identity.checkout_id.clone());
+
     let workspace_manager: Option<Arc<Mutex<WorkspaceManager>>> = None;
-    let embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>> = Arc::new(OnceLock::new());
+    let embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>> = Arc::new(OnceLock::new());
+    let embedding_object_root = memory_identity
+        .repository_lattice_dir
+        .join("embedding-objects");
+    let embedding_checkout_id = memory_identity.checkout_id.clone();
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let index_readiness = Arc::new(IndexReadiness::default());
     let watcher_health = Arc::new(WatcherHealth::default());
@@ -671,12 +430,64 @@ pub(crate) async fn build_workspace_runtime(
         &workspace_root,
     )));
 
+    // Establish source coverage before startup indexing takes its scan. An
+    // edit after the scan but before watcher registration would otherwise be
+    // absent from both the startup generation and the native event stream.
+    let mut watcher_registrations = Vec::with_capacity(workspace_roots.len());
+    {
+        let indexer = Arc::clone(&indexer);
+        let graph_store = Arc::clone(&graph_store);
+        let workspace_manager = workspace_manager.clone();
+        let embedding_engine = Arc::clone(&embedding_engine);
+        let vector_index = vector_index.clone();
+        let watcher_session_id = session_id.clone();
+
+        for root in workspace_roots.iter().cloned() {
+            let watcher = crate::watcher::FileWatcher::new(
+                root.clone(),
+                is_multi_repo.then(|| repo_name_for_root(&root)),
+                Some(Arc::clone(&indexer)),
+                workspace_manager.clone(),
+                Arc::clone(&graph_store),
+                Arc::clone(&engine),
+                Arc::clone(&embedding_engine),
+                vector_index.clone(),
+                Arc::clone(&repo_state),
+                Arc::clone(&indexing),
+                Arc::clone(&index_work),
+                Arc::clone(&index_readiness),
+                Arc::clone(&watcher_health),
+                Arc::clone(&index_health),
+                git_refresh_handles.get(&root).cloned(),
+                health_refresh_handles.get(&root).cloned(),
+                watcher_session_id.clone(),
+            )
+            .with_parsed_cache(parsed_cache_runtime.clone())
+            .with_runtime_work_tracker(Arc::clone(&runtime_work));
+            let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                if let Err(e) = watcher.run_with_registration(registered_tx).await {
+                    tracing::error!("File watcher failed for {:?}: {}", root, e);
+                }
+            });
+            background_tasks.push(task);
+            watcher_registrations.push(registered_rx);
+        }
+    }
+    for registration in watcher_registrations {
+        registration
+            .await
+            .context("file watcher exited before establishing native or polling coverage")?;
+    }
+
     {
         let engine_bg = Arc::clone(&engine);
         let indexer_bg = Arc::clone(&indexer);
         let graph_store_bg = Arc::clone(&graph_store);
         let compaction_graph_bg = Arc::clone(&compaction_graph);
         let embedding_engine_bg = Arc::clone(&embedding_engine);
+        let embedding_object_root_bg = embedding_object_root.clone();
+        let embedding_checkout_id_bg = embedding_checkout_id.clone();
         let indexing_bg = Arc::clone(&indexing);
         let ws_roots_bg = workspace_roots.clone();
         let ws_root = workspace_root.clone();
@@ -686,13 +497,26 @@ pub(crate) async fn build_workspace_runtime(
         let index_readiness_bg = Arc::clone(&index_readiness);
         let index_health_bg = Arc::clone(&index_health);
         let parsed_cache_bg = parsed_cache_runtime.clone();
+        let runtime_work_bg = Arc::clone(&runtime_work);
+        let base_reuse = memory_identity
+            .git_common_dir
+            .as_ref()
+            .filter(|_| !is_multi_repo)
+            .map(|git_common_dir| BaseReuseContext {
+                repository_id: memory_identity.repository_id.clone(),
+                checkout_id: memory_identity.checkout_id.clone(),
+                git_common_dir: git_common_dir.clone(),
+            });
 
         let task = tokio::spawn(async move {
             tracing::info!("Background indexing starting for {}...", ws_root.display());
-            let _index_permit = index_work_bg
-                .acquire(ws_root.to_string_lossy().to_string(), "startup")
-                .await
-                .expect("index work coordinator remains open for the process lifetime");
+            let index_permit = Arc::new(
+                index_work_bg
+                    .acquire(ws_root.to_string_lossy().to_string(), "startup")
+                    .await
+                    .expect("index work coordinator remains open for the process lifetime"),
+            );
+            let resource_budget = index_work_bg.resource_budget();
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
             let manifest = load_incremental_manifest(&graph_store_bg).await;
@@ -701,17 +525,29 @@ pub(crate) async fn build_workspace_runtime(
             } else {
                 vec![ws_root.clone()]
             };
+            let runtime_guard = runtime_work_bg.begin();
+            let child_permit = Arc::clone(&index_permit);
             let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots_with_cache(
+                let (_runtime_guard, _child_permit) = (runtime_guard, child_permit);
+                build_incremental_index_for_roots_with_cache_budgeted_base(
                     &roots,
                     Some(&manifest),
                     HashMap::new(),
                     &parsed_cache_bg,
+                    Some(&resource_budget),
+                    base_reuse.as_ref(),
                 )
             })
             .await
             {
-                Ok(incremental) => incremental,
+                Ok(Ok(incremental)) => incremental,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Startup indexing was resource limited; keeping exact filesystem service and reporting partial semantic coverage");
+                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                    index_health_bg.mark_resource_limited(error.to_string());
+                    index_readiness_bg.mark_ready();
+                    return;
+                }
                 Err(error) => {
                     tracing::error!(%error, "Incremental indexing worker failed; keeping the previously published graph");
                     indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -765,7 +601,27 @@ pub(crate) async fn build_workspace_runtime(
                 match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
                     Ok(emb_engine) => {
                         tracing::info!("ONNX embedding model loaded");
-                        let emb = emb_engine;
+                        let emb = cached_embedding_provider(
+                            emb_engine,
+                            &embedding_object_root_bg,
+                            &embedding_checkout_id_bg,
+                        );
+                        if let Some(index) = vector_index_bg.as_ref() {
+                            match emb.storage_identity().and_then(|identity| match identity {
+                                Some(identity) => index
+                                    .bind_embedding_identity(&identity)
+                                    .map_err(anyhow::Error::new),
+                                None => Ok(()),
+                            }) {
+                                Ok(()) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "Failed to bind semantic index to the loaded model; lexical retrieval remains available");
+                                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    index_readiness_bg.mark_ready();
+                                    return;
+                                }
+                            }
+                        }
                         let _ = embedding_engine_bg.set(Arc::clone(&emb));
                         if background_vector_sync_enabled() {
                             let graph_snapshot = {
@@ -807,69 +663,10 @@ pub(crate) async fn build_workspace_runtime(
             index_readiness_bg.mark_ready();
             tracing::info!("Background indexing complete for {}", ws_root.display());
         });
-        background_tasks.push(task);
+        completion_tasks.push(task);
     }
 
-    {
-        let engine = Arc::clone(&engine);
-        let indexer = Arc::clone(&indexer);
-        let graph_store = Arc::clone(&graph_store);
-        let workspace_manager = workspace_manager.clone();
-        let workspace_roots = workspace_roots.clone();
-        let embedding_engine = Arc::clone(&embedding_engine);
-        let vector_index = vector_index.clone();
-        let watcher_health = Arc::clone(&watcher_health);
-        let index_health = Arc::clone(&index_health);
-        let watcher_session_id = session_id.clone();
-
-        for root in workspace_roots {
-            let watcher = crate::watcher::FileWatcher::new(
-                root.clone(),
-                is_multi_repo.then(|| repo_name_for_root(&root)),
-                Some(Arc::clone(&indexer)),
-                workspace_manager.clone(),
-                Arc::clone(&graph_store),
-                Arc::clone(&engine),
-                Arc::clone(&embedding_engine),
-                vector_index.clone(),
-                Arc::clone(&repo_state),
-                Arc::clone(&indexing),
-                Arc::clone(&index_work),
-                Arc::clone(&index_readiness),
-                Arc::clone(&watcher_health),
-                Arc::clone(&index_health),
-                git_refresh_handles.get(&root).cloned(),
-                health_refresh_handles.get(&root).cloned(),
-                watcher_session_id.clone(),
-            )
-            .with_parsed_cache(parsed_cache_runtime.clone());
-            let task = tokio::spawn(async move {
-                if let Err(e) = watcher.run().await {
-                    tracing::error!("File watcher failed for {:?}: {}", root, e);
-                }
-            });
-            background_tasks.push(task);
-        }
-    }
-
-    {
-        let memory_store_decay = Arc::clone(&memory_store);
-        let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                interval.tick().await;
-                let ms = memory_store_decay.lock().await;
-                let decayed = ms.decay_old_memories(7, 0.1).unwrap_or(0);
-                let pruned = ms.prune_old_memories(0.2, 30).unwrap_or(0);
-                if decayed > 0 || pruned > 0 {
-                    tracing::info!("Memory maintenance: decayed {}, pruned {}", decayed, pruned);
-                }
-            }
-        });
-        background_tasks.push(task);
-    }
-
-    let context_cache_path = lattice_dir.join("context_handles.json");
+    let context_cache_path = cache_dir.join("context_handles.json");
     tracing::info!(
         "Creating MCP handler for {} (session: {})",
         workspace_root.display(),
@@ -899,12 +696,15 @@ pub(crate) async fn build_workspace_runtime(
             watcher_health,
             index_health,
         )
+        .with_runtime_work_tracker(Arc::clone(&runtime_work))
         .with_checkout_storage(memory_identity.checkout_id.clone(), parsed_cache_runtime)
         .with_git_intelligence_snapshot_handle(git_intelligence_snapshots)
         .with_health_facts_snapshot_handle(health_fact_snapshots),
     );
     let session_digest_consolidation = session_digest_consolidation_runtime::start(
         memory_identity.repository_id.clone(),
+        memory_identity.checkout_id.clone(),
+        memory_identity.checkout_root.clone(),
         memories_path.clone(),
         Arc::clone(&event_writer),
     );
@@ -913,56 +713,174 @@ pub(crate) async fn build_workspace_runtime(
         memory_identity.checkout_id.clone(),
         memories_path.clone(),
     );
-    {
+    let periodic_maintenance = {
         let handler = Arc::clone(&handler);
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = interval.tick() => {}
+                }
                 let _ = handler.auto_checkpoint_active_states("interval").await;
+                if let Err(error) = handler.process_pending_memory_verifications().await {
+                    tracing::warn!(%error, "Queued memory verification deferred");
+                }
             }
         });
-        background_tasks.push(task);
-    }
+        PeriodicMaintenanceHandle {
+            shutdown: Some(shutdown),
+            task,
+        }
+    };
     Ok(WorkspaceRuntime {
         handler,
         background_tasks,
+        completion_tasks,
         compaction_scheduler,
         session_capture_retention,
         session_digest_consolidation,
+        periodic_maintenance: Some(periodic_maintenance),
+        runtime_work,
+        _checkout_lease: checkout_lease,
+        storage_heartbeat: Some(storage_heartbeat),
     })
+}
+
+fn maintain_checkout_caches(registry: &mut StorageRegistry) -> Result<()> {
+    crate::disk_budget::register_and_collect(registry, now_epoch_secs())?;
+    let policy = CachePolicy::default();
+    let now = now_epoch_secs();
+    registry.advance_shared_accounting(256)?;
+    let inventory = registry.advance_inventory(now, &policy, 256)?;
+    if !inventory.historical_derived_artifacts.is_empty() {
+        tracing::warn!(
+            artifacts = ?inventory.historical_derived_artifacts,
+            allocated_bytes = inventory.historical_derived_allocated_bytes,
+            "Historical derived files require explicit offline migration; live files were preserved"
+        );
+    }
+    let plan = if inventory.accounting_complete && !inventory.pressure_unknown {
+        registry.plan_gc(now, &policy)?
+    } else {
+        tracing::info!("Repository cache accounting is incomplete; bounded sweep will resume");
+        Vec::new()
+    };
+    if !plan.is_empty() {
+        let report = registry.execute_gc(&plan, now, &policy)?;
+        tracing::info!(
+            moved = report.moved_files,
+            deleted = report.deleted_files,
+            released_bytes = report.released_bytes,
+            "Repository derived-cache maintenance completed"
+        );
+    }
+    // Parse objects become collectible only after the checkout cache has been
+    // moved through the registry's durable trash journal.  Bound both the
+    // registry enumeration and database deletion; a corrupt reconstructable
+    // cache is retained and normal indexing falls back to local parsing.
+    match registry.collect_parsed_objects(policy.batch_files) {
+        Ok(removed) if removed > 0 => tracing::info!(
+            removed,
+            "Repository parsed-file cache maintenance completed"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "Parsed-file cache maintenance deferred; preserving reconstructable cache")
+        }
+    }
+    match registry.collect_content_objects(policy.batch_files) {
+        Ok(report) if report.removed > 0 => tracing::info!(
+            removed = report.removed,
+            released_bytes = report.released_bytes,
+            remaining_candidates = report.remaining_candidates,
+            "Repository symbol-body maintenance completed"
+        ),
+        Ok(_) => {}
+        Err(error) if error.to_string().contains("publication is active") => {
+            tracing::debug!(%error, "Symbol-body maintenance deferred")
+        }
+        Err(error) => return Err(error),
+    }
+    let embeddings = registry.collect_embedding_objects(policy.low_bytes, policy.batch_files)?;
+    if embeddings.removed > 0 {
+        tracing::info!(
+            removed = embeddings.removed,
+            released_bytes = embeddings.released_bytes,
+            remaining_bytes = embeddings.remaining_bytes,
+            remaining_candidates = embeddings.remaining_candidates,
+            "Repository embedding-object maintenance completed"
+        );
+    }
+    Ok(())
+}
+
+struct StorageHeartbeat(Option<JoinHandle<()>>);
+
+struct PeriodicMaintenanceHandle {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl PeriodicMaintenanceHandle {
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+impl Drop for StorageHeartbeat {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl StorageHeartbeat {
+    async fn shutdown(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+fn spawn_storage_heartbeat(mut registry: StorageRegistry, checkout_id: String) -> StorageHeartbeat {
+    StorageHeartbeat(Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ticks = 0u8;
+        loop {
+            interval.tick().await;
+            if let Err(error) = registry.heartbeat(&checkout_id, now_epoch_secs(), 0) {
+                tracing::error!(checkout_id, %error, "Checkout storage heartbeat failed");
+            }
+            ticks = ticks.wrapping_add(1);
+            if ticks == 15 {
+                ticks = 0;
+                if let Err(error) = maintain_checkout_caches(&mut registry) {
+                    // Another process may own the repository maintenance lock.
+                    // Its completed journal is authoritative; the next tick retries.
+                    tracing::warn!(checkout_id, %error, "Repository cache maintenance deferred");
+                }
+            }
+        }
+    })))
 }
 
 fn start_event_compaction_scheduler(
     lattice_dir: &Path,
-    memory_mode: MemoryStoreMode,
-    memories_path: &Path,
     event_store: Arc<EventStore>,
     event_writer: Arc<EventWriter>,
     graph: Arc<std::sync::Mutex<Arc<CodeGraph>>>,
 ) -> Option<SchedulerHandle> {
-    if memory_mode == MemoryStoreMode::InMemoryFallback {
-        tracing::warn!(
-            "Event compaction scheduler disabled because memory storage is in-memory fallback"
-        );
-        return None;
-    }
-    let memory = match MemoryStore::open(memories_path) {
-        Ok(store) => Arc::new(std::sync::Mutex::new(store)),
-        Err(err) => {
-            tracing::error!(
-                "Failed to open compaction memory store at {}: {}",
-                memories_path.display(),
-                err
-            );
-            return None;
-        }
-    };
     let compactor = Compactor::new(
         event_store,
         event_writer,
         graph,
-        memory,
         event_compaction_config(lattice_dir),
     );
     Some(compactor.spawn_scheduler())
@@ -1015,20 +933,19 @@ enum WarmGraphLoad {
 fn build_warm_query_engine(
     warm_graph: WarmGraphLoad,
     vector_index: Option<SharedVectorIndex>,
-    memory_store: Option<Arc<std::sync::Mutex<MemoryStore>>>,
 ) -> (Arc<CodeGraph>, QueryEngine) {
     match warm_graph {
         WarmGraphLoad::Snapshot(snapshot) => {
             let graph = Arc::clone(&snapshot.graph);
             (
                 graph,
-                QueryEngine::from_index_snapshot(snapshot, vector_index, memory_store),
+                QueryEngine::from_index_snapshot(snapshot, vector_index),
             )
         }
         // A graph saved before digest snapshots is still structurally valid. It
         // remains available while startup indexing publishes a fresh generation.
         WarmGraphLoad::Graph(graph) => {
-            let engine = QueryEngine::new_shared(Arc::clone(&graph), vector_index, memory_store);
+            let engine = QueryEngine::new_shared(Arc::clone(&graph), vector_index);
             (graph, engine)
         }
     }
@@ -1036,6 +953,8 @@ fn build_warm_query_engine(
 
 async fn open_graph_store_with_warm_graph(
     graph_path: PathBuf,
+    body_objects_path: PathBuf,
+    checkout_id: String,
     workspace_root: PathBuf,
     index_work: Arc<IndexWorkCoordinator>,
 ) -> Result<(GraphStore, WarmGraphLoad)> {
@@ -1044,7 +963,11 @@ async fn open_graph_store_with_warm_graph(
         .await
         .expect("index work coordinator remains open for the process lifetime");
     tokio::task::spawn_blocking(move || {
-        let graph_store = GraphStore::open_recovering(&graph_path)?;
+        let graph_store = GraphStore::open_recovering_with_objects(
+            &graph_path,
+            &body_objects_path,
+            &checkout_id,
+        )?;
         if graph_store.recovery() == lattice_core::storage::GraphStoreRecovery::RebuiltCorrupt {
             tracing::warn!(
                 graph_path = %graph_path.display(),
@@ -1177,134 +1100,47 @@ fn open_vector_index(lattice_dir: &Path) -> Option<SharedVectorIndex> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoryStoreMode {
     Persistent,
-    RecoveredPersistent,
-    InMemoryFallback,
+    Unavailable,
 }
 
-fn open_memory_stores(path: &Path) -> (Arc<Mutex<MemoryStore>>, MemoryStore, MemoryStoreMode) {
-    match try_open_persistent_memory_stores(path) {
-        Ok((primary, engine)) => {
-            tracing::info!("Persistent memory store ready: {}", path.display());
-            (
-                Arc::new(Mutex::new(primary)),
-                engine,
-                MemoryStoreMode::Persistent,
-            )
-        }
-        Err(initial_err) => {
-            tracing::warn!(
-                "Failed to open persistent memory store at {} ({}). Attempting recovery by quarantining the existing workspace memory artifacts and rebuilding a fresh database.",
-                path.display(),
-                initial_err
-            );
-
-            match recover_persistent_memory_store(path) {
-                Ok((primary, engine, quarantine_dir)) => {
-                    tracing::warn!(
-                        "Recovered persistent memory store at {} by quarantining the previous artifacts under {}. The old memory database is preserved there for manual inspection, and new durable memory writes will use a fresh store.",
-                        path.display(),
-                        quarantine_dir.display()
-                    );
-                    (
-                        Arc::new(Mutex::new(primary)),
-                        engine,
-                        MemoryStoreMode::RecoveredPersistent,
-                    )
-                }
-                Err(recovery_err) => fallback_to_in_memory_memory_stores(
-                    path,
-                    format!("initial open failed: {initial_err}; recovery failed: {recovery_err}"),
-                ),
-            }
-        }
-    }
-}
-
-fn try_open_persistent_memory_stores(path: &Path) -> Result<(MemoryStore, MemoryStore), String> {
-    let primary = MemoryStore::open(path)
-        .map_err(|err| format!("primary store initialization failed: {err}"))?;
-    let engine = MemoryStore::open(path)
-        .map_err(|err| format!("secondary store initialization failed: {err}"))?;
-    Ok((primary, engine))
-}
-
-fn recover_persistent_memory_store(
+fn open_memory_store(
     path: &Path,
-) -> Result<(MemoryStore, MemoryStore, PathBuf), String> {
-    let quarantine_dir = quarantine_memory_store_artifacts(path)?;
-    let (primary, engine) = try_open_persistent_memory_stores(path).map_err(|err| {
-        format!(
-            "quarantined previous artifacts to {} but reopening still failed: {}",
-            quarantine_dir.display(),
-            err
-        )
-    })?;
-    Ok((primary, engine, quarantine_dir))
-}
-
-fn quarantine_memory_store_artifacts(path: &Path) -> Result<PathBuf, String> {
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "memory database path {} has no parent directory",
-            path.display()
-        )
-    })?;
-    let recovery_root = parent.join("recovered-memory");
-    std::fs::create_dir_all(&recovery_root).map_err(|err| {
-        format!(
-            "failed to create recovery directory {}: {}",
-            recovery_root.display(),
-            err
-        )
-    })?;
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let quarantine_dir = recovery_root.join(format!("memories-db-{timestamp}"));
-    std::fs::create_dir_all(&quarantine_dir).map_err(|err| {
-        format!(
-            "failed to create quarantine directory {}: {}",
-            quarantine_dir.display(),
-            err
-        )
-    })?;
-
-    let mut moved_any = false;
-    for artifact in memory_store_artifact_paths(path) {
-        if !artifact.exists() {
-            continue;
+    migration: Option<(&str, &std::collections::BTreeSet<String>)>,
+) -> Result<(Arc<Mutex<MemoryStore>>, MemoryStoreMode), LatticeError> {
+    match try_open_persistent_memory_store(path, migration) {
+        Ok(primary) => {
+            tracing::info!("Persistent memory store ready: {}", path.display());
+            Ok((Arc::new(Mutex::new(primary)), MemoryStoreMode::Persistent))
         }
-
-        moved_any = true;
-        let file_name = artifact.file_name().ok_or_else(|| {
-            format!(
-                "memory store artifact path {} has no terminal file name",
-                artifact.display()
-            )
-        })?;
-        let target = quarantine_dir.join(file_name);
-        std::fs::rename(&artifact, &target).map_err(|err| {
-            format!(
-                "failed to move {} to {}: {}",
-                artifact.display(),
-                target.display(),
-                err
-            )
-        })?;
+        Err(initial_err) => unavailable_memory_store(path, initial_err),
     }
-
-    if !moved_any {
-        return Err(format!(
-            "no memory store artifacts were present at {} to recover",
-            path.display()
-        ));
-    }
-
-    Ok(quarantine_dir)
 }
 
+fn try_open_persistent_memory_store(
+    path: &Path,
+    migration: Option<(&str, &std::collections::BTreeSet<String>)>,
+) -> Result<MemoryStore, LatticeError> {
+    let owner = RepositoryMemoryOwner::acquire(path, std::time::Duration::from_secs(5))?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            LatticeError::MemoryStorageAccessDenied("Memory database name is invalid".into())
+        })?;
+    let primary = owner.open_store(leaf)?;
+    if let Some((repository_id, proven)) = migration {
+        let report = primary
+            .with_connection(|connection| migrate_identities(connection, repository_id, proven))?;
+        if report.migrated_memories + report.migrated_dependents + report.migrated_serialized_states
+            > 0
+        {
+            tracing::info!(repository_id, migrated_memories=report.migrated_memories, migrated_dependents=report.migrated_dependents, migrated_serialized_states=report.migrated_serialized_states, before_checksum=%report.before_checksum, after_checksum=%report.after_checksum, "Historical memory identities migrated");
+        }
+    }
+    Ok(primary)
+}
+
+#[cfg(test)]
 fn memory_store_artifact_paths(path: &Path) -> [PathBuf; 3] {
     [
         path.to_path_buf(),
@@ -1313,24 +1149,22 @@ fn memory_store_artifact_paths(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-fn fallback_to_in_memory_memory_stores(
+fn unavailable_memory_store(
     path: &Path,
-    reason: String,
-) -> (Arc<Mutex<MemoryStore>>, MemoryStore, MemoryStoreMode) {
-    tracing::warn!(
-        "Failed to open persistent memory store at {} ({}). Falling back to in-memory memory for this session; durable memory writes are disabled until the workspace database is repaired.",
-        path.display(),
-        reason
-    );
-
-    let primary = MemoryStore::open_in_memory().expect("Failed to create in-memory memory store");
-    let engine =
-        MemoryStore::open_in_memory().expect("Failed to create in-memory engine memory store");
-    (
-        Arc::new(Mutex::new(primary)),
-        engine,
-        MemoryStoreMode::InMemoryFallback,
-    )
+    error: LatticeError,
+) -> Result<(Arc<Mutex<MemoryStore>>, MemoryStoreMode), LatticeError> {
+    let kind = match &error {
+        LatticeError::MemoryStorageBusy(_) => MemoryStoreFailureKind::Busy,
+        LatticeError::MemoryStorageAccessDenied(_) => MemoryStoreFailureKind::AccessDenied,
+        LatticeError::MemoryStorageFull(_) => MemoryStoreFailureKind::Full,
+        LatticeError::UnsupportedMemorySchema(_) => MemoryStoreFailureKind::UnsupportedSchema,
+        LatticeError::CorruptMemoryStorage(_) => MemoryStoreFailureKind::Corrupt,
+        _ => MemoryStoreFailureKind::Other,
+    };
+    let reason = error.to_string();
+    tracing::error!("Persistent memory unavailable at {}: {}. Graph service remains available; memory writes will fail until explicit offline recovery.", path.display(), reason);
+    let primary = MemoryStore::unavailable(path, kind, reason)?;
+    Ok((Arc::new(Mutex::new(primary)), MemoryStoreMode::Unavailable))
 }
 
 fn open_sqlite_vector_fallback(path: &Path) -> Option<SharedVectorIndex> {
@@ -1686,14 +1520,24 @@ fn generate_session_id() -> String {
     format!("s-{:08x}{:08x}", (h >> 32) as u32, now.subsec_nanos())
 }
 
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_incremental_index_for_roots, build_warm_query_engine, memory_store_artifact_paths,
-        open_memory_stores, MemoryStoreMode, WarmGraphLoad,
+        open_memory_store, MemoryStoreMode, WarmGraphLoad,
     };
+    use lattice_core::error::LatticeError;
     use lattice_core::graph::CodeGraph;
-    use lattice_core::memory::{Memory, MemoryScope, MemoryType, MemoryVerificationStatus};
+    use lattice_core::memory::{
+        Memory, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus,
+    };
     use lattice_core::storage::{GraphStore, IndexSnapshotLoad};
     use lattice_core::symbols::{Language, SymbolId, SymbolKind};
     use std::path::PathBuf;
@@ -1764,8 +1608,7 @@ mod tests {
         let snapshot = store
             .save_index_snapshot(&graph_with_payment_symbol())
             .expect("save graph and digest snapshot");
-        let (_, mut engine) =
-            build_warm_query_engine(WarmGraphLoad::Snapshot(snapshot), None, None);
+        let (_, mut engine) = build_warm_query_engine(WarmGraphLoad::Snapshot(snapshot), None);
 
         let capsule = engine.query("charge card payments", None, false);
         assert!(
@@ -1786,7 +1629,7 @@ mod tests {
                 panic!("fresh graph store must not report a digest snapshot")
             }
         };
-        let (loaded_graph, mut engine) = build_warm_query_engine(warm_graph, None, None);
+        let (loaded_graph, mut engine) = build_warm_query_engine(warm_graph, None);
 
         assert_eq!(loaded_graph.stats().node_count, 0);
         let capsule = engine.query("charge card payments", None, false);
@@ -1868,12 +1711,12 @@ mod tests {
     }
 
     #[test]
-    fn test_open_memory_stores_uses_persistent_store_when_available() {
+    fn test_open_memory_store_uses_persistent_store_when_available() {
         let root = unique_temp_path("persistent-root");
         std::fs::create_dir_all(&root).expect("failed to create temp root");
         let db_path = root.join("memories.db");
 
-        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+        let (memory_store, mode) = open_memory_store(&db_path, None).unwrap();
         assert_eq!(mode, MemoryStoreMode::Persistent);
         assert!(
             db_path.exists(),
@@ -1886,7 +1729,6 @@ mod tests {
             .store(make_memory("persistent write"))
             .expect("persistent memory store should accept writes");
         drop(memory_store);
-        drop(engine_store);
 
         let reopened = lattice_core::memory::MemoryStore::open(&db_path)
             .expect("reopening persistent memory store should succeed");
@@ -1900,35 +1742,59 @@ mod tests {
     }
 
     #[test]
-    fn test_open_memory_stores_falls_back_when_persistent_open_fails() {
+    fn test_open_memory_store_migrates_proven_identity_before_open() {
+        let root = unique_temp_path("identity-migration-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("memories.db");
+        let seed = MemoryStore::open(&db_path).unwrap();
+        seed.with_connection(|connection| { connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed,access_count)VALUES('historical','sentinel','fact','/proven/repo/.git',1,1,0)",[]).unwrap(); Ok(()) }).unwrap();
+        drop(seed);
+        let repository_id = format!("repo_{}", "d".repeat(64));
+        let proven = std::collections::BTreeSet::from(["/proven/repo/.git".to_string()]);
+        let (primary, mode) = open_memory_store(&db_path, Some((&repository_id, &proven))).unwrap();
+        assert_eq!(mode, MemoryStoreMode::Persistent);
+        let migrated = primary
+            .try_lock()
+            .unwrap()
+            .get_by_id("historical")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            migrated.workspace_id.as_deref(),
+            Some(repository_id.as_str())
+        );
+        drop(primary);
+        cleanup_memory_store_artifacts(&db_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_open_memory_store_rejects_writes_when_persistent_open_fails() {
         let db_path = unique_temp_path("missing-parent")
             .join("missing")
             .join("memories.db");
 
-        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+        let (memory_store, mode) = open_memory_store(&db_path, None).unwrap();
 
-        assert_eq!(mode, MemoryStoreMode::InMemoryFallback);
+        assert_eq!(mode, MemoryStoreMode::Unavailable);
         assert!(
             !db_path.exists(),
             "fallback path should not create an unusable persistent database"
         );
 
-        memory_store
+        let primary_error = memory_store
             .try_lock()
             .expect("memory store lock should be available")
             .store(make_memory("fallback primary write"))
-            .expect("primary in-memory fallback should accept writes");
-        let stored_id = engine_store
-            .store(make_memory("fallback engine write"))
-            .expect("engine in-memory fallback should accept writes");
-        let stored = engine_store
-            .get_by_id(&stored_id)
-            .expect("fallback lookup should succeed");
-        assert!(stored.is_some(), "fallback memory should be queryable");
+            .expect_err("unavailable primary must reject non-durable writes");
+        assert!(matches!(
+            primary_error,
+            LatticeError::MemoryStorageUnavailable(_)
+        ));
     }
 
     #[test]
-    fn test_open_memory_stores_recovers_by_quarantining_broken_artifacts() {
+    fn test_open_memory_store_preserves_broken_artifacts_without_live_recovery() {
         let root = unique_temp_path("recover-root");
         std::fs::create_dir_all(&root).expect("failed to create temp root");
         let db_path = root.join("memories.db");
@@ -1936,50 +1802,24 @@ mod tests {
         std::fs::create_dir_all(&db_path)
             .expect("failed to create blocking directory at database path");
 
-        let (memory_store, engine_store, mode) = open_memory_stores(&db_path);
+        let (memory_store, mode) = open_memory_store(&db_path, None).unwrap();
 
-        assert_eq!(mode, MemoryStoreMode::RecoveredPersistent);
+        assert_eq!(mode, MemoryStoreMode::Unavailable);
         assert!(
-            db_path.is_file(),
-            "recovery should recreate the sqlite database"
+            db_path.is_dir(),
+            "the original artifact must remain untouched"
         );
-
-        let recovery_root = root.join("recovered-memory");
-        let recovery_entries = std::fs::read_dir(&recovery_root)
-            .expect("recovery directory should exist after quarantine")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("recovery directory should be readable");
-        assert_eq!(
-            recovery_entries.len(),
-            1,
-            "expected exactly one quarantine directory"
-        );
-        let quarantined_db = recovery_entries[0].path().join("memories.db");
         assert!(
-            quarantined_db.is_dir(),
-            "the blocking artifact should be preserved in quarantine"
+            !root.join("recovered-memory").exists(),
+            "startup must not quarantine live artifacts"
         );
-
-        let stored_id = memory_store
+        memory_store
             .try_lock()
             .expect("memory store lock should be available")
             .store(make_memory("recovered persistent write"))
-            .expect("recovered persistent store should accept writes");
+            .expect_err("unavailable store must reject writes");
         drop(memory_store);
-        drop(engine_store);
-
-        let reopened = lattice_core::memory::MemoryStore::open(&db_path)
-            .expect("reopening recovered memory store should succeed");
-        let stored = reopened
-            .get_by_id(&stored_id)
-            .expect("reopen lookup should succeed after recovery");
-        assert!(
-            stored.is_some(),
-            "recovered persistent memory should survive reopen"
-        );
-
         cleanup_memory_store_artifacts(&db_path);
-        let _ = std::fs::remove_dir_all(&recovery_root);
         let _ = std::fs::remove_dir(&root);
     }
 }

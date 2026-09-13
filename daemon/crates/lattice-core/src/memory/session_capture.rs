@@ -794,10 +794,10 @@ mod tests {
         let first = authority(0, Some("main"), "abc123");
         let second = authority(1, Some("feature/d3"), "def456");
         let resolution = format!(
-            r#"{{"schema_version":1,"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"resolved"}}"#
+            r#"{{"schema_version":1,"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"resolved","summary":"missing import"}}"#
         );
         let observed = format!(
-            r#"{{"schema_version":1,"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"observed"}}"#
+            r#"{{"schema_version":1,"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"observed","summary":"missing import"}}"#
         );
         let close = parse_session_capture_close(
             r#"{"schema_version":1,"final_summary":"Everything passed and was resolved."}"#,
@@ -837,6 +837,10 @@ mod tests {
         let same_segment = vec![
             event(second.clone(), &observed),
             event(second.clone(), &resolution),
+            event(
+                second.clone(),
+                r#"{"schema_version":1,"kind":"check","label":"compiler regression","outcome":"passed"}"#,
+            ),
         ];
         let candidates =
             reduce_session_capture_candidates(&same_segment, &close, &second, "capture-v1")
@@ -926,14 +930,14 @@ mod tests {
 
         let candidates =
             reduce_session_capture_candidates(&events, &close, &auth, "capture-v1").unwrap();
-        let narrative = candidates
-            .iter()
-            .find(|candidate| candidate.kind == SessionDigestCandidateKind::Narrative)
-            .expect("corroborated narrative candidate");
-        assert_eq!(narrative.memory_class, MemoryClass::WorkflowOutcome);
+        assert!(
+            candidates.is_empty(),
+            "an unresolved observation and prose remain episode evidence, not a lesson"
+        );
+        let digests = reduce_session_capture(&events, &close, &auth).unwrap();
         assert_eq!(
-            narrative.claim,
-            "Resolved the compiler failure and all checks passed."
+            digests[0].final_summary.as_deref(),
+            Some("Resolved the compiler failure and all checks passed.")
         );
         assert!(candidates.iter().all(|candidate| {
             candidate.kind != SessionDigestCandidateKind::CheckOutcome

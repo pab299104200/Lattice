@@ -14,10 +14,7 @@
 
 use crate::events::{Bootstrap, EventPayload, EventQueryError, QueryOrder, Snapshot};
 
-use super::support::{
-    capture_logs, event_envelope, sample_graph, sample_memory_store, truncate_file,
-    HardeningFixture,
-};
+use super::support::{capture_logs, event_envelope, sample_graph, truncate_file, HardeningFixture};
 
 #[test]
 fn test_replay_from_snapshot_plus_tail_reconstructs_state() {
@@ -27,9 +24,8 @@ fn test_replay_from_snapshot_plus_tail_reconstructs_state() {
         .append(event_envelope("task-snapshot-tail", "session-a", "before"))
         .expect("pre-snapshot event appends");
     let graph = sample_graph();
-    let memory = sample_memory_store();
     let snapshot_path = fixture.snapshot_path("snapshot-1-1.bin");
-    Snapshot::write(&snapshot_path, &graph, &memory, 1).expect("snapshot writes");
+    Snapshot::write(&snapshot_path, &graph, 1).expect("snapshot writes");
     fixture
         .writer(4096)
         .append(event_envelope("task-snapshot-tail", "session-b", "after"))
@@ -38,7 +34,7 @@ fn test_replay_from_snapshot_plus_tail_reconstructs_state() {
     let (bootstrapped, logs) =
         capture_logs(|| Bootstrap::load(&snapshot_path, &fixture.reopen_store()));
     let bootstrapped = bootstrapped.expect("snapshot bootstrap succeeds");
-    let expected = Snapshot::capture(&graph, &memory, 2).expect("full state captures");
+    let expected = Snapshot::capture(&graph, 2).expect("full state captures");
 
     assert_eq!(bootstrapped.replayed_event_rows, 1);
     assert_eq!(bootstrapped.snapshot.graph_state, expected.graph_state);
@@ -77,8 +73,7 @@ fn test_partial_snapshot_falls_back_to_full_replay_without_data_loss() {
         ))
         .expect("first event appends");
     let valid = fixture.snapshot_path("snapshot-1-1.bin");
-    Snapshot::write(&valid, &sample_graph(), &sample_memory_store(), 1)
-        .expect("valid snapshot writes");
+    Snapshot::write(&valid, &sample_graph(), 1).expect("valid snapshot writes");
     writer
         .append(event_envelope(
             "task-partial-snapshot",
@@ -87,8 +82,7 @@ fn test_partial_snapshot_falls_back_to_full_replay_without_data_loss() {
         ))
         .expect("tail event appends");
     let corrupt = fixture.snapshot_path("snapshot-2-2.bin");
-    Snapshot::write(&corrupt, &sample_graph(), &sample_memory_store(), 2)
-        .expect("corruptible snapshot writes");
+    Snapshot::write(&corrupt, &sample_graph(), 2).expect("corruptible snapshot writes");
     truncate_file(&corrupt);
 
     let (bootstrapped, logs) = capture_logs(|| Bootstrap::load(&corrupt, &fixture.reopen_store()));

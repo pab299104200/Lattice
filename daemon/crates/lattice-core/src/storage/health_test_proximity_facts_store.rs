@@ -122,9 +122,8 @@ impl HealthTestProximityFactsStore {
     pub fn open(path: &Path) -> Result<Self, LatticeError> {
         let conn = Connection::open(path)
             .map_err(|error| storage_error("open health test-proximity-fact database", error))?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(|error| {
-            storage_error("enable WAL for health test-proximity facts", error)
-        })?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| storage_error("enable WAL for health test-proximity facts", error))?;
         let store = Self {
             conn,
             path: Some(path.to_path_buf()),
@@ -179,9 +178,7 @@ impl HealthTestProximityFactsStore {
              ON CONFLICT(repository_id) DO NOTHING",
             [repository_id],
         )
-        .map_err(|error| {
-            storage_error("initialize test-proximity-fact repository state", error)
-        })?;
+        .map_err(|error| storage_error("initialize test-proximity-fact repository state", error))?;
 
         if let Some(active) = active_identity(&tx, repository_id)? {
             if active.graph_revision.as_deref() == graph_revision && active.digest == digest {
@@ -617,9 +614,9 @@ fn validate_snapshot(snapshot: &TestProximitySnapshot) -> Result<(), LatticeErro
         || snapshot.files.len() > limits.max_files
         || usize::try_from(report.production_files_observed).ok() < Some(snapshot.files.len())
         || report.file_overflow
-            != (usize::try_from(report.production_files_observed).ok()
-                > Some(snapshot.files.len()))
-        || (report.availability() == crate::health::test_proximity_facts::FactAvailability::Unavailable
+            != (usize::try_from(report.production_files_observed).ok() > Some(snapshot.files.len()))
+        || (report.availability()
+            == crate::health::test_proximity_facts::FactAvailability::Unavailable
             && !snapshot.files.is_empty())
     {
         return Err(LatticeError::Storage(
@@ -831,9 +828,15 @@ mod tests {
     #[test]
     fn generations_are_isolated_and_only_one_prior_is_retained() {
         let store = HealthTestProximityFactsStore::open_in_memory().unwrap();
-        let first = store.publish("repo", Some("r1"), 1, &snapshot(false)).unwrap();
-        let second = store.publish("repo", Some("r2"), 2, &snapshot(true)).unwrap();
-        let third = store.publish("repo", Some("r3"), 3, &snapshot(false)).unwrap();
+        let first = store
+            .publish("repo", Some("r1"), 1, &snapshot(false))
+            .unwrap();
+        let second = store
+            .publish("repo", Some("r2"), 2, &snapshot(true))
+            .unwrap();
+        let third = store
+            .publish("repo", Some("r3"), 3, &snapshot(false))
+            .unwrap();
 
         assert_eq!(
             (first.generation, second.generation, third.generation),
@@ -861,9 +864,15 @@ mod tests {
     #[test]
     fn repositories_do_not_observe_each_others_generations() {
         let store = HealthTestProximityFactsStore::open_in_memory().unwrap();
-        let left = store.publish("left", Some("l1"), 1, &snapshot(false)).unwrap();
-        let right = store.publish("right", Some("r1"), 2, &snapshot(true)).unwrap();
-        store.publish("left", Some("l2"), 3, &snapshot(true)).unwrap();
+        let left = store
+            .publish("left", Some("l1"), 1, &snapshot(false))
+            .unwrap();
+        let right = store
+            .publish("right", Some("r1"), 2, &snapshot(true))
+            .unwrap();
+        store
+            .publish("left", Some("l2"), 3, &snapshot(true))
+            .unwrap();
 
         assert_eq!(store.load_active("right").unwrap(), Some(right));
         assert_ne!(
@@ -883,7 +892,9 @@ mod tests {
     #[test]
     fn failed_candidate_rolls_back_and_preserves_the_active_pointer() {
         let store = HealthTestProximityFactsStore::open_in_memory().unwrap();
-        let first = store.publish("repo", Some("r1"), 1, &snapshot(false)).unwrap();
+        let first = store
+            .publish("repo", Some("r1"), 1, &snapshot(false))
+            .unwrap();
         store
             .conn
             .execute_batch(
@@ -906,7 +917,10 @@ mod tests {
             1
         );
         assert_eq!(
-            count(&store, "SELECT count(*) FROM health_test_proximity_facts_files"),
+            count(
+                &store,
+                "SELECT count(*) FROM health_test_proximity_facts_files"
+            ),
             i64::try_from(snapshot(false).files.len()).unwrap(),
             "no partial file rows from the aborted candidate survive"
         );
@@ -915,14 +929,18 @@ mod tests {
     #[test]
     fn file_delta_since_prior_confines_an_incremental_refresh() {
         let store = HealthTestProximityFactsStore::open_in_memory().unwrap();
-        store.publish("repo", Some("r1"), 1, &snapshot(false)).unwrap();
+        store
+            .publish("repo", Some("r1"), 1, &snapshot(false))
+            .unwrap();
         assert_eq!(
             store.file_delta_since_prior("repo").unwrap(),
             None,
             "the first generation has no predecessor to compare against"
         );
 
-        store.publish("repo", Some("r2"), 2, &snapshot(true)).unwrap();
+        store
+            .publish("repo", Some("r2"), 2, &snapshot(true))
+            .unwrap();
         let delta = store.file_delta_since_prior("repo").unwrap().unwrap();
         assert_eq!(delta.updated, ["src/orphan.rs"]);
         assert!(delta.added.is_empty());
@@ -940,8 +958,12 @@ mod tests {
                  INSERT INTO nodes_for_recovery_proof VALUES ('preserved');",
             )
             .unwrap();
-        store.publish("broken", Some("b1"), 1, &snapshot(false)).unwrap();
-        let healthy = store.publish("healthy", Some("h1"), 1, &snapshot(true)).unwrap();
+        store
+            .publish("broken", Some("b1"), 1, &snapshot(false))
+            .unwrap();
+        let healthy = store
+            .publish("healthy", Some("h1"), 1, &snapshot(true))
+            .unwrap();
         store
             .conn
             .execute(
@@ -970,7 +992,9 @@ mod tests {
     #[test]
     fn tampered_fact_rows_are_detected_by_the_snapshot_digest() {
         let store = HealthTestProximityFactsStore::open_in_memory().unwrap();
-        store.publish("repo", Some("r1"), 1, &snapshot(false)).unwrap();
+        store
+            .publish("repo", Some("r1"), 1, &snapshot(false))
+            .unwrap();
         // Inflate a linked file's count without touching any other column:
         // every column CHECK still passes (count > 0, kind is graph_edge,
         // untested_change is 0), so only the recomputed snapshot digest
@@ -1004,7 +1028,9 @@ mod tests {
             .find(|file| file.path == "src/orphan.rs")
             .unwrap();
         orphan.untested_change = false;
-        assert!(store.publish("repo", Some("r2"), 2, &fabricated_link).is_err());
+        assert!(store
+            .publish("repo", Some("r2"), 2, &fabricated_link)
+            .is_err());
 
         let mut mismatched_kind = snapshot(false);
         let widget = mismatched_kind
@@ -1043,7 +1069,9 @@ mod tests {
         let path = directory.path().join("graph.db");
         let expected = {
             let store = HealthTestProximityFactsStore::open(&path).unwrap();
-            store.publish("repo", Some("r1"), 17, &snapshot(false)).unwrap()
+            store
+                .publish("repo", Some("r1"), 17, &snapshot(false))
+                .unwrap()
         };
         let reopened = HealthTestProximityFactsStore::open(&path).unwrap();
         assert_eq!(reopened.load_active("repo").unwrap(), Some(expected));
@@ -1063,7 +1091,9 @@ mod tests {
         let _ = GraphFactProducer::default();
 
         let facts = HealthTestProximityFactsStore::open(&path).unwrap();
-        let published = facts.publish("repo", Some("r1"), 2, &snapshot(false)).unwrap();
+        let published = facts
+            .publish("repo", Some("r1"), 2, &snapshot(false))
+            .unwrap();
 
         assert_eq!(facts.load_active("repo").unwrap(), Some(published));
         assert!(graph_facts_store.load_active("repo").unwrap().is_some());

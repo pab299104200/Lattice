@@ -171,29 +171,34 @@ connection.execute(
 connection.commit()
 PY
   printf '%s\n' 'dirty working-set fixture' >"$e2e_repo/src/example.rs"
-  python3 - "$e2e_repo/.lattice/verification-checks.json" <<'PY'
+  failure_check="$e2e_repo/fixture-failure-check"
+  recovery_check="$e2e_repo/fixture-recovery-check"
+  printf '%s\n' '#!/bin/sh' '[ "$FIXTURE_CHECK" = true ] || exit 99' 'printf "%s\\n" "private-check-output"' 'exit 17' >"$failure_check"
+  printf '%s\n' '#!/bin/sh' '[ "$FIXTURE_CHECK" = true ] || exit 99' 'exit 0' >"$recovery_check"
+  chmod 755 "$failure_check" "$recovery_check"
+  python3 - "$e2e_repo/.lattice/verification-checks.json" "$failure_check" "$recovery_check" <<'PY'
 from pathlib import Path
 import json
 import sys
 
 fingerprint = "sha256:" + ("4" * 64)
 Path(sys.argv[1]).write_text(json.dumps({
-    "schema_version": 1,
+    "schema_version": 2,
     "checks": [
         {
             "id": "fixture-failure",
             "label": "fixture declared failure",
-            "argv": [
-                "python3", "-c",
-                "import sys; print('private-check-output'); sys.exit(17)",
-                "private-check-argument"
-            ],
+            "argv": [sys.argv[2], "private-check-argument"],
+            "timeout_ms": 120000,
+            "env": {"FIXTURE_CHECK": "true"},
             "error": {"category": "test", "fingerprint": fingerprint}
         },
         {
             "id": "fixture-recovery",
             "label": "fixture declared recovery",
-            "argv": ["python3", "-c", "raise SystemExit(0)"],
+            "argv": [sys.argv[3]],
+            "timeout_ms": 120000,
+            "env": {"FIXTURE_CHECK": "true"},
             "error": {"category": "test", "fingerprint": fingerprint}
         }
     ]

@@ -97,7 +97,10 @@ fn a_lower_is_riskier_feature_is_inverted_so_high_always_means_risk() {
         vector("well_spread", &[(FeatureKind::BusFactor, 3)]),
         vector("very_well_spread", &[(FeatureKind::BusFactor, 4)]),
     ]);
-    assert_eq!(FeatureKind::BusFactor.direction(), RiskDirection::LowerIsRiskier);
+    assert_eq!(
+        FeatureKind::BusFactor.direction(),
+        RiskDirection::LowerIsRiskier
+    );
     assert_eq!(normalized[0].get(FeatureKind::BusFactor), Some(750));
     assert_eq!(normalized[1].get(FeatureKind::BusFactor), Some(500));
     assert_eq!(normalized[2].get(FeatureKind::BusFactor), Some(250));
@@ -266,9 +269,18 @@ fn a_weight_set_reports_whether_a_family_has_any_signal_left() {
 #[test]
 fn normalization_is_independent_of_input_order() {
     let forward = vec![
-        vector("a", &[(FeatureKind::FanIn, 3), (FeatureKind::LineChurn, 10)]),
-        vector("b", &[(FeatureKind::FanIn, 1), (FeatureKind::LineChurn, 90)]),
-        vector("c", &[(FeatureKind::FanIn, 2), (FeatureKind::LineChurn, 50)]),
+        vector(
+            "a",
+            &[(FeatureKind::FanIn, 3), (FeatureKind::LineChurn, 10)],
+        ),
+        vector(
+            "b",
+            &[(FeatureKind::FanIn, 1), (FeatureKind::LineChurn, 90)],
+        ),
+        vector(
+            "c",
+            &[(FeatureKind::FanIn, 2), (FeatureKind::LineChurn, 50)],
+        ),
     ];
     let mut reversed = forward.clone();
     reversed.reverse();

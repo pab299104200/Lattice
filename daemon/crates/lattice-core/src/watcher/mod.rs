@@ -137,7 +137,10 @@ pub fn start_watcher(
                 .to_string_lossy()
                 .to_string();
 
-            if should_index_file(&rel) {
+            if crate::security::workspace::allows_source_path(
+                &root_clone,
+                PathBuf::from(&rel).as_path(),
+            ) {
                 let _ = tx.send(FileEvent {
                     path: path.clone(),
                     kind: kind.clone(),

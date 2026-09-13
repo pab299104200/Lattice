@@ -74,6 +74,46 @@ fn full_bounded_queue_skips_before_loading_facts_or_invoking_provider() {
 }
 
 #[test]
+fn inapplicable_capture_facts_never_reach_the_provider() {
+    for mutation in [
+        "UPDATE session_digest_deliveries SET checkout_id='foreign-checkout'",
+        "UPDATE session_digest_deliveries SET branch='foreign-branch'",
+        "UPDATE memories SET applicable_checkout_id='foreign-checkout' WHERE source_query='automatic_session_digest'",
+        "UPDATE memories SET scope='branch', branch='foreign-branch' WHERE source_query='automatic_session_digest'",
+        "UPDATE memories SET is_invalidated=1 WHERE source_query='automatic_session_digest'",
+        "UPDATE memories SET scope='session' WHERE source_query='automatic_session_digest'",
+    ] {
+        let mut fixture = Fixture::new(8);
+        fixture.memory_store.with_connection(|connection| {
+            connection.execute_batch(mutation).unwrap();
+            Ok(())
+        }).unwrap();
+        let outcome = fixture.run(&config(true, Some(MOCK_KEY))).unwrap();
+        assert_skip(outcome, ConsolidationSkipReason::NoEligibleCaptureFacts);
+        assert_eq!(fixture.driver.call_count(), 0, "{mutation}");
+        assert_eq!(fixture.proposal_count(), 0);
+    }
+}
+
+#[test]
+fn mismatched_capture_evidence_fails_before_provider_invocation() {
+    for field in ["repository_id", "checkout_id", "branch"] {
+        let mut fixture = Fixture::new(8);
+        fixture.memory_store.with_connection(|connection| {
+            connection.execute(
+                "UPDATE memory_evidence SET detail=json_set(detail, ?1, 'foreign') WHERE kind='session_digest'",
+                [format!("$.{field}")],
+            ).unwrap();
+            Ok(())
+        }).unwrap();
+        let error = fixture.run(&config(true, Some(MOCK_KEY))).unwrap_err();
+        assert!(error.to_string().contains("authority"), "{error}");
+        assert_eq!(fixture.driver.call_count(), 0, "{field}");
+        assert_eq!(fixture.proposal_count(), 0);
+    }
+}
+
+#[test]
 fn valid_mocked_key_creates_repo_review_proposals_only_from_persisted_sanitized_facts() {
     let mut fixture = Fixture::new(8);
     fixture.driver.push_ok(valid_response());
@@ -91,7 +131,10 @@ fn valid_mocked_key_creates_repo_review_proposals_only_from_persisted_sanitized_
         panic!("expected proposals");
     };
     assert_eq!(proposal_ids.len(), 2);
-    assert!(source_fact_count >= 2);
+    assert_eq!(
+        source_fact_count, 1,
+        "one validated failure episode supplies one reusable source fact"
+    );
     assert_eq!(fixture.driver.call_count(), 1);
     assert_eq!(fixture.memory_store.direct_write_count(), 0);
     assert_eq!(
@@ -240,6 +283,11 @@ impl Fixture {
             runtime: &mut self.runtime,
             memory_store: &self.memory_store,
             event_writer: &self.event_writer,
+            authority: &crate::consolidation::EvolutionAuthority {
+                repository_id: REPOSITORY_ID,
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         };
         SessionDigestLlmConsolidator::run(config, REPOSITORY_ID, &mut services)
     }
@@ -315,11 +363,31 @@ fn persist_sanitized_capture(memory_store: &MemoryStore) {
         ended_at: now,
         received_at: now,
         edited_paths: vec!["daemon/src/main.rs".to_string()],
-        final_summary: Some("Kept repository capture deterministic".to_string()),
-        observations: vec![SessionDigestObservation::Check {
-            label: "lattice core tests".to_string(),
-            outcome: CheckOutcome::Passed,
-        }],
+        final_summary: Some(
+            "Corrected the missing import and kept the change scoped to the parser.".to_string(),
+        ),
+        observations: vec![
+            SessionDigestObservation::Error {
+                category: "compiler".to_string(),
+                fingerprint:
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                status: crate::memory::ErrorStatus::Observed,
+                summary: Some("missing import".to_string()),
+            },
+            SessionDigestObservation::Error {
+                category: "compiler".to_string(),
+                fingerprint:
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                status: crate::memory::ErrorStatus::Resolved,
+                summary: Some("missing import".to_string()),
+            },
+            SessionDigestObservation::Check {
+                label: "lattice core tests".to_string(),
+                outcome: CheckOutcome::Passed,
+            },
+        ],
         payload_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
         dropped_observation_count: 0,

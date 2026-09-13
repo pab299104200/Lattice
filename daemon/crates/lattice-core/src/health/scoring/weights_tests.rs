@@ -147,7 +147,10 @@ fn defect_risk_draws_on_every_family_the_report_measured() {
         .collect();
 
     for family in [FactFamily::Graph, FactFamily::Git, FactFamily::Complexity] {
-        assert!(families.contains(&family), "{family:?} is a measured family");
+        assert!(
+            families.contains(&family),
+            "{family:?} is a measured family"
+        );
     }
 }
 

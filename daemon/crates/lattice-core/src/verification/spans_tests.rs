@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     SpanMismatchReason, SpanReader, SpanValidationError, SpanValidator, VerificationStatus,
+    WorkspaceFileReader,
 };
 use crate::identity::FileId;
 use crate::memory::{EvidenceSpan, MemoryEvidence};
@@ -132,6 +133,26 @@ fn span_validation_never_reads_the_whole_file() {
     assert_eq!(verdict.status, VerificationStatus::Verified);
     assert_eq!(reader.bytes_read(), 5);
     assert_eq!(reader.line_bytes_read(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_reader_rejects_symlink_evidence_like_the_indexer() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("secret.rs"), "secret").expect("outside file");
+    symlink(
+        outside.path().join("secret.rs"),
+        root.path().join("evidence.rs"),
+    )
+    .expect("evidence symlink");
+    let reader = WorkspaceFileReader::new(root.path());
+    let error = reader
+        .read_range(&file_id("evidence.rs"), 0, 1)
+        .expect_err("symlink evidence must be rejected");
+    assert!(matches!(error, SpanValidationError::ReadFailed { .. }));
 }
 
 fn file_id(path: &str) -> FileId {

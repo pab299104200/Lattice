@@ -18,7 +18,7 @@ use tracing::info;
 
 use crate::consolidation::{
     empty_state, ApplyOutcome, ConsolidationConfig, ConsolidationJobMode, ConsolidationJobRuntime,
-    ConsolidationJobSpec, PendingProposalSpec, ProposalDecision, ProposalKind,
+    ConsolidationJobSpec, EvolutionAuthority, PendingProposalSpec, ProposalDecision, ProposalKind,
 };
 use crate::events::{
     Actor, BranchRef, CompactSummary, ContextBundleReturnedPayload, EventPayload, EventQuery,
@@ -239,9 +239,6 @@ impl EventFixture {
             self.store.clone(),
             self.writer.clone(),
             Arc::new(std::sync::Mutex::new(Arc::new(CodeGraph::new()))),
-            Arc::new(std::sync::Mutex::new(
-                MemoryStore::open_in_memory().unwrap(),
-            )),
             crate::events::CompactionConfig {
                 interval: Duration::from_secs(60),
                 min_events_since_last: 1,
@@ -453,6 +450,11 @@ fn run_consolidation_trace(label: &str) -> ConsolidationTrace {
     let fixture = ConsolidationFixture::new(label);
     seed_deterministic_event_trace(&fixture.event_writer);
     let mut runtime = fixture.runtime();
+    let authority = EvolutionAuthority {
+        repository_id: WORKSPACE,
+        checkout_id: "checkout-main",
+        branch: BRANCH,
+    };
     for kind in [
         "episode_summary",
         "procedure_extraction",
@@ -462,7 +464,9 @@ fn run_consolidation_trace(label: &str) -> ConsolidationTrace {
             .submit(consolidation_job(kind))
             .expect("job enqueues");
     }
-    let proposals = runtime.run_due().expect("jobs run");
+    let proposals = runtime
+        .run_due(&fixture.memory_store, &authority)
+        .expect("jobs run");
     let proposal_json = proposals
         .iter()
         .map(|proposal| {
@@ -483,6 +487,7 @@ fn run_consolidation_trace(label: &str) -> ConsolidationTrace {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &authority,
         )
         .expect("first apply succeeds");
     let second_apply = runtime
@@ -492,6 +497,7 @@ fn run_consolidation_trace(label: &str) -> ConsolidationTrace {
             &fixture.memory_store,
             &fixture.event_writer,
             "operator",
+            &authority,
         )
         .expect("second apply succeeds");
     ConsolidationTrace {

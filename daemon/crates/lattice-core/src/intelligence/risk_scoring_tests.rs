@@ -202,10 +202,7 @@ fn a_symbol_nothing_reaches_is_still_not_a_change_risk() {
     let report = report_for(&graph, "src/lonely.rs", None);
 
     assert!(
-        report
-            .risks
-            .iter()
-            .all(|risk| risk.symbol != "lonely"),
+        report.risks.iter().all(|risk| risk.symbol != "lonely"),
         "an unexported symbol with no dependents is not a change risk"
     );
 }

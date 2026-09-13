@@ -13,7 +13,6 @@
 //!
 //! - Every stale or contradicted memory is surfaced as such, not hidden behind recency.
 
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -147,7 +146,12 @@ impl WorkspaceFileReader {
 impl SpanReader for WorkspaceFileReader {
     fn file_len(&self, file_id: &FileId) -> Result<Option<u64>, SpanValidationError> {
         let path = self.path_for(file_id)?;
-        match std::fs::metadata(&path) {
+        match crate::security::workspace::open_source(
+            &self.workspace_root,
+            Path::new(&file_id.repo_relative_path),
+        )
+        .and_then(|file| file.metadata())
+        {
             Ok(metadata) => Ok(Some(metadata.len())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(read_failed(&path, error)),
@@ -161,7 +165,10 @@ impl SpanReader for WorkspaceFileReader {
         end: u32,
     ) -> Result<Option<Vec<u8>>, SpanValidationError> {
         let path = self.path_for(file_id)?;
-        let mut file = match File::open(&path) {
+        let mut file = match crate::security::workspace::open_source(
+            &self.workspace_root,
+            Path::new(&file_id.repo_relative_path),
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(read_failed(&path, error)),
@@ -182,7 +189,10 @@ impl SpanReader for WorkspaceFileReader {
         line_end: u32,
     ) -> Result<Option<Vec<u8>>, SpanValidationError> {
         let path = self.path_for(file_id)?;
-        let file = match File::open(&path) {
+        let file = match crate::security::workspace::open_source(
+            &self.workspace_root,
+            Path::new(&file_id.repo_relative_path),
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(read_failed(&path, error)),

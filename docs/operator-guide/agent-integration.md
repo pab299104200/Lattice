@@ -1,5 +1,27 @@
 # Agent Integration
 
+## Complete project installation
+
+```sh
+lattice install --workspace /path/to/project --verify
+```
+
+This default (or explicit `install all`) reconciles Claude `.mcp.json`, Codex
+`.codex/config.toml`, both clients' hook files, and managed Lattice workflow
+sections in `AGENTS.md` and `CLAUDE.md`. It preserves unrelated settings and
+instructions. Explicit `mcp`, `codex`, and `claude-code` targets retain their
+focused behavior. Six-file preflight rejects invalid input before publication;
+individual replacements are atomic, but an interrupted or partially failed
+installation should be rerun. Malformed managed markers require correction
+instead of risking unrelated prose. Client trust is not granted automatically.
+
+Codex project-local MCP registration uses `[mcp_servers.lattice]` in a trusted
+project's `.codex/config.toml`, as described in the
+[official MCP documentation](https://developers.openai.com/codex/mcp). Restart or
+reconnect clients to load the updated configuration. Installed instructions
+require per-task tool use; actual adoption still needs trace-based acceptance.
+
+
 Lattice exposes one agent-facing contract: a project-scoped `lattice` MCP server, the 8 public verbs, and optional CLI/hook integrations that call the same verbs.
 
 ## MCP Registration

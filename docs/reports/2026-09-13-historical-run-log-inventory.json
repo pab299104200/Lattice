@@ -1,0 +1,545 @@
+{
+  "purpose": "Preserved historical generated logs moved out of durable design documents; original tracked content remains in Git history. Local archive is not automatically deleted.",
+  "files": [
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/00-decompose.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/00-decompose.log",
+      "bytes": 2882899,
+      "sha256": "4c4bac35e5132b8c52001a4c6f8e76c1cd90560b889f7f4866f80c14f8dec481"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R05.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R05.log",
+      "bytes": 470953,
+      "sha256": "4e88f826f4fa81c4ae531ce4c98aa6a318a766dd1b72236679381a826cdc9010"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R10.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R10.log",
+      "bytes": 770811,
+      "sha256": "e560264501e4c7838dd66630a5784b5dc299649ad3739cd03c052fd4b013b7e1"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R18.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R18.log",
+      "bytes": 829227,
+      "sha256": "778b647ac20ad9fd0170a7635fad3695afa57f702818f314faaecc404b44e81e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R25.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R25.log",
+      "bytes": 980712,
+      "sha256": "b5253614e648fe4e222b8406804a561a51a4c769f47c9f62c22d80b1b7289ca9"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R26.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R26.log",
+      "bytes": 2157530,
+      "sha256": "b0cebdc8d37c349d040b94213b4e0be6bfe4f1090582a9034c2ec8df681ac6b6"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R33.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R33.log",
+      "bytes": 856519,
+      "sha256": "a883620568f4116c22b6bdb43315af22f6ab8cd204a6b47ec289fe0bfae3da9e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R38.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R38.log",
+      "bytes": 711749,
+      "sha256": "8d5c001bede7e6ad56093fc497d58ad0f45aa05855f769c8abc58b2635719859"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R47.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R47.log",
+      "bytes": 1056969,
+      "sha256": "3bcf3f554c64cbc41420e1df420ccf45ae43e218fb8ab721a726da46d099451e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R54.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R54.log",
+      "bytes": 628674,
+      "sha256": "64f63875a3e24efb046095da905ca3947a00c7e68f3ec006c7397d537d3c48ac"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R55.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R55.log",
+      "bytes": 1250091,
+      "sha256": "c72829788df6fee2e3ecc6b2e03465c0895e980cbcecce8b2fba5b1d1d3551b4"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R63.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R63.log",
+      "bytes": 729191,
+      "sha256": "8bf1d93f3854dcd765e345b5f8a5cb7982ab11a3586eda0930992476f478de2e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R64.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R64.log",
+      "bytes": 1759103,
+      "sha256": "cebac54d316f24a403e93009ac1ff970427a04e24196493515462606d721ed43"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R70.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R70.log",
+      "bytes": 761124,
+      "sha256": "a174b025d0c7b0fb65fc85438738dc4ba26ea3dcc2d56bc17845d0b644bb6639"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R78.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R78.log",
+      "bytes": 964614,
+      "sha256": "b8c2d00dfe7c0ea282375089e7f3d34235bbc1a70e2d46cd58156123ca4cb1ac"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R79.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R79.log",
+      "bytes": 900172,
+      "sha256": "05f70441603fcafcc8cdcda03e3b418096076eafc0ec779416a7da2c1929cbe8"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R87.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R87.log",
+      "bytes": 854167,
+      "sha256": "32e85d0818dac81ed5713ac2197d47eceab3f3810c36686aa26cf1d1803e6de0"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R88.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R88.log",
+      "bytes": 4336860,
+      "sha256": "452f04a6ee68dad63c445a9471647471290b0a16026731b2ba712ae7d4d26cdb"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/R89.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/R89.log",
+      "bytes": 682154,
+      "sha256": "0f1ffc8c38e290e4eb7b9b358a79b0cc5b23dfc7d311cb61ddffd648d0e7596e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T01.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T01.log",
+      "bytes": 377529,
+      "sha256": "0c1232faca7b0d852d96f80ee58c327570c7614f0ef555ce728ada86c27c8fd3"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T02.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T02.log",
+      "bytes": 446921,
+      "sha256": "7a8a65937d4b9731128f7c7f9cffa3f799c47a8fb589a6cf8e5176b0185c5576"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T03.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T03.log",
+      "bytes": 1504726,
+      "sha256": "f89e1ba49d6ad219762f60781ce6df4e729a97307316165520ce996a92282127"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T04.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T04.log",
+      "bytes": 2879441,
+      "sha256": "8563bc99f0315528c30bf853a0f2fdef0fc8ac22091ba368225a70b1c3306493"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T06.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T06.log",
+      "bytes": 951828,
+      "sha256": "c0b1f8f7aaa2cae57a9c5f3a3b65351d7f80900d3f3f1042d5a75ac49f02fc0e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T07.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T07.log",
+      "bytes": 1893003,
+      "sha256": "ff7afbbd19ef49a9064999b9effd214e5109e592f4c1b4883fcf22422bac838b"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T08.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T08.log",
+      "bytes": 4456530,
+      "sha256": "a1e90fb2ac34eb836670fd51986ac8af63a218f34d1d44ec0fd799ab2a0df7bb"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T09.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T09.log",
+      "bytes": 968337,
+      "sha256": "1d3f75dc0d7d941a7f539a4e408feb1e102080697c30b56b28bad681ba530751"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T11.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T11.log",
+      "bytes": 1875599,
+      "sha256": "e9e4a1d1828a25e774f47f240fee3e735bdce7565ce698705966ed53f32e6ebe"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T12.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T12.log",
+      "bytes": 1478295,
+      "sha256": "ba553fdf9412d820c80ef54e5558e99cbdb842a04ef876f321088799af51ee40"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T13.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T13.log",
+      "bytes": 2324662,
+      "sha256": "65f5795c21dd39be68e62dff7b0ae620e13568bda43a6b18dcfcbc19146d17dc"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T14.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T14.log",
+      "bytes": 1232002,
+      "sha256": "4ea4c7c11882be373b53b002da86fcd561ddf348f37984ae36b6465c2ff252da"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T15.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T15.log",
+      "bytes": 7509013,
+      "sha256": "32526550d3fc6efab4d39b72929ed8772aecf499b6f19ac46cdb4a36fa25ed5f"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T16.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T16.log",
+      "bytes": 3628141,
+      "sha256": "162561f0eeed1c9a0f0c36660bd92308705963982adffe8b58a6a31b140e94ac"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T17.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T17.log",
+      "bytes": 5286051,
+      "sha256": "9f22e7cf666fef065843008ac8b9cef9e10108e23fc349c5ecf0b069a7639172"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T19.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T19.log",
+      "bytes": 956754,
+      "sha256": "ad1ac6fb6f28ab2fac198d98cc3ad8aa8a97c04abbea8c32b743b763a569d0be"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T20.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T20.log",
+      "bytes": 6235530,
+      "sha256": "55a2bb4a641dbd96439385fddb4888c883d0280bef6c91becb0d9d63ed736763"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T21.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T21.log",
+      "bytes": 2875903,
+      "sha256": "d8e5865b1f1db79167d42ea4a7b7cecb4cfed065893c973f1f87c48e9e03c9de"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T22.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T22.log",
+      "bytes": 22219495,
+      "sha256": "6192f353f807a74e3635ffb228b6c2121af671f82e0f72284567a58f2258d32c"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T23.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T23.log",
+      "bytes": 11517933,
+      "sha256": "5cad5c0983cf2e818ba641a548a3148269bdbe9ba5d5864e226c737f10431756"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T24.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T24.log",
+      "bytes": 6320297,
+      "sha256": "52b4da85c06e2790628a62ec4a34078b5476d71d814f70b4387be056228fb1d6"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T27.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T27.log",
+      "bytes": 1593624,
+      "sha256": "2b086de487bc19fb5f9ceaa1b8c6ee16b19b628d8482e3562b7ed109204f107e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T28.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T28.log",
+      "bytes": 1375787,
+      "sha256": "2e9c999b614c103309c40d42996dc2a8e117e7f12ca67423565da58134599f6e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T29.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T29.log",
+      "bytes": 2130992,
+      "sha256": "a12777da2c545d66631856ad4adbce7c5965182253b662e668a3561332d7764f"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T30.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T30.log",
+      "bytes": 4836799,
+      "sha256": "829c085d9481d6b5e5ed7979de4d3255957d1674fc8bde340c51c0637eff3a72"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T31.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T31.log",
+      "bytes": 1662017,
+      "sha256": "28210bd48816d3ecc6f0237ec750c56e659d4854f8786d384575633005dad585"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T32.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T32.log",
+      "bytes": 6710249,
+      "sha256": "682441b5c8507067079997af8998c372cf03b21d3b14b141a3fea2ea2c9a6994"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T34.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T34.log",
+      "bytes": 1306992,
+      "sha256": "abd854cd7a1235d98b7066e8aa955317ba70324eb836bba9f1a0c184f541c7b7"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T35.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T35.log",
+      "bytes": 2456742,
+      "sha256": "24e54ed815c0048d691539e2f8cc629d7ef4e4ad15c6667e43ece9a4ac9a7228"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T36.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T36.log",
+      "bytes": 6200339,
+      "sha256": "7a5eaae98036c319bebef7b16d6c9f58fca89651f7012678fdd0537c66a93271"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T37.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T37.log",
+      "bytes": 1869621,
+      "sha256": "440bc0077e7b1433d51a074d99d96619a5cc9d39c331f5c2512d85a84ec5503a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T39.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T39.log",
+      "bytes": 3673759,
+      "sha256": "3941756ca218e5f646c947d42a4a15431f567fe4163a92ce85a4de149912feb5"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T40.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T40.log",
+      "bytes": 6240878,
+      "sha256": "805a535acb17fbff45d4bb29dbd6c1d9023e8e3cc7261b5c4bfc37d99da7c909"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T41.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T41.log",
+      "bytes": 5939311,
+      "sha256": "466a57d5f6f9430a449b220e438952714555bc004d90b75e9f8acc0ea54296f9"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T42.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T42.log",
+      "bytes": 4805350,
+      "sha256": "9de83e40db06edcd369577d123402e37ba1f1b3a2b768d1ab4ccf2b4b2678137"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T43.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T43.log",
+      "bytes": 8746156,
+      "sha256": "ee75a967dbfadbeed2cc958956e93a7f5d0e2e304ddfbfe17dc7d2ad3888a6d6"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T44.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T44.log",
+      "bytes": 4807207,
+      "sha256": "c212858278bb0618c630b9245b261ce33e285cd6fa169117edd67e91b1d9a67f"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T45.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T45.log",
+      "bytes": 5820904,
+      "sha256": "04c80c826a246b4f0b40feab98ebf4eef3dab5f7e59f64d894754b79ee129b1a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T46.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T46.log",
+      "bytes": 2093473,
+      "sha256": "2dec228bd746b07ed4c6de7d0265cfb7a2c1f386b9066b9fcbdcbb3b73968c09"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T48.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T48.log",
+      "bytes": 4276484,
+      "sha256": "88a3872bfdd54db202f2238faa70edaea5484a1bd23602078f5db575b00dad42"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T49.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T49.log",
+      "bytes": 4963005,
+      "sha256": "4e21b9b6e4b6ec242913582dba6f943610287c2d3bd5587c4afbdb1d4f1b4901"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T50.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T50.log",
+      "bytes": 7908835,
+      "sha256": "b496b31cc0e0d5df7895eadf3138498f0bd8ba4d1de7e5911b171595d478f553"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T51.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T51.log",
+      "bytes": 4355344,
+      "sha256": "a60c1cf0f915bb84b071c59b22d5d26aa0b39c2279643f021762540e49878930"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T52.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T52.log",
+      "bytes": 1990911,
+      "sha256": "3f6f94c16e36386837b941cef73743f7089b9acb4d0ff973932b577e456542df"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T53.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T53.log",
+      "bytes": 2065646,
+      "sha256": "c209079ee585078b54eb2ad00aa3a0c34a5085f11417f8bc7a42204a1e552286"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T56.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T56.log",
+      "bytes": 19791567,
+      "sha256": "ae3c436ecd825aca2d399f2eb24220c341873431df3140a16fbc08bc0bb74bf3"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T57.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T57.log",
+      "bytes": 7978058,
+      "sha256": "c0e27199d1329feeba829254304eb8787d18ecf0aef8c25948a9dd1139d12f8f"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T58.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T58.log",
+      "bytes": 10075372,
+      "sha256": "0f1caa295eafb3fd80b34058d76fb513b01a28951ac7d696d72e99d196c9f50a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T59.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T59.log",
+      "bytes": 13099712,
+      "sha256": "c7e5e73d6bc0338b9734b73f6dd1407e21292fcb5c254f792d0f4ae3ac221c7c"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T60.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T60.log",
+      "bytes": 5813813,
+      "sha256": "4e20b61013c53f7d641d7cf3f3811bd0b52449602c881130b64df309ac26324c"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T61.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T61.log",
+      "bytes": 818999,
+      "sha256": "d8d49b2036d960c078bd431479b1543ffac59eabf3f54497900009f512586281"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T62.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T62.log",
+      "bytes": 3472576,
+      "sha256": "178331caf7a9ed974eba929d173852bdd5ec653186101fc30dbf0f9639efbfd1"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T65.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T65.log",
+      "bytes": 3470565,
+      "sha256": "f8f7c14ee77ad1cbbbf7079e7c934581bbf5e1aaf69cc557fd4b0d3fdd73a578"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T66.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T66.log",
+      "bytes": 4529568,
+      "sha256": "ca52addefe32b7f27d75eeceb785a517f5d31b903d5ba471a117e3c9f8451890"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T67.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T67.log",
+      "bytes": 5961791,
+      "sha256": "73fe3c8a6486f4a2df9411d2fa0cd1acc306b42482e547a273e68b8c9282df30"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T68.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T68.log",
+      "bytes": 9575913,
+      "sha256": "f1f8fd7be99509ec1b3f683f782ae56da4396c85d6ae2a6ecb18c6ff3a0aea2a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T69.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T69.log",
+      "bytes": 2484184,
+      "sha256": "78f98a2c579fa260b7fb5921d67e61408a5d39828acf58cbca9d90ec939fea0e"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T71.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T71.log",
+      "bytes": 4453323,
+      "sha256": "cd09c9a5f4b88f191ee8d8efc6ff18e7dc1d5532334079df0a8748a71c6cc584"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T72.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T72.log",
+      "bytes": 2976390,
+      "sha256": "ebbfb424813fe50bdd157c58d7573b4dd76b58c97713eff2114f2fb4406f8d1d"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T73.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T73.log",
+      "bytes": 13615404,
+      "sha256": "981381d377931f62a9a0e384ac0949eb520b83c31daedfa82e51ab849f6da56a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T74.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T74.log",
+      "bytes": 13157489,
+      "sha256": "817d74c4b8bb9f4bb8a119b131a07499939ff85d67de6af439493492c7dcc9dd"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T75.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T75.log",
+      "bytes": 13373186,
+      "sha256": "a9b07181d137bda6175369f12742c18a4b3c17a59be56b74a780a4430064b4e9"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T76.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T76.log",
+      "bytes": 3416384,
+      "sha256": "d78766eab286b92c8fbab16c9bb5cc307814437fabe20d0dc4305fd457ff6e7a"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T77.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T77.log",
+      "bytes": 538160,
+      "sha256": "e257be5363b7d60a3600ac4e2cd4738ef0041d844eddd71aad4f2eaf03f86aeb"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T80.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T80.log",
+      "bytes": 6255510,
+      "sha256": "77e229e2f58a311147fd74809edd943594b11d849f2ca41c124ad1a710e8e264"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T81.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T81.log",
+      "bytes": 1598474,
+      "sha256": "b1f5de8551ea5bcb0d2404f5d797cd39f90c2bab5a7243f36ed5ae63fca7ecd7"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T82.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T82.log",
+      "bytes": 3510949,
+      "sha256": "1458f5f570f36f4b05d84e5990d5f38e78385410a4b19864f76fd1bdb2e16354"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T83.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T83.log",
+      "bytes": 8544597,
+      "sha256": "ffdc3d4fd5feb9be53e095ebaf47fee3e788fea6425b5d286f263cd8d723271f"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T84.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T84.log",
+      "bytes": 7927904,
+      "sha256": "2edb309de5190cbddf2ea4a2747b3d391612799e05b958dd11ae9065deb9cd8c"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T85.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T85.log",
+      "bytes": 990277,
+      "sha256": "94d09486df01927e352371bf84ba55457da675a8d51a431e457d0b8d201b5eba"
+    },
+    {
+      "original_path": "docs/plans/2026-05-16-cognitive-workspace-fork-build/logs/T86.log",
+      "archive_path": ".local-artifacts/historical/2026-05-16-cognitive-workspace-fork-build/logs/T86.log",
+      "bytes": 1189629,
+      "sha256": "628760caa8e736be4d76ab5541530343fc16763090d4fd4f8a87fae88a2c5450"
+    }
+  ]
+}

@@ -111,7 +111,7 @@ async fn consolidate_session_emits_proposals_without_direct_writes_and_proposals
                     })
             })
             .expect("proposal record")
-            .proposed_state["id"]
+            .proposed_state["memory"]["id"]
             .as_str()
             .expect("proposed memory id")
             .to_string()
@@ -148,6 +148,60 @@ async fn consolidate_session_emits_proposals_without_direct_writes_and_proposals
         .expect("proposal target lookup")
         .expect("memory exists after apply");
     assert_eq!(current.memory_type, MemoryType::Pattern);
+
+    // A second event window refreshes the existing episode. Its prior state
+    // must use the same canonical snapshot as apply-time CAS and replay.
+    seed_task_events(
+        &event_store,
+        &workspace_root,
+        "session-test-consolidate-session",
+        "task-consolidate",
+    );
+    let refresh = handler
+        .handle(
+            "lattice/tool_call",
+            json!({
+                "name":"consolidate_session", "arguments":{
+                    "session_id":"session-test-consolidate-session", "mode":"post_task"
+                }
+            }),
+        )
+        .await
+        .expect("episode refresh proposal succeeds");
+    let refresh_payload = parse_tool_payload(&refresh);
+    let refresh_id = refresh_payload["proposals"][0]["proposal_id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(refresh_id, proposal_id);
+    {
+        let store = memory_store.lock().await;
+        let record = store
+            .with_connection(|conn| {
+                lattice_core::consolidation::ConsolidationProposal::load_record(conn, refresh_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.prior_state["memory"]["id"], proposed_memory_id);
+        assert!(record.prior_state.get("structured_fields").is_some());
+    }
+    let refreshed = handler
+        .handle(
+            "tools/call",
+            json!({
+                "name":"remember", "arguments":{
+                    "kind":"evolution", "action":"apply", "proposal_id":refresh_id
+                }
+            }),
+        )
+        .await
+        .expect("canonical episode refresh applies through public remember");
+    assert_eq!(parse_tool_payload(&refreshed)["decision"], "applied");
+    assert!(memory_store
+        .lock()
+        .await
+        .get_by_id(&proposed_memory_id)
+        .unwrap()
+        .is_some());
 
     let events = read_session_events(&event_store, "session-test-consolidate-session");
     assert!(events
@@ -320,7 +374,7 @@ fn build_handler(
         .with_flush_policy(FlushPolicy::Sync),
     );
     let handler = McpHandler::new(
-        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
         Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
         memory_store.clone(),
         Arc::new(Mutex::new(

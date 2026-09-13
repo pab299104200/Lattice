@@ -28,9 +28,10 @@ impl<'a> DuplicateDetector<'a> {
 
     pub fn scan(
         &mut self,
-        workspace_id: &str,
+        authority: &super::EvolutionAuthority<'_>,
         kind_filter: Option<ProposalKind>,
     ) -> Result<ScanReport, ScanError> {
+        let workspace_id = authority.repository_id;
         let started = Instant::now();
         let span = info_span!(
             "consolidation.duplicates.scan",
@@ -38,7 +39,15 @@ impl<'a> DuplicateDetector<'a> {
             kind = "detect duplicate memories"
         );
         let _entered = span.enter();
-        let memories = self.store.list_workspace_memories(workspace_id)?;
+        let memories: Vec<Memory> = self
+            .store
+            .list_applicable_workspace_memories(workspace_id, authority.checkout_id)?
+            .into_iter()
+            .filter(|memory| {
+                memory.scope != crate::memory::MemoryScope::Branch
+                    || memory.branch.as_deref() == Some(authority.branch)
+            })
+            .collect();
         if memories.is_empty() {
             return Ok(ScanReport::from_counts(0, 0, started));
         }
@@ -82,15 +91,7 @@ impl<'a> DuplicateDetector<'a> {
                         next.structured_fields.verification_status =
                             crate::memory::MemoryVerificationStatus::Superseded;
                         next.structured_fields.superseded_by_memory_id = Some(newer.id.clone());
-                        next.memory_links.push(crate::memory::MemoryLinkRecord {
-                            link_id: format!("dup:{}:{}", older.id, newer.id),
-                            source_memory_id: older.id.clone(),
-                            target_memory_id: newer.id.clone(),
-                            link_type: "supersedes".to_string(),
-                            reason: "duplicate detector matched overlapping evidence".to_string(),
-                            created_at: newer.created_at,
-                            verification_status: "verified".to_string(),
-                        });
+
                         next
                     };
 
@@ -106,6 +107,8 @@ impl<'a> DuplicateDetector<'a> {
                             proposed_state: encode_memory_state(&proposed_state),
                             evidence: json!({
                                 "source_memory_ids": [older.id.clone(), newer.id.clone()],
+                                "superseded_by_memory_id": newer.id.clone(),
+                                "replacement_state_hash": super::state_hash_for_memory(self.store, &newer.id)?,
                                 "shared_files": shared_values(&older.linked_files, &newer.linked_files),
                                 "shared_symbols": shared_values(&older.linked_symbols, &newer.linked_symbols),
                                 "decision_basis": "typed_evidence_overlap",
@@ -118,7 +121,7 @@ impl<'a> DuplicateDetector<'a> {
             }
         }
 
-        let _ = self.runtime.run_due()?;
+        let _ = self.runtime.run_due(self.store, authority)?;
         Ok(ScanReport::from_counts(
             proposals_enqueued,
             skipped,

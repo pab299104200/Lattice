@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 use super::super::labels::HorizonLimits;
 use super::super::replay::{
-    repository_name, replay_repository, replay_repository_streaming, ReplayLimits,
+    replay_repository, replay_repository_streaming, repository_name, ReplayLimits,
 };
 use super::*;
 
@@ -101,8 +101,7 @@ fn fixture_limits() -> ReplayLimits {
 fn fixture_report() -> (TempDir, BacktestReport) {
     let directory = tempfile::tempdir().expect("temp directory");
     build_fixture(directory.path());
-    let replay =
-        replay_repository(directory.path(), fixture_limits()).expect("replay the fixture");
+    let replay = replay_repository(directory.path(), fixture_limits()).expect("replay the fixture");
     let report = build_report(std::slice::from_ref(&replay));
     (directory, report)
 }
@@ -112,10 +111,12 @@ fn replaying_the_same_input_twice_produces_a_byte_identical_report() {
     let directory = tempfile::tempdir().expect("temp directory");
     build_fixture(directory.path());
 
-    let first = build_report(&[replay_repository(directory.path(), fixture_limits())
-        .expect("first replay")]);
-    let second = build_report(&[replay_repository(directory.path(), fixture_limits())
-        .expect("second replay")]);
+    let first = build_report(&[
+        replay_repository(directory.path(), fixture_limits()).expect("first replay")
+    ]);
+    let second = build_report(&[
+        replay_repository(directory.path(), fixture_limits()).expect("second replay")
+    ]);
 
     assert_eq!(
         first.render_markdown(),
@@ -240,7 +241,8 @@ fn a_feature_at_or_below_chance_receives_no_weight() {
         if let Some(auc) = feature.roc_auc_per_mille {
             if auc <= 500 {
                 assert_eq!(
-                    feature.derived_weight, 0,
+                    feature.derived_weight,
+                    0,
                     "{} measured at or below chance but carries weight",
                     feature.feature.as_str()
                 );
@@ -260,7 +262,13 @@ fn the_json_render_is_parseable_and_carries_the_headline_numbers() {
     assert_eq!(parsed["harness_version"], BACKTEST_HARNESS_VERSION);
     assert_eq!(parsed["health_config_version"], HEALTH_CONFIG_VERSION);
     assert_eq!(parsed["pooled_observations"], report.pooled_observations);
-    assert!(parsed["pooled_families"].as_array().expect("families").len() == 3);
+    assert!(
+        parsed["pooled_families"]
+            .as_array()
+            .expect("families")
+            .len()
+            == 3
+    );
     assert!(parsed["features"].as_array().expect("features").len() == FEATURE_COUNT);
     assert!(parsed["audit"]["verdict"].is_string());
 }
@@ -416,9 +424,10 @@ fn a_streaming_replay_reports_the_same_summary_the_collecting_one_does() {
 
     let collected = replay_repository(directory.path(), fixture_limits()).expect("replay");
     let mut streamed_cut_points = 0usize;
-    let summary =
-        replay_repository_streaming(directory.path(), fixture_limits(), |_| streamed_cut_points += 1)
-            .expect("streaming replay");
+    let summary = replay_repository_streaming(directory.path(), fixture_limits(), |_| {
+        streamed_cut_points += 1
+    })
+    .expect("streaming replay");
 
     assert_eq!(summary.name, collected.name);
     assert_eq!(summary.head_commit_id, collected.head_commit_id);

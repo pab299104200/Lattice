@@ -501,16 +501,15 @@ fn is_stopword(token: &str) -> bool {
 
 pub(crate) fn is_structured_remediation_token(token: &str) -> bool {
     let upper = token.to_ascii_uppercase();
-    if upper.starts_with("IU-") || upper.starts_with("PX-") {
-        return upper[3..].chars().all(|ch| ch.is_ascii_digit());
+    for prefix in ["IU-", "PX-", "IM-"] {
+        if let Some(suffix) = upper.strip_prefix(prefix) {
+            return suffix.chars().all(|ch| ch.is_ascii_digit());
+        }
     }
-    if upper.starts_with("IM-") {
-        return upper[3..].chars().all(|ch| ch.is_ascii_digit());
-    }
-    if upper.len() >= 4 {
-        let (prefix, suffix) = upper.split_at(2);
-        return matches!(prefix, "IU" | "PX" | "IM")
-            && suffix.chars().all(|ch| ch.is_ascii_digit());
+    for prefix in ["IU", "PX", "IM"] {
+        if let Some(suffix) = upper.strip_prefix(prefix) {
+            return suffix.len() >= 2 && suffix.chars().all(|ch| ch.is_ascii_digit());
+        }
     }
     false
 }

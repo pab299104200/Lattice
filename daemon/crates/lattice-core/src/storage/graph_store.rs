@@ -8,8 +8,10 @@ use crate::graph::model::CodeGraph;
 use crate::graph::model::EdgeKind;
 use crate::symbols::{Language, SymbolId, SymbolKind};
 use rusqlite::{params, Connection};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -153,27 +155,95 @@ pub struct FileIndexEntry {
 
 /// Persistent storage for the code dependency graph backed by SQLite.
 pub struct GraphStore {
-    conn: Connection,
+    conn: GraphConnection,
     path: Option<PathBuf>,
     recovery: GraphStoreRecovery,
+    body_objects: Option<super::ContentObjectStore>,
+    object_owner_id: Option<String>,
+    publication: Option<super::cache_publication::CachePublicationAuthority>,
+}
+
+enum GraphConnection {
+    Managed(super::managed_sqlite::ManagedSqlite),
+    Direct(Connection),
+}
+impl Deref for GraphConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Managed(v) => v,
+            Self::Direct(v) => v,
+        }
+    }
 }
 
 impl GraphStore {
     /// Open a file-based SQLite database with WAL mode enabled.
     pub fn open(path: &Path) -> Result<Self, LatticeError> {
         reject_symlink(path)?;
-        let conn =
-            Connection::open(path).map_err(|e| map_sqlite_error(path, "open database", e))?;
-
-        validate_integrity(&conn, path)?;
+        let file_name = path.file_name().ok_or_else(|| {
+            LatticeError::Storage(format!(
+                "Graph database path has no file name: {}",
+                path.display()
+            ))
+        })?;
+        let parent = path.parent().ok_or_else(|| {
+            LatticeError::Storage(format!(
+                "Graph database path has no parent: {}",
+                path.display()
+            ))
+        })?;
+        let resolved_path = parent
+            .canonicalize()
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to resolve graph database parent: {e}"))
+            })?
+            .join(file_name);
+        let (conn, publication, _opening_accounting) =
+            match super::cache_publication::CachePublicationAuthority::for_path(&resolved_path)? {
+                Some((authority, leaf)) => {
+                    let guard = authority.begin()?;
+                    let connection = authority
+                        .open_sqlite(
+                            &leaf,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                        )
+                        .map_err(|e| {
+                            map_sqlite_error(&resolved_path, "open managed database", e)
+                        })?;
+                    (
+                        GraphConnection::Managed(connection),
+                        Some(authority),
+                        Some(guard),
+                    )
+                }
+                None => (
+                    GraphConnection::Direct(
+                        Connection::open_with_flags(
+                            &resolved_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                        )
+                        .map_err(|e| map_sqlite_error(&resolved_path, "open database", e))?,
+                    ),
+                    None,
+                    None,
+                ),
+            };
+        validate_integrity(&conn, &resolved_path)?;
 
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| map_sqlite_error(path, "set WAL mode", e))?;
+            .map_err(|e| map_sqlite_error(&resolved_path, "set WAL mode", e))?;
 
         let store = Self {
             conn,
-            path: Some(path.to_path_buf()),
+            path: Some(resolved_path),
             recovery: GraphStoreRecovery::None,
+            body_objects: None,
+            object_owner_id: None,
+            publication,
         };
         store.initialize()?;
         Ok(store)
@@ -196,6 +266,85 @@ impl GraphStore {
         }
     }
 
+    pub fn open_recovering_with_objects(
+        path: &Path,
+        objects: &Path,
+        checkout_id: &str,
+    ) -> Result<Self, LatticeError> {
+        let object_store = super::ContentObjectStore::open(objects)?;
+        let mut store = Self::open_recovering(path)?;
+        store.body_objects = Some(object_store);
+        store.object_owner_id = Some(checkout_id.to_owned());
+        store.migrate_inline_bodies()?;
+        store
+            .body_objects
+            .as_ref()
+            .expect("set above")
+            .recover_owner(checkout_id, &store.conn)?;
+        Ok(store)
+    }
+
+    fn migrate_inline_bodies(&self) -> Result<(), LatticeError> {
+        let Some(objects) = &self.body_objects else {
+            return Ok(());
+        };
+        let rows = {
+            let mut statement = self.conn.prepare("SELECT file,name,byte_offset,body FROM nodes WHERE body_hash IS NULL AND body != ''").map_err(|e| LatticeError::Storage(format!("Failed to inspect inline symbol bodies: {e}")))?;
+            let collected = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to read inline symbol bodies: {e}"))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            collected
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.path.as_ref().ok_or_else(|| {
+            LatticeError::Storage(
+                "repository object storage requires a file-backed graph database".into(),
+            )
+        })?;
+        let proposed = rows
+            .iter()
+            .map(|(_, _, _, body)| format!("{:x}", sha2::Sha256::digest(body.as_bytes())))
+            .collect::<BTreeSet<_>>();
+        let owner = self.object_owner_id.as_deref().ok_or_else(|| {
+            LatticeError::Storage(
+                "repository object storage requires an explicit checkout owner".into(),
+            )
+        })?;
+        let publication = objects.begin_publication(owner, proposed)?;
+        let staged = rows
+            .into_iter()
+            .map(|(file, name, offset, body)| {
+                Ok((file, name, offset, objects.put(body.as_bytes())?))
+            })
+            .collect::<Result<Vec<_>, LatticeError>>()?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| LatticeError::Storage(e.to_string()))?;
+        for (file, name, offset, key) in staged {
+            tx.execute("UPDATE nodes SET body='',body_hash=?4 WHERE file=?1 AND name=?2 AND byte_offset=?3 AND body_hash IS NULL", params![file,name,offset,key]).map_err(|e| LatticeError::Storage(format!("Failed to migrate inline symbol body: {e}")))?;
+        }
+        tx.commit().map_err(|e| {
+            LatticeError::Storage(format!(
+                "Failed to commit inline symbol body migration: {e}"
+            ))
+        })?;
+        publication.promote(&self.conn)
+    }
+
     /// Open an in-memory SQLite database (for tests).
     pub fn open_in_memory() -> Result<Self, LatticeError> {
         let conn = Connection::open_in_memory().map_err(|e| {
@@ -203,9 +352,12 @@ impl GraphStore {
         })?;
 
         let store = Self {
-            conn,
+            conn: GraphConnection::Direct(conn),
             path: None,
             recovery: GraphStoreRecovery::None,
+            body_objects: None,
+            object_owner_id: None,
+            publication: None,
         };
         store.initialize()?;
         Ok(store)
@@ -220,6 +372,13 @@ impl GraphStore {
                 Some(path) => map_sqlite_error(path, "initialize nodes schema", e),
                 None => LatticeError::Storage(format!("Failed to initialize nodes schema: {}", e)),
             })?;
+        if !self.column_exists("nodes", "body_hash")? {
+            self.conn
+                .execute("ALTER TABLE nodes ADD COLUMN body_hash TEXT", [])
+                .map_err(|e| {
+                    LatticeError::Storage(format!("Failed to add node body object reference: {e}"))
+                })?;
+        }
         self.conn
             .execute_batch(CREATE_TABLES)
             .map_err(|e| match &self.path {
@@ -244,6 +403,22 @@ impl GraphStore {
                 )),
             })?;
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, expected: &str) -> Result<bool, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| LatticeError::Storage(format!("Failed to inspect {table} schema: {e}")))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| LatticeError::Storage(format!("Failed to query {table} schema: {e}")))?;
+        for column in columns {
+            if column.map_err(|e| LatticeError::Storage(e.to_string()))? == expected {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Rebuild pre-removal node tables without disturbing the rest of the graph store.
@@ -330,12 +505,25 @@ impl GraphStore {
 
     /// Save a CodeGraph to the database, replacing any previous data.
     pub fn save_graph(&self, graph: &CodeGraph) -> Result<(), LatticeError> {
-        self.commit_graph_generation(graph).map(|_| ())
+        self.commit_graph_generation(graph, None).map(|_| ())
     }
 
     /// Atomically persist a graph generation and return the exact immutable snapshot committed.
     pub fn save_index_snapshot(&self, graph: &CodeGraph) -> Result<IndexSnapshot, LatticeError> {
-        let module_digests = self.commit_graph_generation(graph)?;
+        let module_digests = self.commit_graph_generation(graph, None)?;
+        Ok(IndexSnapshot {
+            epoch: module_digests.epoch(),
+            graph: Arc::new(graph.clone()),
+            module_digests,
+        })
+    }
+
+    pub fn save_index_snapshot_with_manifest(
+        &self,
+        graph: &CodeGraph,
+        files: &[FileIndexEntry],
+    ) -> Result<IndexSnapshot, LatticeError> {
+        let module_digests = self.commit_graph_generation(graph, Some(files))?;
         Ok(IndexSnapshot {
             epoch: module_digests.epoch(),
             graph: Arc::new(graph.clone()),
@@ -346,12 +534,49 @@ impl GraphStore {
     fn commit_graph_generation(
         &self,
         graph: &CodeGraph,
+        files: Option<&[FileIndexEntry]>,
     ) -> Result<ModuleDigestCache, LatticeError> {
         // Generation happens before SQLite mutation so any invalid graph leaves the prior
         // generation wholly intact.
         let digests = generate_module_digests(graph).map_err(|error| {
             LatticeError::Storage(format!("Failed to generate module digests: {}", error))
         })?;
+        let nodes = graph.all_nodes();
+        let (body_hashes, publication) = if let Some(objects) = &self.body_objects {
+            let expected = nodes
+                .iter()
+                .map(|node| format!("{:x}", sha2::Sha256::digest(node.body.as_bytes())))
+                .collect::<Vec<_>>();
+            self.path.as_ref().ok_or_else(|| {
+                LatticeError::Storage(
+                    "repository object storage requires a file-backed graph database".into(),
+                )
+            })?;
+            // Pin the entire proposed generation before creating any object. The shared
+            // publication lock remains held until the committed SQLite epoch is promoted.
+            let owner = self.object_owner_id.as_deref().ok_or_else(|| {
+                LatticeError::Storage(
+                    "repository object storage requires an explicit checkout owner".into(),
+                )
+            })?;
+            let publication = objects
+                .begin_publication(owner, expected.iter().cloned().collect::<BTreeSet<_>>())?;
+            let stored = nodes
+                .iter()
+                .map(|node| objects.put(node.body.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert_eq!(expected, stored);
+            (stored, Some(publication))
+        } else {
+            (vec![String::new(); nodes.len()], None)
+        };
+        let _accounting = self
+            .publication
+            .as_ref()
+            .map(|authority| authority.begin())
+            .transpose()?;
+        // Objects are immutable and durable before SQLite publishes references.
+        // An interrupted save can leave harmless unreferenced objects, never dangling refs.
         let tx = self
             .conn
             .unchecked_transaction()
@@ -376,24 +601,30 @@ impl GraphStore {
             )));
         }
 
-        // Delete all existing data
-        tx.execute("DELETE FROM edges", [])
-            .map_err(|e| LatticeError::Storage(format!("Failed to clear edges: {}", e)))?;
-        tx.execute("DELETE FROM nodes", [])
-            .map_err(|e| LatticeError::Storage(format!("Failed to clear nodes: {}", e)))?;
-        tx.execute("DELETE FROM module_digests", [])
-            .map_err(|e| LatticeError::Storage(format!("Failed to clear module digests: {}", e)))?;
+        // Temporary membership contains keys only; persistent rows are changed
+        // only when their values differ. SQLite rolls back the entire generation.
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS desired_nodes(file TEXT,name TEXT,byte_offset INTEGER,PRIMARY KEY(file,name,byte_offset)); DELETE FROM desired_nodes;
+            CREATE TEMP TABLE IF NOT EXISTS desired_edges(from_file TEXT,from_name TEXT,from_offset INTEGER,to_file TEXT,to_name TEXT,to_offset INTEGER,kind TEXT);
+            CREATE INDEX IF NOT EXISTS temp.idx_desired_edges ON desired_edges(from_file,from_name,from_offset,to_file,to_name,to_offset,kind); DELETE FROM desired_edges;
+            CREATE TEMP TABLE IF NOT EXISTS desired_digests(module_path TEXT PRIMARY KEY); DELETE FROM desired_digests;")
+            .map_err(|e| LatticeError::Storage(format!("Failed to stage graph delta membership: {e}")))?;
 
         // Insert all nodes (scoped so prepared statement is dropped before commit)
         {
             let mut insert_node = tx
                 .prepare(
-                    "INSERT INTO nodes (file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    "INSERT INTO nodes (file, name, byte_offset, kind, signature, body, body_hash, line, end_line, is_exported, language, last_modified) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(file,name,byte_offset) DO UPDATE SET kind=excluded.kind,signature=excluded.signature,body=excluded.body,body_hash=excluded.body_hash,line=excluded.line,end_line=excluded.end_line,is_exported=excluded.is_exported,language=excluded.language,last_modified=excluded.last_modified WHERE nodes.kind IS NOT excluded.kind OR nodes.signature IS NOT excluded.signature OR nodes.body IS NOT excluded.body OR nodes.body_hash IS NOT excluded.body_hash OR nodes.line IS NOT excluded.line OR nodes.end_line IS NOT excluded.end_line OR nodes.is_exported IS NOT excluded.is_exported OR nodes.language IS NOT excluded.language OR nodes.last_modified IS NOT excluded.last_modified",
                 )
                 .map_err(|e| LatticeError::Storage(format!("Failed to prepare node insert: {}", e)))?;
 
-            for node in graph.all_nodes() {
+            let mut membership = tx
+                .prepare("INSERT INTO desired_nodes VALUES(?1,?2,?3)")
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            for (node, body_hash) in nodes.iter().zip(body_hashes.iter()) {
+                membership
+                    .execute(params![node.file, node.name, node.id.byte_offset as i64])
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
                 insert_node
                     .execute(params![
                         &node.file,
@@ -401,7 +632,16 @@ impl GraphStore {
                         node.id.byte_offset as i64,
                         format!("{:?}", node.kind),
                         &*node.signature,
-                        &*node.body,
+                        if self.body_objects.is_some() {
+                            ""
+                        } else {
+                            &*node.body
+                        },
+                        if body_hash.is_empty() {
+                            None
+                        } else {
+                            Some(body_hash.as_str())
+                        },
                         node.line as i64,
                         node.end_line as i64,
                         node.is_exported as i32,
@@ -416,7 +656,7 @@ impl GraphStore {
         {
             let mut insert_edge = tx
                 .prepare(
-                    "INSERT INTO edges (from_file, from_name, from_offset, to_file, to_name, to_offset, kind) \
+                    "INSERT INTO desired_edges (from_file, from_name, from_offset, to_file, to_name, to_offset, kind) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )
                 .map_err(|e| LatticeError::Storage(format!("Failed to prepare edge insert: {}", e)))?;
@@ -436,11 +676,20 @@ impl GraphStore {
             }
         }
 
+        tx.execute_batch("DELETE FROM edges WHERE rowid IN (
+            SELECT rowid FROM (SELECT rowid,*,row_number() OVER(PARTITION BY from_file,from_name,from_offset,to_file,to_name,to_offset,kind ORDER BY rowid) AS occurrence FROM edges) old
+            WHERE occurrence > (SELECT COUNT(*) FROM desired_edges new WHERE new.from_file=old.from_file AND new.from_name=old.from_name AND new.from_offset=old.from_offset AND new.to_file=old.to_file AND new.to_name=old.to_name AND new.to_offset=old.to_offset AND new.kind=old.kind));
+            INSERT INTO edges SELECT from_file,from_name,from_offset,to_file,to_name,to_offset,kind FROM
+            (SELECT *,row_number() OVER(PARTITION BY from_file,from_name,from_offset,to_file,to_name,to_offset,kind ORDER BY rowid) AS occurrence FROM desired_edges) new
+            WHERE occurrence > (SELECT COUNT(*) FROM edges old WHERE new.from_file=old.from_file AND new.from_name=old.from_name AND new.from_offset=old.from_offset AND new.to_file=old.to_file AND new.to_name=old.to_name AND new.to_offset=old.to_offset AND new.kind=old.kind);
+            DELETE FROM nodes WHERE NOT EXISTS(SELECT 1 FROM desired_nodes d WHERE d.file=nodes.file AND d.name=nodes.name AND d.byte_offset=nodes.byte_offset);")
+            .map_err(|e| LatticeError::Storage(format!("Failed to apply graph membership delta: {e}")))?;
+
         {
             let mut insert_digest = tx
                 .prepare(
                     "INSERT INTO module_digests (module_path, index_epoch, generator_version, input_fingerprint, payload_sha256, payload_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(module_path) DO UPDATE SET index_epoch=excluded.index_epoch,generator_version=excluded.generator_version,input_fingerprint=excluded.input_fingerprint,payload_sha256=excluded.payload_sha256,payload_json=excluded.payload_json WHERE module_digests.generator_version IS NOT excluded.generator_version OR module_digests.input_fingerprint IS NOT excluded.input_fingerprint OR module_digests.payload_sha256 IS NOT excluded.payload_sha256 OR module_digests.payload_json IS NOT excluded.payload_json",
                 )
                 .map_err(|e| {
                     LatticeError::Storage(format!(
@@ -448,7 +697,13 @@ impl GraphStore {
                         e
                     ))
                 })?;
+            let mut membership = tx
+                .prepare("INSERT INTO desired_digests VALUES(?1)")
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
             for digest in &digests {
+                membership
+                    .execute([&digest.module_path])
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
                 insert_digest
                     .execute(params![
                         &digest.module_path,
@@ -467,6 +722,10 @@ impl GraphStore {
             }
         }
 
+        tx.execute("DELETE FROM module_digests WHERE NOT EXISTS(SELECT 1 FROM desired_digests d WHERE d.module_path=module_digests.module_path)", []).map_err(|e| LatticeError::Storage(e.to_string()))?;
+        if let Some(files) = files {
+            Self::write_file_index_delta(&tx, files)?;
+        }
         tx.execute(
             "UPDATE graph_metadata SET index_epoch = ?1, digest_schema_version = ?2 WHERE singleton = 1",
             params![next_epoch, i64::from(MODULE_DIGEST_SCHEMA_VERSION)],
@@ -477,6 +736,10 @@ impl GraphStore {
 
         tx.commit()
             .map_err(|e| LatticeError::Storage(format!("Failed to commit transaction: {}", e)))?;
+
+        if let Some(publication) = publication {
+            publication.promote(&self.conn)?;
+        }
 
         Ok(ModuleDigestCache::new(next_epoch as u64, digests))
     }
@@ -514,18 +777,39 @@ impl GraphStore {
     }
 
     pub fn save_file_index(&self, entries: &[FileIndexEntry]) -> Result<(), LatticeError> {
+        let _accounting = self
+            .publication
+            .as_ref()
+            .map(|authority| authority.begin())
+            .transpose()?;
         let tx = self.conn.unchecked_transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to begin file index transaction: {}", e))
         })?;
-        tx.execute("DELETE FROM file_index", [])
+        Self::write_file_index_delta(&tx, entries)?;
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit file index: {}", e)))?;
+        Ok(())
+    }
+
+    fn write_file_index_delta(
+        tx: &rusqlite::Transaction<'_>,
+        entries: &[FileIndexEntry],
+    ) -> Result<(), LatticeError> {
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS desired_files(file TEXT PRIMARY KEY); DELETE FROM desired_files;")
             .map_err(|e| LatticeError::Storage(format!("Failed to clear file index: {}", e)))?;
         {
             let mut insert = tx
                 .prepare(
-                    "INSERT INTO file_index (file, content_hash, mtime_ns, size_bytes, parser_version, schema_version, last_indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO file_index (file, content_hash, mtime_ns, size_bytes, parser_version, schema_version, last_indexed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(file) DO UPDATE SET content_hash=excluded.content_hash,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes,parser_version=excluded.parser_version,schema_version=excluded.schema_version,last_indexed_at=excluded.last_indexed_at WHERE file_index.content_hash IS NOT excluded.content_hash OR file_index.mtime_ns IS NOT excluded.mtime_ns OR file_index.size_bytes IS NOT excluded.size_bytes OR file_index.parser_version IS NOT excluded.parser_version OR file_index.schema_version IS NOT excluded.schema_version",
                 )
                 .map_err(|e| LatticeError::Storage(format!("Failed to prepare file index insert: {}", e)))?;
+            let mut membership = tx
+                .prepare("INSERT INTO desired_files VALUES(?1)")
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
             for entry in entries {
+                membership
+                    .execute([&entry.file])
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
                 insert
                     .execute(params![
                         &entry.file,
@@ -541,14 +825,13 @@ impl GraphStore {
                     })?;
             }
         }
-        tx.commit()
-            .map_err(|e| LatticeError::Storage(format!("Failed to commit file index: {}", e)))?;
+        tx.execute("DELETE FROM file_index WHERE NOT EXISTS(SELECT 1 FROM desired_files d WHERE d.file=file_index.file)", []).map_err(|e| LatticeError::Storage(e.to_string()))?;
         Ok(())
     }
 
     /// Load a CodeGraph from the database.
     pub fn load_graph(&self) -> Result<CodeGraph, LatticeError> {
-        Self::load_graph_from(&self.conn)
+        self.load_graph_from(&self.conn)
     }
 
     /// Load graph and digest state under one SQLite read transaction.
@@ -556,7 +839,7 @@ impl GraphStore {
         let tx = self.conn.unchecked_transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to begin graph snapshot read: {}", e))
         })?;
-        let graph = Arc::new(Self::load_graph_from(&tx)?);
+        let graph = Arc::new(self.load_graph_from(&tx)?);
         let (metadata_rows, epoch, schema_version): (i64, i64, i64) = tx
             .query_row(
                 "SELECT COUNT(*), COALESCE(MAX(index_epoch), 0), COALESCE(MAX(digest_schema_version), 0) FROM graph_metadata",
@@ -670,9 +953,9 @@ impl GraphStore {
                     path, epoch, reason
                 ))
             };
-            if row_epoch != epoch {
+            if row_epoch <= 0 || row_epoch > epoch {
                 return Err(invalid(&format!(
-                    "row epoch {} does not match metadata epoch",
+                    "row last-changed epoch {} is outside the committed generation",
                     row_epoch
                 )));
             }
@@ -735,13 +1018,13 @@ impl GraphStore {
         Ok(hydrated)
     }
 
-    fn load_graph_from(conn: &Connection) -> Result<CodeGraph, LatticeError> {
+    fn load_graph_from(&self, conn: &Connection) -> Result<CodeGraph, LatticeError> {
         let mut graph = CodeGraph::new();
 
         // Load all nodes
         let mut stmt = conn
             .prepare(
-                "SELECT file, name, byte_offset, kind, signature, body, line, end_line, is_exported, language, last_modified FROM nodes",
+                "SELECT file, name, byte_offset, kind, signature, body, body_hash, line, end_line, is_exported, language, last_modified FROM nodes",
             )
             .map_err(|e| LatticeError::Storage(format!("Failed to prepare node query: {}", e)))?;
 
@@ -753,11 +1036,12 @@ impl GraphStore {
                 let kind_str: String = row.get(3)?;
                 let signature: String = row.get(4)?;
                 let body: String = row.get(5)?;
-                let line: i64 = row.get(6)?;
-                let end_line: i64 = row.get(7)?;
-                let is_exported: i32 = row.get(8)?;
-                let language_str: String = row.get(9)?;
-                let last_modified: i64 = row.get(10)?;
+                let body_hash: Option<String> = row.get(6)?;
+                let line: i64 = row.get(7)?;
+                let end_line: i64 = row.get(8)?;
+                let is_exported: i32 = row.get(9)?;
+                let language_str: String = row.get(10)?;
+                let last_modified: i64 = row.get(11)?;
 
                 Ok((
                     file,
@@ -766,6 +1050,7 @@ impl GraphStore {
                     kind_str,
                     signature,
                     body,
+                    body_hash,
                     line,
                     end_line,
                     is_exported,
@@ -783,6 +1068,7 @@ impl GraphStore {
                 kind_str,
                 signature,
                 body,
+                body_hash,
                 line,
                 end_line,
                 is_exported,
@@ -791,6 +1077,19 @@ impl GraphStore {
             ) =
                 row.map_err(|e| LatticeError::Storage(format!("Failed to read node row: {}", e)))?;
 
+            let body = match (body_hash, &self.body_objects) {
+                (Some(key), Some(objects)) => {
+                    String::from_utf8(objects.get(&key)?).map_err(|e| {
+                        LatticeError::Storage(format!("symbol body object {key} is not UTF-8: {e}"))
+                    })?
+                }
+                (Some(key), None) => {
+                    return Err(LatticeError::Storage(format!(
+                        "symbol body object {key} requires repository object storage"
+                    )))
+                }
+                (None, _) => body,
+            };
             let kind = parse_symbol_kind(&kind_str).ok_or_else(|| {
                 LatticeError::Storage(format!("Unknown SymbolKind: {}", kind_str))
             })?;
@@ -1040,6 +1339,7 @@ fn parse_edge_kind(s: &str) -> Option<EdgeKind> {
 #[cfg(test)]
 mod module_digest_tests {
     use super::*;
+    use crate::storage::ContentObjectStore;
 
     const LEGACY_SUPPORTING_TABLES: &str = r#"
 CREATE TABLE edges (
@@ -1092,6 +1392,295 @@ CREATE TABLE parsed_files (
             );
         }
         graph
+    }
+
+    #[test]
+    fn unchanged_generation_writes_no_node_edge_digest_or_manifest_rows() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let mut graph = graph(&["src/a.rs", "src/b.rs"]);
+        graph.add_edge(
+            &id("src/a.rs", "symbol_0"),
+            &id("src/b.rs", "symbol_1"),
+            EdgeKind::Calls,
+        );
+        let files = vec![FileIndexEntry {
+            file: "src/a.rs".into(),
+            content_hash: "hash".into(),
+            mtime_ns: 1,
+            size_bytes: 2,
+            parser_version: 1,
+            schema_version: 1,
+            last_indexed_at: 1,
+        }];
+        store
+            .save_index_snapshot_with_manifest(&graph, &files)
+            .unwrap();
+        store
+            .conn
+            .execute_batch("CREATE TABLE mutation_audit(kind TEXT);")
+            .unwrap();
+        for table in ["nodes", "edges", "module_digests", "file_index"] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                store.conn.execute_batch(&format!("CREATE TRIGGER audit_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO mutation_audit VALUES('{table}'); END;")).unwrap();
+            }
+        }
+        store
+            .save_index_snapshot_with_manifest(&graph, &files)
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM mutation_audit", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(ready(store.load_index_snapshot().unwrap()).epoch, 2);
+    }
+
+    #[test]
+    fn ten_checkout_graphs_share_one_immutable_body_object() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        for checkout in 0..10 {
+            let path = root.path().join(format!("graph-{checkout}.db"));
+            let store = GraphStore::open_recovering_with_objects(
+                &path,
+                &objects,
+                &format!("checkout-{checkout}"),
+            )
+            .unwrap();
+            store.save_graph(&graph(&["src/a.rs"])).unwrap();
+            assert_eq!(store.load_graph().unwrap().node_count(), 1);
+            let inline: String = store
+                .conn
+                .query_row("SELECT body FROM nodes", [], |row| row.get(0))
+                .unwrap();
+            assert!(inline.is_empty());
+        }
+        let files = fs::read_dir(&objects)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.file_name().unwrap().len() == 2).then_some(path)
+            })
+            .flat_map(|path| fs::read_dir(path).unwrap())
+            .count();
+        assert_eq!(
+            files, 1,
+            "ten identical worktrees must store one body object"
+        );
+        let key = format!("{:x}", sha2::Sha256::digest(b"{}"));
+        assert_eq!(
+            fs::metadata(objects.join(&key[..2]).join(key))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn corrupt_body_object_fails_truthfully_without_replacing_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let path = root.path().join("graph.db");
+        let store =
+            GraphStore::open_recovering_with_objects(&path, &objects, "checkout-corrupt").unwrap();
+        store.save_graph(&graph(&["src/a.rs"])).unwrap();
+        let key: String = store
+            .conn
+            .query_row("SELECT body_hash FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        fs::write(objects.join(&key[..2]).join(&key), "corrupt").unwrap();
+        let error = match store.load_graph() {
+            Ok(_) => panic!("corrupt object must not hydrate a graph"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("corrupt symbol body object"), "{error}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn object_gc_preserves_references_from_every_checkout_and_reclaims_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let first = GraphStore::open_recovering_with_objects(
+            &root.path().join("first.db"),
+            &objects,
+            "checkout-first",
+        )
+        .unwrap();
+        let second = GraphStore::open_recovering_with_objects(
+            &root.path().join("second.db"),
+            &objects,
+            "checkout-second",
+        )
+        .unwrap();
+        first.save_graph(&graph(&["src/a.rs"])).unwrap();
+        let mut distinct = CodeGraph::new();
+        distinct.add_node(
+            id("src/b.rs", "symbol_0"),
+            SymbolKind::Function,
+            "symbol_0".to_string(),
+            "fn symbol_0()",
+            "a sizeable checkout-specific body",
+            "src/b.rs".to_string(),
+            1,
+            1,
+            true,
+            Language::Rust,
+        );
+        second.save_graph(&distinct).unwrap();
+        let object_store = ContentObjectStore::open(&objects).unwrap();
+        let orphan = object_store.put(b"rolled back generation").unwrap();
+
+        let report = object_store.collect_garbage(16).unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(object_store.get(&orphan).is_err());
+        assert_eq!(first.load_graph().unwrap().node_count(), 1);
+        assert_eq!(second.load_graph().unwrap().node_count(), 1);
+    }
+
+    #[test]
+    fn restart_reconciles_pending_pin_from_actual_committed_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let path = root.path().join("graph.db");
+        let store =
+            GraphStore::open_recovering_with_objects(&path, &objects, "checkout-restart").unwrap();
+        store.save_graph(&graph(&["src/a.rs"])).unwrap();
+        let object_store = ContentObjectStore::open(&objects).unwrap();
+        let live: String = store
+            .conn
+            .query_row("SELECT body_hash FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        let stale = object_store.put(b"pre-commit crash").unwrap();
+        let pin = object_store
+            .begin_publication("checkout-restart", [stale.clone()])
+            .unwrap();
+        drop(pin); // simulates process death before SQLite commit
+        drop(store);
+
+        assert_eq!(object_store.collect_garbage(16).unwrap().removed, 0);
+        let reopened =
+            GraphStore::open_recovering_with_objects(&path, &objects, "checkout-restart").unwrap();
+        drop(reopened);
+        assert_eq!(object_store.collect_garbage(16).unwrap().removed, 1);
+        assert!(object_store.get(&stale).is_err());
+        assert_eq!(object_store.get(&live).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn restart_after_graph_commit_reconciles_new_refs_before_gc() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let path = root.path().join("graph.db");
+        let store =
+            GraphStore::open_recovering_with_objects(&path, &objects, "checkout-post-commit")
+                .unwrap();
+        store.save_graph(&graph(&["src/a.rs"])).unwrap();
+        let object_store = ContentObjectStore::open(&objects).unwrap();
+        let old: String = store
+            .conn
+            .query_row("SELECT body_hash FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        let new = object_store.put(b"committed replacement body").unwrap();
+        let pin = object_store
+            .begin_publication("checkout-post-commit", [new.clone()])
+            .unwrap();
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .conn
+            .execute("UPDATE nodes SET body='', body_hash=?1", [&new])
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE graph_metadata SET index_epoch=index_epoch+1", [])
+            .unwrap();
+        store.conn.execute_batch("COMMIT").unwrap();
+        drop(pin); // simulates process death after graph commit and before ref promotion
+        drop(store);
+
+        assert_eq!(object_store.collect_garbage(16).unwrap().removed, 0);
+        let reopened =
+            GraphStore::open_recovering_with_objects(&path, &objects, "checkout-post-commit")
+                .unwrap();
+        assert_eq!(reopened.load_graph().unwrap().node_count(), 1);
+        drop(reopened);
+        assert_eq!(object_store.collect_garbage(16).unwrap().removed, 1);
+        assert!(object_store.get(&old).is_err());
+        assert_eq!(
+            object_store.get(&new).unwrap(),
+            b"committed replacement body"
+        );
+    }
+
+    #[test]
+    fn active_publication_excludes_object_gc() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = ContentObjectStore::open(&root.path().join("objects")).unwrap();
+        let path = root.path().join("graph.db");
+        let store = GraphStore::open_recovering_with_objects(
+            &path,
+            &root.path().join("objects"),
+            "checkout-active",
+        )
+        .unwrap();
+        let pin = objects
+            .begin_publication("checkout-active", Vec::<String>::new())
+            .unwrap();
+        assert!(objects
+            .collect_garbage(1)
+            .unwrap_err()
+            .to_string()
+            .contains("publication is active"));
+        drop(pin);
+        drop(store);
+    }
+
+    #[test]
+    fn graph_manifest_failure_rolls_back_every_generation_component() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .save_index_snapshot_with_manifest(&graph(&["src/a.rs"]), &[])
+            .unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_manifest BEFORE INSERT ON file_index BEGIN SELECT RAISE(ABORT,'injected manifest failure'); END;").unwrap();
+        let files = vec![FileIndexEntry {
+            file: "src/b.rs".into(),
+            content_hash: "hash".into(),
+            mtime_ns: 1,
+            size_bytes: 2,
+            parser_version: 1,
+            schema_version: 1,
+            last_indexed_at: 1,
+        }];
+        assert!(store
+            .save_index_snapshot_with_manifest(&graph(&["src/b.rs"]), &files)
+            .is_err());
+        let loaded = ready(store.load_index_snapshot().unwrap());
+        assert_eq!(loaded.epoch, 1);
+        assert!(loaded.module_digests.get("src/a.rs").is_some());
+        assert!(store.load_file_index().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delta_preserves_parallel_edge_multiplicity_and_removes_deleted_edges() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let mut graph = graph(&["src/a.rs", "src/b.rs"]);
+        for _ in 0..3 {
+            graph.add_edge(
+                &id("src/a.rs", "symbol_0"),
+                &id("src/b.rs", "symbol_1"),
+                EdgeKind::Calls,
+            );
+        }
+        store.save_graph(&graph).unwrap();
+        assert_eq!(store.load_graph().unwrap().edge_count(), graph.edge_count());
+        store.save_graph(&graph).unwrap();
+        assert_eq!(store.load_graph().unwrap().edge_count(), graph.edge_count());
+        let empty = CodeGraph::new();
+        store.save_graph(&empty).unwrap();
+        assert_eq!(store.load_graph().unwrap().edge_count(), 0);
     }
 
     fn ready(load: IndexSnapshotLoad) -> IndexSnapshot {
@@ -1159,6 +1748,7 @@ INSERT INTO parsed_files VALUES ('src/a.rs', '{{"legacy":true}}');
                 "kind",
                 "signature",
                 "body",
+                "body_hash",
                 "line",
                 "end_line",
                 "is_exported",

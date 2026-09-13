@@ -69,6 +69,36 @@ impl GitHistoryAdapter {
         self.collect_repository(&repository)
     }
 
+    /// Reads only the bounded, ordered commit identity window.  Shared fact
+    /// storage uses this before diffing so a cache hit avoids a second checkout
+    /// mining the same immutable history.
+    pub(crate) fn commit_ids(
+        &self,
+        repository_path: &Path,
+    ) -> Result<Vec<String>, GitHistoryAdapterError> {
+        let repository =
+            Repository::open(repository_path).map_err(|source| GitHistoryAdapterError::Open {
+                path: repository_path.display().to_string(),
+                source,
+            })?;
+        let mut walk = repository.revwalk().map_err(GitHistoryAdapterError::Walk)?;
+        walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+            .map_err(GitHistoryAdapterError::Walk)?;
+        if repository
+            .is_empty()
+            .map_err(GitHistoryAdapterError::Walk)?
+        {
+            return Ok(Vec::new());
+        }
+        walk.push_head().map_err(GitHistoryAdapterError::Walk)?;
+        walk.take(self.limits.history_limit)
+            .map(|oid| {
+                oid.map(|oid| oid.to_string())
+                    .map_err(GitHistoryAdapterError::Walk)
+            })
+            .collect()
+    }
+
     fn collect_repository(
         &self,
         repository: &Repository,
@@ -399,7 +429,12 @@ mod tests {
     #[test]
     fn records_added_and_deleted_line_counts_from_diff_stats() {
         let (directory, repository) = fixture_repository();
-        commit_file(&repository, "src/a.rs", "a\nb\nc\n", "Initial implementation");
+        commit_file(
+            &repository,
+            "src/a.rs",
+            "a\nb\nc\n",
+            "Initial implementation",
+        );
         commit_file(&repository, "src/a.rs", "a\nx\nc\nd\n", "Fix line churn");
 
         let samples = GitHistoryAdapter::new(GitMiningLimits::default())

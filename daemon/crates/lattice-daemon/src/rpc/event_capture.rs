@@ -76,6 +76,10 @@ impl EventCapture {
         })
     }
 
+    pub fn branch_name(&self) -> &str {
+        &self.branch.name
+    }
+
     pub fn begin_task(&self, task_id: TaskId, statement: &str) -> Result<EventId, EventWriteError> {
         {
             let mut current = self.current_task.lock().map_err(lock_error)?;
@@ -590,6 +594,7 @@ impl EventCapture {
         summary: &str,
     ) -> Result<EventId, EventWriteError> {
         let payload = EventPayload::MemoryConsolidated(MemoryConsolidatedPayload {
+            transition: None,
             source_memory_ids: source_memory_ids.to_vec(),
             consolidated_memory_id: consolidated_memory_id.clone(),
             source_event_ids: source_event_ids.to_vec(),
@@ -621,6 +626,7 @@ impl EventCapture {
         proposed_state_json: Option<String>,
     ) -> Result<EventId, EventWriteError> {
         let payload = EventPayload::MemoryConsolidated(MemoryConsolidatedPayload {
+            transition: None,
             source_memory_ids: source_memory_ids.to_vec(),
             consolidated_memory_id: consolidated_memory_id.clone(),
             source_event_ids: source_event_ids.to_vec(),

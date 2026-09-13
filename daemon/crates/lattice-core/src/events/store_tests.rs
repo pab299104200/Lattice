@@ -18,6 +18,30 @@ fn schema_applies_on_fresh_database() {
 }
 
 #[test]
+fn exact_identity_lookup_is_not_hidden_by_more_than_ten_thousand_events() {
+    let store = EventStore::open_in_memory().expect("event store opens");
+    store
+        .insert_envelope_row(&inline_event("target-event", "task-a", 1))
+        .expect("target inserts");
+    for ordinal in 0..10_001 {
+        let id = format!("noise-{ordinal:05}");
+        store
+            .insert_envelope_row(&inline_event(&id, "noise", ordinal + 2))
+            .expect("noise inserts");
+    }
+
+    let target = store
+        .query_event_by_identity("workspace-main", "target-event")
+        .expect("exact lookup succeeds")
+        .expect("target remains addressable");
+    assert_eq!(target.event_id, 1);
+    assert!(store
+        .query_event_by_identity("workspace-foreign", "target-event")
+        .expect("foreign lookup executes")
+        .is_none());
+}
+
+#[test]
 fn migration_is_idempotent_on_reopen() {
     let path = temp_db_path("idempotent");
     let first = EventStore::open(&path).expect("first open migrates");
@@ -31,6 +55,28 @@ fn migration_is_idempotent_on_reopen() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].event_uuid, "event-1");
+    cleanup_db_files(&path);
+}
+
+#[test]
+fn newer_event_database_is_rejected_on_open() {
+    let path = temp_db_path("future-version");
+    let conn = Connection::open(&path).expect("database creates");
+    conn.execute_batch(
+        "CREATE TABLE event_schema_version (
+           version INTEGER PRIMARY KEY,
+           applied_ts_unix_micros INTEGER NOT NULL
+         );
+         INSERT INTO event_schema_version VALUES (5, 1);",
+    )
+    .expect("future marker writes");
+    drop(conn);
+
+    let error = match EventStore::open(&path) {
+        Ok(_) => panic!("older binary must reject future schema"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("newer than this binary"));
     cleanup_db_files(&path);
 }
 
@@ -184,4 +230,137 @@ fn cleanup_db_files(path: &PathBuf) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("db-wal"));
     let _ = fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[test]
+fn compaction_reclaims_only_last_payload_reference_and_allows_reappend() {
+    let store = EventStore::open_in_memory().unwrap();
+    let mut first = inline_event("spill-1", "task-a", 10);
+    first.payload_inline = Some(vec![42; 8192]);
+    let mut second = first.clone();
+    second.event_uuid = "spill-2".into();
+    let first_id = store
+        .insert_envelope_with_payload(first.clone(), 32)
+        .unwrap();
+    let second_id = store.insert_envelope_with_payload(second, 32).unwrap();
+    let spill = store.query_events_by_task("task-a", 10).unwrap()[0]
+        .payload_spill_id
+        .unwrap();
+    assert_eq!(store.truncate_through(first_id).unwrap(), 1);
+    assert!(store.get_payload_row(spill).unwrap().is_some());
+    assert_eq!(store.truncate_through(second_id).unwrap(), 1);
+    assert!(store.get_payload_row(spill).unwrap().is_none());
+    first.event_uuid = "spill-3".into();
+    store.insert_envelope_with_payload(first, 32).unwrap();
+    let replacement = store.query_events_by_task("task-a", 10).unwrap()[0]
+        .payload_spill_id
+        .unwrap();
+    assert_eq!(
+        store.get_payload_row(replacement).unwrap().unwrap().bytes,
+        vec![42; 8192]
+    );
+}
+
+#[test]
+fn failed_atomic_append_does_not_leave_payload_and_failed_compaction_rolls_back() {
+    let store = EventStore::open_in_memory().unwrap();
+    let first = inline_event("same-id", "task-a", 10);
+    store
+        .insert_envelope_with_payload(first.clone(), 4096)
+        .unwrap();
+    let mut duplicate = first;
+    duplicate.payload_hash = vec![7; 32];
+    duplicate.payload_inline = Some(vec![7; 8192]);
+    assert!(store.insert_envelope_with_payload(duplicate, 32).is_err());
+    store.with_connection(|conn| {
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM event_payloads", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        conn.execute_batch("CREATE TRIGGER reject_compaction AFTER DELETE ON events BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    });
+    assert!(store.truncate_through(i64::MAX).is_err());
+    assert_eq!(store.query_events_by_task("task-a", 10).unwrap().len(), 1);
+    store.with_connection(|conn| {
+        assert_eq!(
+            conn.query_row(
+                "SELECT allow_delete FROM event_compaction_control",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    });
+}
+
+#[test]
+fn physical_reclamation_is_bounded_and_reader_backlog_is_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let store = EventStore::open(&path).unwrap();
+    let mut event = inline_event("large", "task-a", 10);
+    event.payload_inline = Some(vec![42; 1024 * 1024]);
+    let id = store.insert_envelope_with_payload(event, 32).unwrap();
+    store.checkpoint_wal().unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM events;")
+        .unwrap();
+    store.truncate_through(id).unwrap();
+    let (released, backlog) = store.reclaim_free_pages(16).unwrap();
+    assert!(released > 0 && released <= 16);
+    assert!(backlog > 0);
+    reader.execute_batch("ROLLBACK").unwrap();
+    let before = fs::metadata(&path).unwrap().len();
+    let (released, backlog) = store.reclaim_free_pages(4096).unwrap();
+    assert!(released > 0);
+    assert_eq!(backlog, 0);
+    assert!(fs::metadata(&path).unwrap().len() < before);
+    assert!(store.reclaim_free_pages(0).is_err());
+    assert!(store.reclaim_free_pages(4097).is_err());
+}
+
+#[test]
+fn concurrent_atomic_append_and_compaction_preserve_every_surviving_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let store = EventStore::open(&path).unwrap();
+    let writer = EventStore::open(&path).unwrap();
+    let thread = std::thread::spawn(move || {
+        for i in 0..100 {
+            let mut row = inline_event(&format!("concurrent-{i}"), "task-a", i);
+            row.payload_hash = vec![42; 32];
+            row.payload_inline = Some(vec![42; 8192]);
+            writer.insert_envelope_with_payload(row, 32).unwrap();
+        }
+    });
+    for id in 0..100 {
+        store.truncate_through(id).unwrap();
+    }
+    thread.join().unwrap();
+    for row in store.query_events_by_task("task-a", 1000).unwrap() {
+        assert_eq!(
+            store
+                .get_payload_row(row.payload_spill_id.unwrap())
+                .unwrap()
+                .unwrap()
+                .bytes
+                .len(),
+            8192
+        );
+    }
+}
+
+#[test]
+fn atomic_append_rejects_payload_hash_collision() {
+    let store = EventStore::open_in_memory().unwrap();
+    let mut row = inline_event("collision-a", "task-a", 1);
+    row.payload_inline = Some(vec![1; 100]);
+    store.insert_envelope_with_payload(row.clone(), 1).unwrap();
+    row.event_uuid = "collision-b".into();
+    row.payload_inline = Some(vec![2; 100]);
+    assert!(store
+        .insert_envelope_with_payload(row, 1)
+        .unwrap_err()
+        .to_string()
+        .contains("different bytes"));
+    assert_eq!(store.query_events_by_task("task-a", 10).unwrap().len(), 1);
 }

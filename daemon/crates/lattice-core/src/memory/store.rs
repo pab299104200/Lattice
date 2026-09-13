@@ -9,6 +9,8 @@ use super::session_capture::{
 };
 use super::session_digest::{SessionDigest, SessionDigestCandidate};
 use crate::error::LatticeError;
+use crate::storage::managed_sqlite::ManagedSqlite;
+use crate::storage::SecureDir;
 use crate::verification::{
     allows as scope_allows, MemoryScopeFilteredEvent, ScopeFilter, ScopeFilterError,
 };
@@ -19,25 +21,113 @@ use crate::working_memory::{
 use crate::{DateTime, Utc};
 use rusqlite::types::Value;
 use rusqlite::{
-    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MEMORY_DB_BUSY_TIMEOUT_SECS: u64 = 5;
+const RECALL_VM_BUDGET_ENV: &str = "LATTICE_MEMORY_RECALL_VM_INSTRUCTIONS";
+const DEFAULT_RECALL_VM_INSTRUCTIONS: u64 = 5_000_000;
+const MAX_RECALL_VM_INSTRUCTIONS: u64 = 1_000_000_000;
+const RECALL_PROGRESS_GRANULARITY: u64 = 1_000;
+const MAX_RECALL_QUERY_BYTES: usize = 32 * 1024;
+const MAX_RECALL_TERM_BYTES: usize = 512;
+const MAX_RECALL_TERM_GROUPS: usize = 64;
 const MEMORY_DB_AUTO_CHECKPOINT_PAGES: u32 = 100;
 const MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES: u32 = 1_048_576;
+const MAX_MEMORY_SCHEMA_VERSION: i64 = 28;
 const MEMORIES_FTS_TABLE: &str = "memories_fts";
 pub(crate) const MEMORY_FTS_STATE_TABLE: &str = "memory_fts_state";
 pub(crate) const SESSION_DIGEST_DELIVERIES_TABLE: &str = "session_digest_deliveries";
+const MAX_CAPTURE_RETIREMENTS_PER_PRUNE: usize = 256;
+const MIN_TOMBSTONE_RETIREMENTS_PER_PRUNE: usize = 128;
+
+#[derive(Clone, Copy)]
+enum SessionCaptureDeletionMode {
+    RetireTransport,
+    OperatorDeleteKnowledge,
+}
 pub(crate) const SESSION_DIGEST_CAPTURE_COMMITS_TABLE: &str = "session_digest_capture_commits";
 pub(crate) const SESSION_CAPTURE_TOMBSTONES_TABLE: &str = "session_capture_tombstones";
 pub(crate) const SESSION_CAPTURE_TOMBSTONE_PROVENANCE_TABLE: &str =
     "session_capture_tombstone_provenance";
+const MAX_TRUSTED_CHECK_OBSERVATIONS_PER_MEMORY: i64 = 64;
+
+struct RecallProgressBudget<'a> {
+    conn: &'a Connection,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl<'a> RecallProgressBudget<'a> {
+    fn install(conn: &'a Connection, instruction_budget: u64) -> Self {
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let callback_count = Arc::clone(&callbacks);
+        let callback_interrupted = Arc::clone(&interrupted);
+        let callback_budget = instruction_budget
+            .max(1)
+            .div_ceil(RECALL_PROGRESS_GRANULARITY);
+        conn.progress_handler(
+            RECALL_PROGRESS_GRANULARITY as i32,
+            Some(move || {
+                let exceeded = callback_count
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    .saturating_add(1)
+                    >= callback_budget;
+                if exceeded {
+                    callback_interrupted.store(true, AtomicOrdering::Release);
+                }
+                exceeded
+            }),
+        );
+        Self { conn, interrupted }
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.interrupted.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl Drop for RecallProgressBudget<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedCheckObservationRecord {
+    pub observation_id: Option<i64>,
+    pub memory_id: String,
+    pub repository_id: String,
+    pub checkout_id: String,
+    pub check_id: String,
+    pub evidence_reference: Option<String>,
+    pub passed: bool,
+    pub revision: Option<String>,
+    pub graph_generation: u64,
+    pub source_fingerprint: [u8; 32],
+    pub target_digest: [u8; 32],
+    pub observed_at: u64,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationCommitBinding {
+    pub repository_id: String,
+    pub checkout_id: String,
+    pub branch: String,
+    pub target_digest: [u8; 32],
+    pub observations: Vec<TrustedCheckObservationRecord>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedSessionDigestBatch {
@@ -113,27 +203,115 @@ fn now_unix_micros() -> i64 {
 
 /// SQLite-backed store for session memories.
 pub struct MemoryStore {
-    conn: Connection,
+    conn: MemoryConnection,
+    availability: MemoryStoreAvailability,
     #[cfg(test)]
     direct_write_count: AtomicUsize,
     #[cfg(test)]
     capture_failure_after_step: AtomicUsize,
+    #[cfg(test)]
+    fail_verification_commit_once: std::sync::atomic::AtomicBool,
+}
+
+enum MemoryConnection {
+    Managed(ManagedSqlite),
+    Direct(Connection),
+}
+impl std::ops::Deref for MemoryConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Managed(c) => c,
+            Self::Direct(c) => c,
+        }
+    }
+}
+impl std::ops::DerefMut for MemoryConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Managed(c) => c,
+            Self::Direct(c) => c,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryStoreFailureKind {
+    Busy,
+    AccessDenied,
+    Full,
+    UnsupportedSchema,
+    Corrupt,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryStoreAvailability {
+    Persistent {
+        path: PathBuf,
+    },
+    InMemory,
+    Unavailable {
+        path: PathBuf,
+        kind: MemoryStoreFailureKind,
+        reason: String,
+    },
 }
 
 impl MemoryStore {
     /// Open a file-based SQLite database with WAL mode enabled.
     pub fn open(path: &Path) -> Result<Self, LatticeError> {
-        let conn = Connection::open(path)
-            .map_err(|e| LatticeError::Storage(format!("Failed to open memory database: {}", e)))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if path.file_name().is_none() {
+            return Err(LatticeError::MemoryStorageAccessDenied(format!(
+                "memory database {} has no parent",
+                path.display()
+            )));
+        }
+        let leaf = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                LatticeError::MemoryStorageAccessDenied(format!(
+                    "memory database {} has no valid file name",
+                    path.display()
+                ))
+            })?;
+        let directory = SecureDir::open(parent).map_err(|error| {
+            LatticeError::MemoryStorageAccessDenied(format!(
+                "cannot pin memory directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        Self::open_in(&directory, leaf)
+    }
 
+    pub fn open_in(directory: &SecureDir, leaf: &str) -> Result<Self, LatticeError> {
+        let managed = ManagedSqlite::open(
+            directory,
+            leaf,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .map_err(|e| classify_sqlite_error("open managed memory database", e))?;
+        let conn = MemoryConnection::Managed(managed);
+
+        validate_supported_schema(&conn)?;
         configure_connection(&conn, true)?;
 
         let store = Self {
             conn,
+            availability: MemoryStoreAvailability::Persistent {
+                path: directory.path().join(leaf),
+            },
             #[cfg(test)]
             direct_write_count: AtomicUsize::new(0),
             #[cfg(test)]
             capture_failure_after_step: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            fail_verification_commit_once: std::sync::atomic::AtomicBool::new(false),
         };
         store.initialize()?;
         Ok(store)
@@ -141,21 +319,58 @@ impl MemoryStore {
 
     /// Open an in-memory SQLite database (for tests).
     pub fn open_in_memory() -> Result<Self, LatticeError> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            LatticeError::Storage(format!("Failed to open in-memory memory database: {}", e))
-        })?;
+        let conn = Connection::open_in_memory()
+            .map(MemoryConnection::Direct)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to open in-memory memory database: {}", e))
+            })?;
 
         configure_connection(&conn, false)?;
 
         let store = Self {
             conn,
+            availability: MemoryStoreAvailability::InMemory,
             #[cfg(test)]
             direct_write_count: AtomicUsize::new(0),
             #[cfg(test)]
             capture_failure_after_step: AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            fail_verification_commit_once: std::sync::atomic::AtomicBool::new(false),
         };
         store.initialize()?;
         Ok(store)
+    }
+
+    /// Construct an empty queryable store that truthfully rejects every write.
+    pub fn unavailable(
+        path: &Path,
+        kind: MemoryStoreFailureKind,
+        reason: impl Into<String>,
+    ) -> Result<Self, LatticeError> {
+        let mut store = Self::open_in_memory()?;
+        store.availability = MemoryStoreAvailability::Unavailable {
+            path: path.to_path_buf(),
+            kind,
+            reason: reason.into(),
+        };
+        store
+            .conn
+            .pragma_update(None, "query_only", true)
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to protect unavailable memory store: {e}"))
+            })?;
+        Ok(store)
+    }
+
+    pub fn availability(&self) -> &MemoryStoreAvailability {
+        &self.availability
+    }
+
+    pub fn is_persistent_available(&self) -> bool {
+        matches!(
+            self.availability,
+            MemoryStoreAvailability::Persistent { .. }
+        )
     }
 
     #[cfg(test)]
@@ -186,7 +401,175 @@ impl MemoryStore {
     where
         F: FnOnce(&Connection) -> Result<T, LatticeError>,
     {
-        op(&self.conn)
+        match op(&self.conn) {
+            Err(LatticeError::Storage(_))
+                if matches!(
+                    self.availability,
+                    MemoryStoreAvailability::Unavailable { .. }
+                ) =>
+            {
+                let MemoryStoreAvailability::Unavailable { reason, .. } = &self.availability else {
+                    unreachable!()
+                };
+                Err(LatticeError::MemoryStorageUnavailable(reason.clone()))
+            }
+            result => result,
+        }
+    }
+
+    pub fn attempt_memory_delivery(
+        &self,
+        binding: &super::retention::DeliveryBinding<'_>,
+        memory_ids: &[String],
+        now: i64,
+    ) -> Result<(), LatticeError> {
+        super::retention::attempt_delivery(
+            &self.conn,
+            binding,
+            memory_ids,
+            u64::try_from(now)
+                .map_err(|_| LatticeError::Storage("delivery time is negative".into()))?,
+        )
+    }
+
+    /// Atomically bind an expansion receipt only if the exact snapshot read by
+    /// the caller remains eligible under its current delivery authority.
+    pub fn attempt_expansion_memory_delivery(
+        &self,
+        binding: &super::retention::DeliveryBinding<'_>,
+        memory_id: &str,
+        expected_digest: [u8; 32],
+        repository_id: Option<&str>,
+        checkout_id: Option<&str>,
+        branch: Option<&str>,
+        session_id: &str,
+        organization_id: Option<&str>,
+        now: i64,
+    ) -> Result<(), LatticeError> {
+        self.attempt_expansion_memories_delivery(
+            binding,
+            &[(memory_id.to_string(), expected_digest)],
+            repository_id,
+            checkout_id,
+            branch,
+            session_id,
+            organization_id,
+            now,
+        )
+    }
+
+    /// Atomically bind one receipt to a bounded group of exact memory
+    /// snapshots. Every member must remain eligible and byte-identical to the
+    /// projection loaded by the caller; otherwise no receipt or item is stored.
+    pub fn attempt_expansion_memories_delivery(
+        &self,
+        binding: &super::retention::DeliveryBinding<'_>,
+        targets: &[(String, [u8; 32])],
+        repository_id: Option<&str>,
+        checkout_id: Option<&str>,
+        branch: Option<&str>,
+        session_id: &str,
+        organization_id: Option<&str>,
+        now: i64,
+    ) -> Result<(), LatticeError> {
+        if targets.is_empty() || targets.len() > 64 {
+            return Err(LatticeError::Storage(
+                "memory delivery group must contain between 1 and 64 snapshots".into(),
+            ));
+        }
+        let now = u64::try_from(now)
+            .map_err(|_| LatticeError::Storage("delivery time is negative".into()))?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| LatticeError::Storage(error.to_string()))?;
+        for (memory_id, expected_digest) in targets {
+            let authorized: bool = if let Some(organization_id) = organization_id {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND is_invalidated=0 AND purge_pending=0 AND retention_stale=0 AND is_stale=0 AND verification_status NOT IN ('stale','contradicted','superseded','expired','invalidated') AND scope='organization' AND scope_organization_id=?2)",
+                rusqlite::params![memory_id, organization_id],
+                |row| row.get(0),
+            )
+        } else {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND workspace_id=?2 AND is_invalidated=0 AND purge_pending=0 AND retention_stale=0 AND is_stale=0 AND verification_status NOT IN ('stale','contradicted','superseded','expired','invalidated') AND (applicable_checkout_id IS NULL OR applicable_checkout_id=?3) AND ((scope='repo') OR (scope='branch' AND branch=?4) OR (scope='session' AND session_id=?5)))",
+                rusqlite::params![memory_id, repository_id, checkout_id, branch, session_id],
+                |row| row.get(0),
+            )
+        }
+        .map_err(|error| LatticeError::Storage(error.to_string()))?;
+            if !authorized {
+                return Err(LatticeError::Storage(
+                    "memory expansion is no longer eligible under the current authority".into(),
+                ));
+            }
+            let memory = self.get_by_id(memory_id)?.ok_or_else(|| {
+                LatticeError::Storage("memory expansion target disappeared".into())
+            })?;
+            let fields = self.get_structured_fields(memory_id)?.ok_or_else(|| {
+                LatticeError::Storage("memory expansion metadata disappeared".into())
+            })?;
+            let digest_repository = memory.workspace_id.as_deref().ok_or_else(|| {
+                LatticeError::Storage("memory expansion target has no repository provenance".into())
+            })?;
+            if Self::expansion_delivery_digest_for(&memory, &fields, digest_repository)?
+                != *expected_digest
+            {
+                return Err(LatticeError::Storage(
+                    "memory expansion changed before delivery receipt binding".into(),
+                ));
+            }
+        }
+        let ids = targets.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        super::retention::attempt_delivery_in_transaction(&tx, binding, &ids, now)
+            .map_err(|error| LatticeError::Storage(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| LatticeError::Storage(error.to_string()))
+    }
+
+    /// Digest every memory and structured field that can affect the public
+    /// expansion projection or its trust/lifecycle labels.
+    pub fn expansion_delivery_digest_for(
+        memory: &Memory,
+        fields: &MemoryStructuredFields,
+        repository_id: &str,
+    ) -> Result<[u8; 32], LatticeError> {
+        if memory.workspace_id.as_deref() != Some(repository_id) {
+            return Err(LatticeError::Storage(
+                "expansion target is outside repository authority".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec(&(memory, fields)).map_err(|error| {
+            LatticeError::Storage(format!("serialize expansion delivery target: {error}"))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    pub fn acknowledge_memory_delivery(
+        &self,
+        binding: &super::retention::DeliveryBinding<'_>,
+        now: i64,
+    ) -> Result<usize, LatticeError> {
+        super::retention::acknowledge_delivery(
+            &self.conn,
+            binding,
+            u64::try_from(now)
+                .map_err(|_| LatticeError::Storage("delivery time is negative".into()))?,
+        )
+    }
+
+    pub fn memory_delivery_acknowledgement_was_recorded(
+        &self,
+        binding: &super::retention::DeliveryBinding<'_>,
+        now: i64,
+    ) -> Result<bool, LatticeError> {
+        super::retention::acknowledgement_was_recorded(
+            &self.conn,
+            binding,
+            u64::try_from(now)
+                .map_err(|_| LatticeError::Storage("delivery time is negative".into()))?,
+        )
     }
 
     pub fn enqueue_verification_job(
@@ -293,6 +676,78 @@ impl MemoryStore {
                     was_used INTEGER
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_attribution_retrievals (
+                    retrieval_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    checkout_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    branch TEXT,
+                    tool_event_id TEXT NOT NULL,
+                    tool_event_kind TEXT NOT NULL,
+                    tool_event_sequence INTEGER NOT NULL,
+                    tool_event_observed_at INTEGER NOT NULL,
+                    retrieval_event_id TEXT NOT NULL,
+                    retrieval_event_kind TEXT NOT NULL,
+                    retrieval_event_sequence INTEGER NOT NULL,
+                    retrieval_event_observed_at INTEGER NOT NULL,
+                    accessor TEXT NOT NULL,
+                    retrieved_count INTEGER NOT NULL CHECK(retrieved_count BETWEEN 1 AND 256),
+                    metric_client TEXT NOT NULL,
+                    metric_channel TEXT NOT NULL,
+                    payload_hash BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    terminal_event_id TEXT,
+                    terminal_event_kind TEXT,
+                    terminal_event_sequence INTEGER,
+                    terminal_event_observed_at INTEGER,
+                    disposition TEXT,
+                    cited_access_ids_json TEXT,
+                    resolved_at INTEGER,
+                    retrieval_metric_recorded INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS memory_attribution_accesses (
+                    access_id TEXT PRIMARY KEY
+                        REFERENCES memory_accesses(access_id) ON DELETE CASCADE,
+                    retrieval_id TEXT NOT NULL
+                        REFERENCES memory_attribution_retrievals(retrieval_id) ON DELETE CASCADE,
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    inclusion_reason TEXT NOT NULL,
+                    metric_recorded INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS memory_attribution_expired (
+                    retrieval_id TEXT PRIMARY KEY,
+                    payload_hash BLOB NOT NULL,
+                    expired_at INTEGER NOT NULL,
+                    reason TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_retrievals_retention
+                    ON memory_attribution_retrievals(resolved_at, created_at, retrieval_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_retrievals_pending_metric
+                    ON memory_attribution_retrievals(disposition, retrieval_metric_recorded, resolved_at, retrieval_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_retrieval_pending_outbox
+                    ON memory_attribution_retrievals(retrieval_id)
+                    WHERE retrieval_metric_recorded=0;
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_unresolved_age
+                    ON memory_attribution_retrievals(created_at,retrieval_id)
+                    WHERE disposition IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_accesses_retrieval
+                    ON memory_attribution_accesses(retrieval_id, access_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_accesses_pending
+                    ON memory_attribution_accesses(metric_recorded, retrieval_id, access_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_attribution_expired_time
+                    ON memory_attribution_expired(expired_at, retrieval_id);
+                CREATE TRIGGER IF NOT EXISTS memory_attribution_access_cleanup
+                AFTER DELETE ON memory_attribution_accesses BEGIN
+                    INSERT OR IGNORE INTO memory_attribution_expired(retrieval_id,payload_hash,expired_at,reason)
+                    SELECT retrieval_id,payload_hash,unixepoch(),'memory_purged'
+                    FROM memory_attribution_retrievals
+                    WHERE retrieval_id=OLD.retrieval_id
+                      AND NOT EXISTS (SELECT 1 FROM memory_attribution_accesses WHERE retrieval_id=OLD.retrieval_id);
+                    DELETE FROM memory_attribution_retrievals
+                    WHERE retrieval_id=OLD.retrieval_id
+                      AND NOT EXISTS (SELECT 1 FROM memory_attribution_accesses WHERE retrieval_id=OLD.retrieval_id);
+                END;
+
                 CREATE TABLE IF NOT EXISTS memory_scores (
                     memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
                     score_kind TEXT NOT NULL,
@@ -311,6 +766,24 @@ impl MemoryStore {
                     memory_scope TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS trusted_check_observations (
+                    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    repository_id TEXT NOT NULL,
+                    checkout_id TEXT NOT NULL,
+                    check_id TEXT NOT NULL,
+                    evidence_reference TEXT,
+                    passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+                    revision TEXT,
+                    graph_generation INTEGER NOT NULL CHECK(graph_generation >= 0),
+                    source_fingerprint BLOB NOT NULL CHECK(length(source_fingerprint)=32),
+                    target_digest BLOB NOT NULL CHECK(length(target_digest)=32),
+                    observed_at INTEGER NOT NULL CHECK(observed_at >= 0),
+                    exit_code INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS trusted_check_observations_target
+                    ON trusted_check_observations(memory_id, observed_at DESC, observation_id DESC);
 
                 CREATE TABLE IF NOT EXISTS session_digest_deliveries (
                     delivery_key TEXT PRIMARY KEY,
@@ -365,6 +838,18 @@ impl MemoryStore {
                 LatticeError::Storage(format!("Failed to initialize memory schema: {}", e))
             })?;
 
+        if !self.table_column_exists("trusted_check_observations", "target_digest")? {
+            self.conn
+                .execute_batch(
+                    "ALTER TABLE trusted_check_observations ADD COLUMN target_digest BLOB",
+                )
+                .map_err(|e| {
+                    LatticeError::Storage(format!(
+                        "Failed to migrate trusted observation target binding: {e}"
+                    ))
+                })?;
+        }
+
         self.initialize_migration_table()?;
         self.apply_schema_migrations()?;
 
@@ -400,10 +885,16 @@ impl MemoryStore {
                     ON memories(applicable_checkout_id);
                  CREATE INDEX IF NOT EXISTS idx_session_digest_deliveries_session
                     ON session_digest_deliveries(repository_id, checkout_id, session_id, segment);
+                 CREATE INDEX IF NOT EXISTS idx_session_digest_consolidation_scan
+                    ON session_digest_deliveries(repository_id,checkout_id,COALESCE(branch,'unknown'),created_at,delivery_key);
+                 CREATE INDEX IF NOT EXISTS idx_session_digest_deliveries_retention
+                    ON session_digest_deliveries(repository_id, created_at DESC, delivery_key DESC);
                  CREATE INDEX IF NOT EXISTS idx_session_digest_capture_memory
                     ON session_digest_capture_commits(memory_id);
                  CREATE INDEX IF NOT EXISTS idx_session_capture_tombstones_repository_time
                     ON session_capture_tombstones(repository_id, deleted_at, delivery_key);
+                 CREATE INDEX IF NOT EXISTS idx_session_capture_tombstones_retention_time
+                    ON session_capture_tombstones(deletion_reason, deleted_at, delivery_key);
                  CREATE INDEX IF NOT EXISTS idx_session_capture_tombstone_derived
                     ON session_capture_tombstone_provenance(derived_kind, derived_id);",
             )
@@ -432,14 +923,290 @@ impl MemoryStore {
         })?;
         crate::consolidation::initialize_schema(&self.conn)?;
         crate::verification::initialize_schema(&self.conn)?;
+        super::retention::initialize(&self.conn, now_epoch_secs())?;
+        super::retrieval::initialize(&self.conn)?;
 
         Ok(())
+    }
+
+    pub fn record_trusted_check_observation(
+        &self,
+        record: &TrustedCheckObservationRecord,
+    ) -> Result<(), LatticeError> {
+        let generation = i64::try_from(record.graph_generation).map_err(|_| {
+            LatticeError::Storage("trusted check graph generation exceeds SQLite range".into())
+        })?;
+        let observed_at = i64::try_from(record.observed_at).map_err(|_| {
+            LatticeError::Storage("trusted check timestamp exceeds SQLite range".into())
+        })?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(
+            |e| LatticeError::Storage(format!("Failed to begin trusted observation write: {e}")),
+        )?;
+        let scoped: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND workspace_id=?2)",
+                params![record.memory_id, record.repository_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to validate trusted observation target: {e}"
+                ))
+            })?;
+        if !scoped {
+            return Err(LatticeError::Storage(
+                "trusted check target is absent or outside repository authority".into(),
+            ));
+        }
+        if self.verification_target_digest(&record.memory_id, &record.repository_id)?
+            != record.target_digest
+        {
+            return Err(LatticeError::Storage(
+                "trusted check target changed before observation commit".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO trusted_check_observations(memory_id,repository_id,checkout_id,check_id,evidence_reference,passed,revision,graph_generation,source_fingerprint,target_digest,observed_at,exit_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![record.memory_id,record.repository_id,record.checkout_id,record.check_id,record.evidence_reference,record.passed as i64,record.revision,generation,record.source_fingerprint.as_slice(),record.target_digest.as_slice(),observed_at,record.exit_code],
+        ).map_err(|e| LatticeError::Storage(format!("Failed to persist trusted check observation: {e}")))?;
+        tx.execute(
+            "DELETE FROM trusted_check_observations WHERE memory_id=?1 AND observation_id NOT IN (SELECT observation_id FROM trusted_check_observations WHERE memory_id=?1 ORDER BY observed_at DESC,observation_id DESC LIMIT ?2)",
+            params![record.memory_id, MAX_TRUSTED_CHECK_OBSERVATIONS_PER_MEMORY],
+        ).map_err(|e| LatticeError::Storage(format!("Failed to bound trusted check observations: {e}")))?;
+        tx.commit().map_err(|e| {
+            LatticeError::Storage(format!("Failed to commit trusted check observation: {e}"))
+        })
+    }
+
+    fn table_column_exists(&self, table: &str, column: &str) -> Result<bool, LatticeError> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| LatticeError::Storage(format!("inspect {table} schema: {e}")))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| LatticeError::Storage(format!("inspect {table} columns: {e}")))?;
+        for name in names {
+            if name.map_err(|e| LatticeError::Storage(e.to_string()))? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn trusted_check_observations(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<TrustedCheckObservationRecord>, LatticeError> {
+        let mut statement = self.conn.prepare(
+            "SELECT observation_id,memory_id,repository_id,checkout_id,check_id,evidence_reference,passed,revision,graph_generation,source_fingerprint,target_digest,observed_at,exit_code FROM trusted_check_observations WHERE memory_id=?1 ORDER BY observed_at DESC,observation_id DESC LIMIT ?2",
+        ).map_err(|e| LatticeError::Storage(format!("Failed to prepare trusted observation read: {e}")))?;
+        let rows = statement
+            .query_map(
+                params![memory_id, MAX_TRUSTED_CHECK_OBSERVATIONS_PER_MEMORY],
+                |row| {
+                    let fingerprint: Vec<u8> = row.get(9)?;
+                    let fingerprint: [u8; 32] = fingerprint.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            9,
+                            "source_fingerprint".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?;
+                    let target: Vec<u8> = row.get(10)?;
+                    let target_digest: [u8; 32] = target.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            10,
+                            "target_digest".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?;
+                    Ok(TrustedCheckObservationRecord {
+                        observation_id: Some(row.get(0)?),
+                        memory_id: row.get(1)?,
+                        repository_id: row.get(2)?,
+                        checkout_id: row.get(3)?,
+                        check_id: row.get(4)?,
+                        evidence_reference: row.get(5)?,
+                        passed: row.get::<_, i64>(6)? != 0,
+                        revision: row.get(7)?,
+                        graph_generation: row.get::<_, i64>(8)? as u64,
+                        source_fingerprint: fingerprint,
+                        target_digest,
+                        observed_at: row.get::<_, i64>(11)? as u64,
+                        exit_code: row.get(12)?,
+                    })
+                },
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to query trusted observations: {e}"))
+            })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| LatticeError::Storage(format!("Failed to read trusted observations: {e}")))
+    }
+
+    pub fn verification_target_digest(
+        &self,
+        memory_id: &str,
+        repository_id: &str,
+    ) -> Result<[u8; 32], LatticeError> {
+        self.conn
+            .execute_batch("SAVEPOINT verification_target_digest")
+            .map_err(|e| LatticeError::Storage(e.to_string()))?;
+        let result = (|| {
+            let memory = self
+                .get_by_id(memory_id)?
+                .filter(|memory| memory.workspace_id.as_deref() == Some(repository_id))
+                .ok_or_else(|| {
+                    LatticeError::Storage(
+                        "verification target is absent or outside repository authority".into(),
+                    )
+                })?;
+            let fields = self.get_structured_fields(memory_id)?.ok_or_else(|| {
+                LatticeError::Storage("verification target is invalidated".into())
+            })?;
+            Self::verification_target_digest_for(&memory, &fields, repository_id)
+        })();
+        match result {
+            Ok(digest) => {
+                self.conn
+                    .execute_batch("RELEASE verification_target_digest")
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                Ok(digest)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO verification_target_digest; RELEASE verification_target_digest",
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Digest the exact target snapshot supplied to a verifier. Callers use
+    /// this rather than re-reading the row after loading it, then the final
+    /// transactional CAS compares the digest with current database state.
+    pub fn verification_target_digest_for(
+        memory: &Memory,
+        fields: &MemoryStructuredFields,
+        repository_id: &str,
+    ) -> Result<[u8; 32], LatticeError> {
+        if memory.workspace_id.as_deref() != Some(repository_id) {
+            return Err(LatticeError::Storage(
+                "verification target is outside repository authority".into(),
+            ));
+        }
+        let semantic = serde_json::json!({
+            "session_id": memory.session_id, "content": memory.content, "memory_type": memory.memory_type,
+            "scope": memory.scope, "confidence": memory.confidence,
+            "linked_symbols": memory.linked_symbols, "linked_files": memory.linked_files,
+            "workspace_id": memory.workspace_id, "branch": memory.branch,
+            "organization_id": memory.scope_organization_id, "refresh_key": memory.refresh_key,
+            "source_query": memory.source_query, "memory_class": fields.memory_class,
+            "assertion_type": fields.assertion_type, "confidence_reason": fields.confidence_reason,
+            "supersedes": fields.supersedes_memory_id, "superseded_by": fields.superseded_by_memory_id,
+            "contradicts": fields.contradicts_memory_ids, "contradicted_by": fields.contradicted_by_memory_ids,
+            "freshness_policy": fields.freshness_policy, "freshness_detail": fields.freshness_policy_detail,
+            "validity_conditions": fields.validity_conditions, "invalidation_triggers": fields.invalidation_triggers,
+            "provenance": fields.provenance, "evidence": fields.evidence, "linked_docs": fields.linked_docs,
+            "linked_tests": fields.linked_tests, "linked_memories": fields.linked_memories,
+        });
+        let bytes = serde_json::to_vec(&semantic)
+            .map_err(|e| LatticeError::Storage(format!("serialize verification target: {e}")))?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    pub fn persist_verification_result(
+        &self,
+        id: &str,
+        fields: &MemoryStructuredFields,
+        verification_status: MemoryVerificationStatus,
+        is_stale: bool,
+        stale_reason: Option<&str>,
+        last_verified_at: u64,
+        graph_snapshot_id: Option<u64>,
+        expected: &VerificationCommitBinding,
+    ) -> Result<(), LatticeError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| LatticeError::Storage(format!("begin verification result: {e}")))?;
+        let result = (|| {
+            let authorized: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND workspace_id=?2 AND is_invalidated=0 AND (applicable_checkout_id IS NULL OR applicable_checkout_id=?3) AND (scope!='branch' OR branch=?4))",
+                params![id, expected.repository_id, expected.checkout_id, expected.branch], |row| row.get(0),
+            ).map_err(|e| LatticeError::Storage(format!("verify verification authority: {e}")))?;
+            if !authorized {
+                return Err(LatticeError::Storage(
+                    "verification target is outside repository, checkout, or branch authority"
+                        .into(),
+                ));
+            }
+            let digest = self.verification_target_digest(id, &expected.repository_id)?;
+            if digest != expected.target_digest {
+                return Err(LatticeError::Storage(
+                    "verification target changed before commit".into(),
+                ));
+            }
+            if self.trusted_check_observations(id)? != expected.observations {
+                return Err(LatticeError::Storage(
+                    "trusted observations changed before commit".into(),
+                ));
+            }
+            self.persist_structured_fields(id, fields)?;
+            let verified_at = i64::try_from(last_verified_at).map_err(|_| {
+                LatticeError::Storage("verification timestamp exceeds SQLite range".into())
+            })?;
+            let snapshot = graph_snapshot_id
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| LatticeError::Storage("graph snapshot exceeds SQLite range".into()))?;
+            let changed = self.conn.execute("UPDATE memories SET verification_status=?1,is_stale=?2,stale_reason=?3,last_verified_at=?4,last_verified_graph_snapshot_id=?5 WHERE id=?6 AND is_invalidated=0", params![verification_status.as_str(),is_stale as i64,stale_reason,verified_at,snapshot,id]).map_err(|e| LatticeError::Storage(format!("update verification state: {e}")))?;
+            if changed != 1 {
+                return Err(LatticeError::Storage(format!(
+                    "Memory '{id}' not found or invalidated"
+                )));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                let commit_result = if self
+                    .fail_verification_commit_once
+                    .swap(false, Ordering::SeqCst)
+                {
+                    Err(rusqlite::Error::ExecuteReturnedResults)
+                } else {
+                    self.conn.execute_batch("COMMIT")
+                };
+                #[cfg(not(test))]
+                let commit_result = self.conn.execute_batch("COMMIT");
+                if let Err(commit_error) = commit_result {
+                    let rollback_error = self.conn.execute_batch("ROLLBACK").err();
+                    let detail = rollback_error.map_or_else(String::new, |error| {
+                        format!("; rollback after commit failure also failed: {error}")
+                    });
+                    return Err(LatticeError::Storage(format!(
+                        "commit verification result: {commit_error}{detail}"
+                    )));
+                }
+                self.record_direct_write();
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Store a memory. If the memory's id is empty, a UUID-like id is generated.
     /// If created_at is 0, the current timestamp is used.
     /// Returns the id of the stored memory.
     pub fn store(&self, mut memory: Memory) -> Result<String, LatticeError> {
+        if let MemoryStoreAvailability::Unavailable { reason, .. } = &self.availability {
+            return Err(LatticeError::MemoryStorageUnavailable(reason.clone()));
+        }
         self.record_direct_write();
         if memory.id.is_empty() {
             memory.id = generate_id();
@@ -565,7 +1332,7 @@ impl MemoryStore {
                     metadata.applicable_checkout_id,
                 ],
             )
-            .map_err(|e| LatticeError::Storage(format!("Failed to store memory: {}", e)))?;
+            .map_err(|e| classify_sqlite_error("store memory", e))?;
 
         self.sync_memory_evidence(&memory.id, &structured_fields.evidence)?;
 
@@ -585,6 +1352,15 @@ impl MemoryStore {
         candidates: &[SessionDigestCandidate],
         extractor_version: &str,
     ) -> Result<PersistedSessionDigestBatch, LatticeError> {
+        let received_at = digest.received_at.unix_seconds();
+        let now = now_epoch_secs() as i64;
+        if received_at > now
+            || received_at < now.saturating_sub(super::retention::MAX_REPLAY_AGE_SECS as i64)
+        {
+            return Err(LatticeError::Storage(
+                "session digest is outside the permitted replay window".into(),
+            ));
+        }
         let checkout_id = digest.checkout_id.as_deref().ok_or_else(|| {
             LatticeError::Storage(
                 "automatic session capture requires exact checkout applicability".to_string(),
@@ -808,26 +1584,35 @@ impl MemoryStore {
         policy: SessionCaptureRetentionPolicy,
         now: i64,
     ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        // Reserve half of the shared work budget for expired replay fences so
+        // a sustained delivery backlog cannot starve tombstone retirement.
+        let retired_tombstones =
+            self.retire_expired_capture_tombstones(now, MIN_TOMBSTONE_RETIREMENTS_PER_PRUNE)?;
+        let delivery_budget = MAX_CAPTURE_RETIREMENTS_PER_PRUNE - retired_tombstones;
         let max_age_secs = policy.max_age().as_secs().min(i64::MAX as u64) as i64;
         let cutoff = now.saturating_sub(max_age_secs);
         let max_captures = i64::try_from(policy.max_captures()).unwrap_or(i64::MAX);
         let mut statement = self
             .conn
             .prepare(&format!(
-                "SELECT delivery_key
-                 FROM {SESSION_DIGEST_DELIVERIES_TABLE}
-                 WHERE repository_id = ?1
-                   AND (
-                       created_at < ?2
-                       OR delivery_key NOT IN (
-                           SELECT delivery_key
-                           FROM {SESSION_DIGEST_DELIVERIES_TABLE}
-                           WHERE repository_id = ?1
-                           ORDER BY created_at DESC, delivery_key DESC
-                           LIMIT ?3
-                       )
-                   )
-                 ORDER BY created_at ASC, delivery_key ASC"
+                "WITH excess_boundary AS (
+                     SELECT created_at, delivery_key
+                     FROM {SESSION_DIGEST_DELIVERIES_TABLE}
+                     WHERE repository_id = ?1
+                     ORDER BY created_at DESC, delivery_key DESC
+                     LIMIT 1 OFFSET ?3
+                 )
+                 SELECT delivery_key
+                 FROM {SESSION_DIGEST_DELIVERIES_TABLE} AS delivery
+                 WHERE repository_id = ?1 AND (
+                     created_at < ?2 OR EXISTS (
+                         SELECT 1 FROM excess_boundary
+                         WHERE (delivery.created_at, delivery.delivery_key)
+                             <= (excess_boundary.created_at, excess_boundary.delivery_key)
+                     )
+                 )
+                 ORDER BY created_at ASC, delivery_key ASC
+                 LIMIT ?4"
             ))
             .map_err(|error| {
                 LatticeError::Storage(format!(
@@ -835,9 +1620,15 @@ impl MemoryStore {
                 ))
             })?;
         let delivery_keys = statement
-            .query_map(params![repository_id, cutoff, max_captures], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![
+                    repository_id,
+                    cutoff,
+                    max_captures,
+                    i64::try_from(delivery_budget).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|error| {
                 LatticeError::Storage(format!(
                     "Failed to query automatic capture retention candidates: {error}"
@@ -850,7 +1641,19 @@ impl MemoryStore {
                 ))
             })?;
         drop(statement);
-        self.delete_session_capture_deliveries(repository_id, &delivery_keys, now, "retention")
+        let result = self.delete_session_capture_deliveries(
+            repository_id,
+            &delivery_keys,
+            now,
+            "retention",
+            SessionCaptureDeletionMode::RetireTransport,
+        )?;
+        let remaining = MAX_CAPTURE_RETIREMENTS_PER_PRUNE
+            .saturating_sub(retired_tombstones + result.deleted_capture_ids.len());
+        if remaining > 0 {
+            self.retire_expired_capture_tombstones(now, remaining)?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn delete_session_captures(
@@ -897,6 +1700,7 @@ impl MemoryStore {
             &delivery_keys,
             deleted_at,
             "operator",
+            SessionCaptureDeletionMode::OperatorDeleteKnowledge,
         )
     }
 
@@ -906,6 +1710,7 @@ impl MemoryStore {
         delivery_keys: &[String],
         deleted_at: i64,
         deletion_reason: &str,
+        mode: SessionCaptureDeletionMode,
     ) -> Result<SessionCaptureDeletionResult, LatticeError> {
         if delivery_keys.is_empty() {
             return Ok(SessionCaptureDeletionResult::default());
@@ -985,57 +1790,55 @@ impl MemoryStore {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        let retained_derived_memory_count = retain_derived_memory_provenance(
-            &tx,
-            &source_delivery_by_memory,
-            &source_memory_ids,
-            deleted_at,
-        )?;
-        let retained_proposal_count = retain_proposal_tombstone_provenance(
-            &tx,
-            &source_delivery_by_memory,
-            &source_memory_ids,
-        )?;
-
-        tx.execute(
-            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 1 WHERE singleton = 1"),
-            [],
-        )
-        .map_err(|error| {
-            LatticeError::Storage(format!(
-                "Failed to enter automatic capture deletion FTS recovery state: {error}"
-            ))
-        })?;
-        for memory_id in source_delivery_by_memory.keys() {
-            tx.execute(
-                "DELETE FROM verification_jobs WHERE target_memory_id = ?1",
-                params![memory_id],
-            )
-            .map_err(|error| {
-                LatticeError::Storage(format!(
-                    "Failed to delete automatic capture verification jobs: {error}"
-                ))
-            })?;
-            tx.execute(
-                "DELETE FROM memory_links
-                 WHERE source_memory_id = ?1 OR target_memory_id = ?1",
-                params![memory_id],
-            )
-            .map_err(|error| {
-                LatticeError::Storage(format!(
-                    "Failed to delete automatic capture memory links: {error}"
-                ))
-            })?;
-            tx.execute(
-                &format!("DELETE FROM {MEMORIES_FTS_TABLE} WHERE memory_id = ?1"),
-                params![memory_id],
-            )
-            .map_err(|error| {
-                LatticeError::Storage(format!(
-                    "Failed to delete automatic capture FTS document: {error}"
-                ))
-            })?;
-        }
+        let (retained_derived_memory_count, retained_proposal_count) = match mode {
+            SessionCaptureDeletionMode::RetireTransport => (0, 0),
+            SessionCaptureDeletionMode::OperatorDeleteKnowledge => {
+                let derived = retain_derived_memory_provenance(
+                    &tx,
+                    &source_delivery_by_memory,
+                    &source_memory_ids,
+                    deleted_at,
+                )?;
+                let proposals = retain_proposal_tombstone_provenance(
+                    &tx,
+                    &source_delivery_by_memory,
+                    &source_memory_ids,
+                )?;
+                tx.execute(
+                    &format!(
+                        "UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 1 WHERE singleton = 1"
+                    ),
+                    [],
+                )
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to enter automatic capture deletion FTS recovery state: {error}"
+                    ))
+                })?;
+                for memory_id in source_delivery_by_memory.keys() {
+                    tx.execute(
+                        "DELETE FROM verification_jobs WHERE target_memory_id = ?1",
+                        params![memory_id],
+                    )
+                    .map_err(|error| {
+                        LatticeError::Storage(format!(
+                            "Failed to delete automatic capture verification jobs: {error}"
+                        ))
+                    })?;
+                    tx.execute("DELETE FROM memory_links WHERE source_memory_id = ?1 OR target_memory_id = ?1", params![memory_id]).map_err(|error| LatticeError::Storage(format!("Failed to delete automatic capture memory links: {error}")))?;
+                    tx.execute(
+                        &format!("DELETE FROM {MEMORIES_FTS_TABLE} WHERE memory_id = ?1"),
+                        params![memory_id],
+                    )
+                    .map_err(|error| {
+                        LatticeError::Storage(format!(
+                            "Failed to delete automatic capture FTS document: {error}"
+                        ))
+                    })?;
+                }
+                (derived, proposals)
+            }
+        };
         for delivery_key in delivery_keys {
             tx.execute(
                 &format!(
@@ -1061,23 +1864,25 @@ impl MemoryStore {
                 ))
             })?;
         }
-        for memory_id in source_delivery_by_memory.keys() {
-            tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])
-                .map_err(|error| {
-                    LatticeError::Storage(format!(
-                        "Failed to delete automatic capture memory: {error}"
-                    ))
-                })?;
+        if matches!(mode, SessionCaptureDeletionMode::OperatorDeleteKnowledge) {
+            for memory_id in source_delivery_by_memory.keys() {
+                tx.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])
+                    .map_err(|error| {
+                        LatticeError::Storage(format!(
+                            "Failed to delete automatic capture memory: {error}"
+                        ))
+                    })?;
+            }
+            tx.execute(
+                &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 0 WHERE singleton = 1"),
+                [],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to finalize automatic capture deletion FTS state: {error}"
+                ))
+            })?;
         }
-        tx.execute(
-            &format!("UPDATE {MEMORY_FTS_STATE_TABLE} SET is_dirty = 0 WHERE singleton = 1"),
-            [],
-        )
-        .map_err(|error| {
-            LatticeError::Storage(format!(
-                "Failed to finalize automatic capture deletion FTS state: {error}"
-            ))
-        })?;
         tx.commit().map_err(|error| {
             LatticeError::Storage(format!(
                 "Failed to commit automatic capture deletion transaction: {error}"
@@ -1086,10 +1891,48 @@ impl MemoryStore {
 
         Ok(SessionCaptureDeletionResult {
             deleted_capture_ids: delivery_keys.to_vec(),
-            deleted_memory_count: source_delivery_by_memory.len(),
+            deleted_memory_count: if matches!(
+                mode,
+                SessionCaptureDeletionMode::OperatorDeleteKnowledge
+            ) {
+                source_delivery_by_memory.len()
+            } else {
+                0
+            },
             retained_derived_memory_count,
             retained_proposal_count,
         })
+    }
+
+    fn retire_expired_capture_tombstones(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<usize, LatticeError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let replay_cutoff = now.saturating_sub(super::retention::MAX_REPLAY_AGE_SECS as i64);
+        let retired = self
+            .conn
+            .execute(
+                &format!(
+                    "DELETE FROM {SESSION_CAPTURE_TOMBSTONES_TABLE}
+                    WHERE delivery_key IN (
+                        SELECT delivery_key FROM {SESSION_CAPTURE_TOMBSTONES_TABLE}
+                        WHERE deletion_reason = 'retention' AND deleted_at < ?1
+                        ORDER BY deleted_at, delivery_key
+                        LIMIT ?2
+                    )"
+                ),
+                params![replay_cutoff, i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to retire expired capture replay tombstones: {error}"
+                ))
+            })?;
+        Ok(retired)
     }
 
     #[cfg(not(test))]
@@ -1133,23 +1976,143 @@ impl MemoryStore {
         self.query_with_applicable_checkout(keyword, limit, scope, None)
     }
 
-    /// Scope-enforced query for an authority that owns an exact checkout.
-    /// Restricted automatic-capture rows are visible only to that checkout;
-    /// legacy and explicit rows with no applicability restriction remain
-    /// visible under their existing session/branch/repository scope.
-    pub(crate) fn query_for_checkout(
+    /// Apply authority, lifecycle and navigation exclusion before candidate limits.
+    pub fn recall_candidates(
         &self,
         keyword: Option<&str>,
         limit: usize,
         scope: &ScopeFilter,
-        checkout_id: &str,
+        checkout_id: Option<&str>,
+        options: super::retrieval::RecallOptions,
     ) -> Result<Vec<Memory>, LatticeError> {
-        if checkout_id.trim().is_empty() {
-            return Err(LatticeError::Storage(
-                "exact-checkout memory query requires a non-empty checkout identity".to_string(),
-            ));
+        let instruction_budget = recall_vm_instruction_budget()?;
+        self.recall_candidates_with_instruction_budget(
+            keyword,
+            limit,
+            scope,
+            checkout_id,
+            options,
+            instruction_budget,
+        )
+    }
+
+    pub(super) fn recall_candidates_with_instruction_budget(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+        scope: &ScopeFilter,
+        checkout_id: Option<&str>,
+        options: super::retrieval::RecallOptions,
+        instruction_budget: u64,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let keyword = keyword.unwrap_or_default();
+        if keyword.len() > MAX_RECALL_QUERY_BYTES {
+            return Err(LatticeError::Storage(format!(
+                "memory recall query is {} UTF-8 bytes; the maximum is {MAX_RECALL_QUERY_BYTES}",
+                keyword.len()
+            )));
         }
-        self.query_with_applicable_checkout(keyword, limit, scope, Some(checkout_id))
+        if let Some(term) = keyword
+            .split_whitespace()
+            .find(|term| term.len() > MAX_RECALL_TERM_BYTES)
+        {
+            return Err(LatticeError::Storage(format!(
+                "memory recall term is {} UTF-8 bytes; the maximum is {MAX_RECALL_TERM_BYTES}",
+                term.len()
+            )));
+        }
+        let predicate = scope_sql_predicate(scope, checkout_id);
+        let mut values = Vec::new();
+        let mut candidates = Vec::new();
+        let mut seen_terms = HashSet::new();
+        let terms: Vec<String> = keyword
+            .split_whitespace()
+            .map(|term| {
+                term.trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | ';' | '(' | ')'))
+                    .replace('\\', "/")
+                    .to_lowercase()
+            })
+            .filter(|term| recall_exact_term_is_usable(term))
+            .filter(|term| seen_terms.insert(term.clone()))
+            .take(MAX_RECALL_TERM_GROUPS)
+            .collect();
+        if !terms.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(terms.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            for (table, column, rank) in [
+                ("memory_retrieval_paths", "path", 0),
+                ("memory_retrieval_symbols", "symbol", 1),
+                ("memory_retrieval_failures", "failure", 1),
+            ] {
+                candidates.push(format!(
+                    "SELECT memory_id,{rank} AS rank,0 AS lexical_matches FROM {table} WHERE {column} IN ({placeholders})"
+                ));
+                values.extend(terms.iter().cloned().map(Value::Text));
+            }
+        }
+        // Recall accepts natural-language prompts.  Search each sanitized lexical
+        // group separately so one unrelated word cannot hide a relevant lesson;
+        // the grouped query below ranks broader coverage before confidence.
+        let mut seen_fts_groups = HashSet::new();
+        let fts_groups: Vec<String> = keyword
+            .split_whitespace()
+            .filter_map(build_fts_group)
+            .filter(|group| seen_fts_groups.insert(group.clone()))
+            .take(MAX_RECALL_TERM_GROUPS)
+            .collect();
+        for query in fts_groups {
+            candidates.push(format!(
+                "SELECT memory_id,2 AS rank,1 AS lexical_matches FROM {MEMORIES_FTS_TABLE} WHERE {MEMORIES_FTS_TABLE} MATCH ?"
+            ));
+            values.push(Value::Text(query));
+        }
+        if candidates.is_empty() {
+            if !keyword.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            candidates
+                .push("SELECT id AS memory_id,3 AS rank,0 AS lexical_matches FROM memories".into());
+        }
+        values.extend(predicate.bind_values);
+        values.push(Value::Integer(i64::from(options.include_retention_stale)));
+        values.push(Value::Integer(limit.min(4096) as i64));
+        let sql=format!("WITH candidates AS ({})
+            SELECT memories.id,session_id,content,memory_type,scope,confidence,linked_symbols,
+                   linked_files,workspace_id,branch,scope_organization_id,refresh_key,source_query,
+                   created_at,last_accessed,access_count,is_stale,stale_reason,verification_status
+            FROM memories INNER JOIN candidates ON candidates.memory_id=memories.id
+            WHERE is_invalidated=0 AND {} AND (?=1 OR retention_stale=0)
+              AND is_stale=0 AND verification_status NOT IN ('stale','contradicted','superseded','expired','invalidated')
+              AND (refresh_key IS NULL OR (refresh_key != 'repo_playbook' AND refresh_key NOT LIKE 'subsystem_playbook::%'))
+            GROUP BY memories.id
+            ORDER BY min(candidates.rank),
+                     CASE WHEN min(candidates.rank)=2
+                          THEN sum(candidates.lexical_matches)
+                          ELSE 0 END DESC,
+                     confidence DESC,created_at DESC,memories.id LIMIT ?",
+            candidates.join(" UNION ALL "),predicate.where_clause);
+        let progress = RecallProgressBudget::install(&self.conn, instruction_budget);
+        let query = self.query_memories_values(&sql, values, "indexed recall candidates");
+        let was_interrupted = progress.was_interrupted();
+        drop(progress);
+        let rows = match query {
+            Ok(rows) => rows,
+            Err(_) if was_interrupted => {
+                return Err(LatticeError::Storage(format!(
+                    "indexed recall exceeded the bounded SQLite work allowance ({instruction_budget} virtual-machine instructions); narrow the query or reduce broad high-frequency terms"
+                )))
+            }
+            Err(error) => return Err(error),
+        };
+        self.enforce_scope_boundary_with_checkout(
+            rows,
+            scope,
+            checkout_id,
+            "indexed recall candidates",
+        )
     }
 
     fn query_with_applicable_checkout(
@@ -1173,7 +2136,8 @@ impl MemoryStore {
                  FROM memories
                  INNER JOIN {table}
                     ON {table}.memory_id = memories.id
-                 WHERE memories.is_invalidated = 0
+                 WHERE memories.is_invalidated = 0 AND memories.retention_stale=0
+                   AND (refresh_key IS NULL OR (refresh_key != 'repo_playbook' AND refresh_key NOT LIKE 'subsystem_playbook::%'))
                    AND {scope_predicate}
                    AND {table} MATCH ?
                  ORDER BY bm25({table}), memories.created_at DESC
@@ -1190,7 +2154,8 @@ impl MemoryStore {
                         linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
                         created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
                  FROM memories
-                 WHERE is_invalidated = 0
+                 WHERE is_invalidated = 0 AND retention_stale=0
+                   AND (refresh_key IS NULL OR (refresh_key != 'repo_playbook' AND refresh_key NOT LIKE 'subsystem_playbook::%'))
                    AND {}
                  ORDER BY created_at DESC
                  LIMIT ?",
@@ -1225,6 +2190,27 @@ impl MemoryStore {
             return Ok(None);
         };
         if scope_allows(&memory, scope) && self.applicable_checkout_id(id)?.is_none() {
+            return Ok(Some(memory));
+        }
+        self.record_scope_filtered(&memory, scope)?;
+        Ok(None)
+    }
+
+    /// Read a memory through both its visibility scope and its captured
+    /// checkout applicability. Callers must supply a trusted checkout ID.
+    pub fn get_by_id_scoped_for_checkout(
+        &self,
+        id: &str,
+        scope: &ScopeFilter,
+        checkout_id: &str,
+    ) -> Result<Option<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let Some(memory) = self.get_by_id(id)? else {
+            return Ok(None);
+        };
+        if scope_allows(&memory, scope)
+            && self.checkout_applicability_allows(id, Some(checkout_id))?
+        {
             return Ok(Some(memory));
         }
         self.record_scope_filtered(&memory, scope)?;
@@ -1719,6 +2705,25 @@ impl MemoryStore {
         )
     }
 
+    pub fn list_applicable_workspace_memories(
+        &self,
+        repository_id: &str,
+        checkout_id: &str,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        self.query_memories(
+            "SELECT id, session_id, content, memory_type, scope, confidence, linked_symbols,
+                    linked_files, workspace_id, branch, scope_organization_id, refresh_key, source_query,
+                    created_at, last_accessed, access_count, is_stale, stale_reason, verification_status
+             FROM memories
+             WHERE is_invalidated = 0
+               AND workspace_id = ?1
+               AND (applicable_checkout_id IS NULL OR applicable_checkout_id = ?2)
+             ORDER BY created_at DESC",
+            params![repository_id, checkout_id],
+            "checkout-applicable workspace memories",
+        )
+    }
+
     pub fn list_memories_expired_before(
         &self,
         workspace_id: &str,
@@ -1802,6 +2807,23 @@ impl MemoryStore {
         inclusion_reason: &str,
         was_used: Option<bool>,
     ) -> Result<(), LatticeError> {
+        let journal_owned: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_attribution_accesses WHERE access_id=?1)",
+                [access_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to inspect attribution-owned memory access: {e}"
+                ))
+            })?;
+        if journal_owned {
+            return Err(LatticeError::Storage(format!(
+                "Memory access `{access_id}` is owned by the attribution journal and cannot be replaced"
+            )));
+        }
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO memory_accesses
@@ -2449,60 +3471,6 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Decay confidence of memories that haven't been accessed recently.
-    /// Reduces confidence by `decay_rate` for each memory not accessed in `stale_days` days.
-    pub fn decay_old_memories(
-        &self,
-        stale_days: u64,
-        decay_rate: f64,
-    ) -> Result<usize, LatticeError> {
-        let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
-        let count = self
-            .conn
-            .execute(
-                "UPDATE memories SET confidence = MAX(0.1, confidence - ?1)
-                 WHERE last_accessed < ?2 AND is_invalidated = 0 AND confidence > 0.1",
-                params![decay_rate, cutoff as i64],
-            )
-            .map_err(|e| LatticeError::Storage(format!("Failed to decay memories: {}", e)))?;
-        Ok(count)
-    }
-
-    /// Prune (archive) memories with low confidence that haven't been accessed in N days.
-    pub fn prune_old_memories(
-        &self,
-        min_confidence: f64,
-        stale_days: u64,
-    ) -> Result<usize, LatticeError> {
-        let cutoff = now_epoch_secs().saturating_sub(stale_days * 86400);
-        self.set_fts_dirty(true)?;
-        self.conn
-            .execute(
-                &format!(
-                    "DELETE FROM {table}
-                     WHERE memory_id IN (
-                         SELECT id FROM memories
-                         WHERE confidence < ?1 AND last_accessed < ?2 AND is_invalidated = 0
-                     )",
-                    table = MEMORIES_FTS_TABLE,
-                ),
-                params![min_confidence, cutoff as i64],
-            )
-            .map_err(|e| {
-                LatticeError::Storage(format!("Failed to prune memory FTS entries: {}", e))
-            })?;
-        let count = self
-            .conn
-            .execute(
-                "UPDATE memories SET is_invalidated = 1
-                 WHERE confidence < ?1 AND last_accessed < ?2 AND is_invalidated = 0",
-                params![min_confidence, cutoff as i64],
-            )
-            .map_err(|e| LatticeError::Storage(format!("Failed to prune memories: {}", e)))?;
-        self.set_fts_dirty(false)?;
-        Ok(count)
-    }
-
     /// Update last_accessed timestamp when a memory is retrieved.
     pub fn touch_memory(&self, id: &str) -> Result<(), LatticeError> {
         self.conn
@@ -2705,6 +3673,38 @@ impl MemoryStore {
             params![limit as i64],
             "list stale memories",
         )
+    }
+
+    /// Authority-scoped lifecycle inspection. Both evidence-stale and
+    /// retention-stale rows are discoverable, with authority applied before
+    /// the caller's result bound.
+    pub fn list_stale_scoped(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        scope: &ScopeFilter,
+    ) -> Result<Vec<Memory>, LatticeError> {
+        scope.validate().map_err(scope_filter_error)?;
+        let predicate = scope_sql_predicate(scope, None);
+        let mut values = predicate.bind_values;
+        let mut sql = format!(
+            "SELECT memories.id,session_id,content,memory_type,scope,confidence,linked_symbols,
+                    linked_files,workspace_id,branch,scope_organization_id,refresh_key,source_query,
+                    created_at,last_accessed,access_count,is_stale,stale_reason,verification_status
+             FROM memories WHERE is_invalidated=0 AND ({})
+               AND (is_stale=1 OR retention_stale=1)",
+            predicate.where_clause
+        );
+        if let Some(fts_query) = build_fts_query(query.unwrap_or_default()) {
+            sql.push_str(&format!(
+                " AND id IN (SELECT memory_id FROM {MEMORIES_FTS_TABLE} WHERE {MEMORIES_FTS_TABLE} MATCH ?)"
+            ));
+            values.push(Value::Text(fts_query));
+        }
+        sql.push_str(" ORDER BY created_at DESC,id LIMIT ?");
+        values.push(Value::Integer(limit.min(4096) as i64));
+        let rows = self.query_memories_values(&sql, values, "list scoped stale memories")?;
+        self.enforce_scope_boundary(rows, scope, "list scoped stale memories")
     }
 
     fn resolve_structured_fields_for_store(
@@ -3015,9 +4015,7 @@ impl MemoryStore {
                  INSERT OR IGNORE INTO {MEMORY_FTS_STATE_TABLE} (singleton, is_dirty)
                  VALUES (1, 1);"
             ))
-            .map_err(|error| {
-                LatticeError::Storage(format!("Failed to initialize memory FTS state: {error}"))
-            })
+            .map_err(|error| classify_sqlite_error("initialize memory FTS state", error))
     }
 
     fn rebuild_fts_if_dirty(&self) -> Result<(), LatticeError> {
@@ -3615,6 +4613,16 @@ fn retain_proposal_tombstone_provenance(
         if referenced.is_empty() {
             continue;
         }
+
+        tx.execute(
+            "DELETE FROM consolidation_event_outbox WHERE proposal_id=?1",
+            [&proposal_id],
+        )
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to delete tombstoned proposal event outbox: {error}"
+            ))
+        })?;
 
         scrub_capture_memory_snapshots(&mut prior, source_memory_ids);
         scrub_capture_memory_snapshots(&mut proposed, source_memory_ids);
@@ -4380,6 +5388,38 @@ fn build_fts_query(keyword: &str) -> Option<String> {
     }
 }
 
+fn recall_exact_term_is_usable(term: &str) -> bool {
+    term.len() <= MAX_RECALL_TERM_BYTES && term.chars().any(|character| character.is_alphanumeric())
+}
+
+fn recall_vm_instruction_budget() -> Result<u64, LatticeError> {
+    parse_recall_vm_instruction_budget(std::env::var_os(RECALL_VM_BUDGET_ENV))
+}
+
+pub(super) fn parse_recall_vm_instruction_budget(
+    raw: Option<OsString>,
+) -> Result<u64, LatticeError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_RECALL_VM_INSTRUCTIONS);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        LatticeError::Storage(format!(
+            "{RECALL_VM_BUDGET_ENV} must contain a UTF-8 positive integer"
+        ))
+    })?;
+    let value = raw.parse::<u64>().map_err(|_| {
+        LatticeError::Storage(format!(
+            "{RECALL_VM_BUDGET_ENV} must be a positive integer no greater than {MAX_RECALL_VM_INSTRUCTIONS}"
+        ))
+    })?;
+    if value == 0 || value > MAX_RECALL_VM_INSTRUCTIONS {
+        return Err(LatticeError::Storage(format!(
+            "{RECALL_VM_BUDGET_ENV} must be between 1 and {MAX_RECALL_VM_INSTRUCTIONS}"
+        )));
+    }
+    Ok(value)
+}
+
 fn build_fts_group(raw: &str) -> Option<String> {
     let variants = expand_search_terms(raw);
     if variants.is_empty() {
@@ -4614,24 +5654,762 @@ fn now_epoch_secs() -> u64 {
 
 fn configure_connection(conn: &Connection, enable_wal: bool) -> Result<(), LatticeError> {
     conn.busy_timeout(Duration::from_secs(MEMORY_DB_BUSY_TIMEOUT_SECS))
-        .map_err(|e| LatticeError::Storage(format!("Failed to set busy timeout: {}", e)))?;
+        .map_err(|e| classify_sqlite_error("set memory busy timeout", e))?;
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .map_err(|e| classify_sqlite_error("set memory incremental auto-vacuum", e))?;
 
     if enable_wal {
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
+            .map_err(|e| classify_sqlite_error("set memory WAL mode", e))?;
         conn.pragma_update(None, "wal_autocheckpoint", MEMORY_DB_AUTO_CHECKPOINT_PAGES)
-            .map_err(|e| {
-                LatticeError::Storage(format!("Failed to set WAL auto-checkpoint: {}", e))
-            })?;
+            .map_err(|e| classify_sqlite_error("set memory WAL auto-checkpoint", e))?;
         conn.pragma_update(
             None,
             "journal_size_limit",
             MEMORY_DB_JOURNAL_SIZE_LIMIT_BYTES,
         )
-        .map_err(|e| LatticeError::Storage(format!("Failed to set journal size limit: {}", e)))?;
+        .map_err(|e| classify_sqlite_error("set memory journal size limit", e))?;
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(|e| LatticeError::Storage(format!("Failed to checkpoint WAL: {}", e)))?;
+            .map_err(|e| classify_sqlite_error("checkpoint memory WAL", e))?;
     }
 
     Ok(())
+}
+
+fn validate_supported_schema(conn: &Connection) -> Result<(), LatticeError> {
+    let has_migrations: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_schema_migrations')",
+        [], |row| row.get(0),
+    ).map_err(|e| classify_sqlite_error("inspect memory schema", e))?;
+    if !has_migrations {
+        return Ok(());
+    }
+    let version: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(version) FROM memory_schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| classify_sqlite_error("read memory schema version", e))?;
+    if version.unwrap_or(0) > MAX_MEMORY_SCHEMA_VERSION {
+        return Err(LatticeError::UnsupportedMemorySchema(format!(
+            "database version {} is newer than supported version {}",
+            version.unwrap_or(0),
+            MAX_MEMORY_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
+}
+
+fn classify_sqlite_error(operation: &str, error: rusqlite::Error) -> LatticeError {
+    use rusqlite::ErrorCode;
+    let detail = format!("{operation}: {error}");
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
+            LatticeError::MemoryStorageBusy(detail)
+        }
+        Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly | ErrorCode::CannotOpen) => {
+            LatticeError::MemoryStorageAccessDenied(detail)
+        }
+        Some(ErrorCode::DiskFull) => LatticeError::MemoryStorageFull(detail),
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => {
+            LatticeError::CorruptMemoryStorage(detail)
+        }
+        _ => LatticeError::Storage(detail),
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_store_is_queryable_but_rejects_acknowledged_writes() {
+        let store = MemoryStore::unavailable(
+            Path::new("/unavailable/memories.db"),
+            MemoryStoreFailureKind::AccessDenied,
+            "injected denial",
+        )
+        .unwrap();
+        assert!(!store.is_persistent_available());
+        assert!(store.list_all().unwrap().is_empty());
+        assert!(store
+            .enqueue_verification_job("workspace", "memory")
+            .is_err());
+        let direct = store.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO memories (id, content, memory_type) VALUES ('direct', 'x', 'fact')",
+                [],
+            )
+            .map_err(|error| classify_sqlite_error("direct unavailable write", error))?;
+            Ok(())
+        });
+        assert!(
+            direct.is_err(),
+            "query_only must cover direct connection writes"
+        );
+        assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_without_changing_the_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("memories.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE memory_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL); INSERT INTO memory_schema_migrations VALUES (999, 'future', 1);").unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        let error = MemoryStore::open(&path)
+            .err()
+            .expect("future schema must fail closed");
+        assert!(matches!(error, LatticeError::UnsupportedMemorySchema(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn corrupt_artifact_is_typed_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("memories.db");
+        let bytes = b"not a sqlite database";
+        std::fs::write(&path, bytes).unwrap();
+        let error = MemoryStore::open(&path)
+            .err()
+            .expect("corrupt store must fail closed");
+        assert!(matches!(error, LatticeError::CorruptMemoryStorage(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+    }
+
+    #[test]
+    fn sqlite_full_is_returned_as_typed_memory_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = Connection::open(root.path().join("bounded.db")).unwrap();
+        conn.execute_batch("CREATE TABLE bounded (payload BLOB NOT NULL);")
+            .unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        conn.pragma_update(None, "max_page_count", pages).unwrap();
+        let sqlite_error = conn
+            .execute("INSERT INTO bounded VALUES (zeroblob(1048576))", [])
+            .err()
+            .expect("max_page_count must inject SQLITE_FULL");
+        let error = classify_sqlite_error("injected full write", sqlite_error);
+        assert!(matches!(error, LatticeError::MemoryStorageFull(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_database_open_is_typed_and_preserves_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("memories.db");
+        drop(MemoryStore::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let result = MemoryStore::open(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result
+            .err()
+            .expect("read-only store must fail opening WAL mode");
+        assert!(
+            matches!(error, LatticeError::MemoryStorageAccessDenied(_)),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn trusted_check_observations_are_scoped_bounded_and_cascade_with_memory() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('m','claim','observation','repo',1,1)",[])
+                .map_err(|error| LatticeError::Storage(error.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let target_digest = store.verification_target_digest("m", "repo").unwrap();
+        for observed_at in 0..70 {
+            store
+                .record_trusted_check_observation(&TrustedCheckObservationRecord {
+                    observation_id: None,
+                    memory_id: "m".into(),
+                    repository_id: "repo".into(),
+                    checkout_id: "checkout".into(),
+                    check_id: "unit".into(),
+                    evidence_reference: Some("test:unit".into()),
+                    passed: observed_at % 2 == 0,
+                    revision: Some("abc".into()),
+                    graph_generation: 7,
+                    source_fingerprint: [observed_at as u8; 32],
+                    target_digest,
+                    observed_at,
+                    exit_code: Some(0),
+                })
+                .unwrap();
+        }
+        let records = store.trusted_check_observations("m").unwrap();
+        assert_eq!(records.len(), 64);
+        assert_eq!(records[0].observed_at, 69);
+        assert_eq!(records.last().unwrap().observed_at, 6);
+        let wrong = TrustedCheckObservationRecord {
+            repository_id: "other".into(),
+            ..records[0].clone()
+        };
+        assert!(store.record_trusted_check_observation(&wrong).is_err());
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute("DELETE FROM memories WHERE id='m'", [])
+                    .map_err(|error| LatticeError::Storage(error.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.trusted_check_observations("m").unwrap().is_empty());
+    }
+
+    #[test]
+    fn verification_result_rolls_back_structured_fields_when_status_write_fails() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('atomic','claim','observation','repo',1,1)",[])
+                .map_err(|error| LatticeError::Storage(error.to_string()))?;
+            connection.execute_batch("CREATE TRIGGER reject_verification_status BEFORE UPDATE OF is_stale ON memories BEGIN SELECT RAISE(ABORT,'injected status failure'); END;")
+                .map_err(|error| LatticeError::Storage(error.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let before = store.get_structured_fields("atomic").unwrap().unwrap();
+        let mut proposed = before.clone();
+        proposed.confidence_reason = Some("must roll back".into());
+        proposed.verification_status = MemoryVerificationStatus::Verified;
+        let binding = VerificationCommitBinding {
+            repository_id: "repo".into(),
+            checkout_id: "checkout-main".into(),
+            branch: "main".into(),
+            target_digest: store.verification_target_digest("atomic", "repo").unwrap(),
+            observations: Vec::new(),
+        };
+        assert!(store
+            .persist_verification_result(
+                "atomic",
+                &proposed,
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                2,
+                Some(3),
+                &binding,
+            )
+            .is_err());
+        let after = store.get_structured_fields("atomic").unwrap().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            store
+                .get_by_id("atomic")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+    }
+
+    #[test]
+    fn corrupt_fingerprint_fails_closed_even_alongside_valid_observation() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('corrupt','claim','observation','repo',1,1)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            connection.execute("INSERT INTO trusted_check_observations(memory_id,repository_id,checkout_id,check_id,evidence_reference,passed,graph_generation,source_fingerprint,target_digest,observed_at) VALUES('corrupt','repo','checkout','valid','test',1,1,zeroblob(32),zeroblob(32),1)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            connection.execute("PRAGMA ignore_check_constraints=ON",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            connection.execute("INSERT INTO trusted_check_observations(memory_id,repository_id,checkout_id,check_id,evidence_reference,passed,graph_generation,source_fingerprint,target_digest,observed_at) VALUES('corrupt','repo','checkout','bad','test',0,1,zeroblob(3),zeroblob(32),2)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            Ok(())
+        }).unwrap();
+        assert!(store.trusted_check_observations("corrupt").is_err());
+    }
+
+    #[test]
+    fn verification_target_digest_tracks_claim_inputs_but_not_verification_outputs() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('digest','claim','observation','repo',1,1)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let original = store.verification_target_digest("digest", "repo").unwrap();
+        store
+            .set_verification_state(
+                "digest",
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                99,
+                Some(7),
+            )
+            .unwrap();
+        assert_eq!(
+            store.verification_target_digest("digest", "repo").unwrap(),
+            original
+        );
+        let mut fields = store.get_structured_fields("digest").unwrap().unwrap();
+        fields.provenance.push(MemoryProvenance {
+            source: "test".into(),
+            reference: Some("changed".into()),
+            captured_at: Some(1),
+            note: None,
+        });
+        store.update_structured_fields("digest", &fields).unwrap();
+        assert_ne!(
+            store.verification_target_digest("digest", "repo").unwrap(),
+            original
+        );
+        let after_provenance = store.verification_target_digest("digest", "repo").unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET last_accessed=88,access_count=12 WHERE id='digest'",
+                        [],
+                    )
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.verification_target_digest("digest", "repo").unwrap(),
+            after_provenance
+        );
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET content='replacement' WHERE id='digest'",
+                        [],
+                    )
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+        assert_ne!(
+            store.verification_target_digest("digest", "repo").unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn expansion_delivery_atomically_checks_authority_lifecycle_and_snapshot() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,session_id,content,memory_type,scope,workspace_id,branch,created_at,last_accessed,applicable_checkout_id) VALUES('expand','session-a','complete lesson','observation','branch','repo','feature',1,1,'checkout-a')",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let memory = store.get_by_id("expand").unwrap().unwrap();
+        let fields = store.get_structured_fields("expand").unwrap().unwrap();
+        let digest = MemoryStore::expansion_delivery_digest_for(&memory, &fields, "repo").unwrap();
+        let binding = crate::memory::retention::DeliveryBinding {
+            delivery_id: "expand-delivery",
+            repository_id: "repository:repo",
+            session_id: "session-a",
+            payload_hash: "sha256:expansion",
+        };
+        store
+            .attempt_expansion_memory_delivery(
+                &binding,
+                "expand",
+                digest,
+                Some("repo"),
+                Some("checkout-a"),
+                Some("feature"),
+                "session-a",
+                None,
+                10,
+            )
+            .unwrap();
+
+        let grouped = crate::memory::retention::DeliveryBinding {
+            delivery_id: "grouped-rollback",
+            ..binding.clone()
+        };
+        assert!(store
+            .attempt_expansion_memories_delivery(
+                &grouped,
+                &[
+                    ("expand".to_string(), digest),
+                    ("expand".to_string(), [0; 32])
+                ],
+                Some("repo"),
+                Some("checkout-a"),
+                Some("feature"),
+                "session-a",
+                None,
+                10,
+            )
+            .is_err());
+        store.with_connection(|connection| {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_deliveries WHERE delivery_id='grouped-rollback')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            assert!(!exists);
+            Ok(())
+        }).unwrap();
+
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET content='changed' WHERE id='expand'",
+                        [],
+                    )
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+        let changed = crate::memory::retention::DeliveryBinding {
+            delivery_id: "changed-delivery",
+            ..binding.clone()
+        };
+        assert!(store
+            .attempt_expansion_memory_delivery(
+                &changed,
+                "expand",
+                digest,
+                Some("repo"),
+                Some("checkout-a"),
+                Some("feature"),
+                "session-a",
+                None,
+                11,
+            )
+            .is_err());
+        store.with_connection(|connection| {
+            connection.execute("UPDATE memories SET content='complete lesson',verification_status='verified' WHERE id='expand'",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let trust_changed = crate::memory::retention::DeliveryBinding {
+            delivery_id: "trust-changed-delivery",
+            ..binding.clone()
+        };
+        assert!(store
+            .attempt_expansion_memory_delivery(
+                &trust_changed,
+                "expand",
+                digest,
+                Some("repo"),
+                Some("checkout-a"),
+                Some("feature"),
+                "session-a",
+                None,
+                12,
+            )
+            .is_err());
+        store.with_connection(|connection| {
+            connection.execute("UPDATE memories SET verification_status='unverified',retention_stale=1 WHERE id='expand'",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            let count:i64=connection.query_row("SELECT COUNT(*) FROM memory_deliveries",[],|row|row.get(0)).map_err(|e|LatticeError::Storage(e.to_string()))?;
+            assert_eq!(count,1);
+            Ok(())
+        }).unwrap();
+        let stale = crate::memory::retention::DeliveryBinding {
+            delivery_id: "stale-delivery",
+            ..binding
+        };
+        assert!(store
+            .attempt_expansion_memory_delivery(
+                &stale,
+                "expand",
+                digest,
+                Some("repo"),
+                Some("checkout-a"),
+                Some("feature"),
+                "session-a",
+                None,
+                13,
+            )
+            .is_err());
+        store
+            .with_connection(|connection| {
+                let count: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM memory_deliveries", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn independent_connection_mutation_rejects_observation_and_status_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memories.db");
+        let primary = MemoryStore::open(&path).unwrap();
+        let concurrent = MemoryStore::open(&path).unwrap();
+        primary.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('cas','original','observation','repo',1,1)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?; Ok(())
+        }).unwrap();
+        let digest = primary.verification_target_digest("cas", "repo").unwrap();
+        let loaded_memory = primary.get_by_id("cas").unwrap().unwrap();
+        let loaded_fields = primary.get_structured_fields("cas").unwrap().unwrap();
+        let record = TrustedCheckObservationRecord {
+            observation_id: None,
+            memory_id: "cas".into(),
+            repository_id: "repo".into(),
+            checkout_id: "checkout".into(),
+            check_id: "check".into(),
+            evidence_reference: Some("test".into()),
+            passed: true,
+            revision: Some("abc".into()),
+            graph_generation: 1,
+            source_fingerprint: [1; 32],
+            target_digest: digest,
+            observed_at: 1,
+            exit_code: Some(0),
+        };
+        concurrent
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET content='replacement' WHERE id='cas'",
+                        [],
+                    )
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+        let loaded_digest =
+            MemoryStore::verification_target_digest_for(&loaded_memory, &loaded_fields, "repo")
+                .unwrap();
+        assert_eq!(loaded_digest, digest);
+        assert_ne!(
+            loaded_digest,
+            primary.verification_target_digest("cas", "repo").unwrap()
+        );
+        assert!(primary.record_trusted_check_observation(&record).is_err());
+        assert!(primary
+            .trusted_check_observations("cas")
+            .unwrap()
+            .is_empty());
+
+        let fields = primary.get_structured_fields("cas").unwrap().unwrap();
+        let binding = VerificationCommitBinding {
+            repository_id: "repo".into(),
+            checkout_id: "checkout-main".into(),
+            branch: "main".into(),
+            target_digest: loaded_digest,
+            observations: Vec::new(),
+        };
+        assert!(primary
+            .persist_verification_result(
+                "cas",
+                &fields,
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                2,
+                Some(1),
+                &binding
+            )
+            .is_err());
+        assert_eq!(
+            primary
+                .get_by_id("cas")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        let current_digest = primary.verification_target_digest("cas", "repo").unwrap();
+        let empty_binding = VerificationCommitBinding {
+            repository_id: "repo".into(),
+            checkout_id: "checkout-main".into(),
+            branch: "main".into(),
+            target_digest: current_digest,
+            observations: Vec::new(),
+        };
+        let mut newer_failure = record.clone();
+        newer_failure.target_digest = current_digest;
+        newer_failure.passed = false;
+        newer_failure.observed_at = 2;
+        concurrent
+            .record_trusted_check_observation(&newer_failure)
+            .unwrap();
+        assert!(primary
+            .persist_verification_result(
+                "cas",
+                &fields,
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                3,
+                Some(1),
+                &empty_binding
+            )
+            .is_err());
+        assert_eq!(
+            primary
+                .get_by_id("cas")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+    }
+
+    #[test]
+    fn verification_commit_failure_rolls_back_and_releases_file_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memories.db");
+        let store = MemoryStore::open(&path).unwrap();
+        store.with_connection(|connection| {
+            connection.execute("INSERT INTO memories(id,content,memory_type,workspace_id,created_at,last_accessed) VALUES('commit-failure','claim','observation','repo',1,1)",[]).map_err(|e| LatticeError::Storage(e.to_string()))?;
+            Ok(())
+        }).unwrap();
+        let fields = store
+            .get_structured_fields("commit-failure")
+            .unwrap()
+            .unwrap();
+        let binding = VerificationCommitBinding {
+            repository_id: "repo".into(),
+            checkout_id: "checkout-main".into(),
+            branch: "main".into(),
+            target_digest: store
+                .verification_target_digest("commit-failure", "repo")
+                .unwrap(),
+            observations: Vec::new(),
+        };
+
+        store
+            .fail_verification_commit_once
+            .store(true, Ordering::SeqCst);
+        assert!(store
+            .persist_verification_result(
+                "commit-failure",
+                &fields,
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                2,
+                Some(1),
+                &binding,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .get_by_id("commit-failure")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        let reopened = MemoryStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_by_id("commit-failure")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Unverified
+        );
+        store
+            .persist_verification_result(
+                "commit-failure",
+                &fields,
+                MemoryVerificationStatus::Verified,
+                false,
+                None,
+                3,
+                Some(1),
+                &binding,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_by_id("commit-failure")
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            MemoryVerificationStatus::Verified
+        );
+    }
+
+    #[test]
+    fn capture_transport_and_tombstone_retirement_are_page_bounded() {
+        fn count(store: &MemoryStore, table: &str) -> i64 {
+            store
+                .with_connection(|connection| {
+                    connection
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .map_err(|error| LatticeError::Storage(error.to_string()))
+                })
+                .unwrap()
+        }
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .with_connection(|connection| {
+                let tx = connection.unchecked_transaction().unwrap();
+                for ordinal in 0..300 {
+                    tx.execute(
+                        "INSERT INTO session_digest_deliveries(delivery_key,repository_id,checkout_id,session_id,revision,segment,schema_version,payload_hash,extractor_version,normalized_fingerprint,candidate_count,committed_count,dropped_observation_count,created_at) VALUES(?1,'repo','checkout','session','revision',0,1,'hash','extractor','fingerprint',0,0,0,1)",
+                        params![format!("delivery-{ordinal:03}")],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let policy = SessionCaptureRetentionPolicy::new(Duration::from_secs(1), 1).unwrap();
+        let first = store.prune_session_captures("repo", policy, 10).unwrap();
+        assert_eq!(first.deleted_capture_ids.len(), 256);
+        assert_eq!(count(&store, SESSION_DIGEST_DELIVERIES_TABLE), 44);
+        let second = store.prune_session_captures("repo", policy, 10).unwrap();
+        assert_eq!(second.deleted_capture_ids.len(), 44);
+        assert_eq!(count(&store, SESSION_DIGEST_DELIVERIES_TABLE), 0);
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 300);
+
+        store
+            .with_connection(|connection| {
+                let tx = connection.unchecked_transaction().unwrap();
+                for ordinal in 0..300 {
+                    tx.execute(
+                        "INSERT INTO session_digest_deliveries(delivery_key,repository_id,checkout_id,session_id,revision,segment,schema_version,payload_hash,extractor_version,normalized_fingerprint,candidate_count,committed_count,dropped_observation_count,created_at) VALUES(?1,'repo','checkout','session','revision',0,1,'hash','extractor','fingerprint',0,0,0,1)",
+                        params![format!("second-delivery-{ordinal:03}")],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let after_replay_window = 11 + crate::memory::retention::MAX_REPLAY_AGE_SECS as i64;
+        store
+            .prune_session_captures("repo", policy, after_replay_window)
+            .unwrap();
+        assert_eq!(count(&store, SESSION_DIGEST_DELIVERIES_TABLE), 172);
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 300);
+        store
+            .prune_session_captures("repo", policy, after_replay_window)
+            .unwrap();
+        assert_eq!(count(&store, SESSION_DIGEST_DELIVERIES_TABLE), 44);
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 300);
+        store
+            .prune_session_captures("repo", policy, after_replay_window)
+            .unwrap();
+        assert_eq!(count(&store, SESSION_DIGEST_DELIVERIES_TABLE), 0);
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 300);
+        let after_second_replay_window =
+            after_replay_window + crate::memory::retention::MAX_REPLAY_AGE_SECS as i64 + 1;
+        store
+            .prune_session_captures("repo", policy, after_second_replay_window)
+            .unwrap();
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 44);
+        store
+            .prune_session_captures("repo", policy, after_second_replay_window)
+            .unwrap();
+        assert_eq!(count(&store, SESSION_CAPTURE_TOMBSTONES_TABLE), 0);
+    }
 }

@@ -14,7 +14,10 @@ use super::session_digest::{
     extract_default_session_digest_candidates, SessionDigest, SessionDigestCandidate,
     SESSION_DIGEST_EXTRACTOR_VERSION,
 };
-use super::{Memory, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryVerificationStatus};
+use super::{
+    Memory, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryVerificationStatus,
+    RecallOptions,
+};
 use crate::error::LatticeError;
 use crate::events::BranchRef;
 use crate::verification::ScopeFilter;
@@ -162,6 +165,7 @@ pub struct MemoryRecallResult {
     pub origin_verification_status: MemoryVerificationStatus,
     pub effective_verification_status: MemoryVerificationStatus,
     pub trust_reason: String,
+    pub retention_stale: bool,
 }
 
 /// Durable outcome of one repository-owned automatic session capture batch.
@@ -291,6 +295,7 @@ impl<'a> MemoryStoreRouter<'a> {
         digest: &SessionDigest,
         candidates: &[SessionDigestCandidate],
     ) -> Result<SessionDigestCaptureResult, LatticeError> {
+        require_writable(self.repository_store)?;
         if digest.repository_id != self.authority.repository_id
             || digest.session_id != self.authority.session_id
             || digest.checkout_id.as_deref() != Some(self.authority.checkout_id.as_str())
@@ -348,6 +353,7 @@ impl<'a> MemoryStoreRouter<'a> {
         policy: SessionCaptureRetentionPolicy,
         now: crate::DateTime<crate::Utc>,
     ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        require_writable(self.repository_store)?;
         self.repository_store.prune_session_captures(
             &self.authority.repository_id,
             policy,
@@ -363,6 +369,7 @@ impl<'a> MemoryStoreRouter<'a> {
         selector: &SessionCaptureSelector,
         deleted_at: crate::DateTime<crate::Utc>,
     ) -> Result<SessionCaptureDeletionResult, LatticeError> {
+        require_writable(self.repository_store)?;
         if selector.repository_id() != self.authority.repository_id {
             self.audit_denial(
                 "delete session captures",
@@ -387,30 +394,55 @@ impl<'a> MemoryStoreRouter<'a> {
         keyword: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryRecallResult>, LatticeError> {
+        self.recall_with_options(keyword, limit, RecallOptions::default())
+    }
+
+    /// Merged recall with an explicit lifecycle inspection option. Normal
+    /// assistant delivery never includes retention-stale records.
+    pub fn recall_with_options(
+        &self,
+        keyword: Option<&str>,
+        limit: usize,
+        options: RecallOptions,
+    ) -> Result<Vec<MemoryRecallResult>, LatticeError> {
         let limit = limit.max(1);
         let oversample = limit.saturating_mul(2).clamp(8, 64);
-        let repository = self.repository_store.query_for_checkout(
+        let repository = self.repository_store.recall_candidates(
             keyword,
             oversample,
             &self.authority.repository_scope_filter(),
-            &self.authority.checkout_id,
+            Some(&self.authority.checkout_id),
+            options,
         )?;
+        let repository_retention = retention_stale(&self.repository_store, &repository)?;
         let mut ranked = repository
             .into_iter()
             .enumerate()
             .map(|(query_rank, memory)| {
-                self.normalize(memory, MemoryRecallTier::Repository, query_rank)
+                let retention_stale = repository_retention
+                    .get(&memory.id)
+                    .copied()
+                    .unwrap_or(false);
+                self.normalize(
+                    memory,
+                    MemoryRecallTier::Repository,
+                    query_rank,
+                    retention_stale,
+                )
             })
             .collect::<Vec<_>>();
 
         if let (Some(organization_id), Some(shared_store)) =
             (self.authority.organization_id.as_deref(), self.shared_store)
         {
-            let shared = shared_store.query(
+            let shared = shared_store.recall_candidates(
                 keyword,
                 oversample,
                 &self.authority.organization_scope_filter(organization_id),
+                None,
+                options,
             )?;
+            let shared_retention = retention_stale(shared_store, &shared)?;
             ranked.extend(
                 shared
                     .into_iter()
@@ -421,12 +453,22 @@ impl<'a> MemoryStoreRouter<'a> {
                     .filter(recall_eligible)
                     .enumerate()
                     .map(|(query_rank, memory)| {
-                        self.normalize(memory, MemoryRecallTier::Organization, query_rank)
+                        let retention_stale =
+                            shared_retention.get(&memory.id).copied().unwrap_or(false);
+                        self.normalize(
+                            memory,
+                            MemoryRecallTier::Organization,
+                            query_rank,
+                            retention_stale,
+                        )
                     }),
             );
         }
 
-        ranked.retain(|ranked| recall_eligible(&ranked.result.memory));
+        ranked.retain(|ranked| {
+            recall_eligible(&ranked.result.memory)
+                && (options.include_retention_stale || !ranked.result.retention_stale)
+        });
 
         ranked.sort_by(|left, right| recall_order(left, right));
         ranked.dedup_by(|left, right| left.result.memory_id == right.result.memory_id);
@@ -467,7 +509,13 @@ impl<'a> MemoryStoreRouter<'a> {
         Ok(migrated)
     }
 
-    fn normalize(&self, memory: Memory, tier: MemoryRecallTier, query_rank: usize) -> RankedRecall {
+    fn normalize(
+        &self,
+        memory: Memory,
+        tier: MemoryRecallTier,
+        query_rank: usize,
+        retention_stale: bool,
+    ) -> RankedRecall {
         let authority = match tier {
             MemoryRecallTier::Repository => {
                 MemoryAuthority::Repository(self.authority.repository_id.clone())
@@ -509,6 +557,7 @@ impl<'a> MemoryStoreRouter<'a> {
                 origin_verification_status,
                 effective_verification_status,
                 trust_reason,
+                retention_stale,
             },
         }
     }
@@ -536,6 +585,18 @@ impl<'a> MemoryStoreRouter<'a> {
             Ok(())
         })
     }
+}
+
+fn retention_stale(
+    store: &MemoryStore,
+    memories: &[Memory],
+) -> Result<std::collections::BTreeMap<String, bool>, LatticeError> {
+    store.with_connection(|conn| {
+        super::retrieval::retention_stale_by_id(
+            conn,
+            memories.iter().map(|memory| memory.id.clone()),
+        )
+    })
 }
 
 struct RankedRecall {
@@ -644,6 +705,14 @@ fn assertion_key(memory: &Memory) -> String {
 }
 
 fn ensure_store_role(store: &MemoryStore, role: &MemoryStoreRole) -> Result<(), LatticeError> {
+    if matches!(
+        store.availability(),
+        super::store::MemoryStoreAvailability::Unavailable { .. }
+    ) {
+        // Empty disabled stores carry no authority; trusted daemon configuration
+        // still binds this router. Reads can degrade without schema writes.
+        return Ok(());
+    }
     store.with_connection(|conn| {
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {STORE_ROLE_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
@@ -735,6 +804,22 @@ mod tests {
     use crate::DateTime;
     use std::time::Duration;
 
+    #[test]
+    fn unavailable_store_keeps_scoped_reads_available_and_rejects_durable_writes() {
+        let store = MemoryStore::unavailable(
+            std::path::Path::new("/unavailable/memories.db"),
+            super::super::store::MemoryStoreFailureKind::Busy,
+            "busy fixture",
+        )
+        .unwrap();
+        let router = MemoryStoreRouter::new(&store, None, authority("repo-a", None)).unwrap();
+        assert!(router.recall(Some("lesson"), 10).unwrap().is_empty());
+        let error = router
+            .remember(memory(MemoryScope::Repo, None, "lesson"), &fields(), None)
+            .unwrap_err();
+        assert!(matches!(error, LatticeError::MemoryStorageUnavailable(_)));
+    }
+
     fn authority(repository: &str, organization: Option<&str>) -> MemoryQueryAuthority {
         MemoryQueryAuthority::new(
             repository,
@@ -789,20 +874,22 @@ mod tests {
     }
 
     fn capture_digest(checkout: &str, branch: Option<&str>) -> SessionDigest {
-        let received_at = DateTime::from_unix_seconds(1_700_000_010);
-        let content = parse_session_digest(
-            r#"{
+        let received_at = DateTime::from_unix_seconds(crate::Utc::now().timestamp());
+        let input = format!(
+            r#"{{
                 "schema_version":1,
-                "ended_at":"2023-11-14T22:13:20Z",
+                "ended_at":"{}",
                 "edited_paths":["src/capture.rs"],
                 "final_summary":"Implemented atomic session capture.",
                 "observations":[
-                    {"kind":"check","label":"lattice-core tests","outcome":"passed"}
+                    {{"kind":"error","category":"compiler","fingerprint":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"observed","summary":"missing import"}},
+                    {{"kind":"error","category":"compiler","fingerprint":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"resolved","summary":"missing import"}},
+                    {{"kind":"check","label":"lattice-core tests","outcome":"passed"}}
                 ]
-            }"#,
-            received_at,
-        )
-        .unwrap();
+            }}"#,
+            digest_timestamp(received_at)
+        );
+        let content = parse_session_digest(&input, received_at).unwrap();
         bind_session_digest_authority(
             content,
             &SessionDigestAuthority {
@@ -828,22 +915,32 @@ mod tests {
         .unwrap()
     }
 
+    fn digest_timestamp(value: DateTime<crate::Utc>) -> String {
+        serde_json::to_value(value)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn capture_digest_at(
         session_id: &str,
         checkout: &str,
         segment: u64,
         received_at: i64,
     ) -> SessionDigest {
-        let content = parse_session_digest(
-            r#"{
+        let received = DateTime::from_unix_seconds(received_at);
+        let input = format!(
+            r#"{{
                 "schema_version":1,
-                "ended_at":"2023-11-14T22:13:20Z",
+                "ended_at":"{}",
                 "edited_paths":["src/capture.rs"],
-                "observations":[]
-            }"#,
-            DateTime::from_unix_seconds(received_at),
-        )
-        .unwrap();
+                "final_summary":"Applied the repository-local correction.",
+                "observations":[{{"kind":"error","category":"compiler","fingerprint":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"observed","summary":"missing import"}},{{"kind":"error","category":"compiler","fingerprint":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","status":"resolved","summary":"missing import"}},{{"kind":"check","label":"lattice-core tests","outcome":"passed"}}]
+            }}"#,
+            digest_timestamp(received)
+        );
+        let content = parse_session_digest(&input, received).unwrap();
         bind_session_digest_authority(
             content,
             &SessionDigestAuthority {
@@ -1317,9 +1414,16 @@ mod tests {
     fn capture_retention_applies_repository_local_age_and_count_bounds() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let mut capture_ids = Vec::new();
-        for (segment, received_at) in [(1, 100), (2, 200), (3, 300)] {
+        let mut retired_replay = None;
+        // Keep the capture replay contract valid while retaining deterministic
+        // ordering inside this test's repository-local retention window.
+        let now = crate::Utc::now().timestamp();
+        for (segment, received_at) in [(1, now - 3), (2, now - 2), (3, now - 1)] {
             let digest = capture_digest_at("retention-session", "checkout-a", segment, received_at);
             let candidates = extract_default_session_digest_candidates(&digest);
+            if segment == 1 {
+                retired_replay = Some((digest.clone(), candidates.clone()));
+            }
             let result = MemoryStoreRouter::new(
                 &repository,
                 None,
@@ -1345,13 +1449,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.deleted_capture_ids, capture_ids[..2]);
-        assert_eq!(result.deleted_memory_count, 2);
+        assert_eq!(result.deleted_memory_count, 0);
         assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
-        assert_eq!(table_count(&repository, "memories"), 1);
+        assert_eq!(table_count(&repository, "memories"), 3);
         assert_eq!(
             table_count(&repository, SESSION_CAPTURE_TOMBSTONES_TABLE),
             2
         );
+        let (retired_digest, retired_candidates) = retired_replay.unwrap();
+        assert!(router
+            .capture_session_digest_candidate_batch(&retired_digest, &retired_candidates)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be replayed"));
         assert_eq!(
             router
                 .prune_session_captures(
@@ -1361,13 +1471,31 @@ mod tests {
                 .unwrap(),
             SessionCaptureDeletionResult::default()
         );
+        router
+            .prune_session_captures(
+                SessionCaptureRetentionPolicy::new(Duration::from_secs(150), 1).unwrap(),
+                DateTime::from_unix_seconds(
+                    351 + crate::memory::retention::MAX_REPLAY_AGE_SECS as i64,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            table_count(&repository, SESSION_CAPTURE_TOMBSTONES_TABLE),
+            0,
+            "content-free retention tombstones expire after replay is no longer admissible"
+        );
     }
 
     #[test]
     fn operator_deletion_prunes_dependencies_and_retains_derived_records_as_tombstones() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let authority = capture_authority_for_session("delete-session", "checkout-a");
-        let digest = capture_digest_at("delete-session", "checkout-a", 1, 500);
+        let digest = capture_digest_at(
+            "delete-session",
+            "checkout-a",
+            1,
+            crate::Utc::now().timestamp(),
+        );
         let candidates = extract_default_session_digest_candidates(&digest);
         let router = MemoryStoreRouter::new(&repository, None, authority).unwrap();
         let captured = router
@@ -1507,7 +1635,12 @@ mod tests {
     fn operator_deletion_refuses_cross_repository_selector() {
         let repository = MemoryStore::open_in_memory().unwrap();
         let authority = capture_authority_for_session("delete-session", "checkout-a");
-        let digest = capture_digest_at("delete-session", "checkout-a", 1, 500);
+        let digest = capture_digest_at(
+            "delete-session",
+            "checkout-a",
+            1,
+            crate::Utc::now().timestamp(),
+        );
         let candidates = extract_default_session_digest_candidates(&digest);
         let router = MemoryStoreRouter::new(&repository, None, authority).unwrap();
         router
@@ -1522,4 +1655,16 @@ mod tests {
         assert_eq!(table_count(&repository, SESSION_DIGEST_DELIVERIES_TABLE), 1);
         assert_eq!(table_count(&repository, "memories"), 1);
     }
+}
+
+fn require_writable(store: &MemoryStore) -> Result<(), LatticeError> {
+    if let super::store::MemoryStoreAvailability::Unavailable { path, reason, .. } =
+        store.availability()
+    {
+        return Err(LatticeError::MemoryStorageUnavailable(format!(
+            "{}: {reason}",
+            path.display()
+        )));
+    }
+    Ok(())
 }

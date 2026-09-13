@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::retention::MAX_REPLAY_AGE_SECS;
 use super::MemoryClass;
 use crate::{DateTime, Utc};
 
@@ -277,6 +278,13 @@ pub fn parse_session_digest(
     } else {
         ended_at
     };
+    if ended_at.unix_seconds()
+        < received_at
+            .unix_seconds()
+            .saturating_sub(MAX_REPLAY_AGE_SECS as i64)
+    {
+        return Err(SessionDigestError::InvalidTimestamp);
+    }
 
     if raw.edited_paths.len() > MAX_EDITED_PATHS {
         return Err(SessionDigestError::TooManyEditedPaths);
@@ -358,69 +366,39 @@ pub fn extract_session_digest_candidates(
     let extractor_version = sanitize_extractor_version(extractor_version);
     let mut candidates = Vec::new();
 
-    if !digest.edited_paths.is_empty() {
+    let Some(correction) = digest.final_summary.as_deref() else {
+        return candidates;
+    };
+    let Some(check) = digest
+        .observations
+        .iter()
+        .find_map(|observation| match observation {
+            SessionDigestObservation::Check {
+                label,
+                outcome: CheckOutcome::Passed,
+            } => Some(SessionDigestCheckEvidence {
+                label: label.clone(),
+                outcome: CheckOutcome::Passed,
+            }),
+            _ => None,
+        })
+    else {
+        return candidates;
+    };
+
+    // A reusable lesson requires all four bounded facts: an observed failure
+    // later resolved under the same fingerprint, its recorded cause, a
+    // correction summary, and a check that actually passed. Edited paths and
+    // failed/skipped checks remain episode evidence and never become lessons.
+    for error in matched_resolved_errors(&digest.observations)
+        .into_iter()
+        .filter(|error| error.summary.is_some())
+    {
+        let cause = error.summary.as_deref().expect("filtered above");
         let claim = format!(
-            "Session edited {} repository file(s).",
-            digest.edited_paths.len()
+            "{} failure ({}) was corrected: {} Cause: {} Validation: {} passed.",
+            error.category, error.fingerprint, correction, cause, check.label
         );
-        candidates.push(candidate(
-            digest,
-            SessionDigestCandidateKind::EditedPaths,
-            MemoryClass::WorkflowOutcome,
-            claim,
-            SessionDigestEvidence {
-                session_id: digest.session_id.clone(),
-                repository_id: digest.repository_id.clone(),
-                checkout_id: digest.checkout_id.clone(),
-                branch: digest.branch.clone(),
-                revision: digest.revision.clone(),
-                segment: digest.segment,
-                captured_at: digest.received_at,
-                ended_at: digest.ended_at,
-                edited_paths: digest.edited_paths.clone(),
-                check: None,
-                resolved_error: None,
-                summary_hash: None,
-            },
-            &extractor_version,
-        ));
-    }
-
-    for observation in &digest.observations {
-        if let SessionDigestObservation::Check { label, outcome } = observation {
-            let claim = format!("Check `{label}` {}.", outcome.as_str());
-            candidates.push(candidate(
-                digest,
-                SessionDigestCandidateKind::CheckOutcome,
-                MemoryClass::WorkflowOutcome,
-                claim,
-                base_evidence(
-                    digest,
-                    SessionDigestEvidence {
-                        session_id: String::new(),
-                        repository_id: String::new(),
-                        checkout_id: None,
-                        branch: None,
-                        revision: String::new(),
-                        segment: 0,
-                        captured_at: digest.received_at,
-                        ended_at: digest.ended_at,
-                        edited_paths: Vec::new(),
-                        check: Some(SessionDigestCheckEvidence {
-                            label: label.clone(),
-                            outcome: *outcome,
-                        }),
-                        resolved_error: None,
-                        summary_hash: None,
-                    },
-                ),
-                &extractor_version,
-            ));
-        }
-    }
-
-    for error in matched_resolved_errors(&digest.observations) {
-        let claim = format!("Resolved {} failure.", error.category);
         candidates.push(candidate(
             digest,
             SessionDigestCandidateKind::ResolvedFailure,
@@ -437,39 +415,10 @@ pub fn extract_session_digest_candidates(
                     segment: 0,
                     captured_at: digest.received_at,
                     ended_at: digest.ended_at,
-                    edited_paths: Vec::new(),
-                    check: None,
+                    edited_paths: digest.edited_paths.clone(),
+                    check: Some(check.clone()),
                     resolved_error: Some(error),
-                    summary_hash: None,
-                },
-            ),
-            &extractor_version,
-        ));
-    }
-
-    // Narrative prose is evidence only when paired with at least one typed
-    // observation.  It cannot on its own claim a check result or resolution.
-    if let (Some(summary), true) = (&digest.final_summary, !digest.observations.is_empty()) {
-        candidates.push(candidate(
-            digest,
-            SessionDigestCandidateKind::Narrative,
-            MemoryClass::WorkflowOutcome,
-            summary.clone(),
-            base_evidence(
-                digest,
-                SessionDigestEvidence {
-                    session_id: String::new(),
-                    repository_id: String::new(),
-                    checkout_id: None,
-                    branch: None,
-                    revision: String::new(),
-                    segment: 0,
-                    captured_at: digest.received_at,
-                    ended_at: digest.ended_at,
-                    edited_paths: Vec::new(),
-                    check: None,
-                    resolved_error: None,
-                    summary_hash: Some(hash_text(summary)),
+                    summary_hash: Some(hash_text(correction)),
                 },
             ),
             &extractor_version,
@@ -948,7 +897,7 @@ mod tests {
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn received_at() -> DateTime<Utc> {
-        DateTime::from_unix_seconds(1_800_000_000)
+        DateTime::from_unix_seconds(1_779_042_660)
     }
 
     fn authority() -> SessionDigestAuthority {
@@ -997,10 +946,19 @@ mod tests {
         let first = extract_default_session_digest_candidates(&digest);
         let second = extract_default_session_digest_candidates(&digest);
         assert_eq!(first, second);
-        assert_eq!(first.len(), 4);
-        assert!(first
-            .iter()
-            .any(|candidate| candidate.kind == SessionDigestCandidateKind::ResolvedFailure));
+        assert_eq!(first.len(), 1);
+        let lesson = &first[0];
+        assert_eq!(lesson.kind, SessionDigestCandidateKind::ResolvedFailure);
+        assert_eq!(lesson.memory_class, MemoryClass::FailurePattern);
+        assert_eq!(
+            lesson.evidence.check.as_ref().map(|check| check.outcome),
+            Some(CheckOutcome::Passed)
+        );
+        assert!(lesson.evidence.resolved_error.is_some());
+        assert_eq!(
+            lesson.evidence.summary_hash,
+            Some(hash_text("Implemented digest capture."))
+        );
         assert!(first
             .iter()
             .all(|candidate| candidate.idempotency_key.starts_with("sha256:")));
@@ -1058,12 +1016,8 @@ mod tests {
 
         let first_candidates = extract_default_session_digest_candidates(&first);
         let second_candidates = extract_default_session_digest_candidates(&second);
-        assert_ne!(
-            first_candidates[0].idempotency_key,
-            second_candidates[0].idempotency_key
-        );
-        assert_eq!(first_candidates[0].evidence.session_id, "session-1");
-        assert_eq!(second_candidates[0].evidence.repository_id, "repo-2");
+        assert!(first_candidates.is_empty());
+        assert!(second_candidates.is_empty());
     }
 
     #[test]
@@ -1207,6 +1161,52 @@ mod tests {
     }
 
     #[test]
+    fn generic_edits_and_failed_checks_are_episode_evidence_not_lessons() {
+        let digest = parse(
+            r#"{
+          "schema_version":1,
+          "ended_at":"2026-05-17T14:30:00Z",
+          "edited_paths":["src/lib.rs"],
+          "final_summary":"Changed a file.",
+          "observations":[
+            {"kind":"check","label":"cargo test","outcome":"failed"}
+          ]
+        }"#,
+        );
+        assert!(extract_default_session_digest_candidates(&digest).is_empty());
+    }
+
+    #[test]
+    fn validated_failure_correction_lesson_has_bounded_provenance_and_applicability() {
+        let digest = parse(&format!(
+            r#"{{
+              "schema_version":1,
+              "ended_at":"2026-05-17T14:30:00Z",
+              "edited_paths":["src/lib.rs"],
+              "final_summary":"Added the missing import and kept the scope local.",
+              "observations":[
+                {{"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"observed","summary":"missing import"}},
+                {{"kind":"error","category":"compiler","fingerprint":"{FINGERPRINT}","status":"resolved","summary":"missing import"}},
+                {{"kind":"check","label":"cargo test -p lattice-core","outcome":"passed"}}
+              ]
+            }}"#
+        ));
+        let candidates = extract_default_session_digest_candidates(&digest);
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.memory_class, MemoryClass::FailurePattern);
+        assert_eq!(candidate.evidence.repository_id, "repo-1");
+        assert_eq!(candidate.evidence.branch.as_deref(), Some("feature/digest"));
+        assert_eq!(candidate.evidence.edited_paths, vec!["src/lib.rs"]);
+        assert_eq!(
+            candidate.evidence.check.as_ref().map(|check| check.outcome),
+            Some(CheckOutcome::Passed)
+        );
+        assert!(candidate.claim.contains("missing import"));
+        assert!(candidate.claim.contains("Added the missing import"));
+    }
+
+    #[test]
     fn future_timestamp_is_clamped_and_unknown_envelope_fields_are_rejected() {
         let clamped = parse(
             r#"{
@@ -1222,6 +1222,18 @@ mod tests {
         assert_eq!(
             parse_session_digest(invalid, received_at()),
             Err(SessionDigestError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn rejects_digest_older_than_the_replay_window() {
+        let input = r#"{
+          "schema_version":1,
+          "ended_at":"2026-05-01T00:00:00Z"
+        }"#;
+        assert_eq!(
+            parse_session_digest(input, received_at()),
+            Err(SessionDigestError::InvalidTimestamp)
         );
     }
 }

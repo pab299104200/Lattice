@@ -1,19 +1,21 @@
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::Instrument;
 
 use lattice_core::consolidation::{
     EpisodeOutcome, EpisodeTemplate, SessionConsolidationConfig, SessionConsolidator,
 };
-use lattice_core::embeddings::{embedding_runtime_status, EmbeddingEngine, EmbeddingRuntimeStatus};
+use lattice_core::embeddings::{
+    embedding_runtime_status, EmbeddingProvider, EmbeddingRuntimeStatus,
+};
 use lattice_core::events::{
-    Actor, BranchRef, EventKind, EventPage, EventQuery, EventReader, EventWriter, QueryOrder,
-    SessionId,
+    BranchRef, EventKind, EventPage, EventQuery, EventReader, EventWriter, QueryOrder, SessionId,
 };
 use lattice_core::git_intelligence::GitIntelligenceSnapshot;
 use lattice_core::git_intelligence_consumers::{
@@ -44,14 +46,15 @@ use lattice_core::intelligence::{
     WorkingSetContext,
 };
 use lattice_core::memory::model::MemoryStructuredFields;
+use lattice_core::memory::retrieval::retention_stale_by_id;
 use lattice_core::memory::{
-    Memory, MemoryClass, MemoryQueryAuthority, MemoryRecallTier, MemoryScope, MemoryStore,
-    MemoryStoreRouter, MemoryType, MemoryVerificationStatus,
+    AttributionAccessInput, AttributionDisposition as StoredAttributionDisposition,
+    AttributionEventFact, AttributionEventKind, AttributionRetrievalInput, DeliveryBinding, Memory,
+    MemoryClass, MemoryQueryAuthority, MemoryRecallTier, MemoryScope, MemoryStore,
+    MemoryStoreAvailability, MemoryStoreFailureKind, MemoryStoreRouter, MemoryType,
+    MemoryVerificationStatus, PendingAttributionCursor, PendingAttributionMetric, RecallOptions,
 };
-use lattice_core::memory_graph::{
-    initialize_schema as initialize_memory_graph_schema, list_accesses_for, mark_used,
-    record_access, MemoryAccess, MemoryAccessId,
-};
+use lattice_core::memory_graph::MemoryAccessId;
 use lattice_core::query::engine::{QueryAdmission, QueryAdmissionError};
 use lattice_core::query::{ContextCapsule, QueryEngine, QueryProgress};
 use lattice_core::storage::{GraphStore, SharedVectorIndex, StoredGitIntelligenceSnapshot};
@@ -64,7 +67,7 @@ use lattice_core::workspace::WorkspaceManager;
 use super::context_cache::ContextHandleCache;
 use super::event_capture::{EventCapture, ToolOutcome};
 use super::memory_v2;
-use super::metrics_surface::{detail_payload, MetricsSurface};
+use super::metrics_surface::MetricsSurface;
 use super::server::RequestHandler;
 use super::session_metrics::{SessionMetrics, SessionMetricsReport, ToolCallMetadata};
 use super::workflow_v2::outcome_capture::WorkflowOutcomeRecorder;
@@ -72,26 +75,31 @@ use super::workflow_v2::{
     self, VecEventSink, WorkflowBundle, WorkflowRenderChoice, WorkflowRequest,
 };
 use super::working_memory_tool;
-use crate::adoption_metrics::{HealthEvidenceRecord, 
+use crate::adoption_metrics::{
     source_from_arguments, suggested_files_from_tool_result, AdoptionMetricsStore,
-    MemoryRetrievalRecord, MemoryUseRecord, ToolCallRecord,
+    HealthEvidenceRecord, MemoryRetrievalRecord, MemoryUseRecord, ToolCallRecord,
 };
 use crate::index_health::IndexHealth;
 use crate::index_work::IndexWorkCoordinator;
+use crate::index_work::RuntimeWorkTracker;
 use crate::memory_attribution::{
-    AccessDisposition, AccessResolution, MemoryAttributionBridge, MemoryAttributionEvents,
-    MemoryAttributionGraph, MemoryAttributionMetrics, PendingMemoryAccess, RetrievalRecord,
-    RetrievedMemory,
+    derive_access_id, derive_metric_id, derive_retrieval_id, AccessDisposition,
+    MemoryAttributionMetrics, RetrievedMemory,
 };
 use crate::repo_state::{resolve_repo_state, RepoStateTracker, ValidationOutcome};
 use crate::rpc::request_control;
 use crate::runtime_support::{
-    background_vector_sync_enabled, build_incremental_index_for_roots_with_cache,
+    background_vector_sync_enabled, build_incremental_index_for_roots_with_cache_budgeted,
     load_incremental_manifest, max_warm_graph_bytes, max_warm_graph_files,
     persist_incremental_cache, IncrementalIndexResult, ParsedCacheRuntime,
     WARM_GRAPH_BYTE_LIMIT_ENV, WARM_GRAPH_FILE_LIMIT_ENV,
 };
+use crate::trusted_check_runner::{
+    load_verification_config, observation_matches_current_state, run_explicit_check,
+    TrustedCheckRequest, TrustedCheckStatus,
+};
 use crate::watcher_health::WatcherHealth;
+use crate::workspace_identity::WorkspaceIdentity;
 
 /// MCP (Model Context Protocol) handler that routes JSON-RPC methods
 /// to the appropriate tool implementations.
@@ -106,7 +114,7 @@ pub struct McpHandler {
     shared_memory: Option<SharedMemoryRuntime>,
     shared_memory_error: Option<String>,
     graph_store: Arc<Mutex<GraphStore>>,
-    embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+    embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>>,
     vector_index: Option<SharedVectorIndex>,
     workspace_root: PathBuf,
     /// Canonical repository identity used only for durable memory scope. The
@@ -120,6 +128,7 @@ pub struct McpHandler {
     workspace_roots: Vec<PathBuf>,
     indexing: Arc<AtomicBool>,
     index_work: Arc<IndexWorkCoordinator>,
+    runtime_work: Arc<RuntimeWorkTracker>,
     context_cache: Arc<Mutex<ContextHandleCache>>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
@@ -128,6 +137,7 @@ pub struct McpHandler {
     /// Monotonic per-handler sequence so every observed retrieval has a
     /// durable, joinable id without exposing internal ledger details on MCP.
     memory_retrieval_sequence: AtomicU64,
+    attribution_metric_cursor: StdMutex<Option<PendingAttributionCursor>>,
     client_name: Arc<Mutex<Option<String>>>,
     event_capture: Option<Arc<EventCapture>>,
     workflow_outcome_recorder: Arc<WorkflowOutcomeRecorder>,
@@ -291,8 +301,7 @@ struct SharedMemoryRuntime {
 struct McpMemoryAttributionRuntime {
     workspace_id: String,
     branch: String,
-    graph: StdMutex<rusqlite::Connection>,
-    index_path: PathBuf,
+    session_id: String,
     event_writer: Arc<EventWriter>,
 }
 
@@ -305,182 +314,41 @@ struct McpAttributionMetrics<'a> {
 
 impl McpMemoryAttributionRuntime {
     fn open(
-        workspace_root: &Path,
         workspace_id: String,
         branch: String,
+        session_id: String,
         event_writer: Arc<EventWriter>,
     ) -> Result<Self, String> {
-        let lattice_dir = workspace_root.join(".lattice");
-        std::fs::create_dir_all(&lattice_dir)
-            .map_err(|error| format!("failed to create attribution directory: {error}"))?;
-        let graph = rusqlite::Connection::open(lattice_dir.join("memory_graph.db"))
-            .map_err(|error| format!("failed to open memory graph: {error}"))?;
-        initialize_memory_graph_schema(&graph)
-            .map_err(|error| format!("failed to initialize memory graph: {error}"))?;
         Ok(Self {
             workspace_id,
             branch,
-            graph: StdMutex::new(graph),
-            index_path: lattice_dir.join("memory_attribution.db"),
+            session_id,
             event_writer,
         })
     }
 
-    fn bridge<'a>(
-        &'a self,
-        metrics: &'a dyn MemoryAttributionMetrics,
-    ) -> Result<MemoryAttributionBridge<'a>, String> {
-        MemoryAttributionBridge::open(
-            &self.index_path,
-            self.workspace_id.clone(),
-            self,
-            self,
-            metrics,
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    fn session_events(
+    fn exact_event(
         &self,
         event: &lattice_core::identity::EventId,
-    ) -> Result<Vec<lattice_core::events::EventEnvelope>, String> {
+    ) -> Result<lattice_core::events::EventEnvelopeRow, String> {
         if event.workspace_id != self.workspace_id {
             return Err(format!(
                 "event workspace `{}` does not match runtime workspace `{}`",
                 event.workspace_id, self.workspace_id
             ));
         }
-        EventReader::new(self.event_writer.store())
-            .execute(
-                EventQuery::new()
-                    .workspace(self.workspace_id.clone())
-                    .branch(self.branch.clone())
-                    .limit(10_000)
-                    .order(QueryOrder::NewestFirst),
-            )
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl MemoryAttributionEvents for McpMemoryAttributionRuntime {
-    fn validate_retrieval(
-        &self,
-        retrieval_event: &lattice_core::identity::EventId,
-        tool_call_event: &lattice_core::identity::EventId,
-    ) -> Result<(), String> {
-        let events = self.session_events(retrieval_event)?;
-        let call_position = events
-            .iter()
-            .position(|event| {
-                event.event_id == *tool_call_event && event.kind == EventKind::ToolCalled
-            })
-            .ok_or_else(|| "tool call event is absent or has the wrong kind".to_string())?;
-        let retrieval_position = events
-            .iter()
-            .position(|event| {
-                event.event_id == *retrieval_event && event.kind == EventKind::MemoryRetrieved
-            })
-            .ok_or_else(|| "retrieval event is absent or has the wrong kind".to_string())?;
-        if retrieval_position >= call_position {
-            return Err("retrieval event must follow its tool call event".to_string());
+        let row = self
+            .event_writer
+            .store()
+            .query_event_by_identity(&event.workspace_id, &event.ulid)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "event is absent or has been compacted".to_string())?;
+        if row.branch != self.branch || row.session_id != self.session_id {
+            return Err(
+                "event branch or session does not match the active retrieval session".into(),
+            );
         }
-        Ok(())
-    }
-
-    fn validate_terminal_outcome(
-        &self,
-        retrieval_event: &lattice_core::identity::EventId,
-        terminal_outcome_event: &lattice_core::identity::EventId,
-    ) -> Result<(), String> {
-        let events = self.session_events(retrieval_event)?;
-        let retrieval_position = events
-            .iter()
-            .position(|event| {
-                event.event_id == *retrieval_event && event.kind == EventKind::MemoryRetrieved
-            })
-            .ok_or_else(|| "retrieval event is absent or has the wrong kind".to_string())?;
-        let terminal_position = events
-            .iter()
-            .position(|event| {
-                event.event_id == *terminal_outcome_event
-                    && matches!(
-                        event.kind,
-                        EventKind::WorkflowSucceeded | EventKind::WorkflowFailed
-                    )
-            })
-            .ok_or_else(|| "terminal outcome event is absent or has the wrong kind".to_string())?;
-        if terminal_position >= retrieval_position {
-            return Err("terminal outcome event must follow the retrieval event".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl MemoryAttributionGraph for McpMemoryAttributionRuntime {
-    fn record_pending_accesses(&self, accesses: &[PendingMemoryAccess]) -> Result<(), String> {
-        let mut connection = self
-            .graph
-            .lock()
-            .map_err(|_| "memory graph lock poisoned".to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        for pending in accesses {
-            let existing = list_accesses_for(&transaction, &pending.memory_id)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|access| access.access_id == pending.access_id);
-            let expected = MemoryAccess {
-                access_id: pending.access_id.clone(),
-                memory_id: pending.memory_id.clone(),
-                accessed_at: lattice_core::Utc::now(),
-                accessed_in_event: pending.retrieval_event.clone(),
-                accessor: pending.accessor.clone(),
-                inclusion_reason: pending.inclusion_reason.clone(),
-                was_used: None,
-                downstream_outcome_event: None,
-            };
-            match existing {
-                Some(existing)
-                    if existing.access_id == expected.access_id
-                        && existing.memory_id == expected.memory_id
-                        && existing.accessed_in_event == expected.accessed_in_event
-                        && existing.accessor == expected.accessor
-                        && existing.inclusion_reason == expected.inclusion_reason
-                        && existing.was_used.is_none()
-                        && existing.downstream_outcome_event.is_none() => {}
-                Some(_) => {
-                    return Err(format!(
-                        "memory access `{}` already exists with a different payload",
-                        pending.access_id
-                    ))
-                }
-                None => {
-                    record_access(&transaction, &expected).map_err(|error| error.to_string())?
-                }
-            }
-        }
-        transaction.commit().map_err(|error| error.to_string())
-    }
-
-    fn resolve_accesses(&self, resolutions: &[AccessResolution]) -> Result<(), String> {
-        let mut connection = self
-            .graph
-            .lock()
-            .map_err(|_| "memory graph lock poisoned".to_string())?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        for resolution in resolutions {
-            mark_used(
-                &transaction,
-                &resolution.access_id,
-                resolution.was_used,
-                Some(&resolution.terminal_outcome_event),
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())
+        Ok(row)
     }
 }
 
@@ -606,6 +474,12 @@ impl SharedMemoryRuntime {
                 },
             )?;
         }
+        crate::memory_retention_runtime::register(&path).map_err(|error| {
+            format!(
+                "failed to register shared memory retention owner {}: {error}",
+                path.display()
+            )
+        })?;
         Ok(Some(Self {
             store: Arc::new(Mutex::new(store)),
             organization_id,
@@ -719,6 +593,46 @@ pub(crate) const AGENT_IMPACT_LIMIT_DEFAULT: u64 = 12;
 pub(crate) const AGENT_RECALL_MODE_DEFAULT: &str = "search";
 pub(crate) const AGENT_STATUS_SCOPE_DEFAULT: &str = "index";
 
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn attribution_event_fact(
+    row: &lattice_core::events::EventEnvelopeRow,
+    checkout_id: &str,
+    kind: AttributionEventKind,
+) -> AttributionEventFact {
+    AttributionEventFact {
+        event_id: lattice_core::identity::EventId {
+            workspace_id: row.workspace_id.clone(),
+            ulid: row.event_uuid.clone(),
+        },
+        kind,
+        checkout_id: checkout_id.to_string(),
+        session_id: row.session_id.clone(),
+        branch: Some(row.branch.clone()),
+        sequence: row.event_id.max(0) as u64,
+        observed_at: row.ts_unix_micros.max(0) as u64 / 1_000_000,
+    }
+}
+
+fn attach_feedback_status(result: &mut Result<Value, (i32, String)>, status: Value) {
+    let Some(response) = result.as_mut().ok() else {
+        return;
+    };
+    let Some(mut payload) = unwrap_tool_text_json(response) else {
+        return;
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("memory_feedback".to_string(), status);
+        replace_wrapped_tool_payload(response, &payload);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowWireFormat {
     Auto,
@@ -772,6 +686,95 @@ enum QueryJobError {
 }
 
 impl McpHandler {
+    async fn drain_memory_attribution_metrics(&self) {
+        let after = self
+            .attribution_metric_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let pending = match self
+            .memory_store
+            .lock()
+            .await
+            .pending_attribution_metrics(after.as_ref(), 256)
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "memory attribution metric replay deferred");
+                return;
+            }
+        };
+        *self
+            .attribution_metric_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pending.next_cursor.clone();
+        for item in pending.items {
+            match item {
+                PendingAttributionMetric::Retrieval {
+                    retrieval_id,
+                    session_id,
+                    metric_client,
+                    metric_channel,
+                    retrieved_count,
+                    ..
+                } => {
+                    let metrics = McpAttributionMetrics {
+                        store: self.adoption_metrics.as_ref(),
+                        session_id: &session_id,
+                        client: metric_client,
+                        channel: metric_channel,
+                    };
+                    if let Ok(metric_id) = derive_metric_id("retrieval", &retrieval_id, None) {
+                        if metrics
+                            .record_retrieval(&metric_id, &retrieval_id, retrieved_count as u64)
+                            .is_ok()
+                        {
+                            let _ = self
+                                .memory_store
+                                .lock()
+                                .await
+                                .mark_attribution_retrieval_metric_recorded(&retrieval_id);
+                        }
+                    }
+                }
+                PendingAttributionMetric::Access {
+                    retrieval_id,
+                    access_id,
+                    was_used,
+                    terminal_event_id,
+                    metric_client,
+                    metric_channel,
+                    session_id,
+                    ..
+                } => {
+                    let metrics = McpAttributionMetrics {
+                        store: self.adoption_metrics.as_ref(),
+                        session_id: &session_id,
+                        client: metric_client,
+                        channel: metric_channel,
+                    };
+                    let emitted = if was_used {
+                        let typed = MemoryAccessId(access_id.clone());
+                        derive_metric_id("use", &retrieval_id, Some((&typed, &terminal_event_id)))
+                            .ok()
+                            .is_some_and(|id| metrics.record_use(&id, &retrieval_id, 1).is_ok())
+                    } else {
+                        true
+                    };
+                    if emitted {
+                        let _ = self
+                            .memory_store
+                            .lock()
+                            .await
+                            .mark_attribution_access_metrics_recorded(std::slice::from_ref(
+                                &access_id,
+                            ));
+                    }
+                }
+            }
+        }
+    }
+
     /// Create a new McpHandler with all shared state.
     #[allow(dead_code)]
     pub fn new(
@@ -779,7 +782,7 @@ impl McpHandler {
         indexer: Arc<Mutex<Indexer>>,
         memory_store: Arc<Mutex<MemoryStore>>,
         graph_store: Arc<Mutex<GraphStore>>,
-        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>>,
         vector_index: Option<SharedVectorIndex>,
         workspace_root: PathBuf,
         context_cache_path: PathBuf,
@@ -824,7 +827,7 @@ impl McpHandler {
         indexer: Arc<Mutex<Indexer>>,
         memory_store: Arc<Mutex<MemoryStore>>,
         graph_store: Arc<Mutex<GraphStore>>,
-        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>>,
         vector_index: Option<SharedVectorIndex>,
         workspace_root: PathBuf,
         memory_workspace_id: String,
@@ -894,9 +897,9 @@ impl McpHandler {
         let adoption_metrics = Arc::new(AdoptionMetricsStore::new(&workspace_root));
         let (memory_attribution, memory_attribution_error) = match event_writer.as_ref() {
             Some(writer) => match McpMemoryAttributionRuntime::open(
-                &workspace_root,
                 memory_workspace_id.clone(),
                 branch.clone(),
+                session_id.clone(),
                 writer.clone(),
             ) {
                 Ok(runtime) => (Some(Arc::new(runtime)), None),
@@ -930,6 +933,7 @@ impl McpHandler {
             workspace_roots,
             indexing,
             index_work,
+            runtime_work: Arc::new(RuntimeWorkTracker::default()),
             context_cache: Arc::new(Mutex::new(ContextHandleCache::new_with_persistence(
                 context_cache_path,
             ))),
@@ -938,6 +942,7 @@ impl McpHandler {
             memory_attribution,
             memory_attribution_error,
             memory_retrieval_sequence: AtomicU64::new(0),
+            attribution_metric_cursor: StdMutex::new(None),
             client_name: Arc::new(Mutex::new(None)),
             event_capture,
             workflow_outcome_recorder: Arc::new(WorkflowOutcomeRecorder::new()),
@@ -984,6 +989,25 @@ impl McpHandler {
     ) -> Self {
         self.checkout_id = checkout_id;
         self.parsed_cache = parsed_cache;
+        self
+    }
+
+    pub(crate) fn with_runtime_work_tracker(
+        mut self,
+        runtime_work: Arc<RuntimeWorkTracker>,
+    ) -> Self {
+        self.runtime_work = runtime_work;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_trusted_check_authority(
+        mut self,
+        repository_id: String,
+        checkout_id: String,
+    ) -> Self {
+        self.memory_workspace_id = repository_id;
+        self.checkout_id = checkout_id;
         self
     }
 
@@ -1076,10 +1100,7 @@ impl McpHandler {
         let mut value = serde_json::to_value(&report)
             .map_err(|error| (-32603, format!("Serialization error: {error}")))?;
         if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "git_generation".to_string(),
-                json!(inputs.git_generation),
-            );
+            object.insert("git_generation".to_string(), json!(inputs.git_generation));
         }
         Ok(wrap_tool_result(value))
     }
@@ -1154,13 +1175,19 @@ impl McpHandler {
         let index_health = Arc::clone(&self.index_health);
         let parsed_cache_runtime = self.parsed_cache.clone();
         let workspace_key = self.workspace_root.to_string_lossy().to_string();
+        let runtime_work = Arc::clone(&self.runtime_work);
+        let task_work = runtime_work.begin();
 
         tokio::spawn(async move {
+            let _task_work = task_work;
             loop {
-                let _index_permit = index_work
-                    .acquire(workspace_key.clone(), "workspace_refresh")
-                    .await
-                    .expect("index work coordinator remains open for the process lifetime");
+                let index_permit = Arc::new(
+                    index_work
+                        .acquire(workspace_key.clone(), "workspace_refresh")
+                        .await
+                        .expect("index work coordinator remains open for the process lifetime"),
+                );
+                let resource_budget = index_work.resource_budget();
                 let target_epoch = {
                     let repo_state = repo_state.lock().await;
                     repo_state.current_epoch()
@@ -1169,17 +1196,26 @@ impl McpHandler {
                 let manifest = load_incremental_manifest(&graph_store).await;
                 let roots = workspace_roots.clone();
                 let parsed_cache_runtime = parsed_cache_runtime.clone();
+                let child_work = runtime_work.begin();
+                let child_permit = Arc::clone(&index_permit);
                 let incremental = match tokio::task::spawn_blocking(move || {
-                    build_incremental_index_for_roots_with_cache(
+                    let (_child_work, _child_permit) = (child_work, child_permit);
+                    build_incremental_index_for_roots_with_cache_budgeted(
                         &roots,
                         Some(&manifest),
                         HashMap::new(),
                         &parsed_cache_runtime,
+                        Some(&resource_budget),
                     )
                 })
                 .await
                 {
-                    Ok(incremental) => incremental,
+                    Ok(Ok(incremental)) => incremental,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Workspace refresh deferred by resource admission; keeping the published graph");
+                        index_health.mark_resource_limited(error.to_string());
+                        break;
+                    }
                     Err(error) => {
                         tracing::error!(%error, "Workspace refresh indexing worker failed; keeping the previously published graph");
                         break;
@@ -1251,7 +1287,10 @@ impl McpHandler {
                         let graph_for_sync = Arc::clone(&new_graph);
                         let embedding_for_sync = Arc::clone(embedding_engine);
                         let vector_for_sync = Arc::clone(vector_index);
+                        let child_work = runtime_work.begin();
+                        let child_permit = Arc::clone(&index_permit);
                         match tokio::task::spawn_blocking(move || {
+                            let (_child_work, _child_permit) = (child_work, child_permit);
                             crate::vector_sync::sync_full_graph_embeddings(
                                 &graph_for_sync,
                                 embedding_for_sync.as_ref(),
@@ -1362,8 +1401,9 @@ impl McpHandler {
                     unreachable!("McpHandler constructs query admission with a positive capacity")
                 }
             })?;
+        let runtime_work = self.runtime_work.begin();
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let (_permit, _runtime_work) = (permit, runtime_work);
             job()
         })
         .await
@@ -1463,6 +1503,11 @@ impl McpHandler {
 
         let engine = self.engine.lock().await;
         status_snapshot_from_graph(engine.graph(), include_languages)
+    }
+
+    async fn memory_store_status(&self) -> Value {
+        let store = self.memory_store.lock().await;
+        memory_store_status_value(store.availability())
     }
 
     pub(crate) fn agent_tools_list_response() -> Value {
@@ -1593,14 +1638,17 @@ impl McpHandler {
                 },
                 {
                     "name": "remember",
-                    "description": "Stores durable task memory or workflow outcomes for future sessions — the cross-session recall grep cannot create. Use only for claims worth reusing.",
+                    "description": "Stores durable task memory, workflow outcomes, or auditable memory-evolution proposals and decisions for future sessions.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
                             "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "content": { "type": "string" },
-                            "kind": { "type": "string", "enum": ["quick", "durable", "outcome"], "default": "quick" },
+                            "kind": { "type": "string", "enum": ["quick", "durable", "outcome", "evolution"], "default": "quick" },
+                            "action": { "type": "string", "enum": ["propose", "apply", "reject"] },
+                            "proposal_id": { "type": "string" },
+                            "memory_id": { "type": "string" },
                             "task": { "type": "string" },
                             "summary": { "type": "string" },
                             "status": { "type": "string", "enum": ["success", "failure"] },
@@ -1609,10 +1657,28 @@ impl McpHandler {
                             "confidence_reason": { "type": "string" },
                             "freshness_policy": { "type": "string" },
                             "memory_class": { "type": "string" },
+                            "assertion_type": { "type": "string" },
                             "linked_files": { "type": "array", "items": { "type": "string" } },
                             "linked_symbols": { "type": "array", "items": { "type": "string" } },
                             "linked_docs": { "type": "array", "items": { "type": "string" } },
                             "linked_tests": { "type": "array", "items": { "type": "string" } },
+                            "linked_memories": { "type": "array", "items": { "type": "string" } },
+                            "validity_conditions": { "type": "array", "items": { "type": "string" } },
+                            "invalidation_triggers": { "type": "array", "items": { "type": "string" } },
+                            "provenance_event_ids": { "type": "array", "items": { "type": "string" } },
+                            "evidence": { "type": "array", "items": { "type": "object" } },
+                            "source_query": { "type": "string" },
+                            "refresh_key": { "type": "string" },
+                            "branch": { "type": "string" },
+                            "organization_id": { "type": "string" },
+                            "task_id": { "type": "string" },
+                            "task_statement": { "type": "string" },
+                            "context_handle": { "type": "string" },
+                            "dry_run": { "type": "boolean" },
+                            "superseded_by_memory_id": { "type": "string" },
+                            "invalidate_reason": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "decided_by": { "type": "string" },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
                             "tests": { "type": "array", "items": { "type": "string" } },
@@ -1628,7 +1694,30 @@ impl McpHandler {
                                 "additionalProperties": false
                             }
                         },
-                        "required": ["content"]
+                        "additionalProperties": false,
+                        "oneOf": [
+                            {"required": ["content"], "properties": {"kind": {"enum": ["quick"]}}},
+                            {"required": ["kind", "content"], "properties": {"kind": {"const": "durable"}}},
+                            {"required": ["kind", "task", "status", "summary"], "properties": {"kind": {"const": "outcome"}}},
+                            {
+                                "required": ["kind", "action"],
+                                "properties": {"kind": {"const": "evolution"}},
+                                "oneOf": [
+                                    {
+                                        "required": ["memory_id"],
+                                        "properties": {"action": {"const": "propose"}},
+                                        "anyOf": [
+                                            {"required": ["content"]}, {"required": ["linked_files"]},
+                                            {"required": ["linked_symbols"]}, {"required": ["linked_docs"]},
+                                            {"required": ["linked_tests"]}, {"required": ["linked_memories"]},
+                                            {"required": ["validity_conditions"]}, {"required": ["invalidation_triggers"]},
+                                            {"required": ["superseded_by_memory_id"]}, {"required": ["invalidate_reason"]}
+                                        ]
+                                    },
+                                    {"required": ["proposal_id"], "properties": {"action": {"enum": ["apply", "reject"]}}}
+                                ]
+                            }
+                        ]
                     }
                 },
                 {
@@ -1640,10 +1729,15 @@ impl McpHandler {
                             "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
                             "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
                             "query": { "type": "string" },
-                            "mode": { "type": "string", "enum": ["search", "task", "verify"], "default": AGENT_RECALL_MODE_DEFAULT },
+                            "mode": { "type": "string", "enum": ["search", "task", "verify", "acknowledge_delivery"], "default": AGENT_RECALL_MODE_DEFAULT },
                             "task_id": { "type": "string" },
                             "task_statement": { "type": "string" },
                             "memory_id": { "type": "string" },
+                            "run_check": { "type": "string", "description": "Only with mode=verify: explicitly execute this repository-declared check for the scoped target memory." },
+                            "authority": { "type": "string", "description": "Receipt authority returned by a prior memory delivery." },
+                            "delivery_id": { "type": "string", "description": "Opaque receipt id returned by a prior memory delivery." },
+                            "payload_hash": { "type": "string", "description": "Exact payload hash returned by a prior memory delivery." },
+                            "include_retention_stale": { "type": "boolean", "description": "Include retention-stale records for explicit lifecycle inspection; automatic briefings exclude them.", "default": false },
                             "limit": { "type": "integer" },
                             "budget_tokens": { "type": "integer" },
                             "focus_files": { "type": "array", "items": { "type": "string" } },
@@ -1661,7 +1755,7 @@ impl McpHandler {
                         "properties": {
                             "_lattice_client": { "type": "string", "description": "Optional client identity for adoption metrics." },
                             "_lattice_channel": { "type": "string", "description": "Optional channel identity for adoption metrics." },
-                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts", "health"], "default": AGENT_STATUS_SCOPE_DEFAULT },
+                            "scope": { "type": "string", "enum": ["index", "docs", "memory", "conflicts", "health", "storage"], "default": AGENT_STATUS_SCOPE_DEFAULT },
                             "query": { "type": "string" },
                             "files": { "type": "array", "items": { "type": "string" } },
                             "symbols": { "type": "array", "items": { "type": "string" } },
@@ -1677,10 +1771,14 @@ impl McpHandler {
     }
 
     async fn handle_agent_tools_call(&self, params: &Value) -> Result<Value, (i32, String)> {
+        self.drain_memory_attribution_metrics().await;
         let tool_name = params["name"]
             .as_str()
             .ok_or((-32602, "Missing tool name".to_string()))?;
         let arguments = &params["arguments"];
+        if !(tool_name == "remember" && arguments["kind"].as_str() == Some("evolution")) {
+            self.drain_pending_consolidation_events().await;
+        }
         validate_memory_attribution_arguments(tool_name, arguments)?;
         let span = tracing::info_span!("tool", name = tool_name);
         let tool_called_event = self.capture_tool_called(tool_name, arguments);
@@ -1721,10 +1819,26 @@ impl McpHandler {
             started.elapsed(),
         )
         .await;
-        self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
+        self.capture_tool_result(tool_name, arguments, &mut result, tool_called_event)
             .await;
 
         result
+    }
+
+    async fn drain_pending_consolidation_events(&self) {
+        let Some(capture) = self.event_capture.as_ref() else {
+            return;
+        };
+        let store = self.memory_store.lock().await;
+        if let Err(error) =
+            lattice_core::consolidation::drain_event_outbox(&store, capture.writer().as_ref(), 64)
+        {
+            tracing::warn!(
+                tool = "consolidation_event_outbox_recovery",
+                %error,
+                "failed to publish pending consolidation audit events; later public requests will retry"
+            );
+        }
     }
 
     async fn tool_agent_context(&self, args: &Value) -> Result<Value, (i32, String)> {
@@ -1983,7 +2097,9 @@ impl McpHandler {
         match args["kind"].as_str().unwrap_or("quick") {
             "durable" => self.tool_save_memory_v2(args).await,
             "outcome" => self.tool_record_workflow_outcome(args).await,
-            "quick" | _ => self.tool_save_quick_memory_v2(args).await,
+            "evolution" => self.tool_propose_memory_evolution_v2(args).await,
+            "quick" => self.tool_save_quick_memory_v2(args).await,
+            kind => Err((-32602, format!("Unknown remember kind: {kind}"))),
         }
     }
 
@@ -1991,12 +2107,103 @@ impl McpHandler {
         match args["mode"].as_str().unwrap_or(AGENT_RECALL_MODE_DEFAULT) {
             "task" => self.tool_get_task_memory_v2(args).await,
             "verify" => self.tool_verify_explain_memory(args).await,
+            "acknowledge_delivery" => self.tool_acknowledge_memory_delivery(args).await,
             "search" | _ => self.tool_search_memory(args).await,
         }
     }
 
+    async fn tool_acknowledge_memory_delivery(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let authority = args
+            .get("authority")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "Missing authority".to_string()))?;
+        let delivery_id = args
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "Missing delivery_id".to_string()))?;
+        let payload_hash = args
+            .get("payload_hash")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "Missing payload_hash".to_string()))?;
+        let binding = DeliveryBinding {
+            delivery_id,
+            repository_id: authority,
+            session_id: &self.session_id,
+            payload_hash,
+        };
+        let repository_authority = format!("repository:{}", self.memory_workspace_id);
+        let result = if authority == repository_authority {
+            self.memory_store
+                .lock()
+                .await
+                .acknowledge_memory_delivery(&binding, current_unix_seconds())
+        } else if let Some(runtime) = self.shared_memory.as_ref() {
+            if authority != format!("organization:{}", runtime.organization_id) {
+                return Err((
+                    -32602,
+                    "Delivery authority is not configured for this trusted repository session"
+                        .to_string(),
+                ));
+            }
+            runtime
+                .store
+                .lock()
+                .await
+                .acknowledge_memory_delivery(&binding, current_unix_seconds())
+        } else {
+            return Err((
+                -32602,
+                "Delivery authority is not configured for this trusted repository session"
+                    .to_string(),
+            ));
+        };
+        let acknowledged = result.map_err(|error| {
+            (
+                -32602,
+                format!("Delivery acknowledgement was rejected or expired: {error}"),
+            )
+        })?;
+        let replayed = if acknowledged == 0 {
+            let acknowledged_before = if authority == repository_authority {
+                self.memory_store
+                    .lock()
+                    .await
+                    .memory_delivery_acknowledgement_was_recorded(&binding, current_unix_seconds())
+            } else {
+                self.shared_memory
+                    .as_ref()
+                    .expect("organization authority was checked")
+                    .store
+                    .lock()
+                    .await
+                    .memory_delivery_acknowledgement_was_recorded(&binding, current_unix_seconds())
+            }
+            .map_err(|error| {
+                (
+                    -32602,
+                    format!("Delivery acknowledgement was rejected or expired: {error}"),
+                )
+            })?;
+            if !acknowledged_before {
+                return Err((
+                    -32602,
+                    "Delivery acknowledgement was rejected or expired".to_string(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        Ok(wrap_tool_result(
+            json!({"authority": authority, "delivery_id": delivery_id, "acknowledged_count": acknowledged, "replayed": replayed}),
+        ))
+    }
+
     async fn tool_agent_status(&self, args: &Value) -> Result<Value, (i32, String)> {
         match args["scope"].as_str().unwrap_or(AGENT_STATUS_SCOPE_DEFAULT) {
+            "storage" => Ok(
+                json!({"content":[{"type":"text","text":crate::storage_operator::status_payload(&self.workspace_root).to_string()}]}),
+            ),
             "health" => self.tool_health_status(args).await,
             "docs" => self.tool_find_stale_docs(args).await,
             "memory" => self.tool_list_stale_memories(args).await,
@@ -2769,6 +2976,11 @@ impl McpHandler {
                                 "type": "integer",
                                 "description": "Maximum number of memories to return (default: 10)",
                                 "default": 10
+                            },
+                            "include_retention_stale": {
+                                "type": "boolean",
+                                "description": "Include retention-stale records for explicit lifecycle inspection; automatic briefings exclude them.",
+                                "default": false
                             }
                         },
                         "required": ["query"]
@@ -2912,6 +3124,7 @@ impl McpHandler {
     }
 
     async fn handle_tools_call(&self, params: &Value) -> Result<Value, (i32, String)> {
+        self.drain_memory_attribution_metrics().await;
         let tool_name = params["name"]
             .as_str()
             .ok_or((-32602, "Missing tool name".to_string()))?;
@@ -2993,7 +3206,7 @@ impl McpHandler {
             )
             .await;
         }
-        self.capture_tool_result(tool_name, arguments, &result, tool_called_event)
+        self.capture_tool_result(tool_name, arguments, &mut result, tool_called_event)
             .await;
 
         result
@@ -3038,6 +3251,12 @@ impl McpHandler {
         else {
             return;
         };
+        // An empty public result has no attributable delivery.  Do not turn a
+        // successful miss (including stale or foreign-only filtering) into an
+        // attribution validator error, event, or diagnostic.
+        if retrieved.is_empty() {
+            return;
+        }
 
         let Some(runtime) = self.memory_attribution.as_ref() else {
             if let Some(error) = self.memory_attribution_error.as_deref() {
@@ -3089,18 +3308,84 @@ impl McpHandler {
             client: source.client,
             channel: source.channel,
         };
-        let pending = runtime.bridge(&metrics).and_then(|bridge| {
-            bridge
-                .record_retrieval(RetrievalRecord {
-                    retrieval_event: retrieval_event.clone(),
-                    tool_call_event: tool_called_event.clone(),
-                    accessor: Actor::Daemon,
-                    memories: retrieved.clone(),
+        let pending = (|| -> Result<_, String> {
+            let tool_row = runtime.exact_event(tool_called_event)?;
+            let retrieval_row = runtime.exact_event(&retrieval_event)?;
+            if tool_row.kind != EventKind::ToolCalled.as_str()
+                || retrieval_row.kind != EventKind::MemoryRetrieved.as_str()
+                || retrieval_row.event_id <= tool_row.event_id
+            {
+                return Err("retrieval event facts have the wrong kind or order".into());
+            }
+            let retrieval_id = derive_retrieval_id(&retrieval_event).map_err(|e| e.to_string())?;
+            let accesses = retrieved
+                .iter()
+                .map(|memory| {
+                    Ok(AttributionAccessInput {
+                        access_id: derive_access_id(&retrieval_event, &memory.memory_id)
+                            .map_err(|e| e.to_string())?,
+                        local_memory_id: memory.memory_id.ulid.clone(),
+                        inclusion_reason: memory.inclusion_reason.clone(),
+                    })
                 })
-                .map_err(|error| error.to_string())
-        });
+                .collect::<Result<Vec<_>, String>>()?;
+            let input = AttributionRetrievalInput {
+                retrieval_id: retrieval_id.clone(),
+                repository_id: self.memory_workspace_id.clone(),
+                checkout_id: self.checkout_id.clone(),
+                session_id: self.session_id.clone(),
+                branch: Some(runtime.branch.clone()),
+                tool_event: attribution_event_fact(
+                    &tool_row,
+                    &self.checkout_id,
+                    AttributionEventKind::ToolCalled,
+                ),
+                retrieval_event: attribution_event_fact(
+                    &retrieval_row,
+                    &self.checkout_id,
+                    AttributionEventKind::MemoryRetrieved,
+                ),
+                accessor: "daemon".into(),
+                metric_client: metrics.client.clone(),
+                metric_channel: metrics.channel.clone(),
+                accesses,
+            };
+            Ok((retrieval_id, input))
+        })();
+        let pending = match pending {
+            Ok((retrieval_id, input)) => {
+                let outcome = self
+                    .memory_store
+                    .lock()
+                    .await
+                    .record_attribution_retrieval(&input)
+                    .map_err(|e| e.to_string());
+                outcome.map(|outcome| (retrieval_id, outcome))
+            }
+            Err(error) => Err(error),
+        };
         match pending {
-            Ok(pending) => {
+            Ok((retrieval_id, pending)) => {
+                if pending.metric_pending {
+                    let metric_id = derive_metric_id("retrieval", &retrieval_id, None)
+                        .map_err(|e| e.to_string());
+                    if let Ok(metric_id) = metric_id {
+                        if metrics
+                            .record_retrieval(
+                                &metric_id,
+                                &retrieval_id,
+                                pending.access_ids.len() as u64,
+                            )
+                            .is_ok()
+                        {
+                            let _ = self
+                                .memory_store
+                                .lock()
+                                .await
+                                .mark_attribution_retrieval_metric_recorded(&retrieval_id);
+                        }
+                    }
+                }
                 let accesses = retrieved
                     .iter()
                     .zip(pending.access_ids.iter())
@@ -3116,8 +3401,8 @@ impl McpHandler {
                         "memory_attribution".to_string(),
                         json!({
                             "status": "recorded",
-                            "retrieval_id": pending.retrieval_id,
-                            "retrieval_event_id": pending.retrieval_event,
+                            "retrieval_id": retrieval_id,
+                            "retrieval_event_id": retrieval_event,
                             "accesses": accesses,
                         }),
                     );
@@ -3128,13 +3413,13 @@ impl McpHandler {
         replace_wrapped_tool_payload(response, &payload);
     }
 
-    fn resolve_explicit_memory_attribution(
+    async fn resolve_explicit_memory_attribution(
         &self,
         arguments: &Value,
         terminal_event: lattice_core::identity::EventId,
-    ) {
+    ) -> Option<Value> {
         let Some(claim) = parse_memory_attribution_claim(arguments) else {
-            return;
+            return None;
         };
         let Some(runtime) = self.memory_attribution.as_ref() else {
             tracing::warn!(
@@ -3144,7 +3429,7 @@ impl McpHandler {
                     .unwrap_or("unavailable"),
                 "explicit memory attribution could not be resolved"
             );
-            return;
+            return Some(json!({"status":"unavailable","error":self.memory_attribution_error}));
         };
         let metrics = McpAttributionMetrics {
             store: self.adoption_metrics.as_ref(),
@@ -3152,19 +3437,98 @@ impl McpHandler {
             client: "mcp".to_string(),
             channel: "mcp".to_string(),
         };
-        let result = runtime.bridge(&metrics).and_then(|bridge| {
-            bridge
-                .resolve_accesses(
+        let result = (|| -> Result<AttributionEventFact, String> {
+            let row = runtime.exact_event(&terminal_event)?;
+            let kind = match row.kind.as_str() {
+                "workflow_succeeded" => AttributionEventKind::WorkflowSucceeded,
+                "workflow_failed" => AttributionEventKind::WorkflowFailed,
+                _ => return Err("terminal attribution event has the wrong kind".into()),
+            };
+            Ok(attribution_event_fact(&row, &self.checkout_id, kind))
+        })();
+        let result = match result {
+            Ok(fact) => self
+                .memory_store
+                .lock()
+                .await
+                .resolve_attribution(
                     &claim.retrieval_id,
-                    terminal_event,
-                    claim.disposition,
-                    &claim.access_ids,
+                    &fact,
+                    match claim.disposition {
+                        AccessDisposition::Used => StoredAttributionDisposition::Applied,
+                        AccessDisposition::NotUsed => StoredAttributionDisposition::Ignored,
+                    },
+                    &claim
+                        .access_ids
+                        .iter()
+                        .map(|id| id.as_str().to_string())
+                        .collect::<Vec<_>>(),
                 )
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        });
-        if let Err(error) = result {
-            tracing::warn!(%error, retrieval_id = claim.retrieval_id, "explicit memory attribution resolution failed");
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(outcome) => {
+                let persisted_terminal = self
+                    .memory_store
+                    .lock()
+                    .await
+                    .load_attribution_retrieval(&claim.retrieval_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|stored| stored.terminal_event)
+                    .map(|fact| fact.event_id)
+                    .unwrap_or_else(|| terminal_event.clone());
+                for access_id in &outcome.access_metric_pending_ids {
+                    let should_record_use = claim.disposition == AccessDisposition::Used
+                        && claim
+                            .access_ids
+                            .iter()
+                            .any(|cited| cited.as_str() == access_id);
+                    if !should_record_use {
+                        let _ = self
+                            .memory_store
+                            .lock()
+                            .await
+                            .mark_attribution_access_metrics_recorded(std::slice::from_ref(
+                                access_id,
+                            ));
+                        continue;
+                    }
+                    let metric_id = derive_metric_id(
+                        "use",
+                        &claim.retrieval_id,
+                        Some((
+                            &lattice_core::memory_graph::MemoryAccessId(access_id.clone()),
+                            &persisted_terminal,
+                        )),
+                    )
+                    .map_err(|e| e.to_string());
+                    if let Ok(metric_id) = metric_id {
+                        if metrics
+                            .record_use(&metric_id, &claim.retrieval_id, 1)
+                            .is_ok()
+                        {
+                            let _ = self
+                                .memory_store
+                                .lock()
+                                .await
+                                .mark_attribution_access_metrics_recorded(std::slice::from_ref(
+                                    access_id,
+                                ));
+                        }
+                    }
+                }
+                Some(
+                    json!({"status":"recorded","retrieval_id":claim.retrieval_id,"newly_resolved":matches!(outcome.status, lattice_core::memory::AttributionResolutionStatus::NewlyResolved)}),
+                )
+            }
+            Err(error) => {
+                tracing::warn!(%error, retrieval_id = claim.retrieval_id, "explicit memory attribution resolution failed");
+                Some(
+                    json!({"status":"error","retrieval_id":claim.retrieval_id,"error":error,"retryable":true}),
+                )
+            }
         }
     }
 
@@ -3172,13 +3536,25 @@ impl McpHandler {
         &self,
         tool_name: &str,
         arguments: &Value,
-        result: &Result<Value, (i32, String)>,
+        result: &mut Result<Value, (i32, String)>,
         tool_called_event: Option<lattice_core::identity::EventId>,
     ) {
         let Some(capture) = self.event_capture.as_ref() else {
+            if parse_memory_attribution_claim(arguments).is_some() {
+                attach_feedback_status(
+                    result,
+                    json!({"status":"unavailable","error":"event capture is unavailable","retryable":true}),
+                );
+            }
             return;
         };
         let Some(parent) = tool_called_event else {
+            if parse_memory_attribution_claim(arguments).is_some() {
+                attach_feedback_status(
+                    result,
+                    json!({"status":"error","error":"the durable tool-call event was not recorded","retryable":true}),
+                );
+            }
             return;
         };
         let outcome = match result {
@@ -3233,7 +3609,17 @@ impl McpHandler {
             }
         };
         if let Some(terminal_event) = terminal_event {
-            self.resolve_explicit_memory_attribution(arguments, terminal_event);
+            if let Some(status) = self
+                .resolve_explicit_memory_attribution(arguments, terminal_event)
+                .await
+            {
+                attach_feedback_status(result, status);
+            }
+        } else if parse_memory_attribution_claim(arguments).is_some() {
+            attach_feedback_status(
+                result,
+                json!({"status":"error","error":"a durable terminal workflow event was not recorded","retryable":true}),
+            );
         }
     }
 
@@ -3429,11 +3815,12 @@ impl McpHandler {
         }
 
         capsule.memories = self
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 query,
                 &entry_files,
                 &entry_symbols,
-                capsule.memories,
+                self.load_relevant_memory_values(Some(query), &entry_files, &entry_symbols, 5)
+                    .await?,
                 5,
             )
             .await?;
@@ -3448,8 +3835,7 @@ impl McpHandler {
                 // Built once per request rather than once per bundle mode: a
                 // score walks every input weight and the index ranks the whole
                 // file population.
-                let health =
-                    health_fact_index(
+                let health = health_fact_index(
                     engine.graph(),
                     git_intelligence.as_ref(),
                     published_health.as_ref(),
@@ -3481,10 +3867,8 @@ impl McpHandler {
                 };
                 // Scored inside the job: the index borrows the graph snapshot
                 // this closure owns, and only the rendered section escapes.
-                let health_presentation = change_set_health_presentation(
-                    Some(&health),
-                    task_bundle_change_set(&bundle),
-                );
+                let health_presentation =
+                    change_set_health_presentation(Some(&health), task_bundle_change_set(&bundle));
                 (bundle, delivery_mode, mode_reason, health_presentation)
             })
             .await
@@ -3627,11 +4011,12 @@ impl McpHandler {
         }
 
         capsule.memories = self
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 query,
                 &entry_files,
                 &entry_symbols,
-                capsule.memories,
+                self.load_relevant_memory_values(Some(query), &entry_files, &entry_symbols, 5)
+                    .await?,
                 5,
             )
             .await?;
@@ -3645,8 +4030,7 @@ impl McpHandler {
         let (bundle, delivery_mode, mode_reason, health_presentation) = match self
             .run_query_job(move || {
                 // See `tool_prepare_change`: one index per request.
-                let health =
-                    health_fact_index(
+                let health = health_fact_index(
                     engine.graph(),
                     git_intelligence.as_ref(),
                     published_health.as_ref(),
@@ -3938,11 +4322,11 @@ impl McpHandler {
             let engine = self.engine.lock().await;
             let project_rules = detect_project_rules(engine.graph());
             let health = health_fact_index(
-                    engine.graph(),
-                    git_intelligence.as_ref(),
-                    published_health.as_ref(),
-                    false,
-                );
+                engine.graph(),
+                git_intelligence.as_ref(),
+                published_health.as_ref(),
+                false,
+            );
             let report = impact_from_diff(
                 engine.graph(),
                 diff,
@@ -4048,7 +4432,7 @@ impl McpHandler {
         let memory_query = build_memory_query(query, &files, &symbols);
 
         let memories = self
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 query.unwrap_or(memory_query.as_deref().unwrap_or("working set")),
                 &files,
                 &symbols,
@@ -4137,7 +4521,7 @@ impl McpHandler {
             return Ok(response);
         }
         let mut memories = self
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 query,
                 &files,
                 &symbols,
@@ -4218,7 +4602,7 @@ impl McpHandler {
 
                 if candidate_files != files || candidate_symbols != symbols {
                     let candidate_memories = self
-                        .augment_memory_values_with_playbooks(
+                        .augment_memory_values_with_outcomes(
                             query,
                             &candidate_files,
                             &candidate_symbols,
@@ -4326,32 +4710,9 @@ impl McpHandler {
             .store_context_handle("summarize_subsystem", seed_from_subsystem_summary(&report))
             .await;
 
-        let playbook_memory = self
-            .auto_upsert_playbook_memory(
-                format!(
-                    "subsystem_playbook::{}",
-                    stable_refresh_key(query, &files, &symbols)
-                ),
-                summarize_subsystem_memory_content(&report),
-                report
-                    .key_files
-                    .iter()
-                    .map(|item| item.file.clone())
-                    .collect(),
-                report
-                    .key_symbols
-                    .iter()
-                    .map(|item| item.symbol.clone())
-                    .collect(),
-                Some(query.to_string()),
-                true,
-            )
-            .await?;
-
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "summarize_subsystem");
-        attach_playbook_memory(&mut value, playbook_memory);
         self.finalize_workflow_value(
             "summarize_subsystem",
             args,
@@ -4415,29 +4776,9 @@ impl McpHandler {
             .store_context_handle("get_repo_playbook", seed_from_repo_playbook(&report))
             .await;
 
-        let playbook_memory = self
-            .auto_upsert_playbook_memory(
-                "repo_playbook".to_string(),
-                summarize_repo_playbook_memory_content(&report),
-                report
-                    .key_files
-                    .iter()
-                    .map(|item| item.file.clone())
-                    .collect(),
-                report
-                    .notable_symbols
-                    .iter()
-                    .map(|item| item.symbol.clone())
-                    .collect(),
-                Some("repo playbook".to_string()),
-                false,
-            )
-            .await?;
-
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, &handle.legacy_handle, "get_repo_playbook");
-        attach_playbook_memory(&mut value, playbook_memory);
         self.finalize_workflow_value(
             "get_repo_playbook",
             args,
@@ -4577,11 +4918,11 @@ impl McpHandler {
             let project_rules = detect_project_rules(engine.graph());
             // See `tool_prepare_change`: one index per request.
             let health = health_fact_index(
-                    engine.graph(),
-                    git_intelligence.as_ref(),
-                    published_health.as_ref(),
-                    false,
-                );
+                engine.graph(),
+                git_intelligence.as_ref(),
+                published_health.as_ref(),
+                false,
+            );
             let compact_report = diagnose_failure(
                 engine.graph(),
                 input,
@@ -4608,7 +4949,7 @@ impl McpHandler {
         };
 
         let memories = self
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 input,
                 &report.extracted_files,
                 &report.extracted_symbols,
@@ -4801,7 +5142,7 @@ impl McpHandler {
                     confidence: if status == "success" { 0.96 } else { 0.72 },
                     linked_symbols: symbols.clone(),
                     linked_files: files.clone(),
-                    workspace_id: Some(workspace_id),
+                    workspace_id: Some(workspace_id.clone()),
                     branch: branch.clone(),
                     scope_organization_id: None,
                     refresh_key: Some(refresh_key.clone()),
@@ -4841,14 +5182,22 @@ impl McpHandler {
         let Some(consolidator) = self.session_consolidator.as_ref().cloned() else {
             return;
         };
+        let Some(capture) = self.event_capture.as_ref() else {
+            tracing::warn!("session consolidation requires trusted event capture authority");
+            return;
+        };
         let workspace_id = self.memory_workspace_id.clone();
+        let checkout_id = self.checkout_id.clone();
+        let branch = capture.branch_name().to_string();
         let task_id = task.to_string();
         let outcome = match status {
             "failure" | "failed" => EpisodeOutcome::Failure,
             "abandoned" => EpisodeOutcome::Abandoned,
             _ => EpisodeOutcome::Success,
         };
+        let runtime_work = self.runtime_work.begin();
         tokio::task::spawn_blocking(move || {
+            let _runtime_work = runtime_work;
             let mut consolidator = match consolidator.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -4856,8 +5205,13 @@ impl McpHandler {
                     return;
                 }
             };
+            let authority = lattice_core::consolidation::EvolutionAuthority {
+                repository_id: &workspace_id,
+                checkout_id: &checkout_id,
+                branch: &branch,
+            };
             if let Err(error) = consolidator.on_task_complete(
-                &workspace_id,
+                &authority,
                 &lattice_core::events::TaskId {
                     value: task_id.clone(),
                 },
@@ -4913,7 +5267,7 @@ impl McpHandler {
 
         let cached = {
             let mut cache = self.context_cache.lock().await;
-            cache.get(handle).ok_or((
+            cache.peek(handle).ok_or((
                 -32602,
                 format!("Unknown or expired context handle: {}", handle),
             ))?
@@ -4938,13 +5292,396 @@ impl McpHandler {
             ));
         }
 
+        if let Some(key) = focus.strip_prefix("relevance:") {
+            let detail = cached.relevance_detail.as_ref().ok_or((
+                -32602,
+                "This handle has no typed relevance snapshot; rerun the parent workflow."
+                    .to_string(),
+            ))?;
+            if key.is_empty() || detail.key != key {
+                return Err((
+                    -32602,
+                    format!("Unknown relevance focus {focus}; use the exact focus from the parent workflow."),
+                ));
+            }
+            if detail.kind == "memory" {
+                let reference = detail.memory_reference.as_ref().ok_or((
+                    -32602,
+                    "The cached memory relevance snapshot has no canonical memory reference; rerun the parent workflow."
+                        .to_string(),
+                ))?;
+                let _ = self.load_context_memory_reference(reference).await?;
+            } else if detail.kind != "pivot" {
+                return Err((
+                    -32602,
+                    "The cached relevance snapshot kind is invalid; rerun the parent workflow."
+                        .to_string(),
+                ));
+            }
+            let value = json!({
+                "focus": focus,
+                "focus_type": "relevance",
+                "relevance": {
+                    "kind": detail.kind,
+                    "key": detail.key,
+                    "total_score": detail.total_score,
+                    "ranking_signals": detail.ranking_signals,
+                    "explanation": "This snapshot records the original retrieval ranking signals; it is not a current verification result."
+                },
+                "context_handle": handle,
+                "context_origin": cached.origin,
+            });
+            if serde_json::to_vec(&value)
+                .map(|bytes| bytes.len().div_ceil(4))
+                .unwrap_or(usize::MAX)
+                > max_tokens
+            {
+                return Err((
+                    -32603,
+                    format!("The complete relevance snapshot cannot fit the requested {max_tokens}-token budget; retry with a larger max_tokens value."),
+                ));
+            }
+            self.context_cache.lock().await.renew(handle);
+            return Ok(wrap_tool_result(value));
+        }
+
+        let mut seed = cached.seed.clone();
+        let mut expansion_delivery = None;
+        let expands_memory = if let Some(target) = focus.strip_prefix("memory:") {
+            if let Ok(index) = target.parse::<usize>() {
+                Some(index)
+            } else {
+                let matches = cached
+                    .memory_references
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, reference)| {
+                        let reference = reference.as_ref()?;
+                        let encoded = format!("{}:{}", reference.authority, reference.memory_id);
+                        (encoded == target).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err((
+                        -32602,
+                        format!(
+                            "Invalid or unavailable exact memory expansion focus: {focus}; use a memory target from the parent workflow."
+                        ),
+                    ));
+                }
+                matches.first().copied()
+            }
+        } else {
+            None
+        };
+        if let Some(index) = expands_memory {
+            let reference = cached
+                .memory_references
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or((
+                    -32602,
+                    format!(
+                        "Memory position {index} is unavailable for context handle {handle}; retry the parent workflow to obtain current memory references."
+                    ),
+                ))?;
+            let (memory, digest) = self.load_context_memory_reference(reference).await?;
+            seed.memories = vec![memory];
+            expansion_delivery = Some((reference.clone(), digest));
+        }
+
         let engine = self.engine.lock().await;
-        let report = expand_context(engine.graph(), &cached.seed, focus, max_tokens);
+        let report = expand_context(
+            engine.graph(),
+            &seed,
+            if expands_memory.is_some() {
+                "memory:0"
+            } else {
+                focus
+            },
+            max_tokens,
+        );
+        drop(engine);
 
         let mut value = serde_json::to_value(&report)
             .map_err(|e| (-32603, format!("Serialization error: {}", e)))?;
         attach_context_handle(&mut value, handle, &cached.origin);
+        if expands_memory.is_some() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("focus".into(), Value::String(focus.to_string()));
+                object.insert(
+                    "rationale".into(),
+                    json!(["Resolved the exact cached memory reference against current authority and lifecycle state."]),
+                );
+            }
+            self.fit_expanded_memory_delivery(&mut value, max_tokens)?;
+            let (reference, digest) = expansion_delivery.expect("memory expansion binding");
+            self.bind_expanded_memory_delivery(&mut value, &reference, digest)
+                .await?;
+        }
+        self.context_cache.lock().await.renew(handle);
         Ok(wrap_tool_result(value))
+    }
+
+    async fn load_context_memory_reference(
+        &self,
+        reference: &super::context_cache::CachedMemoryReference,
+    ) -> Result<(Value, [u8; 32]), (i32, String)> {
+        let repository_authority = format!("repository:{}", self.memory_workspace_id);
+        if reference.authority == repository_authority {
+            let store = self.memory_store.lock().await;
+            let memory = store
+                .get_by_id_scoped_for_checkout(
+                    &reference.memory_id,
+                    &self.current_memory_scope_filter(),
+                    &self.checkout_id,
+                )
+                .map_err(|error| (-32603, format!("Failed to resolve current memory: {error}")))?
+                .filter(memory_is_delivery_eligible)
+                .ok_or((
+                    -32001,
+                    format!(
+                        "Memory {} is no longer available under the current repository, checkout, branch, and session authority; retry the parent workflow.",
+                        reference.memory_id
+                    ),
+                ))?;
+            let stale = store
+                .with_connection(|connection| {
+                    retention_stale_by_id(connection, [reference.memory_id.clone()])
+                })
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to validate memory retention state: {error}"),
+                    )
+                })?
+                .get(&reference.memory_id)
+                .copied()
+                .unwrap_or(true);
+            if stale {
+                return Err((
+                    -32001,
+                    format!(
+                        "Memory {} is no longer available under the current retention policy; retry the parent workflow.",
+                        reference.memory_id
+                    ),
+                ));
+            }
+            let fields = store
+                .get_structured_fields(&reference.memory_id)
+                .map_err(|error| (-32603, format!("Failed to load memory metadata: {error}")))?
+                .ok_or((
+                    -32001,
+                    "Memory metadata is no longer available; retry the parent workflow."
+                        .to_string(),
+                ))?;
+            let digest = MemoryStore::expansion_delivery_digest_for(
+                &memory,
+                &fields,
+                &self.memory_workspace_id,
+            )
+            .map_err(|error| (-32603, format!("Failed to bind memory snapshot: {error}")))?;
+            let mut value = serialize_memory_value(&store, &memory, true)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "memory_id".into(),
+                    json!({"workspace_id": self.memory_workspace_id, "ulid": reference.memory_id}),
+                );
+            }
+            return Ok((value, digest));
+        }
+
+        let Some(runtime) = self.shared_memory.as_ref() else {
+            return Err((
+                -32001,
+                "Organization memory is unavailable because no shared memory authority is configured."
+                    .to_string(),
+            ));
+        };
+        let expected = format!("organization:{}", runtime.organization_id);
+        if reference.authority != expected {
+            return Err((
+                -32001,
+                "The cached memory reference belongs to a different memory authority; retry the parent workflow."
+                    .to_string(),
+            ));
+        }
+        let store = runtime.store.lock().await;
+        let memory = store
+            .get_by_id(&reference.memory_id)
+            .map_err(|error| (-32603, format!("Failed to resolve current shared memory: {error}")))?
+            .filter(memory_is_delivery_eligible)
+            .filter(|memory| {
+                memory.scope == MemoryScope::Organization
+                    && memory.scope_organization_id.as_deref()
+                        == Some(runtime.organization_id.as_str())
+            })
+            .ok_or((
+                -32001,
+                format!(
+                    "Memory {} is no longer available under the configured organization authority; retry the parent workflow.",
+                    reference.memory_id
+                ),
+            ))?;
+        let stale = store
+            .with_connection(|connection| {
+                retention_stale_by_id(connection, [reference.memory_id.clone()])
+            })
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to validate shared memory retention state: {error}"),
+                )
+            })?
+            .get(&reference.memory_id)
+            .copied()
+            .unwrap_or(true);
+        if stale {
+            return Err((
+                -32001,
+                format!(
+                    "Memory {} is no longer available under the configured organization retention policy; retry the parent workflow.",
+                    reference.memory_id
+                ),
+            ));
+        }
+        let fields = store
+            .get_structured_fields(&reference.memory_id)
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to load shared memory metadata: {error}"),
+                )
+            })?
+            .ok_or((
+                -32001,
+                "Shared memory metadata is no longer available; retry the parent workflow."
+                    .to_string(),
+            ))?;
+        let digest_repository = memory.workspace_id.as_deref().ok_or((
+            -32001,
+            "Shared memory provenance is no longer available; retry the parent workflow."
+                .to_string(),
+        ))?;
+        let digest =
+            MemoryStore::expansion_delivery_digest_for(&memory, &fields, digest_repository)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to bind shared memory snapshot: {error}"),
+                    )
+                })?;
+        let mut value = serialize_memory_value(&store, &memory, true)?;
+        let verification_status = value["verification_status"]
+            .as_str()
+            .unwrap_or("unverified")
+            .to_string();
+        annotate_shared_memory_value(
+            &mut value,
+            &format!("{}:{}", reference.authority, reference.memory_id),
+            "organization",
+            memory.workspace_id.as_deref() != Some(self.memory_workspace_id.as_str()),
+            memory.workspace_id.as_deref(),
+            None,
+            &verification_status,
+            "resolved from current organization memory",
+        );
+        Ok((value, digest))
+    }
+
+    async fn bind_expanded_memory_delivery(
+        &self,
+        value: &mut Value,
+        reference: &super::context_cache::CachedMemoryReference,
+        expected_digest: [u8; 32],
+    ) -> Result<(), (i32, String)> {
+        let entries = rendered_workflow_memory_entries(value);
+        if entries.len() != 1 {
+            return Err((
+                -32603,
+                "Memory expansion did not produce one exact current memory projection.".to_string(),
+            ));
+        }
+        let projection = vec![entries[0].1.clone()];
+        let receipt =
+            memory_delivery_receipt_value(&reference.authority, &self.session_id, &projection);
+        let binding = DeliveryBinding {
+            delivery_id: receipt["delivery_id"].as_str().unwrap_or_default(),
+            repository_id: &reference.authority,
+            session_id: &self.session_id,
+            payload_hash: receipt["payload_hash"].as_str().unwrap_or_default(),
+        };
+        let organization_id = reference.authority.strip_prefix("organization:");
+        let result = if organization_id.is_some() {
+            let runtime = self.shared_memory.as_ref().ok_or((
+                -32001,
+                "Organization memory authority is no longer configured; retry the parent workflow."
+                    .to_string(),
+            ))?;
+            runtime
+                .store
+                .lock()
+                .await
+                .attempt_expansion_memory_delivery(
+                    &binding,
+                    &reference.memory_id,
+                    expected_digest,
+                    None,
+                    None,
+                    None,
+                    &self.session_id,
+                    organization_id,
+                    current_unix_seconds(),
+                )
+        } else {
+            self.memory_store
+                .lock()
+                .await
+                .attempt_expansion_memory_delivery(
+                    &binding,
+                    &reference.memory_id,
+                    expected_digest,
+                    Some(&self.memory_workspace_id),
+                    Some(&self.checkout_id),
+                    current_git_branch(&self.workspace_root).as_deref(),
+                    &self.session_id,
+                    None,
+                    current_unix_seconds(),
+                )
+        };
+        result.map_err(|error| {
+            (
+                -32001,
+                format!("Memory is no longer available for expansion delivery: {error}; retry the parent workflow."),
+            )
+        })?;
+        value
+            .as_object_mut()
+            .expect("expanded context object")
+            .insert("memory_deliveries".into(), Value::Array(vec![receipt]));
+        Ok(())
+    }
+
+    fn fit_expanded_memory_delivery(
+        &self,
+        value: &Value,
+        max_tokens: usize,
+    ) -> Result<(), (i32, String)> {
+        if self.workflow_memory_delivery_preview_fits(
+            value,
+            max_tokens,
+            WorkflowRenderMode::Json,
+            WorkflowWireFormat::Standard,
+        ) {
+            Ok(())
+        } else {
+            Err((
+                -32603,
+                format!(
+                    "The current memory and its delivery receipt cannot fit the requested {max_tokens}-token expansion budget; retry with a larger max_tokens value."
+                ),
+            ))
+        }
     }
 
     async fn store_context_handle(
@@ -4954,12 +5691,29 @@ impl McpHandler {
     ) -> super::context_cache::HandleRecord {
         let repo_epoch = self.current_repo_epoch().await;
         let mut cache = self.context_cache.lock().await;
-        cache.insert(
+        cache.insert_with_memory_authority(
             origin,
             seed,
             &self.workspace_root.to_string_lossy(),
             &self.session_id,
             repo_epoch,
+            &format!("repository:{}", self.memory_workspace_id),
+        )
+    }
+
+    async fn store_relevance_context_handle(
+        &self,
+        detail: super::context_cache::CachedRelevanceDetail,
+        seed: ExpandContextSeed,
+    ) -> super::context_cache::HandleRecord {
+        let repo_epoch = self.current_repo_epoch().await;
+        self.context_cache.lock().await.insert_relevance_detail(
+            "relevance_detail",
+            seed,
+            &self.workspace_root.to_string_lossy(),
+            &self.session_id,
+            repo_epoch,
+            detail,
         )
     }
 
@@ -4996,6 +5750,20 @@ impl McpHandler {
         if let Some(retrieved_count) = workflow_memory_result_count(&value) {
             self.record_memory_retrieval(tool_name, arguments, retrieved_count)
                 .await;
+        }
+        // Reload exact canonical snapshots before budget pruning. Candidate
+        // prose and trust summaries cannot authorize final memory delivery.
+        let had_memory_candidates = !rendered_workflow_memory_entries(&value).is_empty();
+        let (
+            complete_memory_contents,
+            workflow_memory_snapshots,
+            memory_load_failure,
+            memory_missing,
+        ) = self.load_complete_workflow_memories(&value).await;
+        if had_memory_candidates {
+            // A still-eligible lesson can change after ranking. Its old prose
+            // summaries are not covered by the newly loaded snapshot digest.
+            remove_memory_derived_workflow_summaries(&mut value);
         }
         let pruning_profile = self.session_pruning_profile().await;
         let mut metadata = metadata.clone();
@@ -5038,7 +5806,17 @@ impl McpHandler {
                 prune_health_section(object, 0);
             }
         }
-        let mut truncated = approx_value_tokens(&value) > effective_token_cap;
+        // Current workflow bundles carry audit and legacy structured
+        // projections alongside the public ranked projection. Shed those
+        // duplicates before downgrading the answer to tiny mode, so a compact
+        // budget that can hold a relevant memory does not lose that lesson.
+        let supporting_projections_trimmed = if approx_value_tokens(&value) > effective_token_cap {
+            trim_workflow_v2_supporting_projections(&mut value, effective_token_cap)
+        } else {
+            false
+        };
+        let mut truncated =
+            supporting_projections_trimmed || approx_value_tokens(&value) > effective_token_cap;
         if truncated {
             if !matches!(budget, WorkflowBudget::Tiny) {
                 budget = WorkflowBudget::Tiny;
@@ -5075,6 +5853,13 @@ impl McpHandler {
             trim_value_for_token_budget(&mut value, effective_token_cap);
             truncated = true;
         }
+        synchronize_nested_workflow_memories(&mut value);
+
+        if approx_value_tokens(&value) > effective_token_cap {
+            trim_value_for_token_budget(&mut value, effective_token_cap);
+            synchronize_nested_workflow_memories(&mut value);
+            truncated = true;
+        }
 
         metadata.wire_format = match wire_format {
             WorkflowWireFormat::Dense => "dense".to_string(),
@@ -5083,11 +5868,352 @@ impl McpHandler {
         attach_workflow_metadata(&mut value, &metadata);
         attach_workflow_budget_metadata(&mut value, budget, effective_token_cap, truncated);
 
+        restore_complete_workflow_memories(&mut value, &complete_memory_contents);
+        if memory_missing {
+            remove_memory_derived_workflow_summaries(&mut value);
+            if complete_memory_contents.is_empty() {
+                remove_rendered_workflow_memory(&mut value);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("memory_delivery".into(), json!({
+                        "status": "degraded",
+                        "reason": "memory content withheld because the selected memories are no longer available under current authority or lifecycle constraints"
+                    }));
+                }
+            }
+        }
+        if let Some(error) = memory_load_failure {
+            remove_rendered_workflow_memory(&mut value);
+            remove_memory_derived_workflow_summaries(&mut value);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("memory_delivery".into(), json!({
+                    "status": "degraded",
+                    "reason": format!("memory content withheld because its canonical snapshot could not be loaded: {error}")
+                }));
+            }
+        }
+
+        if matches!(response_options.render, WorkflowRenderMode::Markdown) {
+            prepare_markdown_memory_projection(&mut value);
+        }
+        if !rendered_workflow_memory_entries(&value).is_empty()
+            && !self.workflow_memory_delivery_preview_fits(
+                &value,
+                effective_token_cap,
+                response_options.render,
+                wire_format,
+            )
+        {
+            trim_final_workflow_projection(&mut value);
+            set_workflow_truncated(&mut value);
+            refresh_workflow_approx_tokens(&mut value, response_options.render, wire_format);
+        }
+        self.bind_rendered_workflow_memory_delivery(
+            &mut value,
+            effective_token_cap,
+            response_options.render,
+            wire_format,
+            &workflow_memory_snapshots,
+        )
+        .await;
+        refresh_workflow_approx_tokens(&mut value, response_options.render, wire_format);
+
+        if rendered_workflow_text_tokens(&value, response_options.render, wire_format)
+            > effective_token_cap
+        {
+            trim_final_workflow_projection(&mut value);
+            set_workflow_truncated(&mut value);
+            refresh_workflow_approx_tokens(&mut value, response_options.render, wire_format);
+        }
+
+        if rendered_workflow_text_tokens(&value, response_options.render, wire_format)
+            > effective_token_cap
+        {
+            return Err((
+                -32603,
+                format!(
+                    "The workflow response cannot fit the requested {effective_token_cap}-token budget while preserving its context handle and delivery proof; retry with a larger max_tokens value."
+                ),
+            ));
+        }
+
         if matches!(wire_format, WorkflowWireFormat::Dense) {
             value = densify_workflow_value(value);
         }
 
         Ok(wrap_workflow_tool_result(value, response_options.render))
+    }
+
+    /// Persist the receipt binding for the memory entries that survived final
+    /// workflow pruning. If persistence fails, remove those entries before the
+    /// lexical workflow response is serialized.
+    async fn bind_rendered_workflow_memory_delivery(
+        &self,
+        value: &mut Value,
+        effective_token_cap: usize,
+        render: WorkflowRenderMode,
+        wire_format: WorkflowWireFormat,
+        snapshots: &HashMap<String, (super::context_cache::CachedMemoryReference, [u8; 32])>,
+    ) {
+        let (groups, organization_authority) = self.workflow_memory_delivery_groups(value);
+        if groups.is_empty() {
+            return;
+        }
+        let projected_receipts = groups
+            .iter()
+            .map(|(authority, (_, projection))| {
+                memory_delivery_receipt_value(authority, &self.session_id, projection)
+            })
+            .collect::<Vec<_>>();
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "memory_deliveries".into(),
+                Value::Array(projected_receipts.clone()),
+            );
+        }
+        if rendered_workflow_text_tokens(value, render, wire_format) > effective_token_cap {
+            remove_rendered_workflow_memory(value);
+            remove_memory_derived_workflow_summaries(value);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("memory_deliveries");
+                object.insert(
+                    "memory_expansion_available".into(),
+                    Value::String(
+                        "A relevant memory exceeded the response budget; use `recall` with the task and file anchor to inspect it."
+                            .to_string(),
+                    ),
+                );
+                object.insert("truncated".into(), Value::Bool(true));
+            }
+            return;
+        }
+
+        let mut receipts = Vec::new();
+        let mut failure = None;
+        for (authority, (ids, projection)) in groups {
+            let receipt = memory_delivery_receipt_value(&authority, &self.session_id, &projection);
+            let binding = DeliveryBinding {
+                delivery_id: receipt["delivery_id"].as_str().unwrap_or_default(),
+                repository_id: &authority,
+                session_id: &self.session_id,
+                payload_hash: receipt["payload_hash"].as_str().unwrap_or_default(),
+            };
+            let targets = ids
+                .iter()
+                .filter_map(|id| {
+                    snapshots
+                        .values()
+                        .find(|(reference, _)| {
+                            reference.authority == authority && reference.memory_id == *id
+                        })
+                        .map(|(_, digest)| (id.clone(), *digest))
+                })
+                .collect::<Vec<_>>();
+            if targets.len() != ids.len() {
+                failure = Some("a complete canonical memory snapshot was unavailable".to_string());
+                break;
+            }
+            let result = if organization_authority.as_deref() == Some(authority.as_str()) {
+                match self.shared_memory.as_ref() {
+                    Some(runtime) => {
+                        let store = runtime.store.lock().await;
+                        store
+                            .attempt_expansion_memories_delivery(
+                                &binding,
+                                &targets,
+                                None,
+                                None,
+                                None,
+                                &self.session_id,
+                                Some(&runtime.organization_id),
+                                current_unix_seconds(),
+                            )
+                            .map(|_| receipt.clone())
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err("organization memory store is unavailable".to_string()),
+                }
+            } else {
+                let store = self.memory_store.lock().await;
+                store
+                    .attempt_expansion_memories_delivery(
+                        &binding,
+                        &targets,
+                        Some(&self.memory_workspace_id),
+                        Some(&self.checkout_id),
+                        current_git_branch(&self.workspace_root).as_deref(),
+                        &self.session_id,
+                        None,
+                        current_unix_seconds(),
+                    )
+                    .map(|_| receipt)
+                    .map_err(|error| error.to_string())
+            };
+            match result {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            remove_rendered_workflow_memory(value);
+            remove_memory_derived_workflow_summaries(value);
+            if let Some(object) = value.as_object_mut() {
+                object.remove("memory_deliveries");
+                object.remove("memory_expansion_available");
+                object.insert("memory_delivery".into(), json!({
+                    "status": "degraded",
+                    "reason": format!("memory content withheld because its receipt could not be persisted: {error}")
+                }));
+            }
+        } else {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("memory_deliveries".into(), Value::Array(receipts));
+            }
+        }
+    }
+
+    fn workflow_memory_delivery_groups(
+        &self,
+        value: &Value,
+    ) -> (BTreeMap<String, (Vec<String>, Vec<Value>)>, Option<String>) {
+        let repository_authority = format!("repository:{}", self.memory_workspace_id);
+        let repository_prefix = format!("{repository_authority}:");
+        let organization_authority = self
+            .shared_memory
+            .as_ref()
+            .map(|runtime| format!("organization:{}", runtime.organization_id));
+        let mut groups: BTreeMap<String, (Vec<String>, Vec<Value>)> = BTreeMap::new();
+        for (external_id, projection) in rendered_workflow_memory_entries(value) {
+            let (authority, local_id) =
+                if let Some(local) = external_id.strip_prefix(&repository_prefix) {
+                    (repository_authority.clone(), local.to_string())
+                } else if let Some(authority) = organization_authority.as_ref() {
+                    let prefix = format!("{authority}:");
+                    match external_id.strip_prefix(&prefix) {
+                        Some(local) => (authority.clone(), local.to_string()),
+                        None => (repository_authority.clone(), external_id),
+                    }
+                } else {
+                    (repository_authority.clone(), external_id)
+                };
+            let group = groups.entry(authority).or_default();
+            if !group.0.contains(&local_id) {
+                group.0.push(local_id);
+            }
+            if !group.1.contains(&projection) {
+                group.1.push(projection);
+            }
+        }
+        (groups, organization_authority)
+    }
+
+    async fn load_complete_workflow_memories(
+        &self,
+        value: &Value,
+    ) -> (
+        HashMap<String, Value>,
+        HashMap<String, (super::context_cache::CachedMemoryReference, [u8; 32])>,
+        Option<String>,
+        bool,
+    ) {
+        let repository_authority = format!("repository:{}", self.memory_workspace_id);
+        let organization_authority = self
+            .shared_memory
+            .as_ref()
+            .map(|runtime| format!("organization:{}", runtime.organization_id));
+        let mut contents = HashMap::new();
+        let mut snapshots = HashMap::new();
+        let mut failure = None;
+        let mut missing = false;
+        for (external_id, _) in rendered_workflow_memory_entries(value) {
+            if snapshots.contains_key(&external_id) {
+                continue;
+            }
+            let reference = if let Some(local) =
+                external_id.strip_prefix(&format!("{repository_authority}:"))
+            {
+                super::context_cache::CachedMemoryReference {
+                    authority: repository_authority.clone(),
+                    memory_id: local.to_string(),
+                }
+            } else if let Some(authority) = organization_authority.as_ref() {
+                if let Some(local) = external_id.strip_prefix(&format!("{authority}:")) {
+                    super::context_cache::CachedMemoryReference {
+                        authority: authority.clone(),
+                        memory_id: local.to_string(),
+                    }
+                } else if external_id.starts_with("repository:")
+                    || external_id.starts_with("organization:")
+                {
+                    missing = true;
+                    continue;
+                } else {
+                    super::context_cache::CachedMemoryReference {
+                        authority: repository_authority.clone(),
+                        memory_id: external_id.clone(),
+                    }
+                }
+            } else if external_id.starts_with("repository:")
+                || external_id.starts_with("organization:")
+            {
+                missing = true;
+                continue;
+            } else {
+                super::context_cache::CachedMemoryReference {
+                    authority: repository_authority.clone(),
+                    memory_id: external_id.clone(),
+                }
+            };
+            let (memory, digest) = match self.load_context_memory_reference(&reference).await {
+                Ok(snapshot) => snapshot,
+                Err((-32001, _)) => {
+                    missing = true;
+                    continue;
+                }
+                Err((_, error)) => {
+                    failure = Some(error);
+                    continue;
+                }
+            };
+            let Some(content) = memory.get("content").and_then(Value::as_str) else {
+                missing = true;
+                continue;
+            };
+            if content.trim().is_empty() {
+                missing = true;
+                continue;
+            }
+            contents.insert(external_id.clone(), memory);
+            snapshots.insert(external_id, (reference, digest));
+        }
+        (contents, snapshots, failure, missing)
+    }
+
+    fn workflow_memory_delivery_preview_fits(
+        &self,
+        value: &Value,
+        effective_token_cap: usize,
+        render: WorkflowRenderMode,
+        wire_format: WorkflowWireFormat,
+    ) -> bool {
+        let (groups, _) = self.workflow_memory_delivery_groups(value);
+        let mut preview = value.clone();
+        if let Some(object) = preview.as_object_mut() {
+            object.insert(
+                "memory_deliveries".into(),
+                Value::Array(
+                    groups
+                        .iter()
+                        .map(|(authority, (_, projection))| {
+                            memory_delivery_receipt_value(authority, &self.session_id, projection)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        rendered_workflow_text_tokens(&preview, render, wire_format) <= effective_token_cap
     }
 
     async fn session_pruning_profile(&self) -> SessionPruningProfile {
@@ -5103,34 +6229,61 @@ impl McpHandler {
         limit: usize,
     ) -> Result<Vec<Value>, (i32, String)> {
         let memory_query = build_memory_query(query, files, symbols);
+        if let Some(runtime) = &self.shared_memory {
+            let authority = runtime
+                .query_authority(
+                    &self.memory_workspace_id,
+                    &self.workspace_root.to_string_lossy(),
+                    current_git_branch(&self.workspace_root),
+                    &self.session_id,
+                )
+                .map_err(|error| (-32602, error))?;
+            let repository_store = self.memory_store.lock().await;
+            let shared_store = runtime.store.lock().await;
+            let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to initialize memory router: {error}"),
+                    )
+                })?;
+            let recalled = router
+                .recall(memory_query.as_deref(), limit.max(1))
+                .map_err(|error| (-32603, format!("Failed to recall scoped memories: {error}")))?;
+            let mut values = Vec::with_capacity(recalled.len());
+            for result in recalled {
+                let store = match result.source_tier {
+                    MemoryRecallTier::Repository => &*repository_store,
+                    MemoryRecallTier::Organization => &*shared_store,
+                };
+                let mut value = serialize_memory_value(store, &result.memory, true)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("memory_id".into(), json!(result.memory_id.encoded()));
+                    object.insert(
+                        "source_tier".into(),
+                        json!(match result.source_tier {
+                            MemoryRecallTier::Repository => "repository",
+                            MemoryRecallTier::Organization => "organization",
+                        }),
+                    );
+                }
+                values.push(value);
+            }
+            return Ok(values);
+        }
         let store = self.memory_store.lock().await;
         let branch = current_git_branch(&self.workspace_root);
         let scope_filter = self.current_memory_scope_filter();
-
-        let scoped_memories = store
-            .list_all_scoped(&scope_filter)
-            .map_err(|e| (-32603, format!("Failed to load scoped memories: {}", e)))?;
-        let current: Vec<_> = scoped_memories
-            .iter()
-            .filter(|memory| memory.session_id == self.session_id)
-            .take(limit.min(3))
-            .cloned()
-            .collect();
-        let mut values = serialize_memory_values(&store, &current, true)?;
-
-        if values.len() < limit {
-            let remaining = limit.saturating_sub(values.len());
-            if let Some(ref keyword) = memory_query {
-                let previous = store
-                    .query(Some(keyword), remaining, &scope_filter)
-                    .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
-                let previous: Vec<_> = previous
-                    .into_iter()
-                    .filter(|memory| memory.session_id != self.session_id)
-                    .collect();
-                values.extend(serialize_memory_values(&store, &previous, true)?);
-            }
-        }
+        let memories = store
+            .recall_candidates(
+                memory_query.as_deref(),
+                limit.max(1),
+                &scope_filter,
+                Some(&self.checkout_id),
+                RecallOptions::default(),
+            )
+            .map_err(|e| (-32603, format!("Failed to recall scoped memories: {e}")))?;
+        let mut values = serialize_memory_values(&store, &memories, true)?;
 
         sort_memory_values_for_recall(&mut values, branch.as_deref());
         dedupe_memory_values(&mut values);
@@ -5138,36 +6291,18 @@ impl McpHandler {
     }
 
     async fn load_durable_memory_values(&self, limit: usize) -> Result<Vec<Value>, (i32, String)> {
-        let workspace_id = self.memory_workspace_id.clone();
-        let store = self.memory_store.lock().await;
         let branch = current_git_branch(&self.workspace_root);
-        let scope_filter = self.current_memory_scope_filter();
-        let mut memories = store
-            .list_all_scoped(&scope_filter)
-            .map_err(|e| (-32603, format!("Failed to list scoped memories: {}", e)))?;
-
-        memories.retain(|memory| {
-            !memory.is_stale
-                && memory.scope != MemoryScope::Session
-                && memory.workspace_id.as_deref() == Some(workspace_id.as_str())
-        });
-        memories.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.access_count.cmp(&a.access_count))
-                .then_with(|| b.created_at.cmp(&a.created_at))
-        });
-        memories.truncate(limit.max(1).saturating_mul(8));
-
-        let mut values = serialize_memory_values(&store, &memories, true)?;
+        let mut values = self
+            .load_relevant_memory_values(None, &[], &[], limit.max(1).saturating_mul(8))
+            .await?;
+        values.retain(|value| value.get("scope").and_then(Value::as_str) != Some("session"));
         sort_memory_values_for_recall(&mut values, branch.as_deref());
         dedupe_memory_values(&mut values);
         values.truncate(limit.max(1));
         Ok(values)
     }
 
-    async fn augment_memory_values_with_playbooks(
+    async fn augment_memory_values_with_outcomes(
         &self,
         query: &str,
         files: &[String],
@@ -5175,62 +6310,14 @@ impl McpHandler {
         mut values: Vec<Value>,
         limit: usize,
     ) -> Result<Vec<Value>, (i32, String)> {
-        let playbooks = self
-            .load_playbook_memory_values(query, files, symbols)
-            .await?;
         let outcomes = self
             .load_outcome_memory_values(query, files, symbols)
             .await?;
         let branch = current_git_branch(&self.workspace_root);
-        values.splice(0..0, playbooks);
         values.splice(0..0, outcomes);
         sort_memory_values_for_recall(&mut values, branch.as_deref());
         dedupe_memory_values(&mut values);
         values.truncate(limit.max(1));
-        Ok(values)
-    }
-
-    async fn load_playbook_memory_values(
-        &self,
-        query: &str,
-        files: &[String],
-        symbols: &[String],
-    ) -> Result<Vec<Value>, (i32, String)> {
-        let workspace_id = self.memory_workspace_id.clone();
-        let branch = current_git_branch(&self.workspace_root);
-        let subsystem_key = format!(
-            "subsystem_playbook::{}",
-            stable_refresh_key(query, files, symbols)
-        );
-
-        let store = self.memory_store.lock().await;
-        let mut values = Vec::new();
-
-        if let Some(memory) = store
-            .find_by_refresh_key("repo_playbook", Some(&workspace_id), None)
-            .map_err(|e| {
-                (
-                    -32603,
-                    format!("Failed to load repo playbook memory: {}", e),
-                )
-            })?
-        {
-            values.push(serialize_memory_value(&store, &memory, true)?);
-        }
-
-        if let Some(memory) = store
-            .find_by_refresh_key(&subsystem_key, Some(&workspace_id), branch.as_deref())
-            .map_err(|e| {
-                (
-                    -32603,
-                    format!("Failed to load subsystem playbook memory: {}", e),
-                )
-            })?
-        {
-            values.push(serialize_memory_value(&store, &memory, true)?);
-        }
-
-        sort_memory_values_for_recall(&mut values, branch.as_deref());
         Ok(values)
     }
 
@@ -5258,6 +6345,7 @@ impl McpHandler {
                     format!("Failed to load workflow outcome memory: {}", e),
                 )
             })?
+            .filter(memory_is_delivery_eligible)
         {
             values.push(serialize_memory_value(&store, &memory, true)?);
         }
@@ -5266,6 +6354,7 @@ impl McpHandler {
             if let Some(memory) = store
                 .find_by_refresh_key(&refresh_key, Some(&workspace_id), None)
                 .map_err(|e| (-32603, format!("Failed to load repo outcome memory: {}", e)))?
+                .filter(memory_is_delivery_eligible)
             {
                 values.push(serialize_memory_value(&store, &memory, true)?);
             }
@@ -5274,12 +6363,20 @@ impl McpHandler {
         if values.len() < 2 {
             if let Some(keyword) = build_memory_query(Some(query), files, symbols) {
                 let scope_filter = self.current_memory_scope_filter();
-                let mut searched = store.query(Some(&keyword), 2, &scope_filter).map_err(|e| {
-                    (
-                        -32603,
-                        format!("Failed to search scoped outcome memories: {}", e),
+                let mut searched = store
+                    .recall_candidates(
+                        Some(&keyword),
+                        2,
+                        &scope_filter,
+                        None,
+                        RecallOptions::default(),
                     )
-                })?;
+                    .map_err(|e| {
+                        (
+                            -32603,
+                            format!("Failed to search scoped outcome memories: {}", e),
+                        )
+                    })?;
                 searched.retain(|memory| {
                     memory.session_id != self.session_id
                         && memory.workspace_id.as_deref() == Some(workspace_id.as_str())
@@ -5293,96 +6390,31 @@ impl McpHandler {
             }
         }
 
+        let states = store
+            .with_connection(|conn| {
+                lattice_core::memory::retrieval::retention_stale_by_id(
+                    conn,
+                    values.iter().filter_map(|value| {
+                        value.get("id").and_then(Value::as_str).map(str::to_owned)
+                    }),
+                )
+            })
+            .map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to inspect outcome retention: {error}"),
+                )
+            })?;
+        values.retain(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| states.get(id) == Some(&false))
+        });
         sort_memory_values_for_recall(&mut values, branch.as_deref());
         dedupe_memory_values(&mut values);
         values.truncate(2);
         Ok(values)
-    }
-
-    async fn auto_upsert_playbook_memory(
-        &self,
-        refresh_key: String,
-        content: String,
-        linked_files: Vec<String>,
-        linked_symbols: Vec<String>,
-        source_query: Option<String>,
-        prefer_branch_scope: bool,
-    ) -> Result<Value, (i32, String)> {
-        let workspace_id = self.memory_workspace_id.clone();
-        let branch = current_git_branch(&self.workspace_root);
-        let scope = if prefer_branch_scope && branch.is_some() {
-            MemoryScope::Branch
-        } else {
-            MemoryScope::Repo
-        };
-        let scoped_branch = if scope == MemoryScope::Branch {
-            branch.clone()
-        } else {
-            None
-        };
-
-        let store = self.memory_store.lock().await;
-        let existing = store
-            .find_by_refresh_key(&refresh_key, Some(&workspace_id), scoped_branch.as_deref())
-            .map_err(|e| (-32603, format!("Failed to find playbook memory: {}", e)))?;
-
-        let result = if let Some(existing) = existing {
-            let refreshed = store
-                .refresh_memory(
-                    &existing.id,
-                    Some(&content),
-                    Some(MemoryType::Pattern),
-                    Some(scope.clone()),
-                    Some(&linked_symbols),
-                    Some(&linked_files),
-                    Some(&workspace_id),
-                    scoped_branch.as_deref(),
-                    Some(&refresh_key),
-                    source_query.as_deref(),
-                    Some(0.95),
-                )
-                .map_err(|e| (-32603, format!("Failed to refresh playbook memory: {}", e)))?;
-            json!({
-                "id": refreshed.id,
-                "status": "refreshed",
-                "scope": refreshed.scope.as_str(),
-                "refresh_key": refresh_key
-            })
-        } else {
-            let id = store
-                .store(Memory {
-                    id: String::new(),
-                    session_id: self.session_id.clone(),
-                    content,
-                    memory_type: MemoryType::Pattern,
-                    scope: scope.clone(),
-                    confidence: 0.95,
-                    linked_symbols,
-                    linked_files,
-                    workspace_id: Some(workspace_id),
-                    branch: scoped_branch.clone(),
-                    scope_organization_id: None,
-                    refresh_key: Some(refresh_key.clone()),
-                    source_query,
-                    created_at: 0,
-                    last_accessed: 0,
-                    access_count: 0,
-                    is_stale: false,
-                    stale_reason: None,
-                    verification_status: MemoryVerificationStatus::Unverified,
-                })
-                .map_err(|e| (-32603, format!("Failed to store playbook memory: {}", e)))?;
-            json!({
-                "id": id,
-                "status": "stored",
-                "scope": scope.as_str(),
-                "refresh_key": refresh_key
-            })
-        };
-        drop(store);
-        self.record_auto_memory_write(1).await;
-
-        Ok(result)
     }
 
     async fn record_auto_memory_write(&self, count: usize) {
@@ -5444,13 +6476,16 @@ impl McpHandler {
         // through the same ledger and the same edit-follow-through join the
         // other rows use, so there is one attribution pipeline and not two.
         if !cited_files.is_empty() {
-            if let Err(error) = self.adoption_metrics.record_health_evidence(HealthEvidenceRecord {
-                session_id: self.session_id.clone(),
-                client: source.client,
-                channel: source.channel,
-                tool: tool_name.to_string(),
-                cited_files,
-            }) {
+            if let Err(error) = self
+                .adoption_metrics
+                .record_health_evidence(HealthEvidenceRecord {
+                    session_id: self.session_id.clone(),
+                    client: source.client,
+                    channel: source.channel,
+                    tool: tool_name.to_string(),
+                    cited_files,
+                })
+            {
                 tracing::warn!(%error, tool = tool_name, "failed to record health evidence metrics");
             }
         }
@@ -5783,164 +6818,154 @@ impl McpHandler {
         let query = args["query"]
             .as_str()
             .ok_or((-32602, "Missing required parameter: query".to_string()))?;
+        let focus_files = args
+            .get("focus_files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let memory_query = build_memory_query(Some(query), &focus_files, &[]);
         let limit = (args["limit"].as_u64().unwrap_or(10) as usize).min(100);
+        if limit == 0 {
+            return Ok(wrap_tool_result(json!({
+                "query": query,
+                "memories": [],
+                "count": 0,
+                "memory_deliveries": [],
+                "diagnostics": bounded_recall_diagnostics(query, &[]),
+            })));
+        }
 
         if self.shared_memory.is_some() {
             return self.tool_search_memory_merged(query, limit, args).await;
         }
 
+        let authority = MemoryQueryAuthority::new(
+            self.memory_workspace_id.clone(),
+            self.checkout_id.clone(),
+            current_git_branch(&self.workspace_root),
+            self.session_id.clone(),
+            None,
+        )
+        .map_err(|error| (-32602, error.to_string()))?;
+        let include_retention_stale = args
+            .get("include_retention_stale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let store = self.memory_store.lock().await;
-        let scope_filter = self.current_memory_scope_filter();
-        let workspace_id = self.memory_workspace_id.clone();
-        let fts_memories = store
-            .query(Some(query), limit.saturating_mul(4).max(20), &scope_filter)
-            .map_err(|e| (-32603, format!("Failed to search scoped memories: {}", e)))?;
-        let all_memories = store
-            .list_all_scoped(&scope_filter)
-            .map_err(|e| (-32603, format!("Failed to list scoped memories: {}", e)))?;
-        let exact_terms = memory_v2::get_task_memory::structured_query_terms(query, None);
-        let mut durable_exact_term_counts: HashMap<String, usize> =
-            exact_terms.iter().map(|term| (term.clone(), 0)).collect();
-        let mut candidates_by_id: HashMap<String, Memory> = HashMap::new();
-        for memory in fts_memories.into_iter().chain(all_memories) {
-            if memory
-                .workspace_id
-                .as_deref()
-                .is_some_and(|memory_workspace| memory_workspace != workspace_id)
-            {
-                continue;
-            }
-            candidates_by_id.entry(memory.id.clone()).or_insert(memory);
-        }
-
-        let mut candidate_text_by_id = HashMap::new();
-        for memory in candidates_by_id.values() {
-            let fields = store
-                .get_structured_fields(&memory.id)
-                .map_err(|e| (-32603, format!("Failed to load memory fields: {}", e)))?
-                .unwrap_or_default();
-            let text = memory_v2::get_task_memory::durable_memory_search_text(memory, &fields);
-            for term in &exact_terms {
-                if text.to_ascii_lowercase().contains(term) {
-                    *durable_exact_term_counts.entry(term.clone()).or_insert(0) += 1;
-                }
-            }
-            candidate_text_by_id.insert(memory.id.clone(), (text, fields));
-        }
-
-        let mut ranked = Vec::new();
-        for memory in candidates_by_id.into_values() {
-            let (text, fields) = candidate_text_by_id
-                .remove(&memory.id)
-                .unwrap_or_else(|| (memory.content.clone(), MemoryStructuredFields::default()));
-            let matched_terms = memory_v2::get_task_memory::matching_query_terms(&text, query);
-            if matched_terms.is_empty() {
-                continue;
-            }
-            let matched_exact_terms: Vec<String> = matched_terms
-                .iter()
-                .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
-                .cloned()
-                .collect();
-            if !exact_terms.is_empty() && matched_exact_terms.is_empty() {
-                continue;
-            }
-            let mut score = memory_v2::get_task_memory::search_match_score(&matched_terms)
-                + (memory.confidence * 100.0).round() as i64;
-            if !exact_terms.is_empty() && matched_exact_terms.len() == exact_terms.len() {
-                score += 2500;
-            }
-            score += match fields.verification_status {
-                MemoryVerificationStatus::Verified => 600,
-                MemoryVerificationStatus::InReview => 200,
-                MemoryVerificationStatus::Unverified => 0,
-                MemoryVerificationStatus::Superseded => -2500,
-                MemoryVerificationStatus::Contradicted => -3500,
-                MemoryVerificationStatus::Stale => -3000,
-                MemoryVerificationStatus::Expired | MemoryVerificationStatus::Invalidated => -4000,
-            };
-            if memory.is_stale {
-                score -= 3000;
-            }
-            if memory_current_state_warning(&memory, &self.workspace_root).is_some() {
-                score -= 1800;
-            }
-            ranked.push((memory, matched_terms, score, fields.verification_status));
-        }
-        let matched_exact_terms: Vec<String> = ranked
-            .iter()
-            .flat_map(|(_, matched_terms, _, _)| matched_terms.iter())
-            .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
-            .fold(Vec::new(), |mut terms, term| {
-                if !terms.contains(term) {
-                    terms.push(term.clone());
-                }
-                terms
-            });
-        let unmatched_exact_terms: Vec<String> = exact_terms
-            .iter()
-            .filter(|term| !matched_exact_terms.contains(term))
-            .cloned()
-            .collect();
-        let exact_term_status = if exact_terms.is_empty() {
-            "not_requested"
-        } else if unmatched_exact_terms.is_empty() {
-            "matched"
-        } else if matched_exact_terms.is_empty()
-            && durable_exact_term_counts.values().all(|count| *count == 0)
-        {
-            "absent_from_durable_memory"
-        } else {
-            "partially_matched"
+        let recalled = {
+            let router = MemoryStoreRouter::new(&store, None, authority).map_err(|error| {
+                (
+                    -32603,
+                    format!("Failed to initialize memory router: {error}"),
+                )
+            })?;
+            router
+                .recall_with_options(
+                    memory_query.as_deref(),
+                    limit,
+                    RecallOptions {
+                        include_retention_stale,
+                    },
+                )
+                .map_err(|error| (-32603, format!("Failed to recall scoped memory: {error}")))?
         };
-        ranked.sort_by(|left, right| {
-            right
-                .2
-                .cmp(&left.2)
-                .then_with(|| right.0.created_at.cmp(&left.0.created_at))
-        });
-        ranked.truncate(limit);
-        let diagnostics: Vec<Value> = ranked
-            .iter()
-            .map(|(memory, matched_terms, score, verification_status)| {
-                json!({
-                    "memory_id": memory.id,
-                    "workspace": memory.workspace_id,
-                    "matched_terms": matched_terms,
-                    "matched_exact_terms": matched_terms
-                        .iter()
-                        .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
-                        .collect::<Vec<_>>(),
-                    "score": score,
-                    "verification_status": verification_status.as_str(),
-                    "is_stale": memory.is_stale
-                })
-            })
-            .collect();
-        let memories: Vec<Memory> = ranked.into_iter().map(|(memory, _, _, _)| memory).collect();
-        let mut memory_values = serialize_memory_values(&store, &memories, true)?;
-        annotate_memory_freshness_values(&mut memory_values, &memories, &self.workspace_root);
-        let retrieved_count = memory_values.len();
+
+        let mut values = Vec::with_capacity(recalled.len());
+        let mut delivery_entries = Vec::with_capacity(recalled.len());
+        let mut delivered_memories = Vec::with_capacity(recalled.len());
+        let exact_terms = memory_v2::get_task_memory::structured_query_terms(query, None);
+        for result in recalled {
+            if !memory_matches_exact_terms(&store, &result.memory, &exact_terms)? {
+                continue;
+            }
+            let mut value = serialize_memory_value(&store, &result.memory, true)?;
+            annotate_shared_memory_value(
+                &mut value,
+                &result.memory_id.encoded(),
+                "repository",
+                false,
+                result.origin_repository_id.as_deref(),
+                result.origin_checkout_id.as_deref(),
+                result.effective_verification_status.as_str(),
+                &result.trust_reason,
+            );
+            if let Some(object) = value.as_object_mut() {
+                object.insert("assertion_key".to_string(), json!(result.assertion_key));
+                object.insert(
+                    "origin_verification_status".to_string(),
+                    json!(result.origin_verification_status.as_str()),
+                );
+                object.insert("retention_stale".to_string(), json!(result.retention_stale));
+            }
+            delivered_memories.push(result.memory.clone());
+            delivery_entries.push((
+                result.memory.id.clone(),
+                json!({"id": result.memory_id.encoded(), "content": result.memory.content}),
+            ));
+            values.push(value);
+        }
+        annotate_memory_freshness_values(&mut values, &delivered_memories, &self.workspace_root);
+
+        let mut memory_deliveries = Vec::new();
+        if !delivery_entries.is_empty() {
+            let authority = format!("repository:{}", self.memory_workspace_id);
+            let payload_hash = format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(
+                        &delivery_entries
+                            .iter()
+                            .map(|(_, value)| value)
+                            .collect::<Vec<_>>()
+                    )
+                    .unwrap_or_default()
+                )
+            );
+            let delivery_id = format!(
+                "mdel_{:x}",
+                Sha256::digest(
+                    format!("{}\0{}\0{}", self.session_id, authority, payload_hash).as_bytes()
+                )
+            );
+            let ids = delivery_entries
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            store
+                .attempt_memory_delivery(
+                    &DeliveryBinding {
+                        delivery_id: &delivery_id,
+                        repository_id: &authority,
+                        session_id: &self.session_id,
+                        payload_hash: &payload_hash,
+                    },
+                    &ids,
+                    current_unix_seconds(),
+                )
+                .map_err(|error| (-32603, format!("Failed to record memory delivery: {error}")))?;
+            memory_deliveries.push(json!({
+                "authority": authority,
+                "delivery_id": delivery_id,
+                "payload_hash": payload_hash,
+                "ack_required": true,
+            }));
+        }
+        let diagnostics = bounded_recall_diagnostics(query, &values);
+        let retrieved_count = values.len();
         drop(store);
         if self.memory_attribution.is_none() {
             self.record_memory_retrieval("search_memory", args, retrieved_count)
                 .await;
         }
-
         Ok(wrap_tool_result(json!({
             "query": query,
-            "memories": memory_values,
-            "count": memory_values.len(),
-            "diagnostics": {
-                "workspace": workspace_id,
-                "exact_term_rerank": true,
-                "query_exact_terms": exact_terms,
-                "matched_exact_terms": matched_exact_terms,
-                "unmatched_exact_terms": unmatched_exact_terms,
-                "durable_exact_term_counts": durable_exact_term_counts,
-                "exact_term_status": exact_term_status,
-                "matches": diagnostics
-            }
+            "memories": values,
+            "count": retrieved_count,
+            "memory_deliveries": memory_deliveries,
+            "diagnostics": diagnostics,
         })))
     }
 
@@ -5950,6 +6975,15 @@ impl McpHandler {
         limit: usize,
         args: &Value,
     ) -> Result<Value, (i32, String)> {
+        let focus_files = args
+            .get("focus_files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let memory_query = build_memory_query(Some(query), &focus_files, &[]);
         let runtime = self.shared_memory.as_ref().expect("checked above");
         let authority = runtime
             .query_authority(
@@ -5961,7 +6995,7 @@ impl McpHandler {
             .map_err(|error| (-32602, error))?;
         let repository_store = self.memory_store.lock().await;
         let shared_store = runtime.store.lock().await;
-        let values = {
+        let (values, memory_deliveries) = {
             let router = MemoryStoreRouter::new(&repository_store, Some(&shared_store), authority)
                 .map_err(|error| {
                     (
@@ -5969,15 +7003,31 @@ impl McpHandler {
                         format!("Failed to initialize shared memory router: {error}"),
                     )
                 })?;
+            let include_retention_stale = args
+                .get("include_retention_stale")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let recalled = router
-                .recall(Some(query), limit)
+                .recall_with_options(
+                    memory_query.as_deref(),
+                    limit,
+                    RecallOptions {
+                        include_retention_stale,
+                    },
+                )
                 .map_err(|error| (-32603, format!("Failed to recall scoped memory: {error}")))?;
             let mut values = Vec::with_capacity(recalled.len());
+            let mut repository_delivery = Vec::new();
+            let mut organization_delivery = Vec::new();
             for result in recalled {
                 let store = match result.source_tier {
                     MemoryRecallTier::Repository => &*repository_store,
                     MemoryRecallTier::Organization => &*shared_store,
                 };
+                let exact_terms = memory_v2::get_task_memory::structured_query_terms(query, None);
+                if !memory_matches_exact_terms(store, &result.memory, &exact_terms)? {
+                    continue;
+                }
                 let mut value = serialize_memory_value(store, &result.memory, true)?;
                 annotate_shared_memory_value(
                     &mut value,
@@ -5992,16 +7042,79 @@ impl McpHandler {
                     result.effective_verification_status.as_str(),
                     &result.trust_reason,
                 );
+                if matches!(result.source_tier, MemoryRecallTier::Repository) {
+                    annotate_memory_freshness_values(
+                        std::slice::from_mut(&mut value),
+                        std::slice::from_ref(&result.memory),
+                        &self.workspace_root,
+                    );
+                }
                 if let Some(object) = value.as_object_mut() {
                     object.insert("assertion_key".to_string(), json!(result.assertion_key));
                     object.insert(
                         "origin_verification_status".to_string(),
                         json!(result.origin_verification_status.as_str()),
                     );
+                    object.insert("retention_stale".to_string(), json!(result.retention_stale));
+                }
+                let projection =
+                    json!({"id": result.memory_id.encoded(), "content": result.memory.content});
+                match result.source_tier {
+                    MemoryRecallTier::Repository => {
+                        repository_delivery.push((result.memory.id.clone(), projection))
+                    }
+                    MemoryRecallTier::Organization => {
+                        organization_delivery.push((result.memory.id.clone(), projection))
+                    }
                 }
                 values.push(value);
             }
-            values
+            let mut deliveries = Vec::new();
+            for (authority, store, entries) in [
+                (
+                    format!("repository:{}", self.memory_workspace_id),
+                    &*repository_store,
+                    repository_delivery,
+                ),
+                (
+                    format!("organization:{}", runtime.organization_id),
+                    &*shared_store,
+                    organization_delivery,
+                ),
+            ] {
+                if entries.is_empty() {
+                    continue;
+                }
+                let payload_hash = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(
+                            &entries.iter().map(|(_, value)| value).collect::<Vec<_>>()
+                        )
+                        .unwrap_or_default()
+                    )
+                );
+                let delivery_id = format!(
+                    "mdel_{:x}",
+                    Sha256::digest(
+                        format!("{}\0{}\0{}", self.session_id, authority, payload_hash).as_bytes()
+                    )
+                );
+                let ids = entries.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+                let binding = DeliveryBinding {
+                    delivery_id: &delivery_id,
+                    repository_id: &authority,
+                    session_id: &self.session_id,
+                    payload_hash: &payload_hash,
+                };
+                store
+                    .attempt_memory_delivery(&binding, &ids, current_unix_seconds())
+                    .map_err(|error| {
+                        (-32603, format!("Failed to record memory delivery: {error}"))
+                    })?;
+                deliveries.push(json!({"authority": authority, "delivery_id": delivery_id, "payload_hash": payload_hash, "ack_required": true}));
+            }
+            (values, deliveries)
         };
         let retrieved_count = values.len();
         drop(shared_store);
@@ -6014,6 +7127,7 @@ impl McpHandler {
             "query": query,
             "memories": values,
             "count": values.len(),
+            "memory_deliveries": memory_deliveries,
             "diagnostics": {
                 "repository_id": self.memory_workspace_id,
                 "organization_id": runtime.organization_id,
@@ -6028,16 +7142,74 @@ impl McpHandler {
         let limit = (args["limit"].as_u64().unwrap_or(50) as usize).min(200);
 
         let store = self.memory_store.lock().await;
+        let scope_filter = self.current_memory_scope_filter();
         let memories = store
-            .list_stale(query, limit)
+            .list_stale_scoped(query, limit, &scope_filter)
             .map_err(|e| (-32603, format!("Failed to list stale memories: {}", e)))?;
-
-        let entries = serialize_memory_values(&store, &memories, true)?;
+        let retention = store
+            .with_connection(|connection| {
+                retention_stale_by_id(connection, memories.iter().map(|memory| memory.id.clone()))
+            })
+            .map_err(|e| (-32603, format!("Failed to inspect memory retention: {e}")))?;
+        let mut entries = serialize_memory_values(&store, &memories, true)?;
+        for entry in &mut entries {
+            if let Some(object) = entry.as_object_mut() {
+                let stale = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| retention.get(id))
+                    .copied()
+                    .unwrap_or(false);
+                object.insert("retention_stale".into(), json!(stale));
+            }
+        }
+        let mut memory_deliveries = Vec::new();
+        if !entries.is_empty() {
+            let authority = format!("repository:{}", self.memory_workspace_id);
+            let projection = entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(json!({
+                        "id": entry.get("id")?.as_str()?, "content": entry.get("content")?.as_str()?
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let payload_hash = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&projection).unwrap_or_default())
+            );
+            let delivery_id = format!(
+                "mdel_{:x}",
+                Sha256::digest(
+                    format!("{}\0{}\0{}", self.session_id, authority, payload_hash).as_bytes()
+                )
+            );
+            let ids = memories
+                .iter()
+                .map(|memory| memory.id.clone())
+                .collect::<Vec<_>>();
+            let binding = DeliveryBinding {
+                delivery_id: &delivery_id,
+                repository_id: &authority,
+                session_id: &self.session_id,
+                payload_hash: &payload_hash,
+            };
+            store
+                .attempt_memory_delivery(&binding, &ids, current_unix_seconds())
+                .map_err(|e| {
+                    (
+                        -32603,
+                        format!("Failed to record stale-memory delivery: {e}"),
+                    )
+                })?;
+            memory_deliveries.push(json!({"authority":authority,"delivery_id":delivery_id,"payload_hash":payload_hash,"ack_required":true}));
+        }
 
         Ok(wrap_tool_result(json!({
             "count": entries.len(),
             "query": query,
-            "memories": entries
+            "memories": entries,
+            "memory_deliveries": memory_deliveries
         })))
     }
 
@@ -6227,6 +7399,7 @@ impl McpHandler {
         let effective_files = persisted_files.unwrap_or(snapshot.stats.file_count);
         let watcher_health = self.watcher_health.snapshot();
         let index_health = self.index_health.snapshot(10);
+        let memory_store = self.memory_store_status().await;
 
         let mut result = json!({
             "status": if is_indexing { "indexing" } else { "ready" },
@@ -6239,6 +7412,7 @@ impl McpHandler {
             "workspace_field_meaning": "shard_workspace",
             "request_workspace": self.workspace_root.to_string_lossy(),
             "semantic_retrieval": self.semantic_retrieval_status(is_indexing),
+            "memory_store": memory_store,
             "nodes": snapshot.stats.node_count,
             "edges": snapshot.stats.edge_count,
             "files": snapshot.stats.file_count,
@@ -6421,6 +7595,14 @@ impl McpHandler {
                     (created, None)
                 }
             };
+        if let Some(statement) = parsed
+            .task_statement
+            .as_deref()
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            state.task_statement = statement.to_string();
+        }
         self.apply_task_focus_to_state(&mut state, &effective_focus_files);
         self.working_memory_states
             .lock()
@@ -6429,14 +7611,42 @@ impl McpHandler {
         let _ = self
             .checkpoint_working_memory_state(&parsed.task_id, &state, "access", false)
             .await?;
+        let mut candidate_anchors = effective_focus_files.clone();
+        candidate_anchors.extend(effective_focus_dirs.iter().cloned());
+        let has_retrieval_context = parsed
+            .task_statement
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || parsed
+                .intent_hint
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || !candidate_anchors.is_empty();
+        let has_retrieval_context = has_retrieval_context
+            || (!state.task_statement.trim().is_empty()
+                && state.task_statement.trim() != parsed.task_id.trim());
+        let task_query = (!state.task_statement.trim().is_empty())
+            .then_some(state.task_statement.as_str())
+            .or(parsed.intent_hint.as_deref());
+        let candidate_query = build_memory_query(task_query, &candidate_anchors, &[]);
         let scope_filter = self.current_memory_scope_filter();
         let store = self.memory_store.lock().await;
-        let candidates = store
-            .list_all_scoped(&scope_filter)
-            .map_err(|error| (-32603, format!("Failed to list scoped memories: {error}")))?;
+        let candidates = if has_retrieval_context && candidate_query.is_some() {
+            store
+                .recall_candidates(
+                    candidate_query.as_deref(),
+                    256,
+                    &scope_filter,
+                    Some(&self.checkout_id),
+                    RecallOptions::default(),
+                )
+                .map_err(|error| (-32603, format!("Failed to recall scoped memories: {error}")))?
+        } else {
+            Vec::new()
+        };
         let ranked = memory_v2::get_task_memory::rank_memories(
             &store,
-            &self.workspace_root.to_string_lossy(),
+            &self.memory_workspace_id,
             &state,
             candidates,
             parsed.intent_hint.as_deref(),
@@ -6448,7 +7658,7 @@ impl McpHandler {
         let clipped = memory_v2::get_task_memory::clip_to_budget(&ranked, parsed.budget_tokens);
         let bundle = memory_v2::get_task_memory::build_bundle(
             &store,
-            &self.workspace_root.to_string_lossy(),
+            &self.memory_workspace_id,
             parsed.task_id,
             checkpoint_id,
             &state,
@@ -6667,33 +7877,40 @@ impl McpHandler {
             .map_err(|message| (-32602, message))?;
         memory_v2::propose_memory_evolution::validate_args(&parsed)
             .map_err(|message| (-32602, message))?;
+        let capture = self.event_capture.as_ref().ok_or((
+            -32603,
+            "Event capture is not configured for this session; memory evolution requires trusted branch authority".to_string(),
+        ))?;
+        let branch = capture.branch_name().to_string();
         let workspace_id = self.memory_workspace_id.clone();
         let store = self.memory_store.lock().await;
         match parsed.action {
             memory_v2::EvolutionAction::Propose => {
                 let proposal = memory_v2::propose_memory_evolution::build_proposal(
                     &workspace_id,
+                    &self.checkout_id,
+                    &branch,
                     &store,
                     &parsed,
                 )
                 .map_err(|error| (-32603, error))?;
-                let workspace_for_persist = workspace_id.clone();
                 let proposal_kind = proposal.proposal_kind;
                 let proposal_id = proposal.proposal_id.clone();
                 let prior_state = proposal.prior_state.clone();
                 let proposed_state = proposal.proposed_state.clone();
-                store
-                    .with_connection(|conn| {
-                        lattice_core::consolidation::persist_pending_proposal(
-                            conn,
-                            &workspace_for_persist,
-                            proposal_kind.as_str(),
-                            lattice_core::consolidation::ConsolidationJobMode::SynchronousPostTask,
-                            &proposal,
-                        )
-                        .map(|_| ())
-                    })
-                    .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
+                let authority = lattice_core::consolidation::EvolutionAuthority {
+                    repository_id: &workspace_id,
+                    checkout_id: &self.checkout_id,
+                    branch: &branch,
+                };
+                lattice_core::consolidation::persist_pending_proposal(
+                    &store,
+                    &authority,
+                    proposal_kind.as_str(),
+                    lattice_core::consolidation::ConsolidationJobMode::SynchronousPostTask,
+                    &proposal,
+                )
+                .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
                 let response = memory_v2::EvolutionProposal {
                     proposal_id,
                     action: parsed.action,
@@ -6712,16 +7929,37 @@ impl McpHandler {
                     .proposal_id
                     .as_deref()
                     .ok_or((-32602, "Missing proposal_id".to_string()))?;
-                let capture = self.event_capture.as_ref().ok_or((
-                    -32603,
-                    "Event capture is not configured for this session".to_string(),
-                ))?;
                 let writer = capture.writer();
                 let decided_by = parsed.decided_by.as_deref().unwrap_or("assistant");
                 store
                     .with_connection(|conn| {
+                        let tx = conn.unchecked_transaction().map_err(|error| {
+                            lattice_core::LatticeError::Storage(format!(
+                                "Failed to begin proposal decision transaction: {error}"
+                            ))
+                        })?;
+                        let proposal_record =
+                            lattice_core::consolidation::ConsolidationProposal::load_record(
+                                &tx,
+                                proposal_id,
+                            )?
+                            .ok_or_else(|| {
+                                lattice_core::LatticeError::Storage(format!(
+                                    "Proposal `{proposal_id}` was not found"
+                                ))
+                            })?;
+                        if proposal_record.workspace_id != workspace_id {
+                            return Err(lattice_core::LatticeError::Storage(format!(
+                                "Proposal `{proposal_id}` does not belong to repository authority `{workspace_id}`"
+                            )));
+                        }
+                        let authority = lattice_core::consolidation::EvolutionAuthority {
+                            repository_id: &workspace_id,
+                            checkout_id: &self.checkout_id,
+                            branch: &branch,
+                        };
                         let proposal = lattice_core::consolidation::ConsolidationProposal::load(
-                            conn,
+                            &tx,
                             proposal_id,
                         )?
                         .ok_or_else(|| {
@@ -6729,29 +7967,106 @@ impl McpHandler {
                                 "Proposal `{proposal_id}` was not found"
                             ))
                         })?;
+                        if let Some(target_id) = proposal.target.memory_id() {
+                            let target = store.get_by_id(target_id)?.ok_or_else(|| {
+                                lattice_core::LatticeError::Storage(format!(
+                                    "Proposal `{proposal_id}` target memory `{target_id}` was not found"
+                                ))
+                            })?;
+                            memory_v2::propose_memory_evolution::validate_memory_authority(
+                                &store,
+                                target_id,
+                                &target,
+                                &workspace_id,
+                                &self.checkout_id,
+                            )
+                            .map_err(lattice_core::LatticeError::Storage)?;
+                        }
                         match parsed.action {
                             memory_v2::EvolutionAction::Apply => {
-                                proposal.apply(
-                                    conn,
+                                let outcome = proposal.apply_transactional(
+                                    &tx,
                                     &store,
-                                    writer.as_ref(),
+                                    &authority,
                                     decided_by,
                                     parsed.reason.as_deref(),
                                 )?;
+                                if let lattice_core::consolidation::ApplyOutcome::AlreadyDecided { decision } = outcome {
+                                    if decision != lattice_core::consolidation::ProposalDecision::Applied {
+                                        return Err(lattice_core::LatticeError::Storage(format!(
+                                            "Proposal `{proposal_id}` was already decided as {} and cannot be applied",
+                                            decision.as_str()
+                                        )));
+                                    }
+                                }
                             }
                             memory_v2::EvolutionAction::Reject => {
-                                proposal.reject(
-                                    conn,
-                                    writer.as_ref(),
+                                let outcome = proposal.reject_transactional(
+                                    &tx,
+                                    &authority,
                                     decided_by,
                                     parsed.reason.as_deref(),
                                 )?;
+                                if let lattice_core::consolidation::RejectOutcome::AlreadyDecided { decision } = outcome {
+                                    if decision != lattice_core::consolidation::ProposalDecision::Rejected {
+                                        return Err(lattice_core::LatticeError::Storage(format!(
+                                            "Proposal `{proposal_id}` was already decided as {} and cannot be rejected",
+                                            decision.as_str()
+                                        )));
+                                    }
+                                }
                             }
                             memory_v2::EvolutionAction::Propose => {}
                         }
+                        tx.commit().map_err(|error| {
+                            lattice_core::LatticeError::Storage(format!(
+                                "Failed to commit proposal decision transaction: {error}"
+                            ))
+                        })?;
                         Ok(())
                     })
                     .map_err(|error| (-32603, format!("Failed to decide proposal: {error}")))?;
+                let proposal_event_was_pending = if matches!(
+                    parsed.action,
+                    memory_v2::EvolutionAction::Apply
+                ) {
+                    store
+                        .with_connection(|conn| {
+                            conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM consolidation_event_outbox WHERE proposal_id=?1)",
+                                [proposal_id],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+                        })
+                        .map_err(|error| (-32603, format!("Failed to inspect proposal audit event: {error}")))?
+                } else {
+                    false
+                };
+                let publication =
+                    lattice_core::consolidation::drain_event_outbox(&store, writer.as_ref(), 64)
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!(
+                                "Proposal decision committed but audit event publication is pending: {error}"
+                            ),
+                        )
+                    })?;
+                let proposal_event_is_pending = if proposal_event_was_pending {
+                    store
+                        .with_connection(|conn| {
+                            conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM consolidation_event_outbox WHERE proposal_id=?1)",
+                                [proposal_id],
+                                |row| row.get::<_, bool>(0),
+                            )
+                            .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+                        })
+                        .map_err(|error| (-32603, format!("Failed to inspect proposal audit event: {error}")))?
+                } else {
+                    false
+                };
                 let record = store
                     .with_connection(|conn| {
                         lattice_core::consolidation::ConsolidationProposal::load_record(
@@ -6777,9 +8092,18 @@ impl McpHandler {
                     prior_state: record.prior_state.clone(),
                     proposed_state: record.proposed_state.clone(),
                 };
-                serde_json::to_value(&response)
-                    .map(wrap_tool_result)
-                    .map_err(|error| (-32603, format!("Serialization error: {error}")))
+                let mut value = serde_json::to_value(&response)
+                    .map_err(|error| (-32603, format!("Serialization error: {error}")))?;
+                value["audit_event"] = match parsed.action {
+                    memory_v2::EvolutionAction::Apply => json!({
+                        "status": if proposal_event_is_pending { "pending" } else { "published" },
+                        "published_in_this_request": proposal_event_was_pending && !proposal_event_is_pending,
+                        "has_more_pending": publication.has_more,
+                    }),
+                    memory_v2::EvolutionAction::Reject => json!({"status": "not_applicable"}),
+                    memory_v2::EvolutionAction::Propose => unreachable!(),
+                };
+                Ok(wrap_tool_result(value))
             }
         }
     }
@@ -6813,8 +8137,14 @@ impl McpHandler {
             })?;
         let slices = memory_v2::consolidate_session::group_task_slices(&events);
         let mut store = self.memory_store.lock().await;
-        let proposals =
-            persist_session_consolidation_proposals(&workspace_id, &mut store, &slices, mode)?;
+        let proposals = persist_session_consolidation_proposals(
+            &workspace_id,
+            &self.checkout_id,
+            capture.branch_name(),
+            &mut store,
+            &slices,
+            mode,
+        )?;
         emit_consolidation_proposal_events(capture, &workspace_id, &proposals)?;
         tracing::info!(
             tool = "consolidate_session",
@@ -7051,21 +8381,26 @@ impl McpHandler {
         );
 
         for (pivot, detail) in bundle.ranked_pivots.iter_mut().zip(report.pivots.iter()) {
-            let focus = format!("memory:{}", detail.pivot_key);
+            let focus = format!("relevance:{}", detail.pivot_key);
             let seed = ExpandContextSeed {
-                query: Some(detail.label.clone()),
+                query: None,
                 files: pivot.file.clone().into_iter().collect(),
                 symbols: pivot.symbol.clone().into_iter().collect(),
                 tests: Vec::new(),
-                memories: vec![detail_payload(
-                    &detail.label,
-                    &detail.pivot_key,
-                    "pivot",
-                    &detail.inclusion_reason,
-                    &detail.breakdown,
-                )],
+                memories: Vec::new(),
             };
-            let handle = self.store_context_handle("relevance_detail", seed).await;
+            let handle = self
+                .store_relevance_context_handle(
+                    super::context_cache::CachedRelevanceDetail {
+                        key: detail.pivot_key.clone(),
+                        kind: "pivot".to_string(),
+                        total_score: detail.breakdown.total_score,
+                        ranking_signals: detail.breakdown.ranking_signals.clone(),
+                        memory_reference: None,
+                    },
+                    seed,
+                )
+                .await;
             pivot.relevance_detail_handle = Some(handle.legacy_handle);
             pivot.relevance_detail_focus = Some(focus);
             if compact_mode {
@@ -7083,21 +8418,29 @@ impl McpHandler {
             .iter_mut()
             .zip(report.memories.iter())
         {
-            let focus = format!("memory:{}", detail.memory_key);
+            let focus = format!("relevance:{}", detail.memory_key);
             let seed = ExpandContextSeed {
-                query: Some(memory.content.clone()),
+                query: None,
                 files: Vec::new(),
                 symbols: Vec::new(),
                 tests: Vec::new(),
-                memories: vec![detail_payload(
-                    &memory.content,
-                    &detail.memory_key,
-                    "memory",
-                    &detail.inclusion_reason,
-                    &detail.breakdown,
-                )],
+                memories: Vec::new(),
             };
-            let handle = self.store_context_handle("relevance_detail", seed).await;
+            let handle = self
+                .store_relevance_context_handle(
+                    super::context_cache::CachedRelevanceDetail {
+                        key: detail.memory_key.clone(),
+                        kind: "memory".to_string(),
+                        total_score: detail.breakdown.total_score,
+                        ranking_signals: detail.breakdown.ranking_signals.clone(),
+                        memory_reference: cached_memory_reference_from_qualified(
+                            &detail.memory_key,
+                            &self.memory_workspace_id,
+                        ),
+                    },
+                    seed,
+                )
+                .await;
             memory.relevance_detail_handle = Some(handle.legacy_handle);
             memory.relevance_detail_focus = Some(focus);
             if compact_mode {
@@ -7111,15 +8454,330 @@ impl McpHandler {
         }
     }
 
+    pub(crate) async fn process_pending_memory_verifications(&self) -> Result<usize, String> {
+        if self.is_indexing() {
+            return Ok(0);
+        }
+        let scope = self.current_memory_scope_filter();
+        let store = self.memory_store.lock().await;
+        let indexer = self.indexer.lock().await;
+        let graph = self.graph_store.lock().await;
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_micros()
+            .min(i64::MAX as u128) as i64;
+        memory_v2::verification_queue::drain(
+            &store,
+            &indexer,
+            &graph,
+            &self.workspace_root,
+            &scope,
+            &self.checkout_id,
+            micros,
+        )
+    }
+
     async fn tool_verify_explain_memory(&self, args: &Value) -> Result<Value, (i32, String)> {
         let parsed = memory_v2::verify_explain_memory::parse_args(args)
             .map_err(|message| (-32602, message))?;
         let scope_filter = self.current_memory_scope_filter();
+        let mut behavioral = Vec::new();
+        let mut behavioral_revision = None;
+        let mut explicit_target_binding: Option<([u8; 32], String)> = None;
+        let mut observed_set_binding: Option<(
+            String,
+            [u8; 32],
+            Vec<lattice_core::memory::store::TrustedCheckObservationRecord>,
+        )> = None;
+        if let Some(check_id) = parsed.run_check.clone() {
+            if matches!(
+                parsed.mode,
+                memory_v2::verify_explain_memory::VerifyExplainMode::Explain
+            ) {
+                return Err((-32602, "run_check is invalid with mode=explain".into()));
+            }
+            let target = parsed
+                .memory_id
+                .clone()
+                .into_memory_id(&scope_filter.workspace_id);
+            let workspace = WorkspaceIdentity::resolve(&self.workspace_root).map_err(|error| {
+                (
+                    -32603,
+                    format!("Cannot resolve trusted-check authority: {error:#}"),
+                )
+            })?;
+            if workspace.repository_id != self.memory_workspace_id
+                || workspace.checkout_id != self.checkout_id
+            {
+                return Err((
+                    -32603,
+                    "Trusted-check workspace authority changed; retry after workspace refresh"
+                        .into(),
+                ));
+            }
+            let (evidence_reference, target_digest) = {
+                let store = self.memory_store.lock().await;
+                let memory = store
+                    .get_by_id_scoped(&target.ulid, &scope_filter)
+                    .map_err(|error| (-32603, format!("Failed to inspect trusted-check target: {error}")))?
+                    .ok_or_else(|| (-32602, "Trusted-check target is missing or outside the active repository scope".into()))?;
+                if matches!(memory.scope, MemoryScope::Organization) {
+                    return Err((
+                        -32602,
+                        "run_check does not support organization-owned memories".into(),
+                    ));
+                }
+                let fields = store
+                    .get_structured_fields(&memory.id)
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!("Failed to inspect trusted-check evidence: {error}"),
+                        )
+                    })?
+                    .unwrap_or_default();
+                let config = load_verification_config(&workspace.checkout_root)
+                    .map_err(|error| (-32602, error.to_string()))?;
+                let declared = config.checks.iter().find(|item| item.id == check_id)
+                    .ok_or_else(|| (-32602, format!("verification check `{check_id}` is not declared by this repository")))?;
+                let reference = declared.evidence_reference.clone().ok_or_else(|| (-32602, format!("verification check `{check_id}` has no evidence_reference and cannot verify a memory")))?;
+                let linked = fields.linked_tests.iter().any(|item| item == &reference)
+                    || fields
+                        .evidence
+                        .iter()
+                        .any(|item| item.reference.as_deref() == Some(reference.as_str()));
+                if !linked {
+                    return Err((-32602, format!("verification check `{check_id}` is not linked as evidence for memory `{}`", memory.id)));
+                }
+                let digest = lattice_core::memory::MemoryStore::verification_target_digest_for(
+                    &memory,
+                    &fields,
+                    &workspace.repository_id,
+                )
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to bind trusted-check target: {error}"),
+                    )
+                })?;
+                (reference, digest)
+            };
+            explicit_target_binding = Some((target_digest, target.ulid.clone()));
+            let generation = self.indexer.lock().await.graph_snapshot_id();
+            let request_workspace = workspace.clone();
+            let request_check = check_id.clone();
+            let runtime_work = self.runtime_work.begin();
+            let observation = tokio::task::spawn_blocking(move || {
+                let _runtime_work = runtime_work;
+                run_explicit_check(TrustedCheckRequest {
+                    check_id: &request_check,
+                    workspace: &request_workspace,
+                    graph_generation: generation,
+                    max_timeout: Duration::from_secs(10 * 60),
+                })
+            })
+            .await
+            .map_err(|error| (-32603, format!("Trusted check worker failed: {error}")))?
+            .map_err(|error| (-32603, error.to_string()))?;
+            if observation.evidence_reference.as_deref() != Some(evidence_reference.as_str())
+                || !observation_matches_current_state(&observation, &workspace, generation)
+                    .map_err(|error| (-32603, error.to_string()))?
+            {
+                return Err((
+                    -32603,
+                    "Trusted-check source or evidence authority changed; result was discarded"
+                        .into(),
+                ));
+            }
+            {
+                let store = self.memory_store.lock().await;
+                let current_digest = store
+                    .verification_target_digest(&target.ulid, &workspace.repository_id)
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!("Failed to revalidate trusted-check target: {error}"),
+                        )
+                    })?;
+                if current_digest != target_digest {
+                    return Err((-32603, "Target memory or its verification evidence changed while the check ran; result was discarded".into()));
+                }
+                store
+                    .record_trusted_check_observation(
+                        &lattice_core::memory::store::TrustedCheckObservationRecord {
+                            observation_id: None,
+                            memory_id: target.ulid.clone(),
+                            repository_id: observation.repository_id.clone(),
+                            checkout_id: observation.checkout_id.clone(),
+                            check_id: observation.check_id.clone(),
+                            evidence_reference: observation.evidence_reference.clone(),
+                            passed: observation.status == TrustedCheckStatus::Passed,
+                            revision: observation.revision.clone(),
+                            graph_generation: observation.graph_generation,
+                            source_fingerprint: observation.source_fingerprint,
+                            target_digest,
+                            observed_at: observation.observed_at,
+                            exit_code: observation.exit_code,
+                        },
+                    )
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!("Failed to persist trusted check observation: {error}"),
+                        )
+                    })?;
+            }
+            if self.indexer.lock().await.graph_snapshot_id() != generation
+                || !observation_matches_current_state(&observation, &workspace, generation)
+                    .map_err(|error| (-32603, error.to_string()))?
+            {
+                return Err((
+                    -32603,
+                    "Trusted-check observation became stale before verification".into(),
+                ));
+            }
+        }
+        if !matches!(
+            parsed.mode,
+            memory_v2::verify_explain_memory::VerifyExplainMode::Explain
+        ) {
+            let target = parsed
+                .memory_id
+                .clone()
+                .into_memory_id(&scope_filter.workspace_id);
+            let (stored, current_target_digest) = {
+                let store = self.memory_store.lock().await;
+                let records = store
+                    .trusted_check_observations(&target.ulid)
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!("Failed to load trusted check observations: {error}"),
+                        )
+                    })?;
+                let digest = store
+                    .verification_target_digest(&target.ulid, &self.memory_workspace_id)
+                    .map_err(|error| {
+                        (
+                            -32603,
+                            format!("Failed to bind verification target: {error}"),
+                        )
+                    })?;
+                (records, digest)
+            };
+            observed_set_binding =
+                Some((target.ulid.clone(), current_target_digest, stored.clone()));
+            if !stored.is_empty() {
+                let workspace =
+                    WorkspaceIdentity::resolve(&self.workspace_root).map_err(|error| {
+                        (
+                            -32603,
+                            format!("Cannot resolve trusted-check authority: {error:#}"),
+                        )
+                    })?;
+                let generation = self.indexer.lock().await.graph_snapshot_id();
+                for record in stored {
+                    if record.target_digest != current_target_digest {
+                        continue;
+                    }
+                    let observation = crate::trusted_check_runner::TrustedCheckObservation {
+                        repository_id: record.repository_id.clone(),
+                        checkout_id: record.checkout_id.clone(),
+                        check_id: record.check_id,
+                        evidence_reference: record.evidence_reference.clone(),
+                        status: if record.passed {
+                            TrustedCheckStatus::Passed
+                        } else {
+                            TrustedCheckStatus::Failed
+                        },
+                        revision: record.revision.clone(),
+                        graph_generation: record.graph_generation,
+                        source_fingerprint: record.source_fingerprint,
+                        observed_at: record.observed_at,
+                        exit_code: record.exit_code,
+                        elapsed: Duration::ZERO,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    };
+                    if observation_matches_current_state(&observation, &workspace, generation)
+                        .map_err(|error| (-32603, error.to_string()))?
+                    {
+                        if behavioral_revision.is_none() {
+                            behavioral_revision = record.revision.clone();
+                        }
+                        behavioral.push(lattice_core::memory::BehavioralValidationRecord {
+                            repository_id: record.repository_id,
+                            checkout_id: record.checkout_id,
+                            evidence_reference: record.evidence_reference.unwrap_or_default(),
+                            status: if record.passed {
+                                lattice_core::memory::BehavioralValidationStatus::Passed
+                            } else {
+                                lattice_core::memory::BehavioralValidationStatus::Failed
+                            },
+                            revision: record.revision,
+                            graph_generation: Some(record.graph_generation),
+                            observed_at: record.observed_at,
+                        });
+                    }
+                }
+            }
+        }
         let store = self.memory_store.lock().await;
+        if let Some((memory_id, expected_digest, expected)) = &observed_set_binding {
+            let actual_digest = store
+                .verification_target_digest(memory_id, &self.memory_workspace_id)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to revalidate verification target: {error}"),
+                    )
+                })?;
+            if &actual_digest != expected_digest {
+                return Err((
+                    -32603,
+                    "Target memory changed while stored check observations were revalidated; retry"
+                        .into(),
+                ));
+            }
+            let actual = store
+                .trusted_check_observations(memory_id)
+                .map_err(|error| {
+                    (
+                        -32603,
+                        format!("Failed to revalidate trusted observation set: {error}"),
+                    )
+                })?;
+            if &actual != expected {
+                return Err((-32603, "Trusted-check observations changed during verification; retry with the current result set".into()));
+            }
+        }
+        if let Some((expected, memory_id)) = &explicit_target_binding {
+            let actual = store.verification_target_digest(memory_id, &self.memory_workspace_id)
+                .map_err(|error| (-32603, format!("Failed to revalidate trusted-check target before verification: {error}")))?;
+            if &actual != expected {
+                return Err((-32603, "Target memory changed before verification; the check observation was not applied".into()));
+            }
+        }
+        let commit_binding = observed_set_binding
+            .as_ref()
+            .map(|(_, digest, observations)| {
+                lattice_core::memory::store::VerificationCommitBinding {
+                    repository_id: self.memory_workspace_id.clone(),
+                    checkout_id: self.checkout_id.clone(),
+                    branch: scope_filter
+                        .branch
+                        .as_ref()
+                        .map(|branch| branch.name.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    target_digest: *digest,
+                    observations: observations.clone(),
+                }
+            });
         let indexer = self.indexer.lock().await;
         let graph_store = self.graph_store.lock().await;
         let mut reports = self.verify_explain_reports.lock().await;
-        let execution = memory_v2::verify_explain_memory::execute(
+        let execution = memory_v2::verify_explain_memory::execute_with_behavioral_validations(
             &store,
             &indexer,
             &graph_store,
@@ -7127,6 +8785,11 @@ impl McpHandler {
             &scope_filter,
             &mut reports,
             parsed.clone(),
+            &behavioral,
+            Some(&self.memory_workspace_id),
+            Some(&self.checkout_id),
+            behavioral_revision.as_deref(),
+            commit_binding.as_ref(),
         )
         .map_err(|message| (-32603, message))?;
         drop(reports);
@@ -7187,8 +8850,13 @@ impl McpHandler {
             .map_err(|message| (-32602, message))?;
         let scope_filter = self.current_memory_scope_filter();
         let store = self.memory_store.lock().await;
-        let execution = memory_v2::list_memory_conflicts::execute(&store, &scope_filter, parsed)
-            .map_err(|message| (-32603, message))?;
+        let execution = memory_v2::list_memory_conflicts::execute(
+            &store,
+            &scope_filter,
+            Some(&self.checkout_id),
+            parsed,
+        )
+        .map_err(|message| (-32603, message))?;
         tracing::info!(
             tool = "list_memory_conflicts",
             scope = scope_filter.workspace_id.as_str(),
@@ -7585,26 +9253,43 @@ impl McpHandler {
         let index_health = Arc::clone(&self.index_health);
         let parsed_cache_runtime = self.parsed_cache.clone();
         let workspace_key = self.workspace_root.to_string_lossy().to_string();
+        let runtime_work = Arc::clone(&self.runtime_work);
+        let task_work = runtime_work.begin();
 
         indexing.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
-            let _index_permit = index_work
-                .acquire(workspace_key, "explicit_reindex")
-                .await
-                .expect("index work coordinator remains open for the process lifetime");
+            let _task_work = task_work;
+            let index_permit = Arc::new(
+                index_work
+                    .acquire(workspace_key, "explicit_reindex")
+                    .await
+                    .expect("index work coordinator remains open for the process lifetime"),
+            );
+            let resource_budget = index_work.resource_budget();
             let manifest = load_incremental_manifest(&graph_store).await;
             let roots = workspace_roots.clone();
+            let child_work = runtime_work.begin();
+            let child_permit = Arc::clone(&index_permit);
             let incremental = match tokio::task::spawn_blocking(move || {
-                build_incremental_index_for_roots_with_cache(
+                let (_child_work, _child_permit) = (child_work, child_permit);
+                build_incremental_index_for_roots_with_cache_budgeted(
                     &roots,
                     Some(&manifest),
                     HashMap::new(),
                     &parsed_cache_runtime,
+                    Some(&resource_budget),
                 )
             })
             .await
             {
-                Ok(incremental) => incremental,
+                Ok(Ok(incremental)) => incremental,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Explicit reindex deferred by resource admission; keeping the published graph");
+                    index_health.mark_resource_limited(error.to_string());
+                    indexing.store(false, Ordering::Relaxed);
+                    refresh_running.store(false, Ordering::Release);
+                    return;
+                }
                 Err(error) => {
                     tracing::error!(%error, "Reindex worker failed; keeping the previously published graph");
                     indexing.store(false, Ordering::Relaxed);
@@ -7642,7 +9327,10 @@ impl McpHandler {
                 let graph_for_sync = Arc::clone(&new_graph);
                 let embedding_for_sync = Arc::clone(embedding_engine);
                 let vector_for_sync = Arc::clone(vector_index);
+                let child_work = runtime_work.begin();
+                let child_permit = Arc::clone(&index_permit);
                 match tokio::task::spawn_blocking(move || {
+                    let (_child_work, _child_permit) = (child_work, child_permit);
                     crate::vector_sync::sync_full_graph_embeddings(
                         &graph_for_sync,
                         embedding_for_sync.as_ref(),
@@ -7835,10 +9523,17 @@ fn attach_retrieval_completion_metadata(
         .is_some_and(request_control::RequestControl::deadline_reached);
     let has_results = [
         "pivots",
+        "ranked_pivots",
         "context",
+        "relevant_context",
         "primary_files",
+        "pf",
         "key_files",
         "suspects",
+        "memory_highlights",
+        "memories",
+        "mh",
+        "mm",
     ]
     .iter()
     .any(|field| {
@@ -7999,8 +9694,9 @@ fn health_fact_index(
 
     builder = match published.and_then(|facts| facts.graph.clone()) {
         Some(snapshot) => builder.with_shared_graph_facts(snapshot),
-        None => builder
-            .with_graph_facts(GraphFactProducer::default().produce(graph, index_complete)),
+        None => {
+            builder.with_graph_facts(GraphFactProducer::default().produce(graph, index_complete))
+        }
     };
 
     builder = match published.and_then(|facts| facts.test_proximity.clone()) {
@@ -8359,6 +10055,7 @@ impl RequestHandler for McpHandler {
             "lattice/status" => {
                 let is_indexing = self.is_indexing();
                 let snapshot = self.current_status_snapshot(false).await;
+                let memory_store = self.memory_store_status().await;
                 Ok(json!({
                     "status": if is_indexing { "indexing" } else { "ready" },
                     "version": env!("CARGO_PKG_VERSION"),
@@ -8366,7 +10063,8 @@ impl RequestHandler for McpHandler {
                     "nodes": snapshot.stats.node_count,
                     "edges": snapshot.stats.edge_count,
                     "files": snapshot.stats.file_count,
-                    "index_work": self.index_work.snapshot()
+                    "index_work": self.index_work.snapshot(),
+                    "memory_store": memory_store
                 }))
             }
             "lattice/reindex" => self.handle_reindex().await,
@@ -8385,6 +10083,62 @@ impl RequestHandler for McpHandler {
 }
 
 // ── Helper Functions ──────────────────────────────────────────────────
+
+fn memory_store_status_value(availability: &MemoryStoreAvailability) -> Value {
+    match availability {
+        MemoryStoreAvailability::Persistent { path } => json!({
+            "status": "available",
+            "kind": "persistent",
+            "path": path,
+        }),
+        MemoryStoreAvailability::InMemory => json!({
+            "status": "available",
+            "kind": "in_memory",
+        }),
+        MemoryStoreAvailability::Unavailable { path, kind, reason } => json!({
+            "status": "unavailable",
+            "kind": memory_store_failure_kind_label(kind),
+            "path": path,
+            "reason": reason,
+            "recovery": memory_store_recovery_action(kind, path),
+        }),
+    }
+}
+
+fn memory_store_failure_kind_label(kind: &MemoryStoreFailureKind) -> &'static str {
+    match kind {
+        MemoryStoreFailureKind::Busy => "busy",
+        MemoryStoreFailureKind::AccessDenied => "access_denied",
+        MemoryStoreFailureKind::Full => "full",
+        MemoryStoreFailureKind::UnsupportedSchema => "unsupported_schema",
+        MemoryStoreFailureKind::Corrupt => "corrupt",
+        MemoryStoreFailureKind::Other => "other",
+    }
+}
+
+fn memory_store_recovery_action(kind: &MemoryStoreFailureKind, path: &Path) -> String {
+    let path = path.display();
+    match kind {
+        MemoryStoreFailureKind::Busy => format!(
+            "Wait for the process holding {path} to finish, then retry; do not delete the database."
+        ),
+        MemoryStoreFailureKind::AccessDenied => format!(
+            "Restore read/write permission for {path} and its parent directory, then retry."
+        ),
+        MemoryStoreFailureKind::Full => {
+            "Free disk space on the volume containing the memory database, then retry.".to_string()
+        }
+        MemoryStoreFailureKind::UnsupportedSchema => format!(
+            "Upgrade Lattice to a version that supports {path}; preserve the database before any migration."
+        ),
+        MemoryStoreFailureKind::Corrupt => format!(
+            "Preserve {path}, restore it from a known-good backup or run the documented recovery procedure, then retry."
+        ),
+        MemoryStoreFailureKind::Other => format!(
+            "Inspect the reported storage error for {path}, correct the filesystem or SQLite condition, then retry."
+        ),
+    }
+}
 
 /// Find a symbol by name with fuzzy matching.
 /// Supports:
@@ -9194,6 +10948,48 @@ fn apply_workflow_budget(
         }
         WorkflowBudget::Auto => {}
     }
+    synchronize_nested_workflow_memories(value);
+}
+
+fn rendered_memory_id(value: &Value) -> Option<&str> {
+    let identity = value.get("memory_id").or_else(|| value.get("id"))?;
+    identity.as_str().or_else(|| {
+        identity
+            .as_object()
+            .and_then(|identity| identity.get("ulid"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn synchronize_nested_workflow_memories(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let allowed = object
+        .get("memory_highlights")
+        .or_else(|| object.get("memories"))
+        .or_else(|| object.get("mh"))
+        .or_else(|| object.get("mm"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(rendered_memory_id)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let Some(payload) = object
+        .get_mut("structured_payload")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for field in ["memory_highlights", "memories", "mh", "mm"] {
+        if let Some(items) = payload.get_mut(field).and_then(Value::as_array_mut) {
+            items.retain(|item| rendered_memory_id(item).is_some_and(|id| allowed.contains(id)));
+        }
+    }
 }
 
 /// Files the `health` section may cite under each workflow budget.
@@ -9303,14 +11099,8 @@ fn prune_health_section(object: &mut serde_json::Map<String, Value>, file_limit:
             let dropped = files.len().saturating_sub(file_limit);
             if dropped > 0 {
                 files.truncate(file_limit);
-                let truncated = health
-                    .get("truncated")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                health.insert(
-                    "truncated".to_string(),
-                    json!(truncated + dropped as u64),
-                );
+                let truncated = health.get("truncated").and_then(Value::as_u64).unwrap_or(0);
+                health.insert("truncated".to_string(), json!(truncated + dropped as u64));
             }
         }
         truncate_array_field(health, "untested_changes", file_limit);
@@ -9800,6 +11590,112 @@ fn trim_value_for_token_budget(value: &mut Value, max_tokens: usize) {
     truncate_array_field(object, "next_steps", 1);
     truncate_array_field(object, "likely_causes", 1);
     truncate_string_field(object, "overview", 72);
+
+    // Workflow-v2 wraps the legacy intelligence report with retrieval and
+    // audit projections. Those projections are useful at wider budgets, but
+    // they must participate in the same hard cap as the legacy top-level
+    // fields. Keep one actionable public anchor and leave the complete audit
+    // record behind the context handle/event store.
+    truncate_array_field(object, "ranked_pivots", 1);
+    truncate_array_field(object, "relevant_context", 1);
+    truncate_array_field(object, "stable_handles", 1);
+    truncate_array_field(object, "verification_commands", 1);
+    object.remove("event_episodes");
+    object.remove("workflow_record");
+    object.remove("render_choice");
+    object.remove("completed_stages");
+    object.remove("omitted_stages");
+
+    if approx_value_tokens(&Value::Object(object.clone())) > max_tokens {
+        // `structured_payload` duplicates the ranked public projection. It is
+        // available through the stable context handle and is the first large
+        // section to yield when a caller requests a strict response budget.
+        object.remove("structured_payload");
+    }
+
+    if approx_value_tokens(&Value::Object(object.clone())) > max_tokens {
+        object.remove("memory_empty_rationale");
+        object.remove("freshness");
+        object.remove("last_completed_stage");
+        object.remove("suggested_next_expansion");
+    }
+}
+
+fn trim_workflow_v2_supporting_projections(value: &mut Value, max_tokens: usize) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+
+    let before = object.len();
+
+    truncate_array_field(object, "ranked_pivots", 1);
+    truncate_array_field(object, "relevant_context", 1);
+    truncate_array_field(object, "stable_handles", 1);
+    truncate_array_field(object, "verification_commands", 1);
+    object.remove("event_episodes");
+    object.remove("workflow_record");
+    object.remove("render_choice");
+    object.remove("completed_stages");
+    object.remove("omitted_stages");
+
+    if approx_value_tokens(&Value::Object(object.clone())) > max_tokens {
+        object.remove("structured_payload");
+    }
+    object.len() != before
+}
+
+fn rendered_workflow_text_tokens(
+    value: &Value,
+    render: WorkflowRenderMode,
+    wire_format: WorkflowWireFormat,
+) -> usize {
+    let projected = if matches!(wire_format, WorkflowWireFormat::Dense) {
+        densify_workflow_value(value.clone())
+    } else {
+        value.clone()
+    };
+    let wrapped = wrap_workflow_tool_result(projected, render);
+    let bytes = wrapped["content"][0]["text"]
+        .as_str()
+        .map(str::len)
+        .unwrap_or(0);
+    bytes.div_ceil(4).max(1)
+}
+
+fn trim_final_workflow_projection(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("structured_payload");
+    object.remove("workflow_record");
+    object.remove("event_episodes");
+    object.remove("freshness");
+    object.remove("memory_empty_rationale");
+    object.remove("last_completed_stage");
+    object.remove("verification_commands");
+    object.remove("ranked_pivots");
+    object.remove("relevant_context");
+    object.remove("stable_handles");
+    truncate_string_field(object, "overview", 48);
+}
+
+fn set_workflow_truncated(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("truncated".to_string(), Value::Bool(true));
+    }
+}
+
+fn refresh_workflow_approx_tokens(
+    value: &mut Value,
+    render: WorkflowRenderMode,
+    wire_format: WorkflowWireFormat,
+) {
+    for _ in 0..2 {
+        let tokens = rendered_workflow_text_tokens(value, render, wire_format);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("approx_tokens".to_string(), json!(tokens));
+        }
+    }
 }
 
 fn densify_workflow_value(value: Value) -> Value {
@@ -10056,7 +11952,13 @@ fn truncate_text_value(value: &str, limit: usize) -> String {
         value.to_string()
     } else {
         let cutoff = limit.saturating_sub(3);
-        format!("{}...", &value[..cutoff])
+        let boundary = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= cutoff)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &value[..boundary])
     }
 }
 
@@ -10223,6 +12125,10 @@ fn memory_to_value(
 
         if let Some(fields) = structured_fields {
             object.insert(
+                "memory_class".to_string(),
+                json!(fields.memory_class.as_str()),
+            );
+            object.insert(
                 "assertion_type".to_string(),
                 json!(fields.assertion_type.as_str()),
             );
@@ -10293,6 +12199,40 @@ fn serialize_memory_values(
         .iter()
         .map(|memory| serialize_memory_value(store, memory, include_session_id))
         .collect()
+}
+
+fn memory_is_delivery_eligible(memory: &Memory) -> bool {
+    !memory.is_stale
+        && !matches!(
+            memory.verification_status,
+            MemoryVerificationStatus::Stale
+                | MemoryVerificationStatus::Contradicted
+                | MemoryVerificationStatus::Superseded
+                | MemoryVerificationStatus::Expired
+                | MemoryVerificationStatus::Invalidated
+        )
+        && memory.refresh_key.as_deref() != Some("repo_playbook")
+        && !memory
+            .refresh_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("subsystem_playbook::"))
+}
+
+fn memory_delivery_receipt_value(authority: &str, session_id: &str, projection: &[Value]) -> Value {
+    let payload_hash = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(projection).unwrap_or_default())
+    );
+    let delivery_id = format!(
+        "mdel_{:x}",
+        Sha256::digest(format!("{session_id}\0{authority}\0{payload_hash}").as_bytes())
+    );
+    json!({
+        "authority": authority,
+        "delivery_id": delivery_id,
+        "payload_hash": payload_hash,
+        "ack_required": true
+    })
 }
 
 /// Attach the fields that identify a record's owning memory authority. This is
@@ -10708,26 +12648,28 @@ fn build_memory_query(query: Option<&str>, files: &[String], symbols: &[String])
     let mut terms = Vec::new();
 
     if let Some(query) = query {
+        // Structured remediation identifiers are hard anchors. Put them ahead
+        // of generic prose so a bounded query cannot discard a late IU/PX/etc.
+        // token merely because the task starts with four ordinary words.
+        terms.extend(memory_v2::get_task_memory::structured_query_terms(
+            query, None,
+        ));
         terms.extend(extract_search_terms(query, 4));
     }
 
-    if terms.is_empty() {
-        for symbol in symbols.iter().take(2) {
-            terms.extend(extract_search_terms(symbol, 1));
-        }
+    for symbol in symbols.iter().take(2) {
+        terms.extend(extract_search_terms(symbol, 1));
     }
 
-    if terms.is_empty() {
-        for file in files.iter().take(2) {
-            terms.extend(extract_search_terms(file, 1));
-        }
+    for file in files.iter().take(2) {
+        terms.extend(extract_search_terms(file, 1));
     }
 
     if terms.is_empty() {
         None
     } else {
-        terms.sort();
-        terms.dedup();
+        let mut seen = HashSet::new();
+        terms.retain(|term| seen.insert(term.clone()));
         Some(terms.join(" "))
     }
 }
@@ -11011,6 +12953,7 @@ fn seed_from_failure_diagnosis(report: &FailureDiagnosis) -> ExpandContextSeed {
             .iter()
             .map(|memory| {
                 json!({
+                    "id": memory.memory_id,
                     "content": memory.content,
                     "type": memory.memory_type,
                     "scope": memory.scope,
@@ -11048,6 +12991,7 @@ fn seed_from_subsystem_summary(report: &SubsystemSummary) -> ExpandContextSeed {
             .iter()
             .map(|memory| {
                 json!({
+                    "id": memory.memory_id,
                     "content": memory.content,
                     "type": memory.memory_type,
                     "scope": memory.scope,
@@ -11085,6 +13029,7 @@ fn seed_from_repo_playbook(report: &RepoPlaybook) -> ExpandContextSeed {
             .iter()
             .map(|memory| {
                 json!({
+                    "id": memory.memory_id,
                     "content": memory.content,
                     "type": memory.memory_type,
                     "scope": memory.scope,
@@ -11128,12 +13073,6 @@ fn normalize_seed_values(values: &mut Vec<String>) {
     values.retain(|item| !item.trim().is_empty());
     values.sort();
     values.dedup();
-}
-
-fn attach_playbook_memory(value: &mut Value, playbook_memory: Value) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("playbook_memory".to_string(), playbook_memory);
-    }
 }
 
 fn extract_wrapped_tool_metrics(
@@ -11246,6 +13185,11 @@ fn report_memory_highlights(values: &[Value], limit: usize) -> Vec<MemoryHighlig
         .filter_map(|value| {
             let content = value.get("content")?.as_str()?;
             Some(MemoryHighlight {
+                memory_id: value
+                    .get("memory_id")
+                    .or_else(|| value.get("id"))
+                    .and_then(Value::as_str)?
+                    .to_string(),
                 content: truncate_memory_snippet(content, 120),
                 memory_type: value
                     .get("type")
@@ -11312,6 +13256,7 @@ fn memory_seed_values(memories: &[Value], highlights: &[MemoryHighlight]) -> Vec
         .iter()
         .map(|memory| {
             json!({
+                "id": memory.memory_id,
                 "content": memory.content,
                 "type": memory.memory_type,
                 "scope": memory.scope,
@@ -11319,6 +13264,34 @@ fn memory_seed_values(memories: &[Value], highlights: &[MemoryHighlight]) -> Vec
             })
         })
         .collect()
+}
+
+fn cached_memory_reference_from_qualified(
+    encoded: &str,
+    repository_id: &str,
+) -> Option<super::context_cache::CachedMemoryReference> {
+    if let Some(rest) = encoded.strip_prefix("organization:") {
+        let (organization, memory_id) = rest.split_once(':')?;
+        return (!organization.is_empty() && !memory_id.is_empty()).then(|| {
+            super::context_cache::CachedMemoryReference {
+                authority: format!("organization:{organization}"),
+                memory_id: memory_id.to_string(),
+            }
+        });
+    }
+    if let Some(rest) = encoded.strip_prefix("repository:") {
+        let (repository, memory_id) = rest.rsplit_once(':')?;
+        return (!repository.is_empty() && !memory_id.is_empty()).then(|| {
+            super::context_cache::CachedMemoryReference {
+                authority: format!("repository:{repository}"),
+                memory_id: memory_id.to_string(),
+            }
+        });
+    }
+    (!encoded.trim().is_empty()).then(|| super::context_cache::CachedMemoryReference {
+        authority: format!("repository:{repository_id}"),
+        memory_id: encoded.to_string(),
+    })
 }
 
 fn truncate_memory_snippet(content: &str, limit: usize) -> String {
@@ -11332,68 +13305,24 @@ fn truncate_memory_snippet(content: &str, limit: usize) -> String {
     output
 }
 
-fn summarize_subsystem_memory_content(report: &SubsystemSummary) -> String {
-    let file_list = report
-        .key_files
-        .iter()
-        .map(|item| item.file.clone())
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let symbol_list = report
-        .key_symbols
-        .iter()
-        .map(|item| item.symbol.clone())
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!(
-        "Subsystem playbook for '{}': {} Key files: {}. Key symbols: {}.",
-        report.query, report.overview, file_list, symbol_list
-    )
-}
-
-fn summarize_repo_playbook_memory_content(report: &RepoPlaybook) -> String {
-    let file_list = report
-        .key_files
-        .iter()
-        .map(|item| item.file.clone())
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let conventions = report
-        .conventions
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    format!(
-        "Repo playbook: {} High-signal files: {}. Conventions: {}.",
-        report.overview, file_list, conventions
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    include!("memory_retention_delivery_tests.rs");
+
     use super::{
         build_failure_overview_value, count_outcome_memory_reuse, extract_wrapped_tool_metrics,
-        memory_seed_values, parse_shared_memory_config, parse_workflow_response_options,
-        parse_wrapped_tool_payload, report_memory_highlights, seed_from_plan_edit_bundle,
-        seed_from_task_bundle, seed_from_trace_scenario_bundle, stable_refresh_key,
-        summarize_workflow_outcome_content, workflow_outcome_identifiers, wrap_tool_result,
-        wrap_workflow_tool_result, GitIntelligenceSnapshotHandle, HealthFactsSnapshotHandle,
-        McpHandler, PublishedHealthFacts, QueryJobError, RequestHandler, SharedMemoryRuntime,
-        WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
+        memory_seed_values, memory_store_status_value, parse_shared_memory_config,
+        parse_workflow_response_options, parse_wrapped_tool_payload, report_memory_highlights,
+        seed_from_plan_edit_bundle, seed_from_task_bundle, seed_from_trace_scenario_bundle,
+        stable_refresh_key, summarize_workflow_outcome_content, workflow_outcome_identifiers,
+        wrap_tool_result, wrap_workflow_tool_result, GitIntelligenceSnapshotHandle,
+        HealthFactsSnapshotHandle, McpHandler, PublishedHealthFacts, QueryJobError, RequestHandler,
+        SharedMemoryRuntime, WorkflowRenderMode, WorkflowRunMetadata, FULL_WORKFLOW_TOKEN_CAP,
     };
-    use lattice_core::health::graph_facts::GraphFactProducer;
-    use std::collections::BTreeMap;
     use lattice_core::events::{EventStore, EventWriter};
     use lattice_core::git_intelligence::{CommitSample, GitHistoryMiner, PathChange};
     use lattice_core::graph::CodeGraph;
-    use lattice_core::identity::{encode_identity, Identity, MemoryId as GraphMemoryId};
+    use lattice_core::health::graph_facts::GraphFactProducer;
     use lattice_core::indexer::Indexer;
     use lattice_core::intelligence::ExpandContextSeed;
     use lattice_core::intelligence::{
@@ -11401,16 +13330,20 @@ mod tests {
         ScenarioSignal, ScenarioTraceBundle, SymbolRecommendation, TaskBundle,
     };
     use lattice_core::memory::model::{
-        Memory, MemoryAssertionType, MemoryEvidence, MemoryFreshnessPolicy, MemoryProvenance,
-        MemoryStructuredFields, MemoryVerificationStatus,
+        Memory, MemoryAssertionType, MemoryClass, MemoryEvidence, MemoryFreshnessPolicy,
+        MemoryProvenance, MemoryStructuredFields, MemoryVerificationStatus,
     };
-    use lattice_core::memory::{MemoryScope, MemoryStore, MemoryType};
+    use lattice_core::memory::{
+        MemoryScope, MemoryStore, MemoryStoreAvailability, MemoryStoreFailureKind, MemoryType,
+    };
     use lattice_core::query::QueryEngine;
     use lattice_core::query::QueryIntent;
     use lattice_core::storage::{GraphStore, StoredGitIntelligenceSnapshot};
     use lattice_core::symbols::SymbolId;
     use lattice_core::symbols::{Language, SymbolKind};
+    use rusqlite::Connection;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -11418,10 +13351,54 @@ mod tests {
     use tokio::sync::{oneshot, Mutex};
 
     #[test]
+    fn public_remember_schema_exposes_conditional_memory_evolution_contract() {
+        let tools = McpHandler::agent_tools_list_response();
+        let remember = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "remember")
+            .expect("remember tool");
+        let schema = &remember["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("evolution")));
+        let evolution = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["const"] == "evolution")
+            .expect("evolution branch");
+        assert_eq!(evolution["required"], json!(["kind", "action"]));
+        assert_eq!(evolution["oneOf"][0]["required"], json!(["memory_id"]));
+        assert_eq!(evolution["oneOf"][1]["required"], json!(["proposal_id"]));
+    }
+
+    #[test]
+    fn memory_status_surfaces_unavailable_storage_cause_and_recovery() {
+        let value = memory_store_status_value(&MemoryStoreAvailability::Unavailable {
+            path: PathBuf::from("/tmp/memories.db"),
+            kind: MemoryStoreFailureKind::AccessDenied,
+            reason: "permission denied".to_string(),
+        });
+        assert_eq!(value["status"], "unavailable");
+        assert_eq!(value["kind"], "access_denied");
+        assert_eq!(value["path"], "/tmp/memories.db");
+        assert_eq!(value["reason"], "permission denied");
+        assert!(value["recovery"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("permission"));
+    }
+
+    #[test]
     fn test_report_memory_highlights_truncates_content() {
         let long_content = "repo-playbook ".repeat(40);
         let highlights = report_memory_highlights(
             &[json!({
+                "id": "memory-long",
                 "content": long_content,
                 "type": "pattern",
                 "scope": "repo",
@@ -11431,6 +13408,7 @@ mod tests {
         );
 
         assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].memory_id, "memory-long");
         assert!(highlights[0].content.len() <= 123);
         assert!(highlights[0].content.ends_with("..."));
     }
@@ -11439,6 +13417,7 @@ mod tests {
     fn test_build_failure_overview_value_uses_short_memory_reference() {
         let highlights = report_memory_highlights(
             &[json!({
+                "id": "memory-overview",
                 "content": "durable-note ".repeat(30),
                 "type": "pattern",
                 "scope": "repo",
@@ -11450,6 +13429,7 @@ mod tests {
         let overview = build_failure_overview_value("test diagnosis.", highlights.first());
         assert!(overview.contains("Consider prior repo pattern."));
         assert!(overview.len() < 80);
+        assert_eq!(highlights[0].memory_id, "memory-overview");
     }
 
     #[test]
@@ -11457,6 +13437,7 @@ mod tests {
         let seeded = memory_seed_values(
             &[],
             &[super::MemoryHighlight {
+                memory_id: "memory-1".to_string(),
                 content: "prior repo pattern".to_string(),
                 memory_type: "pattern".to_string(),
                 scope: "repo".to_string(),
@@ -11470,6 +13451,7 @@ mod tests {
         );
 
         assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0]["id"], "memory-1");
         assert_eq!(seeded[0]["content"], "prior repo pattern");
     }
 
@@ -12081,10 +14063,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_pruning_never_leaks_suppressed_nested_memories() {
+        let mut value = json!({
+            "memory_highlights": [
+                {"memory_id":"shown", "content":"shown content"},
+                {"memory_id":"hidden", "content":"hidden content"}
+            ],
+            "structured_payload": {
+                "memory_highlights": [
+                    {"memory_id":"shown", "content":"shown full content"},
+                    {"memory_id":"hidden", "content":"hidden full content"}
+                ],
+                "memories": [
+                    {"id":"shown", "content":"shown full content"},
+                    {"id":"hidden", "content":"hidden full content"}
+                ]
+            }
+        });
+        super::apply_compact_workflow_pruning(&mut value, super::SessionPruningProfile::default());
+        super::synchronize_nested_workflow_memories(&mut value);
+        assert_eq!(value["memory_highlights"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["structured_payload"]["memory_highlights"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            value["structured_payload"]["memories"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(!value.to_string().contains("hidden"));
+
+        super::apply_compact_workflow_pruning(
+            &mut value,
+            super::SessionPruningProfile {
+                prune_memory_highlights: true,
+                ..Default::default()
+            },
+        );
+        super::synchronize_nested_workflow_memories(&mut value);
+        assert!(!value.to_string().contains("shown content"));
+        assert!(!value.to_string().contains("shown full content"));
+    }
+
+    #[test]
+    fn rendered_memory_prefers_authority_qualified_id_and_never_restores_partial_content() {
+        let qualified = "organization:org-test:memory-1";
+        let value = json!({
+            "memory_highlights": [{
+                "id": "memory-1",
+                "memory_id": qualified,
+                "content": "complete lesson"
+            }]
+        });
+        let entries = super::rendered_workflow_memory_entries(&value);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, qualified);
+
+        let mut partial = json!({
+            "memory_highlights": [{
+                "memory_id": "memory-2",
+                "content": "never apply a partial corrective command..."
+            }]
+        });
+        let complete = std::collections::HashMap::new();
+        super::restore_complete_workflow_memories(&mut partial, &complete);
+        assert!(partial["memory_highlights"].as_array().unwrap().is_empty());
+
+        let mut shortened = json!({
+            "memory_highlights": [{
+                "memory_id": "memory-3",
+                "content": "complete corrective command..."
+            }]
+        });
+        let originals = std::collections::HashMap::from([(
+            "memory-3".to_string(),
+            json!({"content": "complete corrective command with all required arguments"}),
+        )]);
+        super::restore_complete_workflow_memories(&mut shortened, &originals);
+        assert_eq!(
+            shortened["memory_highlights"][0]["content"],
+            originals["memory-3"]["content"]
+        );
+    }
+
     #[tokio::test]
     async fn mcp_memory_results_record_retrieval_metrics_without_changing_payloads() {
         let (handler, memory_store, workspace_root) = build_memory_test_handler("metrics-session");
-        let workspace_id = workspace_root.to_string_lossy().to_string();
+        let workspace_id = handler.memory_workspace_id.clone();
         {
             let store = memory_store.lock().await;
             store
@@ -12097,7 +14167,7 @@ mod tests {
                     confidence: 0.9,
                     linked_symbols: Vec::new(),
                     linked_files: Vec::new(),
-                    workspace_id: Some(workspace_id),
+                    workspace_id: Some(workspace_id.clone()),
                     branch: None,
                     scope_organization_id: None,
                     refresh_key: None,
@@ -12114,10 +14184,11 @@ mod tests {
 
         let response = RequestHandler::handle(
             &handler,
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "search_memory",
+                "name": "recall",
                 "arguments": {
+                    "mode": "search",
                     "query": "retrieval metrics",
                     "_lattice_client": "codex",
                     "_lattice_channel": "mcp"
@@ -12134,21 +14205,269 @@ mod tests {
         .expect("search payload");
         assert_eq!(payload["count"].as_u64(), Some(1));
 
-        let metric_path = workspace_root.join(".lattice/adoption_metrics.jsonl");
-        let events: Vec<Value> = std::fs::read_to_string(&metric_path)
-            .expect("memory metric ledger")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("valid metric event"))
-            .collect();
-        let retrieval = events
-            .iter()
-            .find(|event| event["kind"] == "memory_retrieval")
-            .expect("memory retrieval metric");
-        assert_eq!(retrieval["session_id"].as_str(), Some("metrics-session"));
-        assert_eq!(retrieval["client"].as_str(), Some("codex"));
-        assert_eq!(retrieval["channel"].as_str(), Some("mcp"));
-        assert_eq!(retrieval["retrieved_count"].as_u64(), Some(1));
+        let metrics = crate::adoption_metrics::AdoptionMetricsStore::new(&workspace_root)
+            .read_json()
+            .expect("memory metric ledger");
+        let retrieval = metrics["days"]
+            .as_object()
+            .expect("metric days")
+            .values()
+            .next()
+            .expect("current metric day")
+            .get("codex")
+            .and_then(|client| client.get("mcp"))
+            .and_then(|channel| channel.get("memory"))
+            .expect("memory metrics");
+        assert_eq!(retrieval["memory_retrievals"].as_u64(), Some(1));
+        assert_eq!(retrieval["memory_retrieved_items"].as_u64(), Some(1));
 
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn repository_recall_delivery_requires_exact_ack_and_replays_idempotently() {
+        let (handler, memory_store, workspace_root) = build_memory_test_handler("receipt-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        {
+            let store = memory_store.lock().await;
+            store
+                .store(Memory {
+                    id: "receipt-memory".to_string(),
+                    session_id: "prior-session".to_string(),
+                    content: "Exact receipt regression memory".to_string(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 0.9,
+                    linked_symbols: Vec::new(),
+                    linked_files: vec!["src/receipt.rs".to_string()],
+                    workspace_id: Some(workspace_id),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: Some("receipt regression".to_string()),
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Verified,
+                })
+                .expect("seed receipt memory");
+        }
+
+        let delivered = handler
+            .tool_search_memory(&json!({"query": "receipt regression"}))
+            .await
+            .expect("repository memory search");
+        let payload = parse_wrapped_tool_payload(
+            delivered["content"][0]["text"]
+                .as_str()
+                .expect("wrapped result"),
+        )
+        .expect("search payload");
+        assert_eq!(payload["count"], 1);
+        let receipt = payload["memory_deliveries"][0].clone();
+        assert_eq!(receipt["ack_required"], true);
+
+        let mut wrong_hash = receipt.clone();
+        wrong_hash["payload_hash"] = json!("sha256:not-the-delivered-payload");
+        assert!(handler
+            .tool_acknowledge_memory_delivery(&wrong_hash)
+            .await
+            .is_err());
+
+        let first = handler
+            .tool_acknowledge_memory_delivery(&receipt)
+            .await
+            .expect("exact acknowledgement");
+        let first = parse_wrapped_tool_payload(
+            first["content"][0]["text"]
+                .as_str()
+                .expect("wrapped acknowledgement"),
+        )
+        .expect("acknowledgement payload");
+        assert_eq!(first["acknowledged_count"], 1);
+        assert_eq!(first["replayed"], false);
+
+        let replay = handler
+            .tool_acknowledge_memory_delivery(&receipt)
+            .await
+            .expect("idempotent acknowledgement replay");
+        let replay = parse_wrapped_tool_payload(
+            replay["content"][0]["text"]
+                .as_str()
+                .expect("wrapped replay"),
+        )
+        .expect("replay payload");
+        assert_eq!(replay["acknowledged_count"], 0);
+        assert_eq!(replay["replayed"], true);
+
+        let store = memory_store.lock().await;
+        let recalled = store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT last_recalled_at FROM memories WHERE id='receipt-memory'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| lattice_core::error::LatticeError::Storage(error.to_string()))
+            })
+            .expect("read recall renewal");
+        assert!(recalled > 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn repository_search_hides_retention_stale_until_explicit_discovery() {
+        let (handler, memory_store, workspace_root) = build_memory_test_handler("stale-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        {
+            let store = memory_store.lock().await;
+            store
+                .store(Memory {
+                    id: "retention-stale-memory".to_string(),
+                    session_id: "prior-session".to_string(),
+                    content: "Discoverable stale retention lesson".to_string(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 0.9,
+                    linked_symbols: Vec::new(),
+                    linked_files: Vec::new(),
+                    workspace_id: Some(workspace_id.clone()),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: None,
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Verified,
+                })
+                .expect("seed stale memory");
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "UPDATE memories SET retention_stale=1 WHERE id='retention-stale-memory'",
+                            [],
+                        )
+                        .map(|_| ())
+                        .map_err(|error| lattice_core::error::LatticeError::Storage(error.to_string()))
+                })
+                .expect("mark stale");
+            store
+                .store(Memory {
+                    id: "semantic-stale-memory".to_string(),
+                    session_id: "prior-session".to_string(),
+                    content: "Discoverable stale retention lesson".to_string(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 1.0,
+                    linked_symbols: Vec::new(),
+                    linked_files: Vec::new(),
+                    workspace_id: Some(workspace_id),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: None,
+                    created_at: 2,
+                    last_accessed: 2,
+                    access_count: 0,
+                    is_stale: true,
+                    stale_reason: Some("source changed".to_string()),
+                    verification_status: MemoryVerificationStatus::Stale,
+                })
+                .expect("seed semantically stale memory");
+        }
+        let hidden = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"recall", "arguments":{"query": "stale retention lesson"}}),
+        )
+        .await
+        .expect("ordinary search");
+        let hidden = parse_wrapped_tool_payload(
+            hidden["content"][0]["text"]
+                .as_str()
+                .expect("wrapped hidden search"),
+        )
+        .expect("hidden payload");
+        assert_eq!(hidden["count"], 0);
+
+        let discovered = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"recall", "arguments":{
+                "query": "stale retention lesson",
+                "include_retention_stale": true
+            }}),
+        )
+        .await
+        .expect("explicit stale discovery");
+        let discovered = parse_wrapped_tool_payload(
+            discovered["content"][0]["text"]
+                .as_str()
+                .expect("wrapped stale discovery"),
+        )
+        .expect("discovery payload");
+        assert_eq!(discovered["count"], 1);
+        assert_eq!(discovered["memories"][0]["retention_stale"], true);
+        assert!(discovered["memories"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with(":retention-stale-memory")));
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn stale_inspection_applies_repository_authority_before_limit() {
+        let (handler, memory_store, workspace_root) =
+            build_memory_test_handler("stale-scope-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        {
+            let store = memory_store.lock().await;
+            for ordinal in 0..8 {
+                let mut memory = Memory {
+                    id: format!("foreign-{ordinal}"),
+                    session_id: "prior".into(),
+                    content: "stale scope".into(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 1.0,
+                    linked_symbols: vec![],
+                    linked_files: vec![],
+                    workspace_id: Some("foreign".into()),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: None,
+                    created_at: 100 + ordinal,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: true,
+                    stale_reason: Some("old".into()),
+                    verification_status: MemoryVerificationStatus::Stale,
+                };
+                store.store(memory.clone()).unwrap();
+                if ordinal == 0 {
+                    memory.id = "local-stale".into();
+                    memory.workspace_id = Some(workspace_id.clone());
+                    memory.created_at = 1;
+                    store.store(memory).unwrap();
+                }
+            }
+        }
+        let response = handler
+            .tool_list_stale_memories(&json!({"query":"stale scope","limit":1}))
+            .await
+            .unwrap();
+        let payload = super::unwrap_tool_text_json(&response).unwrap();
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["memories"][0]["id"], "local-stale");
+        assert_eq!(payload["memory_deliveries"][0]["ack_required"], true);
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -12158,6 +14477,10 @@ mod tests {
             &json!({
                 "memories": [
                     {"id": "repo-memory", "workspace_id": "repo-a", "inclusion_reason": "exact task match"},
+                    {"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "workspace_id": "repo-a", "inclusion_reason": "canonical ULID"},
+                    {"id": "repository:repo-a:9c97d622-1d52-8a9a-ce1d-d1888a6dab10", "workspace_id": "repo-a", "inclusion_reason": "generated durable id"},
+                    {"id": "repository:repo-b:foreign-qualified", "workspace_id": "repo-a"},
+                    {"id": "organization:org-a:organization-qualified", "workspace_id": "repo-a"},
                     {"id": "shared-memory", "source_tier": "organization"},
                     {"id": "foreign-memory", "workspace_id": "repo-b"}
                 ]
@@ -12166,9 +14489,13 @@ mod tests {
             "recall",
         )
         .expect("memory collection");
-        assert_eq!(memories.len(), 1);
+        assert_eq!(memories.len(), 3);
         assert_eq!(memories[0].memory_id.ulid, "repo-memory");
         assert_eq!(memories[0].inclusion_reason, "exact task match");
+        assert_eq!(
+            memories[2].memory_id.ulid,
+            "9c97d622-1d52-8a9a-ce1d-d1888a6dab10"
+        );
 
         let claim = super::parse_memory_attribution_claim(&json!({
             "memory_attribution": {
@@ -12226,41 +14553,67 @@ mod tests {
     async fn mcp_recall_records_graph_access_and_only_explicit_outcome_resolves_it() {
         let (handler, memory_store, workspace_root) =
             build_attributed_memory_test_handler("attribution-session");
-        let workspace_id = workspace_root.to_string_lossy().to_string();
-        let canonical_memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let memory_id = {
-            let store = memory_store.lock().await;
-            store
-                .store(Memory {
-                    id: canonical_memory_id.to_string(),
-                    session_id: "prior-session".to_string(),
-                    content: "Exact attribution integration memory".to_string(),
-                    memory_type: MemoryType::Pattern,
-                    scope: MemoryScope::Repo,
-                    confidence: 0.95,
-                    linked_symbols: Vec::new(),
-                    linked_files: vec!["src/attribution.rs".to_string()],
-                    workspace_id: Some(workspace_id.clone()),
-                    branch: None,
-                    scope_organization_id: None,
-                    refresh_key: None,
-                    source_query: Some("attribution integration".to_string()),
-                    created_at: 1,
-                    last_accessed: 1,
-                    access_count: 0,
-                    is_stale: false,
-                    stale_reason: None,
-                    verification_status: MemoryVerificationStatus::Verified,
-                })
-                .expect("seed repository memory")
-        };
-        seed_memory_graph_identity(&handler, &memory_id);
+        let remembered = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name":"remember",
+                "arguments":{
+                    "kind":"quick","content":"Exact attribution integration memory",
+                    "scope":"repo","memory_class":"pattern","confidence":0.95,
+                    "linked_files":["src/attribution.rs"],"source_query":"attribution integration"
+                }
+            }),
+        )
+        .await
+        .expect("public remember succeeds");
+        let remembered = super::unwrap_tool_text_json(&remembered).expect("remember payload");
+        let memory_id = remembered["memory_id"]
+            .as_str()
+            .expect("generated memory id")
+            .to_string();
+        assert_eq!(
+            memory_id.len(),
+            36,
+            "remember uses the durable UUID-like id form"
+        );
+        let auxiliary = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name":"remember","arguments":{
+                    "kind":"quick","content":"Exact attribution integration auxiliary memory",
+                    "scope":"repo","memory_class":"pattern","confidence":0.9,
+                    "source_query":"attribution integration"
+                }
+            }),
+        )
+        .await
+        .expect("second public remember succeeds");
+        let auxiliary = super::unwrap_tool_text_json(&auxiliary).expect("second remember payload");
+        let auxiliary_id = auxiliary["memory_id"].as_str().unwrap().to_string();
+
+        handler
+            .adoption_metrics
+            .read_json()
+            .expect("initialize repository telemetry");
+        let telemetry_path = crate::workspace_identity::WorkspaceIdentity::resolve(&workspace_root)
+            .expect("resolve telemetry authority")
+            .repository_lattice_dir
+            .join("adoption_metrics.sqlite3");
+        let telemetry = Connection::open(&telemetry_path).expect("open telemetry failure fixture");
+        telemetry
+            .execute_batch(
+                "CREATE TRIGGER fail_attribution_metric BEFORE INSERT ON adoption_metric_events
+                 BEGIN SELECT RAISE(FAIL, 'injected attribution metric failure'); END;",
+            )
+            .expect("install metric failure");
 
         let response = RequestHandler::handle(
             &handler,
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "search_memory",
+                "name": "recall",
                 "arguments": {
                     "query": "attribution integration",
                     "_lattice_client": "codex",
@@ -12272,6 +14625,13 @@ mod tests {
         .expect("memory retrieval succeeds");
         let payload = super::unwrap_tool_text_json(&response).expect("retrieval payload");
         assert_eq!(payload["memory_attribution"]["status"], "recorded");
+        assert_eq!(
+            payload["memory_attribution"]["accesses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         let retrieval_id = payload["memory_attribution"]["retrieval_id"]
             .as_str()
             .expect("retrieval id")
@@ -12280,62 +14640,180 @@ mod tests {
             .as_str()
             .expect("access id")
             .to_string();
+        let failed_metrics = handler
+            .adoption_metrics
+            .read_json()
+            .expect("failed metric leaves telemetry readable");
+        assert!(!failed_metrics["days"]
+            .as_object()
+            .into_iter()
+            .flat_map(|days| days.values())
+            .filter_map(|day| day.get("codex"))
+            .filter_map(|client| client.get("mcp"))
+            .filter_map(|channel| channel.get("memory"))
+            .any(|memory| memory["memory_retrievals"].as_u64().unwrap_or(0) > 0));
+        telemetry
+            .execute_batch("DROP TRIGGER fail_attribution_metric;")
+            .expect("restore telemetry writes");
+        drop(telemetry);
+        let recalled_at = memory_store
+            .lock()
+            .await
+            .get_by_id(&memory_id)
+            .expect("read recalled memory")
+            .expect("recalled memory exists")
+            .last_accessed;
 
-        let graph_memory_id = GraphMemoryId {
-            workspace_id: workspace_id.clone(),
-            ulid: memory_id.clone(),
-        };
+        let restarted = attributed_memory_test_handler(
+            &workspace_root,
+            "repo_attribution_fixture",
+            "restarted-attribution-session",
+            memory_store.clone(),
+            handler
+                .memory_attribution
+                .as_ref()
+                .unwrap()
+                .event_writer
+                .clone(),
+        );
+        let event_store = restarted
+            .memory_attribution
+            .as_ref()
+            .unwrap()
+            .event_writer
+            .store();
+        let through = event_store.latest_cursor().unwrap().unwrap().row_id;
+        event_store
+            .truncate_through(through)
+            .expect("compaction removes original retrieval events");
+
         let before = {
-            let runtime = handler.memory_attribution.as_ref().expect("runtime");
-            let graph = runtime.graph.lock().expect("graph lock");
-            lattice_core::memory_graph::list_accesses_for(&graph, &graph_memory_id)
-                .expect("access rows")
+            let store = memory_store.lock().await;
+            let mut rows = store.list_memory_accesses(&memory_id).expect("access rows");
+            rows.extend(
+                store
+                    .list_memory_accesses(&auxiliary_id)
+                    .expect("auxiliary access rows"),
+            );
+            rows
         };
-        assert_eq!(before.len(), 1);
-        assert_eq!(before[0].access_id.as_str(), access_id);
-        assert_eq!(before[0].was_used, None);
-        assert_eq!(before[0].downstream_outcome_event, None);
+        assert_eq!(before.len(), 2);
+        assert!(before
+            .iter()
+            .any(|row| row.access_id == access_id && row.was_used.is_none()));
 
-        RequestHandler::handle(
-            &handler,
-            "lattice/tool_call",
+        let outcome_arguments = json!({
+            "kind": "outcome",
+            "task": "verify attribution integration",
+            "status": "success",
+            "summary": "the retrieved memory directly informed the completed work",
+            "memory_attribution": {
+                "retrieval_id": retrieval_id,
+                "access_ids": [access_id],
+                "disposition": "used"
+            }
+        });
+        let outcome_response = RequestHandler::handle(
+            &restarted,
+            "tools/call",
             json!({
-                "name": "record_workflow_outcome",
-                "arguments": {
-                    "task": "verify attribution integration",
-                    "status": "success",
-                    "summary": "the retrieved memory directly informed the completed work",
-                    "memory_attribution": {
-                        "retrieval_id": retrieval_id,
-                        "access_ids": [access_id],
-                        "disposition": "used"
-                    }
-                }
+                "name": "remember",
+                "arguments": outcome_arguments.clone()
             }),
         )
         .await
         .expect("explicit terminal outcome succeeds");
+        let outcome_payload =
+            super::unwrap_tool_text_json(&outcome_response).expect("outcome payload");
+        assert_eq!(outcome_payload["memory_feedback"]["status"], "recorded");
+        assert_eq!(outcome_payload["memory_feedback"]["newly_resolved"], true);
+
+        let replay = RequestHandler::handle(
+            &restarted,
+            "tools/call",
+            json!({"name":"remember","arguments":outcome_arguments}),
+        )
+        .await
+        .expect("equal feedback replay succeeds");
+        let replay = super::unwrap_tool_text_json(&replay).expect("replay payload");
+        assert_eq!(replay["memory_feedback"]["status"], "recorded");
+        assert_eq!(replay["memory_feedback"]["newly_resolved"], false);
+
+        let conflict = RequestHandler::handle(
+            &restarted,
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"outcome","task":"conflicting attribution","status":"success","summary":"conflict",
+                "memory_attribution":{"retrieval_id":retrieval_id,"access_ids":[access_id],"disposition":"not_used"}
+            }}),
+        )
+        .await
+        .expect("workflow result remains available when feedback conflicts");
+        let conflict = super::unwrap_tool_text_json(&conflict).expect("conflict payload");
+        assert_eq!(conflict["memory_feedback"]["status"], "error");
 
         let after = {
-            let runtime = handler.memory_attribution.as_ref().expect("runtime");
-            let graph = runtime.graph.lock().expect("graph lock");
-            lattice_core::memory_graph::list_accesses_for(&graph, &graph_memory_id)
-                .expect("resolved access rows")
+            let store = memory_store.lock().await;
+            let mut rows = store
+                .list_memory_accesses(&memory_id)
+                .expect("resolved access rows");
+            rows.extend(
+                store
+                    .list_memory_accesses(&auxiliary_id)
+                    .expect("auxiliary resolved rows"),
+            );
+            rows
         };
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].was_used, Some(true));
-        assert!(after[0].downstream_outcome_event.is_some());
-
-        let metric_events =
-            std::fs::read_to_string(workspace_root.join(".lattice/adoption_metrics.jsonl"))
-                .expect("adoption ledger");
+        assert_eq!(after.len(), 2);
         assert_eq!(
-            metric_events
-                .matches("\"kind\":\"memory_retrieval\"")
+            after
+                .iter()
+                .filter(|row| row.was_used == Some(true))
                 .count(),
             1
         );
-        assert_eq!(metric_events.matches("\"kind\":\"memory_use\"").count(), 1);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row.was_used == Some(false))
+                .count(),
+            1
+        );
+        assert!(memory_store
+            .lock()
+            .await
+            .load_attribution_retrieval(&retrieval_id)
+            .unwrap()
+            .unwrap()
+            .terminal_event
+            .is_some());
+        assert_eq!(
+            memory_store
+                .lock()
+                .await
+                .get_by_id(&memory_id)
+                .expect("read memory after feedback")
+                .expect("memory remains after feedback")
+                .last_accessed,
+            recalled_at,
+            "feedback and outbox replay must not renew retention"
+        );
+
+        let metrics = crate::adoption_metrics::AdoptionMetricsStore::new(&workspace_root)
+            .read_json()
+            .expect("adoption ledger");
+        let memory = metrics["days"]
+            .as_object()
+            .expect("metric days")
+            .values()
+            .next()
+            .expect("current metric day")
+            .get("codex")
+            .and_then(|client| client.get("mcp"))
+            .and_then(|channel| channel.get("memory"))
+            .expect("memory metrics");
+        assert_eq!(memory["memory_retrievals"].as_u64(), Some(1));
+        assert_eq!(memory["memory_used_items"].as_u64(), Some(1));
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -12364,16 +14842,148 @@ mod tests {
             .await
             .expect("workflow finalization");
 
-        let metric_path = workspace_root.join(".lattice/adoption_metrics.jsonl");
-        let event: Value = std::fs::read_to_string(&metric_path)
-            .expect("workflow metric ledger")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("valid metric event"))
+        let metrics = crate::adoption_metrics::AdoptionMetricsStore::new(&workspace_root)
+            .read_json()
+            .expect("workflow metric ledger");
+        let memory = metrics["days"]
+            .as_object()
+            .expect("metric days")
+            .values()
             .next()
-            .expect("workflow retrieval event");
-        assert_eq!(event["kind"].as_str(), Some("memory_retrieval"));
-        assert_eq!(event["retrieved_count"].as_u64(), Some(0));
+            .expect("current metric day")
+            .get("codex")
+            .and_then(|client| client.get("mcp"))
+            .and_then(|channel| channel.get("memory"))
+            .expect("memory metrics");
+        assert_eq!(memory["memory_retrievals"].as_u64(), Some(1));
+        assert_eq!(memory["memory_retrieved_items"].as_u64(), Some(0));
 
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workflow_receipt_binds_final_highlight_and_renews_only_after_ack() {
+        let (handler, memory_store, workspace_root) =
+            build_memory_test_handler("workflow-receipt-session");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        {
+            let store = memory_store.lock().await;
+            store
+                .store(Memory {
+                    id: "workflow-memory".into(),
+                    session_id: "prior".into(),
+                    content: "workflow delivered content".into(),
+                    memory_type: MemoryType::Pattern,
+                    scope: MemoryScope::Repo,
+                    confidence: 0.9,
+                    linked_symbols: vec![],
+                    linked_files: vec![],
+                    workspace_id: Some(workspace_id),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: None,
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Verified,
+                })
+                .expect("seed workflow memory");
+        }
+        let options = parse_workflow_response_options(&json!({"render":"json"})).unwrap();
+        let metadata = WorkflowRunMetadata {
+            delivery_mode: "compact".into(),
+            wire_format: "standard".into(),
+            single_anchor_used: false,
+            _mode_reason: "test".into(),
+            semantic_fallback_used: false,
+            outcome_memory_reuse_count: 0,
+        };
+        let response = handler.finalize_workflow_value(
+            "prepare_change", &json!({}),
+            json!({"memory_highlights":[{"memory_id":"workflow-memory","content":"workflow delivered content"}]}),
+            &metadata, &options,
+        ).await.expect("finalize workflow");
+        let payload = super::unwrap_tool_text_json(&response).expect("workflow payload");
+        assert_eq!(payload["memory_deliveries"][0]["ack_required"], true);
+        let receipt = payload["memory_deliveries"][0].clone();
+        handler
+            .tool_acknowledge_memory_delivery(&receipt)
+            .await
+            .expect("ack workflow receipt");
+        let store = memory_store.lock().await;
+        let recalled = store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT last_recalled_at FROM memories WHERE id='workflow-memory'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| lattice_core::error::LatticeError::Storage(error.to_string()))
+            })
+            .unwrap();
+        assert!(recalled > 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workflow_withholds_memory_when_receipt_cannot_be_persisted() {
+        let (handler, _, workspace_root) = build_memory_test_handler("workflow-receipt-failure");
+        let options = parse_workflow_response_options(&json!({"render":"json"})).unwrap();
+        let metadata = WorkflowRunMetadata {
+            delivery_mode: "compact".into(),
+            wire_format: "standard".into(),
+            single_anchor_used: false,
+            _mode_reason: "test".into(),
+            semantic_fallback_used: false,
+            outcome_memory_reuse_count: 0,
+        };
+        let response = handler.finalize_workflow_value(
+            "prepare_change", &json!({}),
+            json!({
+                "query":"still useful",
+                "overview":"must not escape through a memory-derived summary",
+                "memory_highlights":[{"memory_id":"missing-memory","content":"must not escape"}],
+                "structured_payload": {
+                    "overview":"must not escape through nested summary",
+                    "memory_highlights":[{"memory_id":"missing-memory","content":"must not escape nested"}],
+                    "memories":[{"id":"missing-memory","content":"must not escape full"}]
+                }
+            }),
+            &metadata, &options,
+        ).await.expect("lexical workflow degrades");
+        let payload = super::unwrap_tool_text_json(&response).expect("workflow payload");
+        assert!(payload.get("memory_highlights").is_none());
+        assert!(payload["structured_payload"]
+            .get("memory_highlights")
+            .is_none());
+        assert!(payload["structured_payload"].get("memories").is_none());
+        assert!(payload.get("overview").is_none());
+        assert_eq!(payload["memory_delivery"]["status"], "degraded");
+        assert_eq!(payload["query"], "still useful");
+
+        let markdown_options = parse_workflow_response_options(&json!({})).unwrap();
+        let markdown = handler
+            .finalize_workflow_value(
+                "prepare_change",
+                &json!({}),
+                json!({
+                    "query":"still useful",
+                    "overview":"must not escape summary",
+                    "memory_highlights":[{"memory_id":"missing-memory","content":"must not escape markdown"}]
+                }),
+                &metadata,
+                &markdown_options,
+            )
+            .await
+            .expect("markdown workflow degrades");
+        let text = markdown["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("must not escape"));
+        assert!(text.contains("memory content withheld"));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -12494,8 +15104,8 @@ mod tests {
             MemoryStore::open_in_memory().expect("memory store"),
         ));
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
-            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.to_path_buf()))),
             memory_store.clone(),
             Arc::new(Mutex::new(
                 GraphStore::open_in_memory().expect("graph store"),
@@ -12516,76 +15126,603 @@ mod tests {
         (handler, memory_store, workspace_root)
     }
 
+    #[tokio::test]
+    async fn linked_checkout_prepare_change_delivers_repo_memory_from_file_anchor() {
+        let (handler, memory_store, workspace_root) =
+            build_memory_test_handler("linked-consumer-session");
+        let repository_id = format!("repo_{}", "a".repeat(64));
+        let handler = handler
+            .with_trusted_check_authority(repository_id.clone(), "checkout-consumer".to_string());
+        {
+            let mut engine = handler.engine.lock().await;
+            engine.graph_mut().add_node(
+                SymbolId {
+                    file: "selector.py".to_string(),
+                    name: "select".to_string(),
+                    byte_offset: 0,
+                },
+                SymbolKind::Function,
+                "select".to_string(),
+                "def select(records):".to_string(),
+                "def select(records):\n    return records".to_string(),
+                "selector.py".to_string(),
+                1,
+                2,
+                true,
+                Language::Python,
+            );
+        }
+        let memory_id = {
+            let store = memory_store.lock().await;
+            let memory_id = store
+                .store(Memory {
+                    id: "linked-repo-constraint".to_string(),
+                    session_id: "producer-session".to_string(),
+                    content: "Filter candidates by repository scope before applying the candidate budget; preserve original order.".to_string(),
+                    memory_type: MemoryType::Observation,
+                    scope: MemoryScope::Repo,
+                    confidence: 1.0,
+                    linked_symbols: Vec::new(),
+                    linked_files: vec!["selector.py".to_string()],
+                    workspace_id: Some(repository_id.clone()),
+                    branch: None,
+                    scope_organization_id: None,
+                    refresh_key: None,
+                    source_query: Some("producer checkout".to_string()),
+                    created_at: 1,
+                    last_accessed: 1,
+                    access_count: 0,
+                    is_stale: false,
+                    stale_reason: None,
+                    verification_status: MemoryVerificationStatus::Unverified,
+                })
+                .expect("store repository memory");
+            let mut fields = store
+                .get_structured_fields(&memory_id)
+                .expect("load structured fields")
+                .expect("structured fields exist");
+            fields.memory_class = MemoryClass::Constraint;
+            store
+                .update_structured_fields(&memory_id, &fields)
+                .expect("persist constraint class");
+
+            for (id, workspace_id, branch) in [
+                ("foreign-memory", format!("repo_{}", "b".repeat(64)), None),
+                (
+                    "wrong-branch-memory",
+                    repository_id.clone(),
+                    Some("other-branch".to_string()),
+                ),
+            ] {
+                store
+                    .store(Memory {
+                        id: id.to_string(),
+                        session_id: "producer-session".to_string(),
+                        content: "Competing selector.py memory must remain excluded".to_string(),
+                        memory_type: MemoryType::Decision,
+                        scope: if branch.is_some() {
+                            MemoryScope::Branch
+                        } else {
+                            MemoryScope::Repo
+                        },
+                        confidence: 1.0,
+                        linked_symbols: Vec::new(),
+                        linked_files: vec!["selector.py".to_string()],
+                        workspace_id: Some(workspace_id),
+                        branch,
+                        scope_organization_id: None,
+                        refresh_key: None,
+                        source_query: None,
+                        created_at: 2,
+                        last_accessed: 2,
+                        access_count: 0,
+                        is_stale: false,
+                        stale_reason: None,
+                        verification_status: MemoryVerificationStatus::Verified,
+                    })
+                    .expect("store excluded memory");
+            }
+            memory_id
+        };
+
+        let recalled = handler
+            .load_relevant_memory_values(
+                Some("Select scoped records."),
+                &["selector.py".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("load authority-scoped anchor memory");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0]["id"], memory_id);
+        assert_eq!(recalled[0]["memory_class"], "constraint");
+
+        let response = RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "prepare_change",
+                "arguments": {
+                    "query": "Select scoped records.",
+                    "entry_files": ["selector.py"],
+                    "mode": "full",
+                    "budget": "full",
+                    "max_tokens": 4000,
+                    "render": "json",
+                    "wire_format": "standard"
+                }
+            }),
+        )
+        .await
+        .expect("prepare_change succeeds");
+        let payload = parse_wrapped_tool_payload(
+            response["content"][0]["text"]
+                .as_str()
+                .expect("wrapped workflow JSON"),
+        )
+        .expect("parse workflow JSON");
+        let highlights = payload["memory_highlights"]
+            .as_array()
+            .expect("canonical memory highlights");
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0]["memory_id"]["ulid"], memory_id);
+        assert_eq!(highlights[0]["memory_id"]["workspace_id"], repository_id);
+        assert!(highlights[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("repository scope")));
+        assert_eq!(payload["structured_payload"]["stats"]["memory_count"], 1);
+        assert_eq!(
+            payload["memory_deliveries"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        let dense_response = RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "prepare_change",
+                "arguments": {
+                    "query": "Select scoped records.",
+                    "entry_files": ["selector.py"],
+                    "mode": "full",
+                    "render": "json",
+                    "budget": "tiny",
+                    "max_tokens": 2600
+                }
+            }),
+        )
+        .await
+        .expect("dense prepare_change succeeds");
+        let dense = parse_wrapped_tool_payload(
+            dense_response["content"][0]["text"]
+                .as_str()
+                .expect("wrapped dense workflow JSON"),
+        )
+        .expect("parse dense workflow JSON");
+        assert_eq!(dense["mh"][0]["memory_id"]["ulid"], memory_id);
+        assert!(dense["mh"][0]["ct"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert_eq!(dense["memory_deliveries"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dense["result_set_state"], "complete");
+
+        let markdown_response = RequestHandler::handle(
+            &handler,
+            "lattice/tool_call",
+            json!({
+                "name": "prepare_change",
+                "arguments": {
+                    "query": "Select scoped records.",
+                    "entry_files": ["selector.py"]
+                }
+            }),
+        )
+        .await
+        .expect("default markdown prepare_change succeeds");
+        let markdown = markdown_response["content"][0]["text"]
+            .as_str()
+            .expect("markdown response text");
+        assert!(markdown.contains("### Relevant memory"));
+        assert!(markdown.contains(
+            "Filter candidates by repository scope before applying the candidate budget; preserve original order."
+        ));
+        assert!(markdown.contains("linked-repo-constraint"));
+        assert!(markdown.contains("### Memory delivery receipts"));
+        let receipt_json = markdown
+            .split("### Memory delivery receipts\n```json\n")
+            .nth(1)
+            .and_then(|tail| tail.split("\n```").next())
+            .expect("markdown receipt JSON");
+        let receipts: Value = serde_json::from_str(receipt_json).expect("valid receipt JSON");
+        {
+            let store = memory_store.lock().await;
+            let last_recalled: Option<u64> = store
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT last_recalled_at FROM memories WHERE id=?1",
+                            [&memory_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| {
+                            lattice_core::error::LatticeError::Storage(error.to_string())
+                        })
+                })
+                .expect("read pre-ack recall time");
+            assert_eq!(
+                last_recalled, None,
+                "delivery attempt must not renew retention"
+            );
+        }
+        handler
+            .tool_acknowledge_memory_delivery(&receipts[0])
+            .await
+            .expect("acknowledge exact markdown receipt");
+        {
+            let store = memory_store.lock().await;
+            let last_recalled: Option<u64> = store
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT last_recalled_at FROM memories WHERE id=?1",
+                            [&memory_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| {
+                            lattice_core::error::LatticeError::Storage(error.to_string())
+                        })
+                })
+                .expect("read acknowledged recall time");
+            assert!(last_recalled.is_some());
+        }
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn workflow_recall_includes_current_checkout_and_excludes_sibling_checkout() {
+        let (handler, memory_store, workspace_root) =
+            build_memory_test_handler("checkout-applicability-session");
+        let repository_id = format!("repo_{}", "c".repeat(64));
+        let handler = handler
+            .with_trusted_check_authority(repository_id.clone(), "checkout-current".to_string());
+        {
+            let store = memory_store.lock().await;
+            for (id, checkout) in [
+                ("current-checkout-memory", "checkout-current"),
+                ("sibling-checkout-memory", "checkout-sibling"),
+            ] {
+                store
+                    .store(Memory {
+                        id: id.to_string(),
+                        session_id: "producer".to_string(),
+                        content: format!("checkout applicability {id}"),
+                        memory_type: MemoryType::Observation,
+                        scope: MemoryScope::Repo,
+                        confidence: 1.0,
+                        linked_symbols: Vec::new(),
+                        linked_files: vec!["checkout-anchor.rs".to_string()],
+                        workspace_id: Some(repository_id.clone()),
+                        branch: None,
+                        scope_organization_id: None,
+                        refresh_key: None,
+                        source_query: None,
+                        created_at: 1,
+                        last_accessed: 1,
+                        access_count: 0,
+                        is_stale: false,
+                        stale_reason: None,
+                        verification_status: MemoryVerificationStatus::Unverified,
+                    })
+                    .expect("store checkout-scoped memory");
+                store
+                    .with_connection(|connection| {
+                        connection
+                            .execute(
+                                "UPDATE memories SET applicable_checkout_id=?1 WHERE id=?2",
+                                rusqlite::params![checkout, id],
+                            )
+                            .map_err(|error| {
+                                lattice_core::error::LatticeError::Storage(error.to_string())
+                            })?;
+                        Ok(())
+                    })
+                    .expect("bind checkout applicability");
+            }
+        }
+
+        let recalled = handler
+            .load_relevant_memory_values(None, &["checkout-anchor.rs".to_string()], &[], 5)
+            .await
+            .expect("recall current checkout memory");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0]["id"], "current-checkout-memory");
+
+        let response = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name": "recall",
+                "arguments": {
+                    "query": "checkout applicability",
+                    "focus_files": ["checkout-anchor.rs"]
+                }
+            }),
+        )
+        .await
+        .expect("public recall succeeds");
+        let payload = parse_wrapped_tool_payload(
+            response["content"][0]["text"]
+                .as_str()
+                .expect("wrapped public recall"),
+        )
+        .expect("public recall payload");
+        assert_eq!(payload["count"], 1);
+        assert!(payload["memories"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with(":current-checkout-memory")));
+        assert_eq!(payload["diagnostics"]["bounded"], true);
+        assert_eq!(payload["diagnostics"]["scope_before_limit"], true);
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn task_recall_without_meaningful_context_does_not_list_recent_memory() {
+        let (handler, memory_store, workspace_root) =
+            build_memory_test_handler("task-without-context");
+        let workspace_id = workspace_root.to_string_lossy().to_string();
+        memory_store
+            .lock()
+            .await
+            .store(Memory {
+                id: "unrelated-recent-memory".to_string(),
+                session_id: "prior".to_string(),
+                content: "bounded task lesson for a restored statement".to_string(),
+                memory_type: MemoryType::Pattern,
+                scope: MemoryScope::Repo,
+                confidence: 1.0,
+                linked_symbols: Vec::new(),
+                linked_files: Vec::new(),
+                workspace_id: Some(workspace_id),
+                branch: None,
+                scope_organization_id: None,
+                refresh_key: None,
+                source_query: None,
+                created_at: 10,
+                last_accessed: 10,
+                access_count: 0,
+                is_stale: false,
+                stale_reason: None,
+                verification_status: MemoryVerificationStatus::Verified,
+            })
+            .expect("seed unrelated memory");
+        for _ in 0..2 {
+            let response = RequestHandler::handle(
+                &handler,
+                "tools/call",
+                json!({"name":"recall", "arguments":{"mode":"task", "task_id":"opaque-task"}}),
+            )
+            .await
+            .expect("task recall succeeds");
+            let payload = parse_wrapped_tool_payload(
+                response["content"][0]["text"]
+                    .as_str()
+                    .expect("task payload"),
+            )
+            .expect("parse task payload");
+            assert_eq!(payload["memories"].as_array().map(Vec::len), Some(0));
+        }
+        let punctuation = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({
+                "name":"recall",
+                "arguments":{
+                    "mode":"task",
+                    "task_id":"opaque-task",
+                    "task_statement":"... !!! ---"
+                }
+            }),
+        )
+        .await
+        .expect("punctuation-only task recall succeeds");
+        let punctuation = parse_wrapped_tool_payload(
+            punctuation["content"][0]["text"]
+                .as_str()
+                .expect("task payload"),
+        )
+        .expect("parse task payload");
+        assert_eq!(
+            punctuation["memories"].as_array().map(Vec::len),
+            Some(0),
+            "an unusable query must not fall back to recent scoped memories"
+        );
+        for arguments in [
+            json!({"mode":"task", "task_id":"opaque-task", "task_statement":"bounded task lesson"}),
+            json!({"mode":"task", "task_id":"opaque-task"}),
+        ] {
+            let response = RequestHandler::handle(
+                &handler,
+                "tools/call",
+                json!({"name":"recall", "arguments": arguments}),
+            )
+            .await
+            .expect("contextual task recall succeeds");
+            let payload = parse_wrapped_tool_payload(
+                response["content"][0]["text"]
+                    .as_str()
+                    .expect("task payload"),
+            )
+            .expect("parse task payload");
+            assert_eq!(payload["memories"].as_array().map(Vec::len), Some(1));
+        }
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     fn build_attributed_memory_test_handler(
         session_id: &str,
     ) -> (McpHandler, Arc<Mutex<MemoryStore>>, PathBuf) {
         let workspace_root = unique_test_path("lattice-mcp-attributed-memory");
         std::fs::create_dir_all(workspace_root.join(".lattice"))
             .expect("failed to create temp workspace");
-        let workspace_id = workspace_root.to_string_lossy().to_string();
+        // Production event and memory authority is the stable repository id,
+        // not the checkout path (linked worktrees intentionally differ here).
+        let workspace_id = "repo_attribution_fixture".to_string();
         let event_store = Arc::new(
             EventStore::open(&workspace_root.join(".lattice/events.db"))
                 .expect("event store opens"),
         );
-        let event_writer = Arc::new(EventWriter::new(event_store, workspace_id, 4096));
+        let event_writer = Arc::new(EventWriter::new(event_store, workspace_id.clone(), 4096));
         let memory_store = Arc::new(Mutex::new(
             MemoryStore::open_in_memory().expect("memory store"),
         ));
-        let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
-            Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+        let handler = attributed_memory_test_handler(
+            &workspace_root,
+            &workspace_id,
+            session_id,
+            memory_store.clone(),
+            event_writer,
+        );
+        (handler, memory_store, workspace_root)
+    }
+
+    fn attributed_memory_test_handler(
+        workspace_root: &std::path::Path,
+        workspace_id: &str,
+        session_id: &str,
+        memory_store: Arc<Mutex<MemoryStore>>,
+        event_writer: Arc<EventWriter>,
+    ) -> McpHandler {
+        McpHandler::new_with_shared_repo_state(
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
+            Arc::new(Mutex::new(Indexer::new(workspace_root.to_path_buf()))),
             memory_store.clone(),
             Arc::new(Mutex::new(
                 GraphStore::open_in_memory().expect("graph store"),
             )),
             Arc::new(OnceLock::new()),
             None,
-            workspace_root.clone(),
+            workspace_root.to_path_buf(),
+            workspace_id.to_string(),
+            workspace_root.join("memories.db"),
             workspace_root.join("context_handles.json"),
             session_id.to_string(),
             None,
-            vec![workspace_root.clone()],
+            vec![workspace_root.to_path_buf()],
             Arc::new(AtomicBool::new(false)),
             Some(event_writer),
             Vec::new(),
             Vec::new(),
-        );
-        (handler, memory_store, workspace_root)
+            Arc::new(Mutex::new(super::RepoStateTracker::new(workspace_root))),
+            super::IndexWorkCoordinator::from_env(),
+            Arc::new(crate::watcher_health::WatcherHealth::default()),
+            Arc::new(super::IndexHealth::default()),
+        )
     }
 
-    fn seed_memory_graph_identity(handler: &McpHandler, memory_id: &str) {
-        let runtime = handler
-            .memory_attribution
-            .as_ref()
-            .expect("attribution runtime");
-        let encoded = encode_identity(&Identity::Memory(GraphMemoryId {
-            workspace_id: handler.memory_workspace_id.clone(),
-            ulid: memory_id.to_string(),
-        }));
-        runtime
-            .graph
-            .lock()
-            .expect("memory graph lock")
-            .execute(
-                "INSERT INTO memories (
-                    memory_id, content, class, assertion_type, scope,
-                    scope_session_id, scope_branch, scope_workspace_id, scope_user_id, scope_org_id,
-                    verification_status, confidence, confidence_reason, freshness_policy_json,
-                    validity_conditions_json, invalidation_triggers_json, provenance_event_ids_json,
-                    evidence_references_json, linked_files_json, linked_symbols_json, linked_docs_json,
-                    linked_tests_json, linked_memories_json, contradiction_links_json,
-                    supersession_links_json, access_history_json, last_verified_event_id,
-                    last_verified_state, usefulness_score, usefulness_score_updated_at,
-                    created_at, created_by, updated_at, updated_by, superseded_by, schema_version
-                 ) VALUES (
-                    ?1, 'attribution test memory', 'pattern', 'observation', 'repo',
-                    NULL, NULL, ?2, NULL, NULL, 'verified', 0.9, 'test evidence', '{}',
-                    '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]',
-                    NULL, NULL, 0, 0, 0, 'test', 0, 'test', NULL, 1
-                 )",
-                rusqlite::params![encoded, handler.memory_workspace_id],
+    #[tokio::test]
+    async fn empty_or_stale_filtered_public_recall_skips_attribution_without_error() {
+        let (mut handler, memory_store, workspace_root) =
+            build_attributed_memory_test_handler("empty-attribution-session");
+        let counts = |store: &MemoryStore| {
+            store.with_connection(|connection| {
+                let retrievals = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM memory_attribution_retrievals",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                let accesses = connection
+                    .query_row("SELECT COUNT(*) FROM memory_accesses", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                Ok((retrievals, accesses))
+            })
+        };
+
+        for query in [
+            "no matching attributable lesson",
+            "still no matching lesson",
+        ] {
+            let response = RequestHandler::handle(
+                &handler,
+                "tools/call",
+                json!({"name":"recall","arguments":{"query":query}}),
             )
-            .expect("seed graph memory identity");
+            .await
+            .expect("empty public recall remains successful");
+            let payload = super::unwrap_tool_text_json(&response).expect("empty recall payload");
+            assert_eq!(payload["memories"].as_array().map(Vec::len), Some(0));
+            assert!(payload.get("memory_attribution").is_none(), "{payload}");
+            assert!(!payload
+                .to_string()
+                .contains("attribution retrieval must contain"));
+        }
+
+        let remembered = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"quick","content":"stale attribution fixture lesson","scope":"repo",
+                "memory_class":"pattern","confidence":0.9,"source_query":"stale attribution fixture"
+            }}),
+        )
+        .await
+        .expect("save stale fixture memory");
+        let remembered = super::unwrap_tool_text_json(&remembered).expect("remember payload");
+        let memory_id = remembered["memory_id"]
+            .as_str()
+            .expect("memory id")
+            .to_string();
+        memory_store
+            .lock()
+            .await
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE memories SET retention_stale=1 WHERE id=?1",
+                        [&memory_id],
+                    )
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                Ok(())
+            })
+            .expect("mark retention stale fixture");
+        let stale = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"recall","arguments":{"query":"stale attribution fixture"}}),
+        )
+        .await
+        .expect("stale-filtered public recall remains successful");
+        let stale = super::unwrap_tool_text_json(&stale).expect("stale recall payload");
+        assert_eq!(stale["memories"].as_array().map(Vec::len), Some(0));
+        assert!(stale.get("memory_attribution").is_none(), "{stale}");
+
+        handler.memory_attribution = None;
+        handler.memory_attribution_error =
+            Some("injected unavailable attribution runtime".to_string());
+        let unavailable = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"recall","arguments":{"query":"no matching attributable lesson"}}),
+        )
+        .await
+        .expect("empty recall is independent of unavailable attribution runtime");
+        let unavailable = super::unwrap_tool_text_json(&unavailable).expect("unavailable payload");
+        assert!(
+            unavailable.get("memory_attribution").is_none(),
+            "{unavailable}"
+        );
+        assert!(!unavailable
+            .to_string()
+            .contains("injected unavailable attribution runtime"));
+        let store = memory_store.lock().await;
+        assert_eq!(counts(&store).expect("attribution row counts"), (0, 0));
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[test]
@@ -12666,9 +15803,185 @@ mod tests {
         assert_eq!(memory["cross_repo"], true);
         assert_eq!(memory["effective_verification_status"], "unverified");
         assert_eq!(memory["trust_status"], "advisory");
+        let receipt = search_payload["memory_deliveries"][0].clone();
+        assert_eq!(receipt["authority"], "organization:cadres");
+        let first = handler_b
+            .tool_acknowledge_memory_delivery(&receipt)
+            .await
+            .expect("cross-repository acknowledgement");
+        let first = super::unwrap_tool_text_json(&first).expect("ack payload");
+        assert_eq!(first["acknowledged_count"], 1);
+        let replay = handler_b
+            .tool_acknowledge_memory_delivery(&receipt)
+            .await
+            .expect("cross-repository acknowledgement replay");
+        let replay = super::unwrap_tool_text_json(&replay).expect("replay payload");
+        assert_eq!(replay["acknowledged_count"], 0);
+        assert_eq!(replay["replayed"], true);
 
         let _ = std::fs::remove_dir_all(workspace_a);
         let _ = std::fs::remove_dir_all(workspace_b);
+    }
+
+    #[tokio::test]
+    async fn organization_context_expansion_revalidates_authority_and_binds_exact_delivery() {
+        let shared_store = Arc::new(Mutex::new(
+            MemoryStore::open_in_memory().expect("shared memory store"),
+        ));
+        let (mut handler, _, workspace_root) = build_memory_test_handler("shared-expand");
+        handler.shared_memory = Some(SharedMemoryRuntime {
+            store: shared_store.clone(),
+            organization_id: "cadres".to_string(),
+        });
+        handler.memory_workspace_id = "repo-consumer".to_string();
+        let content = "Preserve the configured organization expansion invariant exactly.";
+        let saved = handler
+            .tool_save_memory_v2(&json!({
+                "content": content,
+                "memory_class": "constraint",
+                "scope": "organization",
+                "confidence": 0.9,
+                "confidence_reason": "organization expansion fixture",
+                "freshness_policy": "manual_review"
+            }))
+            .await
+            .expect("organization memory saves");
+        let saved = super::unwrap_tool_text_json(&saved).expect("save payload");
+        let qualified_id = saved["memory_id"].as_str().expect("qualified id");
+
+        let prepared = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"prepare_change","arguments":{
+                "task":"preserve the configured organization expansion invariant",
+                "render":"json","budget":"full","max_tokens":4000
+            }}),
+        )
+        .await
+        .expect("prepare with organization memory");
+        let prepared = super::unwrap_tool_text_json(&prepared).expect("prepare payload");
+        assert!(prepared.to_string().contains(qualified_id), "{prepared}");
+        let handle = prepared["context_handle"].as_str().expect("context handle");
+        let cached = handler
+            .context_cache
+            .lock()
+            .await
+            .peek(handle)
+            .expect("cached handle");
+        assert!(
+            cached.memory_references.iter().flatten().any(|reference| {
+                reference.authority == "organization:cadres"
+                    && qualified_id.ends_with(&reference.memory_id)
+            }),
+            "{cached:?}"
+        );
+        let focus = format!("memory:{qualified_id}");
+        let expanded = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"context","arguments":{
+                "mode":"expand","handle":handle,"focus":focus,"max_tokens":4000
+            }}),
+        )
+        .await
+        .expect("configured organization expansion");
+        let expanded = super::unwrap_tool_text_json(&expanded).expect("expand payload");
+        assert_eq!(expanded["focus"], focus);
+        assert_eq!(expanded["memories"][0]["content"], content);
+        assert_eq!(expanded["memories"][0]["memory_id"], qualified_id);
+        let receipt = &expanded["memory_deliveries"][0];
+        assert_eq!(receipt["authority"], "organization:cadres");
+        let acknowledged = handler
+            .tool_acknowledge_memory_delivery(receipt)
+            .await
+            .expect("organization expansion acknowledgement");
+        assert_eq!(
+            super::unwrap_tool_text_json(&acknowledged).unwrap()["acknowledged_count"],
+            1
+        );
+
+        let second = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"prepare_change","arguments":{
+                "task":"preserve the configured organization expansion invariant",
+                "render":"json","budget":"full","max_tokens":4000
+            }}),
+        )
+        .await
+        .expect("second organization handle");
+        let second = super::unwrap_tool_text_json(&second).expect("second prepare payload");
+        let second_handle = second["context_handle"].as_str().expect("second handle");
+        let attempts_before = shared_store
+            .lock()
+            .await
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM memory_deliveries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+            })
+            .unwrap();
+        handler.shared_memory.as_mut().unwrap().organization_id = "foreign".to_string();
+        let error = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"context","arguments":{
+                "mode":"expand","handle":second_handle,"focus":focus,"max_tokens":4000
+            }}),
+        )
+        .await
+        .expect_err("foreign organization authority rejects cached reference");
+        assert_eq!(error.0, -32001);
+        assert!(!error.1.contains(content), "{error:?}");
+        let attempts_after = shared_store
+            .lock()
+            .await
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM memory_deliveries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(attempts_after, attempts_before);
+
+        handler.shared_memory.as_mut().unwrap().organization_id = "cadres".to_string();
+        let local_id = qualified_id
+            .rsplit(':')
+            .next()
+            .expect("local organization id");
+        shared_store
+            .lock()
+            .await
+            .mark_memory_superseded(local_id, "replacement-organization-memory")
+            .expect("mark organization memory superseded");
+        let lifecycle_error = RequestHandler::handle(
+            &handler,
+            "tools/call",
+            json!({"name":"context","arguments":{
+                "mode":"expand","handle":second_handle,"focus":focus,"max_tokens":4000
+            }}),
+        )
+        .await
+        .expect_err("superseded organization memory rejects cached reference");
+        assert_eq!(lifecycle_error.0, -32001);
+        assert!(!lifecycle_error.1.contains(content), "{lifecycle_error:?}");
+        let attempts_after_lifecycle = shared_store
+            .lock()
+            .await
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM memory_deliveries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+            })
+            .unwrap();
+        assert_eq!(attempts_after_lifecycle, attempts_before);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -13098,7 +16411,7 @@ export function sendGreeting(): string {
     }
 
     #[tokio::test]
-    async fn test_augment_memory_values_with_playbooks_prefers_verified_workflow_outcome() {
+    async fn test_augment_memory_values_with_outcomes_prefers_verified_workflow_outcome() {
         let (handler, memory_store, workspace_root) =
             build_memory_test_handler("session-memory-preference");
         let workspace_id = workspace_root.to_string_lossy().to_string();
@@ -13185,7 +16498,7 @@ export function sendGreeting(): string {
         };
 
         let values = handler
-            .augment_memory_values_with_playbooks(
+            .augment_memory_values_with_outcomes(
                 "login timeout",
                 &[],
                 &[],
@@ -13474,16 +16787,30 @@ export function sendGreeting(): string {
             .as_array()
             .expect("expected memories array");
 
-        let base = memories
-            .iter()
-            .find(|memory| {
-                memory.get("id").and_then(|value| value.as_str()) == Some(base_id.as_str())
-            })
-            .expect("expected contradicted memory");
+        assert!(memories.iter().all(|memory| memory
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| !id.ends_with(&format!(":{base_id}"))
+                && !id.ends_with(&format!(":{stale_id}")))));
+        handler
+            .tool_verify_explain_memory(&json!({
+                "memory_id": base_id,
+                "mode": "verify",
+                "render_mode": "diagnostic"
+            }))
+            .await
+            .expect("explicit inspection accepts contradicted memory");
+        let store = memory_store.lock().await;
+        let base_memory = store
+            .get_by_id(&base_id)
+            .expect("load contradicted memory")
+            .expect("contradicted memory remains stored for inspection");
+        let base = super::serialize_memory_value(&store, &base_memory, true)
+            .expect("serialize explicitly inspected memory");
         assert_eq!(
             base.get("verification_status")
                 .and_then(|value| value.as_str()),
-            Some("stale")
+            Some("contradicted")
         );
         assert_eq!(
             base.get("superseded_by_memory_id")
@@ -13529,15 +16856,15 @@ export function sendGreeting(): string {
         );
         assert_eq!(
             base.get("is_stale").and_then(|value| value.as_bool()),
-            Some(true)
+            Some(false)
         );
 
-        let stale = memories
-            .iter()
-            .find(|memory| {
-                memory.get("id").and_then(|value| value.as_str()) == Some(stale_id.as_str())
-            })
-            .expect("expected stale memory");
+        let stale_memory = store
+            .get_by_id(&stale_id)
+            .expect("load stale memory")
+            .expect("stale memory remains stored for inspection");
+        let stale = super::serialize_memory_value(&store, &stale_memory, true)
+            .expect("serialize explicitly inspected stale memory");
         assert_eq!(
             stale
                 .get("verification_status")
@@ -13548,6 +16875,7 @@ export function sendGreeting(): string {
             stale.get("stale_reason").and_then(|value| value.as_str()),
             Some("contract changed")
         );
+        drop(store);
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -13577,7 +16905,7 @@ export function sendGreeting(): string {
         let context_cache_path = workspace_root.join("context_handles.json");
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(graph, None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -13697,7 +17025,7 @@ export function sendGreeting(): string {
             .expect("publish Git-intelligence handoff");
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(graph, None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -13788,7 +17116,7 @@ export function sendGreeting(): string {
         let context_cache_path = workspace_root.join("context_handles.json");
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -13871,7 +17199,7 @@ def detect_agent_version_drift(agent, rollout):
         let published_graph = indexer.graph().clone();
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(published_graph, None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(published_graph, None))),
             Arc::new(Mutex::new(indexer)),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -13964,7 +17292,7 @@ def detect_agent_version_drift(agent, rollout):
         let context_cache_path = workspace_root.join("context_handles.json");
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(graph, None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -14072,7 +17400,7 @@ def detect_agent_version_drift(agent, rollout):
         let context_cache_path = workspace_root.join("context_handles.json");
 
         let handler = McpHandler::new(
-            Arc::new(Mutex::new(QueryEngine::new(graph, None, None))),
+            Arc::new(Mutex::new(QueryEngine::new(graph, None))),
             Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
             Arc::new(Mutex::new(
                 MemoryStore::open_in_memory().expect("memory store"),
@@ -14357,7 +17685,9 @@ def detect_agent_version_drift(agent, rollout):
         // of the live graph's file would have to come from a fallback that
         // should not have run.
         let published = PublishedHealthFacts {
-            graph: Some(Arc::new(GraphFactProducer::default().produce(&stored, true))),
+            graph: Some(Arc::new(
+                GraphFactProducer::default().produce(&stored, true),
+            )),
             test_proximity: Some(Arc::new(
                 TestProximityFactProducer::default().produce(&stored, true),
             )),
@@ -14606,7 +17936,10 @@ def detect_agent_version_drift(agent, rollout):
         assert!(summary.starts_with("defect risk "));
         for fact in facts {
             let description = fact["description"].as_str().expect("fact description");
-            assert!(summary.contains(description), "{summary} missing {description}");
+            assert!(
+                summary.contains(description),
+                "{summary} missing {description}"
+            );
         }
         // Graph-only facts here, so the score names the families it lacked.
         assert_eq!(risk["exact"], false);
@@ -14665,13 +17998,7 @@ def detect_agent_version_drift(agent, rollout):
         let helper = id("daemon/src/helper.rs", "helper");
         let caller_one = id("daemon/src/one.rs", "one");
         let caller_two = id("daemon/src/two.rs", "two");
-        for symbol in [
-            &orchestrator,
-            &partner,
-            &helper,
-            &caller_one,
-            &caller_two,
-        ] {
+        for symbol in [&orchestrator, &partner, &helper, &caller_one, &caller_two] {
             graph.add_node(
                 symbol.clone(),
                 SymbolKind::Function,
@@ -14821,7 +18148,10 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
         // A band and a per-mille score, never a bare number on its own.
         assert!(summary.contains("/1000)"), "{summary}");
         // The evidence a reader needs travels with the band.
-        assert!(summary.contains("fan-in") || summary.contains("fan-out"), "{summary}");
+        assert!(
+            summary.contains("fan-in") || summary.contains("fan-out"),
+            "{summary}"
+        );
         assert!(
             summary.contains(
                 "- Untested change: no edge-linked tests for `src/cold.rs`, `src/hot.rs`."
@@ -14843,9 +18173,7 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
             super::build_tool_result_summary(&bundle.structured_payload).expect("impact summary");
 
         assert!(
-            summary.contains(
-                "- Health: no health facts have been produced for this workspace."
-            ),
+            summary.contains("- Health: no health facts have been produced for this workspace."),
             "an agent must be able to tell 'nothing measured' from 'no risk': {summary}"
         );
         assert!(!summary.contains("- Untested change:"), "{summary}");
@@ -14965,13 +18293,15 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
         let health = health_presentation_index();
         let section = super::change_set_health_presentation(
             Some(&health),
-            ["src/hot.rs", "src/cold.rs", "src/partner.rs", "src/caller.rs"],
+            [
+                "src/hot.rs",
+                "src/cold.rs",
+                "src/partner.rs",
+                "src/caller.rs",
+            ],
         );
         let mut value = json!({ "health": section });
-        let full = value["health"]["files"]
-            .as_array()
-            .expect("files")
-            .len();
+        let full = value["health"]["files"].as_array().expect("files").len();
         assert!(full >= 4, "the fixture must exercise the cap: {full}");
 
         let object = value.as_object_mut().expect("payload object");
@@ -15082,12 +18412,7 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
     fn impact_without_health_facts_states_its_absence_and_invents_no_order() {
         let mut bundle = git_presentation_bundle();
 
-        super::enrich_impact_bundle_with_git_intelligence(
-            &mut bundle,
-            None,
-            None,
-            ["src/hot.rs"],
-        );
+        super::enrich_impact_bundle_with_git_intelligence(&mut bundle, None, None, ["src/hot.rs"]);
 
         // Ordering falls back to the caller's stable key, so the original
         // order survives untouched.
@@ -15162,7 +18487,9 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
             .expect("health warnings");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0]["path"], "src/f00.rs");
-        assert!(warnings[0]["band"].as_str().is_some_and(|band| !band.is_empty()));
+        assert!(warnings[0]["band"]
+            .as_str()
+            .is_some_and(|band| !band.is_empty()));
         assert!(warnings[0]["top_fact"]
             .as_str()
             .is_some_and(|fact| fact.contains("fan-out") || fact.contains("fan-in")));
@@ -15176,7 +18503,9 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
         // The old count-based marker is gone, not merely supplemented.
         assert!(!summary.contains("Hotspot warning:"), "{summary}");
         assert!(
-            payload["git_intelligence"].get("hotspot_warnings").is_none(),
+            payload["git_intelligence"]
+                .get("hotspot_warnings")
+                .is_none(),
             "{payload:?}"
         );
     }
@@ -15185,7 +18514,11 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
     #[test]
     fn edit_warning_stays_silent_without_evidence_and_outside_the_top_decile() {
         let health = health_warning_index();
-        let cases: Vec<(&str, Option<&lattice_core::health::scoring::HealthFactIndex>, &str)> = vec![
+        let cases: Vec<(
+            &str,
+            Option<&lattice_core::health::scoring::HealthFactIndex>,
+            &str,
+        )> = vec![
             ("no facts at all", None, "src/f00.rs"),
             ("outside the top decile", Some(&health), "src/f14.rs"),
             ("path never indexed", Some(&health), "src/not-indexed.rs"),
@@ -15352,6 +18685,8 @@ fn detect_project_rules(
 
 fn persist_session_consolidation_proposals(
     workspace_id: &str,
+    checkout_id: &str,
+    branch: &str,
     store: &mut MemoryStore,
     slices: &[Vec<lattice_core::events::EventEnvelope>],
     mode: memory_v2::consolidate_session::ConsolidationMode,
@@ -15379,18 +18714,19 @@ fn persist_session_consolidation_proposals(
             })
             .map_err(|error| (-32603, format!("Failed to query proposal: {error}")))?;
         if existing.is_none() {
-            store
-                .with_connection(|conn| {
-                    lattice_core::consolidation::persist_pending_proposal(
-                        conn,
-                        workspace_id,
-                        &format!("session_consolidation:{}", template.task_id.value),
-                        mode.job_mode(),
-                        &proposal,
-                    )
-                    .map(|_| ())
-                })
-                .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
+            let authority = lattice_core::consolidation::EvolutionAuthority {
+                repository_id: workspace_id,
+                checkout_id,
+                branch,
+            };
+            lattice_core::consolidation::persist_pending_proposal(
+                store,
+                &authority,
+                &format!("session_consolidation:{}", template.task_id.value),
+                mode.job_mode(),
+                &proposal,
+            )
+            .map_err(|error| (-32603, format!("Failed to persist proposal: {error}")))?;
         }
         let record = store
             .with_connection(|conn| {
@@ -15711,8 +19047,36 @@ fn wrap_workflow_tool_result(value: Value, render: WorkflowRenderMode) -> Value 
                 .as_str()
                 .map(|banner| format!("{banner}\n\n"))
                 .unwrap_or_default();
+            let delivery_receipts = value
+                .get("memory_deliveries")
+                .filter(|receipts| receipts.as_array().is_some_and(|items| !items.is_empty()))
+                .map(|receipts| {
+                    format!(
+                        "\n\n### Memory delivery receipts\n```json\n{}\n```",
+                        serde_json::to_string(receipts).unwrap_or_else(|_| "[]".to_string())
+                    )
+                })
+                .unwrap_or_default();
+            let memory_section = markdown_memory_section(&value)
+                .map(|section| format!("\n\n{section}"))
+                .or_else(|| {
+                    value
+                        .get("memory_expansion_available")
+                        .and_then(Value::as_str)
+                        .map(|message| format!("\n\n### Relevant memory\n{message}"))
+                })
+                .unwrap_or_default();
+            let delivery_degradation = value
+                .get("memory_delivery")
+                .map(|status| {
+                    format!(
+                        "\n\n### Memory delivery\n{}",
+                        serde_json::to_string(status).unwrap_or_else(|_| status.to_string())
+                    )
+                })
+                .unwrap_or_default();
             wrap_text_result(format!(
-                "{partial_warning}{freshness_banner}### Summary\n{summary}"
+                "{partial_warning}{freshness_banner}### Summary\n{summary}{memory_section}{delivery_receipts}{delivery_degradation}"
             ))
         }
     }
@@ -15737,6 +19101,270 @@ fn workflow_memory_result_count(value: &Value) -> Option<usize> {
         .or_else(|| object.get("memories"))
         .and_then(Value::as_array)
         .map(Vec::len)
+}
+
+fn bounded_recall_diagnostics(query: &str, values: &[Value]) -> Value {
+    let exact_terms = memory_v2::get_task_memory::structured_query_terms(query, None);
+    let mut exact_term_counts: HashMap<String, usize> =
+        exact_terms.iter().map(|term| (term.clone(), 0)).collect();
+    let mut matches = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let matched_terms = memory_v2::get_task_memory::matching_query_terms(text, query);
+        let matched_exact_terms = matched_terms
+            .iter()
+            .filter(|term| memory_v2::get_task_memory::is_structured_remediation_token(term))
+            .cloned()
+            .collect::<Vec<_>>();
+        for term in &matched_exact_terms {
+            if let Some(count) = exact_term_counts.get_mut(term) {
+                *count += 1;
+            }
+        }
+        matches.push(json!({
+            "memory_id": value.get("memory_id").or_else(|| value.get("id")),
+            "matched_terms": matched_terms,
+            "matched_exact_terms": matched_exact_terms,
+            "verification_status": value.get("verification_status"),
+            "retention_stale": value.get("retention_stale").and_then(Value::as_bool).unwrap_or(false),
+        }));
+    }
+    let matched_exact_terms = exact_terms
+        .iter()
+        .filter(|term| exact_term_counts.get(*term).copied().unwrap_or(0) > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let unmatched_exact_terms = exact_terms
+        .iter()
+        .filter(|term| exact_term_counts.get(*term).copied().unwrap_or(0) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let exact_term_status = if exact_terms.is_empty() {
+        "not_requested"
+    } else if unmatched_exact_terms.is_empty() {
+        "matched"
+    } else if matched_exact_terms.is_empty() {
+        "not_observed_in_bounded_results"
+    } else {
+        "partially_matched"
+    };
+    json!({
+        "bounded": true,
+        "scope_before_limit": true,
+        "exact_term_rerank": true,
+        "query_exact_terms": exact_terms,
+        "matched_exact_terms": matched_exact_terms,
+        "unmatched_exact_terms": unmatched_exact_terms,
+        "durable_exact_term_counts": exact_term_counts,
+        "exact_term_counts_complete": false,
+        "exact_term_status": exact_term_status,
+        "matches": matches,
+    })
+}
+
+fn memory_matches_exact_terms(
+    store: &MemoryStore,
+    memory: &Memory,
+    exact_terms: &[String],
+) -> Result<bool, (i32, String)> {
+    if exact_terms.is_empty() {
+        return Ok(true);
+    }
+    let fields = store
+        .get_structured_fields(&memory.id)
+        .map_err(|error| (-32603, format!("Failed to load memory fields: {error}")))?
+        .unwrap_or_default();
+    let text = memory_v2::get_task_memory::durable_memory_search_text(memory, &fields)
+        .to_ascii_lowercase();
+    Ok(exact_terms.iter().any(|term| text.contains(term)))
+}
+
+fn rendered_workflow_memory_entries(value: &Value) -> Vec<(String, Value)> {
+    fn visit(value: &Value, entries: &mut Vec<(String, Value)>) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if matches!(key.as_str(), "memory_highlights" | "memories" | "mh" | "mm") {
+                        if let Some(items) = child.as_array() {
+                            for item in items {
+                                let Some(identity) =
+                                    item.get("memory_id").or_else(|| item.get("id"))
+                                else {
+                                    continue;
+                                };
+                                let id = identity.as_str().or_else(|| {
+                                    identity
+                                        .as_object()
+                                        .and_then(|identity| identity.get("ulid"))
+                                        .and_then(Value::as_str)
+                                });
+                                let content = item
+                                    .get("content")
+                                    .or_else(|| item.get("ct"))
+                                    .and_then(Value::as_str);
+                                if let (Some(id), Some(content)) = (id, content) {
+                                    entries.push((
+                                        id.to_string(),
+                                        json!({"id": id, "content": content}),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        visit(child, entries);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    visit(item, entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(value, &mut entries);
+    entries
+}
+
+fn restore_complete_workflow_memories(value: &mut Value, complete: &HashMap<String, Value>) {
+    match value {
+        Value::Object(object) => {
+            for key in ["memory_highlights", "memories", "mh", "mm"] {
+                if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
+                    items.retain_mut(|item| {
+                        let Some(id) = rendered_memory_id(item) else {
+                            return false;
+                        };
+                        let Some(canonical) = complete.get(id).and_then(Value::as_object) else {
+                            return false;
+                        };
+                        let Some(item) = item.as_object_mut() else {
+                            return false;
+                        };
+                        let identity = item.get("id").cloned();
+                        let memory_identity = item.get("memory_id").cloned();
+                        let query_fields = [
+                            "relevance_score",
+                            "score",
+                            "ranking_signals",
+                            "matched_terms",
+                            "relevance_detail_handle",
+                            "relevance_detail_focus",
+                            "expansion_handle",
+                            "expansion_target",
+                        ]
+                        .into_iter()
+                        .filter_map(|field| {
+                            item.get(field)
+                                .cloned()
+                                .map(|value| (field.to_string(), value))
+                        })
+                        .collect::<Vec<_>>();
+                        item.clear();
+                        for (field, value) in canonical {
+                            if !matches!(field.as_str(), "id" | "memory_id") {
+                                item.insert(field.clone(), value.clone());
+                            }
+                        }
+                        if let Some(identity) = identity {
+                            item.insert("id".into(), identity);
+                        }
+                        if let Some(identity) = memory_identity {
+                            item.insert("memory_id".into(), identity);
+                        }
+                        item.extend(query_fields);
+                        true
+                    });
+                }
+            }
+            for child in object.values_mut() {
+                restore_complete_workflow_memories(child, complete);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                restore_complete_workflow_memories(item, complete);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prepare_markdown_memory_projection(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(payload) = object.get_mut("structured_payload") {
+        remove_rendered_workflow_memory(payload);
+    }
+    for field in ["memory_highlights", "memories", "mh", "mm"] {
+        if let Some(items) = object.get_mut(field).and_then(Value::as_array_mut) {
+            items.truncate(1);
+            break;
+        }
+    }
+}
+
+fn markdown_memory_section(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    let entry = ["memory_highlights", "memories", "mh", "mm"]
+        .into_iter()
+        .find_map(|field| object.get(field).and_then(Value::as_array)?.first())?;
+    let content = entry.get("content").or_else(|| entry.get("ct"))?.as_str()?;
+    let id = rendered_memory_id(entry)?;
+    let trust = entry
+        .get("trust_status")
+        .or_else(|| entry.get("verification_status"))
+        .or_else(|| entry.get("vs"))
+        .and_then(Value::as_str)
+        .unwrap_or("advisory");
+    Some(format!(
+        "### Relevant memory\n- {content}\n- Memory: `{id}` ({trust})"
+    ))
+}
+
+fn remove_rendered_workflow_memory(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in ["memory_highlights", "memories", "mh", "mm"] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                remove_rendered_workflow_memory(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remove_rendered_workflow_memory(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_memory_derived_workflow_summaries(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in ["overview", "ov", "rationale", "ra"] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                remove_memory_derived_workflow_summaries(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remove_memory_derived_workflow_summaries(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug)]
@@ -15776,12 +19404,23 @@ fn extract_attributable_memories(
         {
             continue;
         }
-        let id = value
+        let wire_id = value
             .get("id")
             .or_else(|| value.get("memory_id"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
+        let repository_prefix = format!("repository:{workspace_id}:");
+        let id = if let Some(local_id) = wire_id.strip_prefix(&repository_prefix) {
+            if local_id.is_empty() {
+                continue;
+            }
+            local_id
+        } else if wire_id.starts_with("repository:") || wire_id.starts_with("organization:") {
+            continue;
+        } else {
+            wire_id
+        };
         let item_workspace = value
             .get("workspace_id")
             .or_else(|| value.get("workspace"))
@@ -16278,3 +19917,7 @@ fn first_item_symbol(value: &Value) -> Option<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
 }
+
+#[cfg(test)]
+#[path = "mcp_schema_tests/workflow_memory_canonical.rs"]
+mod workflow_memory_canonical;

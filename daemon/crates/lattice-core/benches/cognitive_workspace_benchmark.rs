@@ -269,7 +269,7 @@ where
 }
 
 fn context_capsule(runtime: &FixtureRuntime, task: &GoldenTask) -> ContextCapsule {
-    let mut engine = QueryEngine::new(runtime.graph.clone(), None, None);
+    let mut engine = QueryEngine::new(runtime.graph.clone(), None);
     engine.query(&task.task_prompt, None, false)
 }
 

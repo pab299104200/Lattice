@@ -1,9 +1,16 @@
 pub mod engine;
+pub mod object_cache;
 
 #[cfg(test)]
 mod tests;
 
-pub use engine::{embedding_runtime_status, EmbeddingEngine, EmbeddingRuntimeStatus};
+pub use engine::{
+    embedding_runtime_status, CachedEmbeddingEngine, EmbeddingEngine, EmbeddingProvider,
+    EmbeddingRuntimeStatus, EMBEDDING_NORMALIZATION_VERSION, EMBEDDING_PREPROCESSING_VERSION,
+};
+pub use object_cache::{
+    EmbeddingCacheStats, EmbeddingGcReport, EmbeddingIdentity, EmbeddingObjectCache,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};

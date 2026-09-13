@@ -17,8 +17,8 @@
 //! misleading timings.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
@@ -36,8 +36,8 @@ use lattice_core::health::scoring::HealthFactIndex;
 use lattice_core::health::test_proximity_facts::{
     TestProximityFactProducer, TestProximitySnapshot,
 };
-use std::collections::BTreeMap;
 use lattice_core::symbols::{Language, ParsedFile, Symbol, SymbolId, SymbolKind};
+use std::collections::BTreeMap;
 
 const REPO_FILE_COUNT: usize = 609;
 const LARGE_FILE_COUNT: usize = 5_000;

@@ -8,9 +8,9 @@ use lattice_core::metrics::{
 use lattice_core::verification::VerificationStatus;
 use serde_json::json;
 
-use super::context_cache::ContextHandleCache;
+use super::context_cache::{CachedRelevanceDetail, ContextHandleCache};
 use super::memory_v2::get_memory_metrics::{GetMemoryMetricsArgs, MetricRenderMode};
-use super::metrics_surface::{detail_payload, MetricsSurface, MetricsSurfaceError};
+use super::metrics_surface::{MetricsSurface, MetricsSurfaceError};
 use super::workflow_v2::{
     ContextItem, MemoryHighlight, Pivot, RenderChoice, StableIdentity, WorkflowBundle,
     WorkflowRecord,
@@ -105,6 +105,30 @@ fn call_relevance_exposes_every_ranking_signal_column() {
 }
 
 #[test]
+fn memory_relevance_does_not_promote_weak_evidence_to_strong() {
+    let mut bundle = workflow_bundle_fixture();
+    bundle.memory_highlights[0].evidence_strength = "weak".to_string();
+    bundle.memory_highlights[0].verification_status = "unverified".to_string();
+    bundle.memory_highlights[0].trust_status = "advisory".to_string();
+
+    let surface = fixture_surface();
+    let report = surface.build_call_relevance_report(
+        "weak-evidence",
+        "prepare_change",
+        Some("session".to_string()),
+        &bundle,
+    );
+
+    assert_eq!(
+        report.memories[0]
+            .breakdown
+            .ranking_signals
+            .evidence_strength,
+        0.32
+    );
+}
+
+#[test]
 fn compact_mode_digest_is_bounded() {
     let surface = fixture_surface();
     let report = surface.build_call_relevance_report(
@@ -131,39 +155,38 @@ fn diagnostic_expansion_handle_dereferences_to_full_breakdown() {
         &workflow_bundle_fixture(),
     );
     let mut cache = ContextHandleCache::new_with_limits(8, Duration::from_secs(60));
-    let detail = detail_payload(
-        &report.pivots[0].label,
-        &report.pivots[0].pivot_key,
-        "pivot",
-        &report.pivots[0].inclusion_reason,
-        &report.pivots[0].breakdown,
-    );
-    let handle = cache.insert(
+    let handle = cache.insert_relevance_detail(
         "relevance_detail",
         lattice_core::intelligence::ExpandContextSeed {
-            query: Some("login".to_string()),
+            query: None,
             files: vec!["src/lib.rs".to_string()],
             symbols: vec!["login".to_string()],
             tests: Vec::new(),
-            memories: vec![detail],
+            memories: Vec::new(),
         },
         "workspace-main",
         "session-main",
         1,
+        CachedRelevanceDetail {
+            key: report.pivots[0].pivot_key.clone(),
+            kind: "pivot".to_string(),
+            total_score: report.pivots[0].breakdown.total_score,
+            ranking_signals: report.pivots[0].breakdown.ranking_signals.clone(),
+            memory_reference: None,
+        },
     );
     let cached = cache.get(&handle.legacy_handle).expect("cached seed");
-    let expanded = lattice_core::intelligence::expand_context(
-        &lattice_core::graph::model::CodeGraph::default(),
-        &cached.seed,
-        "memory:pivot:0",
-        800,
+    let detail = cached.relevance_detail.expect("typed relevance detail");
+    assert_eq!(detail.key, report.pivots[0].pivot_key);
+    assert_eq!(detail.total_score, report.pivots[0].breakdown.total_score);
+    assert_eq!(
+        detail.ranking_signals,
+        report.pivots[0].breakdown.ranking_signals
     );
-    let relevance = expanded
-        .memories
-        .first()
-        .and_then(|item| item.get("relevance"))
-        .expect("relevance payload");
-    assert!(relevance.get("ranking_signals").is_some());
+    assert!(
+        cached.seed.memories.is_empty(),
+        "diagnostics must not use synthetic lessons"
+    );
 }
 
 #[test]

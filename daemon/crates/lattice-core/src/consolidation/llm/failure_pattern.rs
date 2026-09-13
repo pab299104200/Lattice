@@ -65,7 +65,13 @@ impl FailurePatternJob {
             )?;
         let candidate = completion.value;
         let refresh_key = format!("llm_failure_pattern::{}", cluster.cluster_id);
-        let proposed = proposed_failure_pattern_state(ctx, cluster, refresh_key, &candidate)?;
+        let proposed = proposed_failure_pattern_state(
+            ctx,
+            services.authority.branch,
+            cluster,
+            refresh_key,
+            &candidate,
+        )?;
         submit_memory_proposal(
             ctx,
             services,
@@ -82,6 +88,7 @@ impl FailurePatternJob {
 
 fn proposed_failure_pattern_state(
     ctx: &LlmJobContext,
+    branch: &str,
     cluster: &DiagnosticCluster,
     refresh_key: String,
     candidate: &FailurePatternMemoryCandidate,
@@ -94,6 +101,7 @@ fn proposed_failure_pattern_state(
     );
     let mut memory = create_memory(
         ctx,
+        branch,
         content,
         MemoryType::AntiPattern,
         refresh_key,

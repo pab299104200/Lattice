@@ -154,11 +154,9 @@ impl FeatureKind {
     /// Which producer publishes this feature.
     pub fn family(&self) -> FactFamily {
         match self {
-            Self::FanIn
-            | Self::FanOut
-            | Self::SccSize
-            | Self::CycleMember
-            | Self::Instability => FactFamily::Graph,
+            Self::FanIn | Self::FanOut | Self::SccSize | Self::CycleMember | Self::Instability => {
+                FactFamily::Graph
+            }
             Self::HotspotScore
             | Self::BugFixCommits
             | Self::BugFixDensity
@@ -420,9 +418,7 @@ impl FeatureWeights {
 
     /// Whether any feature in a set carries a non-zero weight.
     pub fn has_signal(&self, set: FamilySet) -> bool {
-        set.features()
-            .iter()
-            .any(|feature| self.get(*feature) > 0)
+        set.features().iter().any(|feature| self.get(*feature) > 0)
     }
 }
 

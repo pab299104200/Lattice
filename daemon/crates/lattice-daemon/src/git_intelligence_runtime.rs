@@ -10,13 +10,18 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use lattice_core::git_intelligence::{mine_repository, GitMiningLimits};
-use lattice_core::storage::{GitIntelligenceStore, StoredGitIntelligenceSnapshot};
+use lattice_core::git_intelligence::{mine_repository, repository_commit_window, GitMiningLimits};
+use lattice_core::storage::{
+    GitIntelligenceStore, HistoryObjectCache, StoredGitIntelligenceSnapshot,
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::index_work::IndexWorkCoordinator;
 use crate::rpc::mcp::GitIntelligenceSnapshotHandle;
+
+const HISTORY_CACHE_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+const HISTORY_CACHE_GC_BATCH: usize = 128;
 
 trait GitIntelligenceSnapshotPublisher: Send + Sync {
     fn publish(
@@ -100,9 +105,11 @@ pub(crate) struct GitIntelligenceRuntime {
     repository_path: PathBuf,
     repository_id: String,
     store: Arc<StdMutex<GitIntelligenceStore>>,
+    history_cache: Arc<StdMutex<HistoryObjectCache>>,
     requests: watch::Receiver<RefreshRequest>,
     index_work: Arc<IndexWorkCoordinator>,
     snapshots: Arc<dyn GitIntelligenceSnapshotPublisher>,
+    runtime_work: Arc<crate::index_work::RuntimeWorkTracker>,
 }
 
 impl GitIntelligenceRuntime {
@@ -111,6 +118,7 @@ impl GitIntelligenceRuntime {
     pub(crate) fn open(
         repository_path: PathBuf,
         graph_path: &Path,
+        history_cache_path: &Path,
         repository_id: String,
         index_work: Arc<IndexWorkCoordinator>,
         snapshots: GitIntelligenceSnapshotHandle,
@@ -118,6 +126,7 @@ impl GitIntelligenceRuntime {
         Self::open_with_snapshot_publisher(
             repository_path,
             graph_path,
+            history_cache_path,
             repository_id,
             index_work,
             Arc::new(snapshots),
@@ -127,6 +136,7 @@ impl GitIntelligenceRuntime {
     fn open_with_snapshot_publisher(
         repository_path: PathBuf,
         graph_path: &Path,
+        history_cache_path: &Path,
         repository_id: String,
         index_work: Arc<IndexWorkCoordinator>,
         snapshots: Arc<dyn GitIntelligenceSnapshotPublisher>,
@@ -134,6 +144,12 @@ impl GitIntelligenceRuntime {
         let store = GitIntelligenceStore::open(graph_path).with_context(|| {
             format!(
                 "failed to initialize Git intelligence for `{}`",
+                repository_path.display()
+            )
+        })?;
+        let history_cache = HistoryObjectCache::open(history_cache_path).with_context(|| {
+            format!(
+                "failed to initialize shared Git history cache for `{}`",
                 repository_path.display()
             )
         })?;
@@ -167,11 +183,21 @@ impl GitIntelligenceRuntime {
                 repository_path,
                 repository_id,
                 store: Arc::new(StdMutex::new(store)),
+                history_cache: Arc::new(StdMutex::new(history_cache)),
                 requests,
                 index_work,
                 snapshots,
+                runtime_work: Arc::new(crate::index_work::RuntimeWorkTracker::default()),
             },
         ))
+    }
+
+    pub(crate) fn with_runtime_work_tracker(
+        mut self,
+        runtime_work: Arc<crate::index_work::RuntimeWorkTracker>,
+    ) -> Self {
+        self.runtime_work = runtime_work;
+        self
     }
 
     pub(crate) fn spawn(mut self) -> JoinHandle<()> {
@@ -213,14 +239,15 @@ impl GitIntelligenceRuntime {
             return Ok(());
         }
 
-        let _permit = self
-            .index_work
-            .acquire(
-                self.repository_path.to_string_lossy().to_string(),
-                "git_intelligence",
-            )
-            .await
-            .context("index work coordinator closed before Git mining")?;
+        let permit = Arc::new(
+            self.index_work
+                .acquire(
+                    self.repository_path.to_string_lossy().to_string(),
+                    "git_intelligence",
+                )
+                .await
+                .context("index work coordinator closed before Git mining")?,
+        );
 
         // A queued request can become redundant while waiting behind indexing.
         let active = {
@@ -239,12 +266,54 @@ impl GitIntelligenceRuntime {
         }
 
         let repository_path = self.repository_path.clone();
-        let mined = tokio::task::spawn_blocking(move || {
-            mine_repository(&repository_path, GitMiningLimits::default())
+        let history_cache = Arc::clone(&self.history_cache);
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
+        let mined = tokio::task::spawn_blocking(move || -> Result<_> {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
+            let limits = GitMiningLimits::default();
+            let commit_window = repository_commit_window(&repository_path, limits)
+                .context("read Git history cache identity")?;
+            if let Some(snapshot) = history_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history cache lock was poisoned"))?
+                .get(&commit_window, limits)
+                .context("read shared Git history cache")?
+                .1
+            {
+                return Ok(lattice_core::git_intelligence::RepositoryGitMiningResult {
+                    report: snapshot.report.clone(),
+                    snapshot,
+                });
+            }
+            let mined = mine_repository(&repository_path, limits)
+                .context("bounded repository mining failed")?;
+            // The commit window is checked again by `put`; a HEAD transition
+            // yields a distinct immutable object and cannot widen another
+            // checkout's active generation.
+            history_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history cache lock was poisoned"))?
+                .put(&mined.snapshot)
+                .context("publish shared Git history cache")?;
+            let oldest = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(HISTORY_CACHE_RETENTION_SECS as u64)
+                as i64;
+            let removed = history_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history cache lock was poisoned"))?
+                .gc_before(oldest, HISTORY_CACHE_GC_BATCH)
+                .context("collect expired shared Git history cache entries")?;
+            if removed > 0 {
+                tracing::info!(removed, "Shared Git history cache maintenance completed");
+            }
+            Ok(mined)
         })
         .await
-        .context("Git mining worker panicked")?
-        .context("bounded repository mining failed")?;
+        .context("Git mining worker panicked")??;
 
         // Coalesce rapid transitions. If the mined snapshot already represents
         // the latest requested HEAD it is safe to publish; otherwise the next
@@ -264,7 +333,10 @@ impl GitIntelligenceRuntime {
         let store = Arc::clone(&self.store);
         let repository_id = self.repository_id.clone();
         let sampled_commits = mined.report.sampled_commits;
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
         let published = tokio::task::spawn_blocking(move || -> Result<_> {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
             let store = store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Git-intelligence store lock was poisoned"))?;
@@ -366,11 +438,13 @@ mod tests {
         );
         let latest_head = git_output(&root, &["rev-parse", "HEAD"]);
         let graph_path = root.join("graph.db");
+        let history_cache_path = root.join("history-object-cache.db");
         let repository_id = "coalesced-repository".to_string();
         let coordinator = IndexWorkCoordinator::new(1);
         let (handle, runtime) = GitIntelligenceRuntime::open(
             root.clone(),
             &graph_path,
+            &history_cache_path,
             repository_id.clone(),
             Arc::clone(&coordinator),
             GitIntelligenceSnapshotHandle::default(),
@@ -388,7 +462,9 @@ mod tests {
                     .load_active(&repository_id)
                     .expect("load observer")
                     .and_then(|active| active.head_commit_id);
-                if published_head.as_deref() == Some(latest_head.as_str()) {
+                if published_head.as_deref() == Some(latest_head.as_str())
+                    && coordinator.snapshot().completed_jobs == 1
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -399,6 +475,7 @@ mod tests {
 
         assert_eq!(coordinator.snapshot().completed_jobs, 1);
         task.abort();
+        let _ = task.await;
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -407,12 +484,14 @@ mod tests {
         let root = unique_test_root("git-runtime");
         init_repository(&root);
         let graph_path = root.join("graph.db");
+        let history_cache_path = root.join("history-object-cache.db");
         let repository_id = "fixture-repository".to_string();
         let coordinator = IndexWorkCoordinator::new(1);
         let snapshots = Arc::new(RecordingSnapshotPublisher::default());
         let (handle, runtime) = GitIntelligenceRuntime::open_with_snapshot_publisher(
             root.clone(),
             &graph_path,
+            &history_cache_path,
             repository_id.clone(),
             Arc::clone(&coordinator),
             snapshots.clone(),
@@ -486,7 +565,7 @@ mod tests {
             .expect_err("mining must fail");
         assert!(error
             .to_string()
-            .contains("bounded repository mining failed"));
+            .contains("read Git history cache identity"));
         let retained = runtime
             .store
             .lock()

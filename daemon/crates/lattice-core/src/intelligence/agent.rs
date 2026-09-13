@@ -636,6 +636,8 @@ pub struct CompactSymbolSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryHighlight {
+    /// Authority-qualified when the retrieval router supplied such an ID.
+    pub memory_id: String,
     pub content: String,
     pub memory_type: String,
     pub scope: String,
@@ -4325,9 +4327,13 @@ pub fn impact_from_diff(
             let impact_count = downstream_impact_count(graph, node, hops);
             changed_symbol_names.push(node.name.clone());
             push_seed_node(&mut seed_nodes, &mut seen_seeds, node);
-            if let Some(risk) =
-                risk_for_node(graph, &health, node, hops, &format!("{} symbol", parsed.status))
-            {
+            if let Some(risk) = risk_for_node(
+                graph,
+                &health,
+                node,
+                hops,
+                &format!("{} symbol", parsed.status),
+            ) {
                 risks.push(risk);
             }
 
@@ -5815,6 +5821,11 @@ fn memory_highlight_from_value(value: &Value, text_limit: usize) -> Option<Memor
         .map(|detail| truncate_text(&detail, 72));
 
     Some(MemoryHighlight {
+        memory_id: value
+            .get("memory_id")
+            .or_else(|| value.get("id"))
+            .and_then(|item| item.as_str())?
+            .to_string(),
         content: truncate_text(content, text_limit),
         memory_type: value
             .get("type")
@@ -6882,7 +6893,7 @@ fn summarize_item_list(items: &[String]) -> String {
     format!("{}, {}, and {}", items[0], items[1], items[2])
 }
 
-fn compress_memory_values(values: &[Value], limit: usize) -> Vec<Value> {
+pub(super) fn compress_memory_values(values: &[Value], limit: usize) -> Vec<Value> {
     assistant_ordered_memory_values(values)
         .into_iter()
         .filter_map(|value| {
@@ -6898,6 +6909,9 @@ fn compress_memory_values(values: &[Value], limit: usize) -> Vec<Value> {
             });
 
             let object = compressed.as_object_mut()?;
+            if let Some(memory_id) = value.get("memory_id").cloned() {
+                object.insert("memory_id".to_string(), memory_id);
+            }
             if let Some(assertion_type) = non_empty_string_field(value, "assertion_type") {
                 object.insert("assertion_type".to_string(), json!(assertion_type));
             }
@@ -8596,9 +8610,9 @@ fn rank_suspects_by_defect_risk_within_proximity_tiers(
         // order stands untouched.
         tier.sort_by(|(_, left_score), (_, right_score)| {
             match (left_score, right_score) {
-                (Some(left_score), Some(right_score)) => right_score
-                    .score_per_mille
-                    .cmp(&left_score.score_per_mille),
+                (Some(left_score), Some(right_score)) => {
+                    right_score.score_per_mille.cmp(&left_score.score_per_mille)
+                }
                 // Scored before unscored, so an unmeasured or test-file
                 // candidate is never ranked as though it had scored low.
                 (Some(_), None) => Ordering::Less,

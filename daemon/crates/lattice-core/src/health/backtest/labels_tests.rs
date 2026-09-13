@@ -29,7 +29,10 @@ fn a_commit_exactly_on_the_day_boundary_is_admitted() {
         "fix: boundary",
         &["src/lib.rs"],
     )]);
-    assert_eq!(selection.report.deadline_seconds, CUT_POINT_TIME + NINETY_DAYS);
+    assert_eq!(
+        selection.report.deadline_seconds,
+        CUT_POINT_TIME + NINETY_DAYS
+    );
     assert_eq!(selection.report.selected_commits, 1);
     assert!(!selection.report.truncated_by_day_cap);
     assert!(label_defects(&selection).is_defective("src/lib.rs"));
@@ -55,9 +58,21 @@ fn a_commit_exactly_on_the_commit_cap_is_admitted_and_the_next_is_not() {
     // constraint. Only the 200th touches `on_the_cap`; the 201st touches
     // `past_the_cap`.
     let mut candidates: Vec<HorizonCommit> = (1..=199)
-        .map(|index| commit(&format!("c{index:03}"), index, "chore: filler", &["src/filler.rs"]))
+        .map(|index| {
+            commit(
+                &format!("c{index:03}"),
+                index,
+                "chore: filler",
+                &["src/filler.rs"],
+            )
+        })
         .collect();
-    candidates.push(commit("c200", 200, "fix: on the cap", &["src/on_the_cap.rs"]));
+    candidates.push(commit(
+        "c200",
+        200,
+        "fix: on the cap",
+        &["src/on_the_cap.rs"],
+    ));
     candidates.push(commit(
         "c201",
         201,
@@ -111,7 +126,12 @@ fn an_exhausted_horizon_reports_neither_truncation() {
 #[test]
 fn only_fix_shaped_commits_label_the_files_they_touch() {
     let selection = select(vec![
-        commit("a", 60, "fix: null deref", &["src/broken.rs", "src/also.rs"]),
+        commit(
+            "a",
+            60,
+            "fix: null deref",
+            &["src/broken.rs", "src/also.rs"],
+        ),
         commit("b", 120, "feat: add a thing", &["src/feature.rs"]),
         commit("c", 180, "refactor: tidy", &["src/broken.rs"]),
     ]);

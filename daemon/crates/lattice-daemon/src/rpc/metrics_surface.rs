@@ -15,7 +15,6 @@ use lattice_core::metrics::{
     MetricScope, MetricSignal, MetricSource, MetricValue, MetricsCollector,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use thiserror::Error;
 
 use super::session_metrics::SessionMetricsReport;
@@ -365,28 +364,6 @@ pub struct ExcludedCandidate {
     pub rejection_reason: String,
     /// Full score breakdown explaining why it almost made the cut.
     pub breakdown: RelevanceBreakdown,
-}
-
-/// Build a memory-like payload that `expand_context` can dereference directly.
-pub fn detail_payload(
-    label: &str,
-    key: &str,
-    kind: &str,
-    inclusion_reason: &str,
-    breakdown: &RelevanceBreakdown,
-) -> Value {
-    json!({
-        "id": key,
-        "content": format!(
-            "Relevance detail for {kind} `{label}`: {inclusion_reason}. Total score {:.2}.",
-            breakdown.total_score,
-        ),
-        "memory_type": "observation",
-        "scope": "session",
-        "inclusion_reason": inclusion_reason,
-        "kind": kind,
-        "relevance": breakdown,
-    })
 }
 
 fn pivot_breakdown(bundle: &WorkflowBundle, pivot: &Pivot, index: usize) -> RelevanceBreakdown {

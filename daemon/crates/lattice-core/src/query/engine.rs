@@ -11,7 +11,6 @@ use thiserror::Error;
 
 use crate::graph::digest::GeneratedModuleDigest;
 use crate::graph::model::{CodeGraph, EdgeKind, GraphNode};
-use crate::memory::MemoryStore;
 use crate::storage::{
     IndexSnapshot, ModuleDigestCache, SharedVectorIndex, VectorScope, VectorSearchResult,
 };
@@ -243,37 +242,27 @@ pub struct QueryEngine {
     /// must never generate or refresh module digests on the hot path.
     module_digests: Option<ModuleDigestCache>,
     vector_index: Option<SharedVectorIndex>,
-    memory_store: Option<Arc<Mutex<MemoryStore>>>,
     query_history: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl QueryEngine {
-    /// Create a new QueryEngine with a code graph, optional vector store,
-    /// and optional memory store.
-    pub fn new(
-        graph: CodeGraph,
-        vector_index: Option<SharedVectorIndex>,
-        memory_store: Option<Arc<Mutex<MemoryStore>>>,
-    ) -> Self {
+    /// Create a new QueryEngine with a code graph and optional vector store.
+    /// Memory retrieval requires repository authority and is composed by the
+    /// daemon workflow layer after this graph-only query completes.
+    pub fn new(graph: CodeGraph, vector_index: Option<SharedVectorIndex>) -> Self {
         Self {
             graph: Arc::new(graph),
             module_digests: None,
             vector_index,
-            memory_store,
             query_history: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn new_shared(
-        graph: Arc<CodeGraph>,
-        vector_index: Option<SharedVectorIndex>,
-        memory_store: Option<Arc<Mutex<MemoryStore>>>,
-    ) -> Self {
+    pub fn new_shared(graph: Arc<CodeGraph>, vector_index: Option<SharedVectorIndex>) -> Self {
         Self {
             graph,
             module_digests: None,
             vector_index,
-            memory_store,
             query_history: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -286,7 +275,6 @@ impl QueryEngine {
     pub fn from_index_snapshot(
         snapshot: IndexSnapshot,
         vector_index: Option<SharedVectorIndex>,
-        memory_store: Option<Arc<Mutex<MemoryStore>>>,
     ) -> Self {
         let IndexSnapshot {
             epoch,
@@ -298,7 +286,6 @@ impl QueryEngine {
             graph,
             module_digests: Some(module_digests),
             vector_index,
-            memory_store,
             query_history: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -306,8 +293,8 @@ impl QueryEngine {
     /// Capture an immutable query snapshot for work that will run after the
     /// caller releases the live engine lock.
     ///
-    /// The returned engine keeps the current graph `Arc`, vector index, memory
-    /// store, and query history. A later `update_graph` on the live engine
+    /// The returned engine keeps the current graph `Arc`, vector index, and
+    /// query history. A later `update_graph` on the live engine
     /// publishes a new graph pointer, so this snapshot can never observe a
     /// mixed graph generation. Query history remains shared deliberately: its
     /// adaptive-budget signal is session state, not graph state.
@@ -1345,29 +1332,10 @@ impl QueryEngine {
         let tokens_saved = total_tokens_if_all.saturating_sub(tokens_used);
         let nodes_included = pivots.len() + context.len();
 
-        // Step 6: Retrieve relevant memories
+        // Repository authority is unavailable at this graph layer. The daemon
+        // composes scoped, typed memories through MemoryStoreRouter.
         deadline_reached |= deadline.is_some_and(|limit| Instant::now() >= limit);
-        let memories = if deadline_reached {
-            Vec::new()
-        } else if let Some(ref ms) = self.memory_store {
-            match ms.lock() {
-                Ok(store) => store
-                    .search_by_keyword(query_text)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .take(5)
-                    .map(|m| {
-                        serde_json::json!({
-                            "content": m.content,
-                            "type": m.memory_type.as_str(),
-                        })
-                    })
-                    .collect(),
-                Err(_) => vec![], // Mutex poisoned — skip memories gracefully
-            }
-        } else {
-            vec![]
-        };
+        let memories = Vec::new();
 
         // Step 7: Assemble capsule
         let capsule = ContextCapsule {

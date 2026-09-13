@@ -292,11 +292,13 @@ fn verify_explain_args_round_trip_with_legacy_and_structured_memory_id() {
         }),
         mode: VerifyExplainMode::VerifyAndExplain,
         render_mode: VerifyExplainRenderMode::Diagnostic,
+        run_check: None,
     };
     let legacy = VerifyExplainArgs {
         memory_id: MemoryIdInput::Legacy("ulid-2".to_string()),
         mode: VerifyExplainMode::Verify,
         render_mode: VerifyExplainRenderMode::Compact,
+        run_check: None,
     };
     assert_round_trip(&structured);
     assert_round_trip(&legacy);
@@ -463,7 +465,7 @@ fn save_memory_response_round_trip_includes_full_memory_record() {
             freshness_status: "manual_review".to_string(),
             contradiction_state: "none".to_string(),
             supersession_state: "none".to_string(),
-            inclusion_reason: "saved by save_memory".to_string(),
+            inclusion_reason: "saved by remember".to_string(),
             evidence_strength: 0.1,
             linked_files: Vec::new(),
             linked_symbols: Vec::new(),

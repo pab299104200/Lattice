@@ -98,10 +98,28 @@ fn per_kind_queue_overflow_drops_job_and_emits_failure_event() {
     let event_writer = EventWriter::new(event_store.clone(), "workspace-main".to_string(), 4096);
 
     let first = queue
-        .enqueue_llm(job("job-a"), &event_writer, "test-model")
+        .enqueue_llm(
+            job("job-a"),
+            &event_writer,
+            "test-model",
+            &crate::consolidation::EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
         .expect("first job queues");
     let second = queue
-        .enqueue_llm(job("job-b"), &event_writer, "test-model")
+        .enqueue_llm(
+            job("job-b"),
+            &event_writer,
+            "test-model",
+            &crate::consolidation::EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
+        )
         .expect("second job drops");
 
     assert!(matches!(first, EnqueueOutcome::Queued { depth: 1 }));

@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::adoption_metrics::render_metrics_for_workspace;
+use crate::adoption_metrics::{
+    render_metrics_for_workspace, AdoptionMetricsStore, MemoryInjectionActionRecord,
+    MemoryInjectionRecord, MemoryRetrievalRecord, MemoryUseRecord,
+};
 use crate::install::{
     reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, InstallPaths,
 };
@@ -17,7 +20,7 @@ use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
 use lattice_core::embeddings::{install_shared_embedding_model, EmbeddingModelInstallStatus};
 use lattice_core::health::backtest::replay::{
-    repository_name, replay_repository_streaming, ReplayLimits,
+    replay_repository_streaming, repository_name, ReplayLimits,
 };
 use lattice_core::health::backtest::report::ReportBuilder;
 use lattice_core::metrics::health_backtest;
@@ -101,7 +104,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--regression] [--output <path>] [--repo <path>]…\n  install [<mcp|claude-code|codex>] [--with-embeddings]\n  doctor\n  memory-migrate\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--regression] [--output <path>] [--repo <path>]…\n  install [all|mcp|claude-code|codex] [--workspace <path>] [--verify] [--with-embeddings]\n  doctor\n  memory-migrate\n  storage status|cache plan|cache apply|backup|restore|relocate|historical plan|historical apply\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -126,6 +129,7 @@ pub(crate) async fn run_from_env() -> i32 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallTarget {
+    Project,
     Mcp,
     ClaudeCode,
     Codex,
@@ -134,18 +138,19 @@ enum InstallTarget {
 impl InstallTarget {
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "all" => Ok(Self::Project),
             "mcp" => Ok(Self::Mcp),
             "claude-code" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
             other => Err(anyhow!(
-                "unknown install target `{other}`; expected one of: mcp, claude-code, codex"
+                "unknown install target `{other}`; expected one of: all, mcp, claude-code, codex"
             )),
         }
     }
 
     fn config_path(self, workspace: &Path) -> PathBuf {
         match self {
-            Self::Mcp => workspace.join(".mcp.json"),
+            Self::Project | Self::Mcp => workspace.join(".mcp.json"),
             Self::ClaudeCode => workspace.join(".claude/settings.json"),
             Self::Codex => workspace.join(".codex/hooks.json"),
         }
@@ -206,14 +211,15 @@ fn install_embeddings_message() -> Result<String> {
 }
 
 fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
-    let target = args
-        .get(2)
-        .ok_or_else(|| anyhow!("install requires a target: mcp, claude-code, or codex"))
-        .and_then(|target| InstallTarget::parse(target))?;
+    let explicit_target = args.get(2).filter(|value| !value.starts_with('-'));
+    let target = explicit_target
+        .map(|target| InstallTarget::parse(target))
+        .transpose()?
+        .unwrap_or(InstallTarget::Project);
     let mut workspaces = Vec::new();
     let mut verify = false;
     let mut with_embeddings = false;
-    let mut index = 3;
+    let mut index = if explicit_target.is_some() { 3 } else { 2 };
     while index < args.len() {
         match args[index].as_str() {
             "--verify" => verify = true,
@@ -234,7 +240,7 @@ fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
     }
     if target != InstallTarget::Mcp && workspaces.len() != 1 {
         return Err(anyhow!(
-            "install hooks accepts exactly one --workspace; received {}",
+            "project and hook installation accepts exactly one --workspace; received {}",
             workspaces.len()
         ));
     }
@@ -293,11 +299,44 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
         .workspaces
         .first()
         .expect("install parser guarantees a workspace");
+    if command.target == InstallTarget::Project {
+        let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
+        let installed = crate::install_project::install_project(config_workspace, &paths)?;
+        if command.verify {
+            for target in [
+                InstallTarget::Mcp,
+                InstallTarget::Codex,
+                InstallTarget::ClaudeCode,
+            ] {
+                let verification = InstallCommand {
+                    target,
+                    ..command.clone()
+                };
+                verify_install_config(
+                    &target.config_path(config_workspace),
+                    &verification,
+                    runtime,
+                )?;
+            }
+        }
+        let mut message = format!(
+            "installed Lattice project integration at {}",
+            config_workspace.display()
+        );
+        for path in installed {
+            message.push_str(&format!("\n  {}", path.display()));
+        }
+        message.push_str("\nRestart/reconnect agent clients to load the configuration. Codex project configuration requires a trusted project; client trust and approval settings are unchanged.");
+        if let Some(embedding_message) = embedding_message {
+            message.push_str(&format!("\n{embedding_message}"));
+        }
+        return Ok(message);
+    }
     let config_path = command.target.config_path(config_workspace);
     let mut config = read_install_config(&config_path)?;
 
     match command.target {
-        InstallTarget::Mcp => {
+        InstallTarget::Project | InstallTarget::Mcp => {
             reconcile_mcp_config(&mut config, &runtime.executable, &command.workspaces)?;
         }
         InstallTarget::ClaudeCode | InstallTarget::Codex => {
@@ -319,7 +358,7 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
     let installed = format!(
         "installed Lattice {} configuration at {}",
         match command.target {
-            InstallTarget::Mcp => "MCP",
+            InstallTarget::Project | InstallTarget::Mcp => "MCP",
             InstallTarget::ClaudeCode => "Claude Code hook",
             InstallTarget::Codex => "Codex hook",
         },
@@ -412,7 +451,7 @@ fn verify_install_config(
     let mut actual = read_install_config(path)?;
     let before = render_config(&actual)?;
     match command.target {
-        InstallTarget::Mcp => {
+        InstallTarget::Project | InstallTarget::Mcp => {
             reconcile_mcp_config(&mut actual, &runtime.executable, &command.workspaces)?
         }
         InstallTarget::ClaudeCode | InstallTarget::Codex => {
@@ -434,7 +473,7 @@ fn verify_install_config(
     }
 
     match command.target {
-        InstallTarget::Mcp => verify_configured_mcp_server(&actual, path)?,
+        InstallTarget::Project | InstallTarget::Mcp => verify_configured_mcp_server(&actual, path)?,
         InstallTarget::ClaudeCode | InstallTarget::Codex => {
             let client = if command.target == InstallTarget::ClaudeCode {
                 HookClient::ClaudeCode
@@ -1357,8 +1396,8 @@ where
 }
 
 fn run_metrics_command(args: Vec<String>) -> i32 {
-    match parse_metrics_args(args).and_then(|(workspace, days, json, projection)| {
-        match projection {
+    match parse_metrics_args(args).and_then(
+        |(workspace, days, json, projection)| match projection {
             MetricsProjection::Memory => {
                 render_memory_metrics_for_workspace(&workspace, days, json)
             }
@@ -1366,8 +1405,8 @@ fn run_metrics_command(args: Vec<String>) -> i32 {
                 render_health_metrics_for_workspace(&workspace, days, json)
             }
             MetricsProjection::All => render_metrics_for_workspace(&workspace, days, json),
-        }
-    }) {
+        },
+    ) {
         Ok(output) => {
             println!("{}", output.trim_end());
             0
@@ -1648,7 +1687,15 @@ fn parse_args(args: Vec<String>) -> Result<CliRequest> {
     };
     parser.reject_unknown_flags()?;
     parser.apply_common(&mut request)?;
-    if !request.json {
+    if request.json
+        && matches!(
+            command.as_str(),
+            "context" | "prepare_change" | "impact" | "diagnose"
+        )
+    {
+        set_default(&mut request.arguments, "render", json!("json"));
+        set_default(&mut request.arguments, "wire_format", json!("standard"));
+    } else if !request.json && command != "remember" {
         set_default(&mut request.arguments, "render", json!("markdown"));
         set_default(&mut request.arguments, "render_mode", json!("compact"));
         set_default(&mut request.arguments, "budget", json!("compact"));
@@ -1777,6 +1824,60 @@ fn parse_remember(parser: &mut ArgParser) -> Result<CliRequest> {
     let kind = parser
         .take_flag_value("--kind")?
         .unwrap_or_else(|| "quick".to_string());
+    if kind == "evolution" {
+        let mut arguments = json!({"kind": "evolution"});
+        for (flag, field) in [
+            ("--action", "action"),
+            ("--memory-id", "memory_id"),
+            ("--proposal-id", "proposal_id"),
+            ("--superseded-by-memory-id", "superseded_by_memory_id"),
+            ("--invalidate-reason", "invalidate_reason"),
+            ("--reason", "reason"),
+            ("--decided-by", "decided_by"),
+        ] {
+            if let Some(value) = parser.take_flag_value(flag)? {
+                set_value(&mut arguments, field, json!(value));
+            }
+        }
+        for (flag, field) in [
+            ("--linked-file", "linked_files"),
+            ("--linked-symbol", "linked_symbols"),
+            ("--linked-doc", "linked_docs"),
+            ("--linked-test", "linked_tests"),
+            ("--linked-memory", "linked_memories"),
+            ("--validity-condition", "validity_conditions"),
+            ("--invalidation-trigger", "invalidation_triggers"),
+        ] {
+            let values = parser.take_repeated(flag)?;
+            if !values.is_empty() {
+                set_value(&mut arguments, field, json!(values));
+            }
+        }
+        parser.reject_unknown_flags()?;
+        let content = parser.join_positionals();
+        if !content.trim().is_empty() {
+            set_value(&mut arguments, "content", json!(content));
+        }
+        let parsed = crate::rpc::memory_v2::propose_memory_evolution::parse_args(&arguments)
+            .map_err(|error| anyhow!(error))?;
+        crate::rpc::memory_v2::propose_memory_evolution::validate_args(&parsed)
+            .map_err(|error| anyhow!(error))?;
+        return Ok(parser.request("remember", arguments));
+    }
+    if !matches!(kind.as_str(), "quick" | "durable" | "outcome") {
+        return Err(anyhow!("unknown remember kind `{kind}`"));
+    }
+    let outcome_status = if kind == "outcome" {
+        let value = parser
+            .take_flag_value("--status")?
+            .unwrap_or_else(|| "success".into());
+        if !matches!(value.as_str(), "success" | "failure") {
+            return Err(anyhow!("outcome --status must be success or failure"));
+        }
+        Some(value)
+    } else {
+        None
+    };
     let content = parser.join_positionals();
     if content.trim().is_empty() {
         return Err(anyhow!("remember requires content"));
@@ -1788,6 +1889,7 @@ fn parse_remember(parser: &mut ArgParser) -> Result<CliRequest> {
     if arguments.get("kind").and_then(Value::as_str) == Some("outcome") {
         set_default(&mut arguments, "task", json!(content));
         set_default(&mut arguments, "summary", json!(content));
+        set_default(&mut arguments, "status", json!(outcome_status));
     }
     Ok(parser.request("remember", arguments))
 }
@@ -1797,9 +1899,61 @@ fn parse_recall(parser: &mut ArgParser) -> Result<CliRequest> {
         .take_flag_value("--mode")?
         .unwrap_or_else(|| "search".to_string());
     let task_id = parser.take_flag_value("--task-id")?;
+    let authority = parser.take_flag_value("--authority")?;
+    let delivery_id = parser.take_flag_value("--delivery-id")?;
+    let payload_hash = parser.take_flag_value("--payload-hash")?;
     let focus_files = parser.take_repeated("--focus-files")?;
+    let memory_id = parser.take_flag_value("--memory-id")?;
+    let run_check = parser.take_flag_value("--run-check")?;
+    let include_retention_stale = parser.take_bool("--include-retention-stale");
     let query = parser.join_positionals();
-    if query.trim().is_empty() {
+    if mode == "verify" {
+        if include_retention_stale {
+            return Err(anyhow!(
+                "--include-retention-stale is only valid for recall search or task"
+            ));
+        }
+        if parser.positionals.len() > 1 {
+            return Err(anyhow!(
+                "recall --mode verify accepts one positional memory ID"
+            ));
+        }
+        if memory_id.is_some() && !query.trim().is_empty() {
+            return Err(anyhow!(
+                "recall --mode verify cannot combine --memory-id with a query"
+            ));
+        }
+        let memory_id = memory_id
+            .or_else(|| (!query.trim().is_empty()).then_some(query.clone()))
+            .ok_or_else(|| anyhow!("recall --mode verify requires --memory-id or a memory ID"))?;
+        let mut arguments = json!({
+            "mode": mode,
+            "memory_id": memory_id,
+        });
+        if let Some(run_check) = run_check {
+            set_value(&mut arguments, "run_check", json!(run_check));
+        }
+        if !focus_files.is_empty() {
+            set_value(&mut arguments, "focus_files", json!(focus_files));
+        }
+        return Ok(parser.request("recall", arguments));
+    }
+    if memory_id.is_some() {
+        return Err(anyhow!(
+            "--memory-id is only valid for recall --mode verify"
+        ));
+    }
+    if run_check.is_some() {
+        return Err(anyhow!(
+            "--run-check is only valid for recall --mode verify"
+        ));
+    }
+    if include_retention_stale && mode != "search" && mode != "task" {
+        return Err(anyhow!(
+            "--include-retention-stale is only valid for recall search or task"
+        ));
+    }
+    if query.trim().is_empty() && mode != "acknowledge_delivery" {
         return Err(anyhow!("recall requires a query"));
     }
     let mut arguments = json!({
@@ -1813,6 +1967,20 @@ fn parse_recall(parser: &mut ArgParser) -> Result<CliRequest> {
     }
     if !focus_files.is_empty() {
         set_value(&mut arguments, "focus_files", json!(focus_files));
+    }
+    if include_retention_stale {
+        set_value(&mut arguments, "include_retention_stale", json!(true));
+    }
+    if mode == "acknowledge_delivery" {
+        let authority = authority
+            .ok_or_else(|| anyhow!("recall --mode acknowledge_delivery requires --authority"))?;
+        let delivery_id = delivery_id
+            .ok_or_else(|| anyhow!("recall --mode acknowledge_delivery requires --delivery-id"))?;
+        let payload_hash = payload_hash
+            .ok_or_else(|| anyhow!("recall --mode acknowledge_delivery requires --payload-hash"))?;
+        set_value(&mut arguments, "authority", json!(authority));
+        set_value(&mut arguments, "delivery_id", json!(delivery_id));
+        set_value(&mut arguments, "payload_hash", json!(payload_hash));
     }
     Ok(parser.request("recall", arguments))
 }
@@ -2126,6 +2294,73 @@ fn compact_value(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remember_evolution_cli_uses_the_public_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let parse = |tail: &[&str]| {
+            let mut args = vec![
+                "lattice".to_string(),
+                "remember".to_string(),
+                "--workspace".to_string(),
+                root.path().display().to_string(),
+            ];
+            args.extend(tail.iter().map(|value| value.to_string()));
+            super::parse_args(args)
+        };
+        let proposed = parse(&[
+            "--kind",
+            "evolution",
+            "--action",
+            "propose",
+            "--memory-id",
+            "old",
+            "--superseded-by-memory-id",
+            "new",
+            "--reason",
+            "Current contract changed",
+        ])
+        .unwrap();
+        assert_eq!(proposed.arguments["superseded_by_memory_id"], "new");
+        assert!(proposed.arguments.get("content").is_none());
+        assert!(proposed.arguments.get("render").is_none());
+        let applied = parse(&[
+            "--kind",
+            "evolution",
+            "--action",
+            "apply",
+            "--proposal-id",
+            "proposal",
+        ])
+        .unwrap();
+        assert_eq!(applied.arguments["action"], "apply");
+        for invalid in [
+            vec!["--kind", "unknown", "text"],
+            vec!["--kind", "evolution", "--action", "apply"],
+            vec![
+                "--kind",
+                "evolution",
+                "--action",
+                "propose",
+                "--memory-id",
+                "old",
+            ],
+            vec![
+                "--kind",
+                "evolution",
+                "--action",
+                "reject",
+                "--proposal-id",
+                "p",
+                "unexpected content",
+            ],
+        ] {
+            assert!(parse(&invalid).is_err());
+        }
+        let outcome = parse(&["--kind", "outcome", "--status", "failure", "Build failed"]).unwrap();
+        assert_eq!(outcome.arguments["status"], "failure");
+        assert_eq!(outcome.arguments["summary"], "Build failed");
+    }
+
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2148,6 +2383,7 @@ mod tests {
             for (_event, script) in INSTALLED_HOOKS {
                 write_executable(&hooks.join(script), "#!/bin/sh\nexit 0\n");
             }
+            write_executable(&hooks.join("common.sh"), "#!/bin/sh\nexit 0\n");
         }
         let executable = root.join("bin/lattice");
         write_executable(
@@ -2254,7 +2490,11 @@ mod tests {
         for bad in [
             vec!["lattice".into(), "health-backtest".into(), "--nope".into()],
             vec!["lattice".into(), "health-backtest".into(), "--repo".into()],
-            vec!["lattice".into(), "health-backtest".into(), "--output".into()],
+            vec![
+                "lattice".into(),
+                "health-backtest".into(),
+                "--output".into(),
+            ],
             vec![
                 "lattice".into(),
                 "health-backtest".into(),
@@ -2333,31 +2573,39 @@ mod tests {
 
     #[test]
     fn memory_metrics_view_projects_retrieval_and_injection_counters() {
-        let root = std::env::temp_dir().join(format!(
-            "lattice-memory-metrics-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(root.join(".lattice")).unwrap();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let events = [
-            json!({"kind":"memory_retrieval","timestamp_secs":now,"session_id":"s","client":"codex","channel":"cli","retrieval_id":"r","retrieved_count":3}),
-            json!({"kind":"memory_use","timestamp_secs":now,"retrieval_id":"r","used_count":2}),
-            json!({"kind":"memory_injection","timestamp_secs":now,"session_id":"s","client":"codex","channel":"cli","injection_id":"i","shown_count":2}),
-            json!({"kind":"memory_injection_action","timestamp_secs":now,"injection_id":"i","acted_count":1}),
-        ];
-        let text = events
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        fs::write(root.join(".lattice/adoption_metrics.jsonl"), text).unwrap();
+        let temporary = tempfile::tempdir().expect("create existing metrics workspace");
+        let root = temporary.path().to_path_buf();
+        let store = AdoptionMetricsStore::new(&root);
+        store
+            .record_memory_retrieval(MemoryRetrievalRecord {
+                session_id: "s".to_string(),
+                client: "codex".to_string(),
+                channel: "cli".to_string(),
+                retrieval_id: "r".to_string(),
+                retrieved_count: 3,
+            })
+            .unwrap();
+        store
+            .record_memory_use(MemoryUseRecord {
+                retrieval_id: "r".to_string(),
+                used_count: 2,
+            })
+            .unwrap();
+        store
+            .record_memory_injection(MemoryInjectionRecord {
+                session_id: "s".to_string(),
+                client: "codex".to_string(),
+                channel: "cli".to_string(),
+                injection_id: "i".to_string(),
+                shown_count: 2,
+            })
+            .unwrap();
+        store
+            .record_memory_injection_action(MemoryInjectionActionRecord {
+                injection_id: "i".to_string(),
+                acted_count: 1,
+            })
+            .unwrap();
 
         let markdown = render_memory_metrics_for_workspace(&root, 14, false).unwrap();
         assert!(markdown.contains("retrievals"));
@@ -2398,7 +2646,30 @@ mod tests {
         assert_eq!(request.arguments["mode"], "docs");
         assert_eq!(request.arguments["min_relevance"], 0.35);
         assert!(request.json);
+        assert_eq!(request.arguments["render"], "json");
         assert_eq!(request.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn json_workflows_request_structured_payloads_and_text_defaults_stay_compact() {
+        for command in ["context", "prepare_change", "impact", "diagnose"] {
+            for structured in [false, true] {
+                let mut args = vec!["lattice".into(), command.into(), "selector.py".into()];
+                if structured {
+                    args.push("--json".into());
+                }
+                let request = parse_args(args).unwrap();
+                assert_eq!(
+                    request.arguments["render"],
+                    if structured { "json" } else { "markdown" }
+                );
+                if !structured {
+                    assert_eq!(request.arguments["render_mode"], "compact");
+                } else {
+                    assert_eq!(request.arguments["wire_format"], "standard");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2417,6 +2688,128 @@ mod tests {
         );
         assert!(request.arguments["target"].is_null());
         assert_eq!(request.arguments["include_tests"], false);
+    }
+
+    #[test]
+    fn parses_delivery_acknowledgement_without_a_query_and_requires_full_receipt() {
+        let request = parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "acknowledge_delivery".into(),
+            "--authority".into(),
+            "repository:repo".into(),
+            "--delivery-id".into(),
+            "mdel_receipt".into(),
+            "--payload-hash".into(),
+            "sha256:payload".into(),
+        ])
+        .expect("parse acknowledgement");
+        assert_eq!(request.tool, "recall");
+        assert_eq!(request.arguments["mode"], "acknowledge_delivery");
+        assert_eq!(request.arguments["authority"], "repository:repo");
+        assert_eq!(request.arguments["delivery_id"], "mdel_receipt");
+        assert_eq!(request.arguments["payload_hash"], "sha256:payload");
+        assert!(parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "acknowledge_delivery".into(),
+            "--authority".into(),
+            "repository:repo".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_verify_memory_id_and_explicit_run_check() {
+        let request = parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "verify".into(),
+            "--memory-id".into(),
+            "memory-123".into(),
+            "--run-check".into(),
+            "unit".into(),
+        ])
+        .expect("parse verify request");
+        assert_eq!(request.arguments["mode"], "verify");
+        assert_eq!(request.arguments["memory_id"], "memory-123");
+        assert_eq!(request.arguments["run_check"], "unit");
+        assert!(request.arguments.get("query").is_none());
+
+        let positional = parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "verify".into(),
+            "memory-positional".into(),
+        ])
+        .expect("parse positional verify request");
+        assert_eq!(positional.arguments["memory_id"], "memory-positional");
+        assert!(positional.arguments.get("run_check").is_none());
+    }
+
+    #[test]
+    fn recall_verify_rejects_missing_or_conflicting_memory_id() {
+        assert!(parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "verify".into(),
+        ])
+        .is_err());
+        assert!(parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "verify".into(),
+            "--memory-id".into(),
+            "memory-123".into(),
+            "query".into(),
+        ])
+        .is_err());
+        assert!(parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "search".into(),
+            "--run-check".into(),
+            "unit".into(),
+            "query".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn forwards_retention_stale_only_for_search_and_task() {
+        for mode in ["search", "task"] {
+            let request = parse_args(vec![
+                "lattice".into(),
+                "recall".into(),
+                "--mode".into(),
+                mode.into(),
+                "query".into(),
+                "--include-retention-stale".into(),
+            ])
+            .expect("parse stale-inclusive recall");
+            assert_eq!(request.arguments["include_retention_stale"], true);
+        }
+        assert!(parse_args(vec![
+            "lattice".into(),
+            "recall".into(),
+            "--mode".into(),
+            "acknowledge_delivery".into(),
+            "--include-retention-stale".into(),
+            "--authority".into(),
+            "repository:repo".into(),
+            "--delivery-id".into(),
+            "receipt".into(),
+            "--payload-hash".into(),
+            "sha256:payload".into(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2656,6 +3049,69 @@ mod tests {
         });
 
         verify_configured_mcp_server(&config, Path::new("/fixture/.mcp.json")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_install_sets_up_both_clients_and_preserves_project_instructions() {
+        let (root, workspace, runtime) = install_fixture();
+        fs::write(
+            workspace.join("AGENTS.md"),
+            "# Project rules\nKeep this exact text.\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("CLAUDE.md"),
+            "# Claude rules\nKeep these too.\n",
+        )
+        .unwrap();
+        let command = parse_install_command(vec![
+            "lattice".into(),
+            "install".into(),
+            "--workspace".into(),
+            workspace.display().to_string(),
+            "--verify".into(),
+        ])
+        .unwrap();
+        assert_eq!(command.target, InstallTarget::Project);
+        run_install_command_with(command.clone(), &runtime).unwrap();
+        let files = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".mcp.json",
+            ".codex/config.toml",
+            ".codex/hooks.json",
+            ".claude/settings.json",
+        ];
+        let before = files
+            .iter()
+            .map(|file| fs::read(workspace.join(file)).unwrap())
+            .collect::<Vec<_>>();
+        run_install_command_with(command, &runtime).unwrap();
+        for (file, original) in files.iter().zip(before) {
+            assert_eq!(
+                fs::read(workspace.join(file)).unwrap(),
+                original,
+                "{file} changed on repeat"
+            );
+        }
+        assert!(fs::read_to_string(workspace.join("AGENTS.md"))
+            .unwrap()
+            .starts_with("# Project rules\nKeep this exact text.\n"));
+        assert!(fs::read_to_string(workspace.join("CLAUDE.md"))
+            .unwrap()
+            .starts_with("# Claude rules\nKeep these too.\n"));
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(workspace.join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            mcp["mcpServers"]["lattice"]["args"],
+            json!(["--stdio", "--workspace", workspace.canonicalize().unwrap().to_string_lossy()])
+        );
+        let codex = fs::read_to_string(workspace.join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("mcp_servers.lattice"));
+        assert!(codex.contains("--stdio"));
+        assert!(codex.contains(workspace.canonicalize().unwrap().to_string_lossy().as_ref()));
         fs::remove_dir_all(root).unwrap();
     }
 

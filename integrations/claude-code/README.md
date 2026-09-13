@@ -45,14 +45,19 @@ Hook delivery is attributed by the daemon as `claude-code` / `hook`; installer f
 A trusted Claude Code plugin may explicitly run a check declared in the
 checkout's `.lattice/verification-checks.json` with the private
 `lattice __hook-verify claude-code <host-session-id> <check-id>` entry point.
-This is not installed or triggered automatically. The strict v1 manifest
-contains a safe ID, fixed display label, and argv array; an optional `error`
-object contains a fixed category and `sha256:` fingerprint. Lattice executes
-argv directly without a shell, discards all process streams, and forwards only
-the label and categorical outcome under an existing session binding. It never
-forwards or stores the ID, argv, command output, environment, cwd, transcript,
-or exit code. Malformed configuration, unknown IDs, missing/closed bindings,
-and transport failure produce no capture output and never create a binding.
+This is not installed or triggered automatically. The strict v2 manifest
+requires `schema_version: 2` and each check's safe ID, fixed display label,
+argv array, positive `timeout_ms`, and explicitly declared environment. The
+executable must be an absolute path or an explicit `./` checkout-relative
+path; shell executables are rejected. Optional `evidence_reference` and
+categorical `error` metadata may also be declared. Lattice executes argv
+directly without a shell, clears the environment before applying declarations,
+discards all process streams, and forwards only the label and categorical
+outcome under an existing session binding. It never forwards or stores the ID,
+argv, command output, environment, cwd, transcript, or exit code. Malformed
+configuration, unknown IDs, missing/closed bindings, and transport failure
+produce no capture output and never create a binding. The runner currently
+fails closed on Windows.
 
 ## Controls
 
@@ -76,3 +81,16 @@ explicit stdio runtime and scope it to the project workspace:
 ```
 
 Do not register a bare `lattice` command or point a workspace at `$HOME`.
+
+## Long-running agent work
+
+Hook injection does not replace direct Lattice calls during a plan. Include the
+[agent workflow](../../docs/agent-workflow.md) in the consuming repository's
+agent instructions and verify actual task-boundary tool calls in acceptance
+tests. Installation alone does not enforce this behavior.
+
+For complete project setup, run `lattice install --workspace /path/to/project`.
+It installs both clients' MCP configurations and hooks and maintains workflow
+instructions in `AGENTS.md` and `CLAUDE.md`. The explicit client target and this
+standalone shell package remain hook-only. Client trust and approval settings
+are not changed.

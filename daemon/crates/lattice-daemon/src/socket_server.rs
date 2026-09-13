@@ -21,9 +21,21 @@ use crate::rpc::protocol::{format_response, parse_request, JsonRpcResponse};
 use crate::rpc::server::RequestHandler;
 use crate::transport::{ClientKind, ConnectionMetadata, ProxyRequest, ServerTransport};
 
+fn lock_owned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct ActiveRequest {
     generation: u64,
     handle: JoinHandle<()>,
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 struct PendingResponse {
@@ -41,10 +53,15 @@ struct ShardEntry {
     index_work: Arc<crate::index_work::IndexWorkCoordinator>,
     active_connections: AtomicUsize,
     last_used_epoch_secs: AtomicU64,
+    _materialization_reservation: crate::resource_budget::ResourceReservation,
 }
 
 impl ShardEntry {
-    fn pending(root: PathBuf, index_work: Arc<crate::index_work::IndexWorkCoordinator>) -> Self {
+    fn pending(
+        root: PathBuf,
+        index_work: Arc<crate::index_work::IndexWorkCoordinator>,
+        materialization_reservation: crate::resource_budget::ResourceReservation,
+    ) -> Self {
         Self {
             root,
             runtime: StdMutex::new(None),
@@ -54,6 +71,7 @@ impl ShardEntry {
             index_work,
             active_connections: AtomicUsize::new(0),
             last_used_epoch_secs: AtomicU64::new(now_epoch_secs()),
+            _materialization_reservation: materialization_reservation,
         }
     }
 
@@ -67,11 +85,7 @@ impl ShardEntry {
             .map(|runtime| Arc::clone(&runtime.handler) as Arc<dyn RequestHandler>))
     }
 
-    fn start_bootstrap(
-        self: &Arc<Self>,
-        focus_files: Vec<String>,
-        focus_dirs: Vec<String>,
-    ) {
+    fn start_bootstrap(self: &Arc<Self>, focus_files: Vec<String>, focus_dirs: Vec<String>) {
         let entry = Arc::clone(self);
         let root = entry.root.clone();
         let index_work = Arc::clone(&entry.index_work);
@@ -80,32 +94,23 @@ impl ShardEntry {
                 .await
             {
                 Ok(runtime) => {
-                    if let Ok(mut slot) = entry.runtime.lock() {
-                        *slot = Some(runtime);
-                    } else {
-                        tracing::error!(workspace = %entry.root.display(), "workspace shard runtime lock poisoned while publishing bootstrap");
-                    }
+                    let mut slot = lock_owned(&entry.runtime);
+                    *slot = Some(runtime);
                 }
                 Err(error) => {
                     let message = error.to_string();
                     tracing::error!(workspace = %entry.root.display(), %message, "workspace shard bootstrap failed");
-                    if let Ok(mut bootstrap_error) = entry.bootstrap_error.lock() {
-                        *bootstrap_error = Some(message);
-                    }
+                    *lock_owned(&entry.bootstrap_error) = Some(message);
                 }
             }
             entry.bootstrapping.store(false, Ordering::Release);
         });
-        if let Ok(mut bootstrap) = self.bootstrap.lock() {
-            *bootstrap = Some(task);
-        }
+        let mut bootstrap = lock_owned(&self.bootstrap);
+        *bootstrap = Some(task);
     }
 
     fn bootstrap_error(&self) -> Option<String> {
-        self.bootstrap_error
-            .lock()
-            .ok()
-            .and_then(|error| error.clone())
+        lock_owned(&self.bootstrap_error).clone()
     }
 
     fn is_bootstrapping(&self) -> bool {
@@ -147,12 +152,15 @@ impl ShardEntry {
     }
 
     async fn shutdown(&self) {
-        let bootstrap = self.bootstrap.lock().ok().and_then(|mut guard| guard.take());
+        let bootstrap = lock_owned(&self.bootstrap).take();
         if let Some(task) = bootstrap {
-            task.abort();
+            // Runtime construction is finite and begins storage workers before
+            // publishing the completed runtime. Aborting here would detach
+            // those workers and release the checkout lease prematurely. Join
+            // construction, then shut down the published runtime below.
             let _ = task.await;
         }
-        let runtime = self.runtime.lock().ok().and_then(|mut guard| guard.take());
+        let runtime = lock_owned(&self.runtime).take();
         if let Some(runtime) = runtime {
             runtime.shutdown().await;
         }
@@ -214,6 +222,13 @@ fn cold_start_response(
             if !is_public_agent_tool(tool_name) {
                 return Err((-32602, format!("Unknown tool: {tool_name}")));
             }
+            if tool_name == "status"
+                && params.pointer("/arguments/scope").and_then(Value::as_str) == Some("storage")
+            {
+                return Ok(wrap_json_text(crate::storage_operator::status_payload(
+                    workspace,
+                )));
+            }
             if tool_name == "status" {
                 return Ok(wrap_json_text(cold_index_status_payload(
                     workspace,
@@ -246,7 +261,14 @@ fn cold_start_response(
 fn is_public_agent_tool(name: &str) -> bool {
     matches!(
         name,
-        "context" | "prepare_change" | "impact" | "diagnose" | "search" | "remember" | "recall" | "status"
+        "context"
+            | "prepare_change"
+            | "impact"
+            | "diagnose"
+            | "search"
+            | "remember"
+            | "recall"
+            | "status"
     )
 }
 
@@ -281,6 +303,7 @@ fn cold_index_status_payload(
             "deferred_reason": deferred_reason,
         },
         "index_work": index_work.snapshot(),
+        "resource_admission": index_work.resource_snapshot(),
         "semantic_retrieval": {
             "status": "initializing",
             "reason": "workspace runtime bootstrap has not published a graph yet; lexical retrieval will remain available after publication"
@@ -337,6 +360,19 @@ struct RuntimeLease {
     handler: Arc<dyn RequestHandler>,
 }
 
+impl RuntimeLease {
+    fn begin_work(&self) -> Vec<crate::index_work::RuntimeWorkGuard> {
+        lock_owned(&self.retained_shards)
+            .values()
+            .filter_map(|shard| {
+                lock_owned(&shard.runtime)
+                    .as_ref()
+                    .map(|runtime| runtime.begin_work())
+            })
+            .collect()
+    }
+}
+
 /// A logical shard that has not been admitted because every resident shard is
 /// active or indexing.  It retries admission on each request, but never turns
 /// that transient resource boundary into a generic RPC availability failure.
@@ -381,16 +417,16 @@ impl RequestHandler for DeferredShardHandler {
 }
 
 fn is_shard_capacity_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("loaded workspace shards")
+    let message = error.to_string();
+    message.contains("loaded workspace shards") || message.contains("resource-limited:")
 }
 
 impl Drop for RuntimeLease {
     fn drop(&mut self) {
-        let retained = self
-            .retained_shards
-            .lock()
-            .map(|mut shards| shards.drain().map(|(_, shard)| shard).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let retained = lock_owned(&self.retained_shards)
+            .drain()
+            .map(|(_, shard)| shard)
+            .collect::<Vec<_>>();
         for shard in retained {
             shard.release();
         }
@@ -613,7 +649,10 @@ impl ViewRequestHandler {
             {
                 Ok(shard) => {
                     let retained = RetainedShard::from_retained(shard);
-                    retained.handler().handle("tools/call", params.clone()).await?
+                    retained
+                        .handler()
+                        .handle("tools/call", params.clone())
+                        .await?
                 }
                 Err(error) if is_shard_capacity_error(&error) => {
                     let reason = error.to_string();
@@ -869,7 +908,10 @@ pub(crate) struct GlobalDaemon {
     has_loaded_runtime: AtomicBool,
     exit_when_idle: bool,
     index_work: Arc<crate::index_work::IndexWorkCoordinator>,
+    resource_budget: Arc<crate::resource_budget::ResourceBudget>,
+    view_reservation_bytes: u64,
     hook_session_route: Option<Arc<HookSessionRoute>>,
+    shutting_down: AtomicBool,
 }
 
 impl GlobalDaemon {
@@ -892,6 +934,7 @@ impl GlobalDaemon {
     }
 
     fn new_with_config(max_loaded_shards: usize, prewarm_view_shards: bool) -> Self {
+        let resource_budget = crate::resource_budget::ResourceBudget::from_env();
         Self {
             shards: Mutex::new(HashMap::new()),
             max_loaded_shards,
@@ -902,8 +945,14 @@ impl GlobalDaemon {
             ),
             has_loaded_runtime: AtomicBool::new(false),
             exit_when_idle: env_bool("LATTICE_DAEMON_EXIT_WHEN_IDLE", false),
-            index_work: crate::index_work::IndexWorkCoordinator::from_env(),
+            index_work: crate::index_work::IndexWorkCoordinator::from_env_with_budget(Arc::clone(
+                &resource_budget,
+            )),
+            resource_budget,
+            view_reservation_bytes:
+                crate::resource_budget::ResourceBudget::default_view_reservation(),
             hook_session_route: None,
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -985,7 +1034,10 @@ impl GlobalDaemon {
                     "primary_shard",
                     serde_json::json!(primary_root.to_string_lossy().to_string()),
                 ),
-                ("primary_shard_deferred", serde_json::json!(deferred_primary)),
+                (
+                    "primary_shard_deferred",
+                    serde_json::json!(deferred_primary),
+                ),
             ],
         );
         Ok(RuntimeLease {
@@ -1056,6 +1108,9 @@ impl GlobalDaemon {
         let key = shard_key(&root);
         let (entry, victim) = {
             let mut shards = self.shards.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                anyhow::bail!("daemon is shutting down; new workspace shards are unavailable");
+            }
             if let Some(entry) = shards.get(&key) {
                 if retain {
                     entry.retain();
@@ -1086,7 +1141,17 @@ impl GlobalDaemon {
                 shards.remove(&victim_key).map(|entry| (victim_key, entry))
             };
 
-            let entry = Arc::new(ShardEntry::pending(root, Arc::clone(&self.index_work)));
+            // Reserve the full configured logical materialization allowance
+            // before runtime bootstrap can allocate a graph or ANN view.
+            let reservation = self
+                .resource_budget
+                .try_reserve("active_checkout_view", self.view_reservation_bytes)
+                .map_err(anyhow::Error::new)?;
+            let entry = Arc::new(ShardEntry::pending(
+                root,
+                Arc::clone(&self.index_work),
+                reservation,
+            ));
             if retain {
                 entry.retain();
             }
@@ -1107,7 +1172,23 @@ impl GlobalDaemon {
             victim.shutdown().await;
         }
 
-        entry.start_bootstrap(focus_files, focus_dirs);
+        {
+            let mut shards = self.shards.lock().await;
+            let still_registered = shards
+                .get(&key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &entry));
+            if self.shutting_down.load(Ordering::Acquire) || !still_registered {
+                if still_registered {
+                    shards.remove(&key);
+                }
+                anyhow::bail!("daemon is shutting down; workspace bootstrap was cancelled");
+            }
+            // Bootstrap ownership is installed while admission remains fenced
+            // by the shard-map lock. Shutdown cannot drain this entry between
+            // the final admission check and constructor-handle publication.
+            entry.start_bootstrap(focus_files, focus_dirs);
+        }
+
         lifecycle_log::log_event(
             "daemon",
             "shard_bootstrap_started",
@@ -1181,17 +1262,21 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
     );
 
     let daemon = Arc::new(GlobalDaemon::new());
+    let mut connections = tokio::task::JoinSet::new();
     let mut cleanup_interval = tokio::time::interval(daemon.cleanup_interval());
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     cleanup_interval.tick().await;
 
-    loop {
+    let result = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error.into()),
+                };
                 let daemon = Arc::clone(&daemon);
                 let transport = Arc::clone(&transport);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(err) = handle_proxy_connection(daemon, transport, stream).await {
                         tracing::warn!("proxy connection failed: {}", err);
                     }
@@ -1202,12 +1287,39 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
                 if daemon.should_shutdown_when_idle().await {
                     tracing::info!("lattice daemon exiting after all workspace runtimes went idle");
                     lifecycle_log::log_event("daemon", "idle_exit", &[]);
-                    break;
+                    break Ok(());
+                }
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "proxy connection task failed");
                 }
             }
         }
+    };
+    // Close admission while holding the same mutex used by `shard_for`; a
+    // request that passed the flag check must finish insertion before this
+    // barrier returns, and later requests cannot repopulate after the drain.
+    close_shard_admission(&daemon).await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    shutdown_daemon_shards(&daemon).await;
+    result
+}
+
+async fn close_shard_admission(daemon: &GlobalDaemon) {
+    let _shards = daemon.shards.lock().await;
+    daemon.shutting_down.store(true, Ordering::Release);
+}
+
+async fn shutdown_daemon_shards(daemon: &GlobalDaemon) {
+    let victims = {
+        let mut shards = daemon.shards.lock().await;
+        shards.drain().map(|(_, entry)| entry).collect::<Vec<_>>()
+    };
+    for shard in victims {
+        shard.shutdown().await;
     }
-    Ok(())
 }
 
 async fn handle_proxy_connection(
@@ -1461,7 +1573,12 @@ async fn run_json_rpc_connection(
                     let method = request.method;
                     let params = request.params;
                     let id = request.id;
+                    let request_work = lease
+                        .as_ref()
+                        .expect("runtime lease was loaded for ordinary RPC")
+                        .begin_work();
                     let task = tokio::spawn(async move {
+                        let _request_work = request_work;
                         let response = match handler.handle(&method, params).await {
                             Ok(result) => JsonRpcResponse::success(id, result),
                             Err((code, message)) => JsonRpcResponse::error(id, code, message),
@@ -1480,7 +1597,12 @@ async fn run_json_rpc_connection(
                     }
                 } else {
                     let handler = Arc::clone(&handler);
+                    let request_work = lease
+                        .as_ref()
+                        .expect("runtime lease was loaded for ordinary RPC")
+                        .begin_work();
                     tokio::spawn(async move {
+                        let _request_work = request_work;
                         let _ = handler.handle(&request.method, request.params).await;
                     });
                 }
@@ -1561,10 +1683,69 @@ fn request_id_key(id: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    include!("socket_shutdown_acceptance_tests.rs");
     use super::*;
     use crate::transport::{client_handshake, ClientKind};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn poisoned_ownership_mutex_preserves_value_for_shutdown() {
+        let owned = Arc::new(StdMutex::new(Some("runtime-or-bootstrap")));
+        let poisoned = Arc::clone(&owned);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison ownership mutex");
+        })
+        .join();
+
+        assert_eq!(lock_owned(&owned).take(), Some("runtime-or-bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn closed_admission_rejects_late_shards_and_drain_joins_bootstrap() {
+        let daemon = Arc::new(GlobalDaemon::new_with_config(2, false));
+        let root = unique_test_root("shutdown-admission");
+        let reservation = daemon
+            .resource_budget
+            .try_reserve("test_view", 1)
+            .expect("reserve test view");
+        let entry = Arc::new(ShardEntry::pending(
+            root.clone(),
+            Arc::clone(&daemon.index_work),
+            reservation,
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        *lock_owned(&entry.bootstrap) = Some(tokio::spawn(async move {
+            let _ = release_rx.await;
+        }));
+        daemon.shards.lock().await.insert(shard_key(&root), entry);
+
+        close_shard_admission(&daemon).await;
+        let cleanup_daemon = Arc::clone(&daemon);
+        let cleanup = tokio::spawn(async move {
+            shutdown_daemon_shards(&cleanup_daemon).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !cleanup.is_finished(),
+            "drain must join constructor ownership"
+        );
+        let late_error = daemon
+            .shard_for(root.clone(), Vec::new(), Vec::new(), false)
+            .await
+            .err()
+            .expect("closed admission rejects late shard");
+        assert!(late_error.to_string().contains("shutting down"));
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("shutdown completed")
+            .expect("cleanup task joined");
+        assert!(daemon.shards.lock().await.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn authenticated_hook_open_does_not_load_a_workspace_shard() {
@@ -1794,10 +1975,11 @@ mod tests {
                     focus_files: Vec::new(),
                     focus_dirs: Vec::new(),
                 };
-                let lease = tokio::time::timeout(Duration::from_millis(250), daemon.handler_for(&request))
-                    .await
-                    .expect("cold shard admission must not wait for bootstrap")
-                    .expect("cold shard admission must not fail at capacity");
+                let lease =
+                    tokio::time::timeout(Duration::from_millis(250), daemon.handler_for(&request))
+                        .await
+                        .expect("cold shard admission must not wait for bootstrap")
+                        .expect("cold shard admission must not fail at capacity");
 
                 let initialized = tokio::time::timeout(
                     Duration::from_millis(250),
@@ -1847,9 +2029,18 @@ mod tests {
         for status in responses {
             assert_eq!(status["status"].as_str(), Some("indexing"));
             assert_eq!(status["graph_snapshot_state"].as_str(), Some("not_loaded"));
-            assert!(status["nodes"].is_null(), "cold status must not claim zero nodes");
-            assert!(status["edges"].is_null(), "cold status must not claim zero edges");
-            assert!(status["files"].is_null(), "cold status must not claim zero files");
+            assert!(
+                status["nodes"].is_null(),
+                "cold status must not claim zero nodes"
+            );
+            assert!(
+                status["edges"].is_null(),
+                "cold status must not claim zero edges"
+            );
+            assert!(
+                status["files"].is_null(),
+                "cold status must not claim zero files"
+            );
         }
 
         drop(bootstrap_gate);
@@ -2023,7 +2214,8 @@ mod tests {
             let shards = daemon.shards.lock().await;
             let entry = shards.get(&shard_key(&root)).expect("shard is resident");
             assert!(
-                !entry.is_bootstrapping() && !daemon.index_work.workspace_is_busy(&shard_key(&root)),
+                !entry.is_bootstrapping()
+                    && !daemon.index_work.workspace_is_busy(&shard_key(&root)),
                 "an evictable shard has finished both bootstrap and index work"
             );
             assert!(entry.is_evictable());
@@ -2075,6 +2267,39 @@ mod tests {
         for root in roots {
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn active_view_byte_limit_returns_explicit_resource_limited_admission() {
+        let budget = Arc::new(crate::resource_budget::ResourceBudget::new(10));
+        let mut daemon = GlobalDaemon::new_with_config(20, false);
+        daemon.resource_budget = Arc::clone(&budget);
+        daemon.index_work = crate::index_work::IndexWorkCoordinator::with_resource_budget(
+            1,
+            Arc::clone(&budget),
+            1,
+        );
+        daemon.view_reservation_bytes = 6;
+        let daemon = Arc::new(daemon);
+        let first_root = unique_test_root("lattice-byte-admission-a");
+        let second_root = unique_test_root("lattice-byte-admission-b");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = daemon
+            .shard_for(first_root, Vec::new(), Vec::new(), true)
+            .await
+            .unwrap();
+        let error = match daemon
+            .shard_for(second_root, Vec::new(), Vec::new(), true)
+            .await
+        {
+            Ok(_) => panic!("second active view exceeded its byte allowance"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("resource-limited:"));
+        assert_eq!(budget.snapshot().reserved_bytes, 6);
+        first.release();
+        first.shutdown().await;
     }
 
     #[tokio::test]

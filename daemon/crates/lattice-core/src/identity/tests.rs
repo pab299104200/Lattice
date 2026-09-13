@@ -38,6 +38,18 @@ fn round_trip_encoding_for_every_identity_kind() {
 }
 
 #[test]
+fn memory_identity_accepts_durable_uuid_ids_without_weakening_event_ulids() {
+    let memory = Identity::Memory(MemoryId {
+        workspace_id: "repo-main".to_string(),
+        ulid: "9c97d622-1d52-8a9a-ce1d-d1888a6dab10".to_string(),
+    });
+    assert_eq!(decode_identity(&encode_identity(&memory)), Ok(memory));
+    assert!(decode_identity("memory:repo-main/bad/id").is_err());
+    assert!(decode_identity("memory:repo-main/bad:id").is_err());
+    assert!(decode_identity("event:repo-main/9c97d622-1d52-8a9a-ce1d-d1888a6dab10").is_err());
+}
+
+#[test]
 fn identity_kind_reports_wrapped_variant() {
     assert_eq!(Identity::File(file_id()).kind(), IdentityKind::File);
     assert_eq!(Identity::Symbol(symbol_id()).kind(), IdentityKind::Symbol);

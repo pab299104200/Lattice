@@ -57,7 +57,7 @@ fn test_detect_explore_with_flow_keyword() {
 
 #[test]
 fn query_snapshot_keeps_one_graph_generation_after_live_publication() {
-    let mut live = QueryEngine::new(build_test_graph(), None, None);
+    let mut live = QueryEngine::new(build_test_graph(), None);
     let snapshot = live.snapshot();
     let graph_snapshot = live.graph_snapshot();
 
@@ -85,7 +85,7 @@ fn query_snapshot_keeps_one_graph_generation_after_live_publication() {
 
 #[test]
 fn query_snapshot_shares_adaptive_history_without_sharing_graph_publication() {
-    let mut live = QueryEngine::new(build_test_graph(), None, None);
+    let mut live = QueryEngine::new(build_test_graph(), None);
     let mut snapshot = live.snapshot();
 
     live.query("How does loginUser work?", None, false);
@@ -207,7 +207,7 @@ fn indexed_query_engine(graph: &CodeGraph) -> QueryEngine {
     let snapshot = store
         .save_index_snapshot(graph)
         .expect("graph and module digests should commit together");
-    QueryEngine::from_index_snapshot(snapshot, None, None)
+    QueryEngine::from_index_snapshot(snapshot, None)
 }
 
 fn module_digest_context(
@@ -557,7 +557,7 @@ impl VectorIndex for StubVectorIndex {
 #[test]
 fn test_query_engine_produces_capsule() {
     let graph = build_test_graph();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     let capsule = engine.query("How does loginUser work?", None, false);
 
@@ -646,8 +646,8 @@ fn cached_digest_selection_is_deterministic_and_respects_ranked_file_filters() {
     let graph = build_test_graph();
     let store = GraphStore::open_in_memory().expect("in-memory graph store");
     let snapshot = store.save_index_snapshot(&graph).expect("indexed snapshot");
-    let mut first = QueryEngine::from_index_snapshot(snapshot.clone(), None, None);
-    let mut second = QueryEngine::from_index_snapshot(snapshot, None, None);
+    let mut first = QueryEngine::from_index_snapshot(snapshot.clone(), None);
+    let mut second = QueryEngine::from_index_snapshot(snapshot, None);
 
     let first_capsule = first.query("file:src/auth.ts auth token flow", None, false);
     let second_capsule = second.query("file:src/auth.ts auth token flow", None, false);
@@ -671,7 +671,7 @@ fn cached_digest_selection_is_deterministic_and_respects_ranked_file_filters() {
 #[test]
 fn graph_only_construction_and_graph_mutation_never_synthesize_digests() {
     let graph = build_test_graph();
-    let mut graph_only = QueryEngine::new(graph.clone(), None, None);
+    let mut graph_only = QueryEngine::new(graph.clone(), None);
     assert!(module_digest_context(&graph_only.query("auth token flow", None, false)).is_empty());
 
     let mut indexed = indexed_query_engine(&graph);
@@ -684,6 +684,16 @@ fn graph_only_construction_and_graph_mutation_never_synthesize_digests() {
 }
 
 #[test]
+fn graph_query_never_performs_ambient_memory_retrieval() {
+    let mut engine = QueryEngine::new(build_test_graph(), None);
+    let capsule = engine.query("auth token flow", None, false);
+    assert!(
+        capsule.memories.is_empty(),
+        "memory requires repository authority supplied by the workflow layer"
+    );
+}
+
+#[test]
 fn test_query_engine_uses_vector_index_abstraction_for_semantic_hits() {
     let graph = build_test_graph();
     let vector_index: SharedVectorIndex = Arc::new(StubVectorIndex::with_symbol_hits(vec![(
@@ -692,7 +702,7 @@ fn test_query_engine_uses_vector_index_abstraction_for_semantic_hits() {
         0,
         0.91,
     )]));
-    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+    let mut engine = QueryEngine::new(graph, Some(vector_index));
 
     let capsule = engine.query("credential hashing", Some(&[0.1, 0.2, 0.3]), false);
 
@@ -717,7 +727,7 @@ fn test_query_engine_reranks_semantic_hits_using_identifier_and_intent_signals()
             0.79,
         ),
     ]));
-    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+    let mut engine = QueryEngine::new(graph, Some(vector_index));
 
     let capsule = engine.query(
         "Fix AuthService::RefreshSession bug",
@@ -761,7 +771,7 @@ fn test_query_engine_reranks_semantic_hits_using_graph_proximity() {
             0.84,
         ),
     ]));
-    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+    let mut engine = QueryEngine::new(graph, Some(vector_index));
 
     let capsule = engine.query("tenant access flow analysis", Some(&[0.2, 0.1, 0.4]), false);
     let enforce_seed = "certificates.py:enforceOrgBoundary".to_string();
@@ -801,7 +811,7 @@ fn test_query_engine_uses_file_summary_vectors_to_seed_file_symbols() {
             0.86,
         )],
     });
-    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+    let mut engine = QueryEngine::new(graph, Some(vector_index));
 
     let capsule = engine.query(
         "cross-org certificate renewal returned 403",
@@ -854,7 +864,7 @@ fn test_query_engine_identifier_queries_still_prefer_keyword_hits_over_scoped_se
             0.97,
         )],
     });
-    let mut engine = QueryEngine::new(graph, Some(vector_index), None);
+    let mut engine = QueryEngine::new(graph, Some(vector_index));
 
     let capsule = engine.query("fix login_user timeout", Some(&[0.5, 0.4, 0.3]), false);
     let lead = capsule
@@ -901,7 +911,7 @@ fn test_query_engine_token_budget() {
         graph.add_edge(&from_id, &to_id, EdgeKind::Calls);
     }
 
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
     let capsule = engine.query("func_0", None, false);
 
     // Token budget is 4000 — with ~500 tokens per body, we can't fit all 20
@@ -917,7 +927,7 @@ fn test_query_engine_token_budget() {
 #[test]
 fn test_adaptive_budget_expands_on_repeat() {
     let graph = build_test_graph();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     // First query — record_query is called inside query(), so repeat_count = 1
     let capsule1 = engine.query("How does loginUser work?", None, false);
@@ -951,7 +961,7 @@ Run `prepare_change` before editing.
     let mut builder = GraphBuilder::new();
     builder.add_file(parse_file("docs/guide.md", guide_source).unwrap());
     let graph = builder.build();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     let capsule = engine.query("setup guide", None, false);
     let all_symbols: Vec<&str> = capsule
@@ -971,7 +981,7 @@ Run `prepare_change` before editing.
 #[test]
 fn test_query_engine_prefers_source_over_markdown_for_workflow_queries() {
     let graph = build_lattice_workflow_graph();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     let capsule = engine.query(
         "Lattice agent workflow path for summarize_subsystem, get_context_capsule, prepare_change, diagnose_failure, expand_context, render modes, and context_handle reuse",
@@ -1052,7 +1062,7 @@ fn test_query_engine_keeps_tool_identifiers_source_first_when_name_contains_docs
         Language::Markdown,
     );
 
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
     let capsule = engine.query("get_docs_capsule render modes", None, false);
     let lead_file = capsule
         .pivots
@@ -1149,7 +1159,7 @@ fn test_query_no_filters() {
 #[test]
 fn test_pivot_has_positive_score() {
     let graph = build_test_graph();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     let capsule = engine.query("How does loginUser work?", None, false);
 
@@ -1165,7 +1175,7 @@ fn test_pivot_has_positive_score() {
 #[test]
 fn test_context_relationship_has_edge_info() {
     let graph = build_test_graph();
-    let mut engine = QueryEngine::new(graph, None, None);
+    let mut engine = QueryEngine::new(graph, None);
 
     let capsule = engine.query("How does loginUser work?", None, false);
 
@@ -1181,7 +1191,7 @@ fn test_context_relationship_has_edge_info() {
 
 #[test]
 fn expired_query_deadline_returns_not_evaluated_checkpoint() {
-    let mut engine = QueryEngine::new(build_test_graph(), None, None);
+    let mut engine = QueryEngine::new(build_test_graph(), None);
     let (capsule, progress) = engine.query_with_progress(
         "How does loginUser work?",
         None,
@@ -1198,7 +1208,7 @@ fn expired_query_deadline_returns_not_evaluated_checkpoint() {
 
 #[test]
 fn forced_post_scoring_deadline_returns_ranked_checkpoint() {
-    let mut engine = QueryEngine::new(build_test_graph(), None, None);
+    let mut engine = QueryEngine::new(build_test_graph(), None);
     set_test_post_scoring_delay(Some(Duration::from_millis(10)));
     let (capsule, progress) = engine.query_with_progress(
         "How does loginUser work?",

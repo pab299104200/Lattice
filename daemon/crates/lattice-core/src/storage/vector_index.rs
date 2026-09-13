@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 pub type VectorSearchResult = (String, String, usize, f32);
 pub type SharedVectorIndex = Arc<dyn VectorIndex>;
+pub trait VectorPublicationLease {}
+struct NoopVectorPublicationLease;
+impl VectorPublicationLease for NoopVectorPublicationLease {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorScope {
@@ -12,6 +15,15 @@ pub enum VectorScope {
 }
 
 pub trait VectorIndex: Send + Sync {
+    fn begin_publication(&self) -> Result<Box<dyn VectorPublicationLease + '_>, LatticeError> {
+        Ok(Box::new(NoopVectorPublicationLease))
+    }
+    /// Bind persisted vectors to the complete embedding identity. Backends
+    /// without identity metadata conservatively discard their accelerator.
+    fn bind_embedding_identity(&self, _identity: &str) -> Result<(), LatticeError> {
+        self.clear_all()
+    }
+
     fn initialize(&self, dimension: usize) -> Result<(), LatticeError>;
 
     fn warm(&self) -> Result<(), LatticeError> {

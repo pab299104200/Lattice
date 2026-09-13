@@ -16,6 +16,7 @@ use lattice_core::memory::{
 use lattice_core::query::QueryEngine;
 use lattice_core::storage::GraphStore;
 use lattice_core::working_memory::WorkingMemoryState;
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -406,11 +407,25 @@ async fn save_memory_defaults_unverified_persists_fields_emits_event_and_queues_
 async fn propose_apply_and_reject_memory_evolution_are_auditable() {
     let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("memory-evolution");
+    assert!(handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{"kind":"unknown","content":"x"}}),
+        )
+        .await
+        .is_err());
+    assert!(handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{"kind":"evolution","action":"unknown"}}),
+        )
+        .await
+        .is_err());
     let memory_id = {
         let store = memory_store.lock().await;
-        let id = store
-            .store(seed_memory("refresh behavior old", MemoryScope::Repo))
-            .expect("store memory");
+        let mut source = seed_memory("refresh behavior old", MemoryScope::Repo);
+        source.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        let id = store.store(source).expect("store memory");
         let mut fields = MemoryStructuredFields::default();
         fields.memory_class = MemoryClass::Observation;
         store
@@ -418,13 +433,57 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
             .expect("update fields");
         id
     };
+    let foreign_memory_id = {
+        let store = memory_store.lock().await;
+        let mut foreign = seed_memory("foreign authority", MemoryScope::Repo);
+        foreign.workspace_id = Some("different-repository".to_string());
+        store.store(foreign).expect("store foreign memory")
+    };
+    let cross_authority = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":foreign_memory_id,
+                "content":"unauthorized change"
+            }}),
+        )
+        .await;
+    assert!(
+        cross_authority.is_err(),
+        "cross-authority source is rejected"
+    );
+
+    let missing_replacement = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,
+                "superseded_by_memory_id":"missing-replacement"
+            }}),
+        )
+        .await;
+    assert!(
+        missing_replacement.is_err(),
+        "supersession requires an existing replacement"
+    );
+    let self_supersession = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,
+                "superseded_by_memory_id":memory_id
+            }}),
+        )
+        .await;
+    assert!(self_supersession.is_err(), "self-supersession is rejected");
 
     let propose = handler
         .handle(
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "propose_memory_evolution",
+                "name": "remember",
                 "arguments": {
+                    "kind": "evolution",
                     "action": "propose",
                     "memory_id": memory_id,
                     "content": "refresh behavior new",
@@ -459,14 +518,19 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
             })
             .expect("proposal record");
         assert_eq!(record.decision.as_str(), "pending");
+        assert_eq!(
+            record.evidence["branch"], "unknown",
+            "proposal binds the non-main branch trusted by event capture"
+        );
     }
 
     let apply = handler
         .handle(
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "propose_memory_evolution",
+                "name": "remember",
                 "arguments": {
+                    "kind": "evolution",
                     "action": "apply",
                     "proposal_id": proposal_id,
                     "reason": "ship updated refresh memory"
@@ -477,6 +541,32 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
         .expect("apply succeeds");
     let apply_payload = parse_tool_payload(&apply);
     assert_eq!(apply_payload["decision"].as_str(), Some("applied"));
+    assert_eq!(apply_payload["audit_event"]["status"], "published");
+    assert_eq!(
+        apply_payload["audit_event"]["published_in_this_request"],
+        true
+    );
+    handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"apply","proposal_id":proposal_id
+            }}),
+        )
+        .await
+        .expect("identical apply retry is idempotent");
+    let conflicting = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"reject","proposal_id":proposal_id
+            }}),
+        )
+        .await;
+    assert!(
+        conflicting.is_err(),
+        "conflicting final decision is rejected"
+    );
     {
         let store = memory_store.lock().await;
         let current = store
@@ -488,10 +578,11 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
 
     let reject_proposal = handler
         .handle(
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "propose_memory_evolution",
+                "name": "remember",
                 "arguments": {
+                    "kind": "evolution",
                     "action": "propose",
                     "memory_id": memory_id,
                     "content": "refresh behavior rejected",
@@ -508,10 +599,11 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
         .to_string();
     let reject = handler
         .handle(
-            "lattice/tool_call",
+            "tools/call",
             json!({
-                "name": "propose_memory_evolution",
+                "name": "remember",
                 "arguments": {
+                    "kind": "evolution",
                     "action": "reject",
                     "proposal_id": reject_id,
                     "reason": "do not accept"
@@ -523,10 +615,244 @@ async fn propose_apply_and_reject_memory_evolution_are_auditable() {
     let reject_payload = parse_tool_payload(&reject);
     assert_eq!(reject_payload["decision"].as_str(), Some("rejected"));
 
+    let stale_proposal = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,
+                "content":"stale candidate"
+            }}),
+        )
+        .await
+        .expect("stale candidate proposal succeeds");
+    let stale_id = parse_tool_payload(&stale_proposal)["proposal_id"]
+        .as_str()
+        .expect("stale proposal id")
+        .to_string();
+    {
+        let store = memory_store.lock().await;
+        let mut current = store.get_by_id(&memory_id).unwrap().unwrap();
+        current.content = "concurrent authoritative change".to_string();
+        store.store(current).expect("concurrent update");
+    }
+    let stale_apply = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"apply","proposal_id":stale_id
+            }}),
+        )
+        .await;
+    assert!(
+        stale_apply.is_err(),
+        "stale proposal cannot overwrite memory"
+    );
+    assert_eq!(
+        memory_store
+            .lock()
+            .await
+            .get_by_id(&memory_id)
+            .unwrap()
+            .unwrap()
+            .content,
+        "concurrent authoritative change"
+    );
+
     let events = read_events(&event_store, &workspace_root);
     assert!(events
         .iter()
         .any(|event| matches!(event.payload, EventPayload::MemoryConsolidated(_))));
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn ordinary_request_recovers_committed_evolution_event_after_new_handler() {
+    let (handler, memory_store, event_store, workspace_root, context_cache_path, _session_id) =
+        build_handler("memory-evolution-recovery");
+    let memory_id = {
+        let store = memory_store.lock().await;
+        let mut memory = seed_memory("old recovery claim", MemoryScope::Repo);
+        memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        store.store(memory).unwrap()
+    };
+    let proposed = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,
+                "content":"committed recovery claim"
+            }}),
+        )
+        .await
+        .unwrap();
+    let proposal_id = parse_tool_payload(&proposed)["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let event_path = workspace_root.join(".lattice/events.db");
+    let event_conn = Connection::open(&event_path).unwrap();
+    event_conn
+        .execute_batch("CREATE TRIGGER fail_evolution_event BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL,'injected event failure'); END;")
+        .unwrap();
+    let failed_publish = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"apply","proposal_id":proposal_id
+            }}),
+        )
+        .await;
+    assert!(failed_publish.is_err());
+    assert_eq!(
+        memory_store
+            .lock()
+            .await
+            .get_by_id(&memory_id)
+            .unwrap()
+            .unwrap()
+            .content,
+        "committed recovery claim"
+    );
+    event_conn
+        .execute_batch("DROP TRIGGER fail_evolution_event;")
+        .unwrap();
+    {
+        let store = memory_store.lock().await;
+        store
+            .with_connection(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF;")
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                conn.execute(
+                    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<65)
+                     INSERT INTO consolidation_event_outbox
+                       (outbox_id,proposal_id,transition,workspace_id,event_uuid,event_ts_unix_micros,envelope_json,created_at,attempt_count)
+                     SELECT printf('backlog-%03d',x),printf('backlog-proposal-%03d',x),transition,workspace_id,
+                            printf('01ARZ3NDEKTSV4RRFFQ69G5F%02d',x),event_ts_unix_micros,envelope_json,0,0
+                     FROM consolidation_event_outbox,n WHERE proposal_id=?1",
+                    [&proposal_id],
+                )
+                .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                conn.execute_batch("PRAGMA foreign_keys=ON;")
+                    .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let bounded = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,
+                "content":"bounded publication claim"
+            }}),
+        )
+        .await
+        .unwrap();
+    let bounded_id = parse_tool_payload(&bounded)["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bounded_apply = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"apply","proposal_id":bounded_id
+            }}),
+        )
+        .await
+        .unwrap();
+    let bounded_payload = parse_tool_payload(&bounded_apply);
+    assert_eq!(bounded_payload["audit_event"]["status"], "pending");
+    assert_eq!(
+        bounded_payload["audit_event"]["published_in_this_request"],
+        false
+    );
+    assert_eq!(bounded_payload["audit_event"]["has_more_pending"], true);
+    drop(handler);
+
+    let restarted = McpHandler::new(
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
+        Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+        memory_store.clone(),
+        Arc::new(Mutex::new(GraphStore::open_in_memory().unwrap())),
+        Arc::new(std::sync::OnceLock::new()),
+        None,
+        workspace_root.clone(),
+        context_cache_path.clone(),
+        "session-restarted".to_string(),
+        None,
+        vec![workspace_root.clone()],
+        Arc::new(AtomicBool::new(false)),
+        Some(Arc::new(
+            EventWriter::new(
+                event_store.clone(),
+                workspace_root.to_string_lossy().to_string(),
+                4096,
+            )
+            .with_flush_policy(FlushPolicy::Sync),
+        )),
+        Vec::new(),
+        Vec::new(),
+    );
+    restarted
+        .handle(
+            "tools/call",
+            json!({"name":"status","arguments":{"scope":"memory"}}),
+        )
+        .await
+        .expect("ordinary request succeeds while draining recovery outbox");
+    let matching = read_events(&event_store, &workspace_root)
+        .into_iter()
+        .filter(|event| match &event.payload {
+            EventPayload::MemoryConsolidated(payload) => {
+                payload.proposal_id.as_deref() == Some(&bounded_id)
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(matching, 1, "recovery publishes exactly one audit event");
+    cleanup_paths(&workspace_root, &context_cache_path);
+}
+
+#[tokio::test]
+async fn evolution_requires_trusted_event_capture_branch_authority() {
+    let workspace_root = unique_test_path("lattice-memory-v2-no-event-capture");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let context_cache_path = workspace_root.join("context_handles.json");
+    let memory_store = Arc::new(Mutex::new(MemoryStore::open_in_memory().unwrap()));
+    let memory_id = {
+        let store = memory_store.lock().await;
+        let mut memory = seed_memory("old", MemoryScope::Repo);
+        memory.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+        store.store(memory).unwrap()
+    };
+    let handler = McpHandler::new(
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
+        Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
+        memory_store,
+        Arc::new(Mutex::new(GraphStore::open_in_memory().unwrap())),
+        Arc::new(std::sync::OnceLock::new()),
+        None,
+        workspace_root.clone(),
+        context_cache_path.clone(),
+        "session-no-capture".to_string(),
+        None,
+        vec![workspace_root.clone()],
+        Arc::new(AtomicBool::new(false)),
+        None,
+        Vec::new(),
+        Vec::new(),
+    );
+    let error = handler
+        .handle(
+            "tools/call",
+            json!({"name":"remember","arguments":{
+                "kind":"evolution","action":"propose","memory_id":memory_id,"content":"new"
+            }}),
+        )
+        .await
+        .expect_err("evolution without trusted capture must fail");
+    assert!(error.1.contains("trusted branch authority"));
     cleanup_paths(&workspace_root, &context_cache_path);
 }
 
@@ -692,7 +1018,11 @@ async fn search_memory_exact_ids_do_not_fall_back_to_generic_terms() {
     );
     assert_eq!(
         payload["diagnostics"]["exact_term_status"].as_str(),
-        Some("absent_from_durable_memory")
+        Some("not_observed_in_bounded_results")
+    );
+    assert_eq!(
+        payload["diagnostics"]["exact_term_counts_complete"].as_bool(),
+        Some(false)
     );
     cleanup_paths(&workspace_root, &context_cache_path);
 }
@@ -771,7 +1101,7 @@ async fn search_memory_warns_when_unverified_failure_memory_references_changed_f
 }
 
 #[tokio::test]
-async fn search_memory_exact_id_rerank_penalizes_stale_memory() {
+async fn search_memory_exact_id_excludes_stale_memory_before_ranking() {
     let (handler, memory_store, _event_store, workspace_root, context_cache_path, _session_id) =
         build_handler("search-memory-stale-penalty");
     {
@@ -811,11 +1141,11 @@ async fn search_memory_exact_id_rerank_penalizes_stale_memory() {
         .expect("search_memory succeeds");
     let payload = parse_tool_payload(&response);
     let memories = payload["memories"].as_array().expect("memories");
-    assert_eq!(memories.len(), 2);
+    assert_eq!(memories.len(), 1);
     assert!(memories[0]["content"]
         .as_str()
         .is_some_and(|content| content.contains("now complete")));
-    assert_eq!(memories[1]["is_stale"].as_bool(), Some(true));
+    assert_eq!(memories[0]["is_stale"].as_bool(), Some(false));
     cleanup_paths(&workspace_root, &context_cache_path);
 }
 
@@ -874,7 +1204,10 @@ fn build_handler(
     let memory_store = Arc::new(Mutex::new(
         MemoryStore::open_in_memory().expect("memory store"),
     ));
-    let event_store = Arc::new(EventStore::open_in_memory().expect("event store"));
+    let event_dir = workspace_root.join(".lattice");
+    std::fs::create_dir_all(&event_dir).expect("event dir");
+    let event_store =
+        Arc::new(EventStore::open(&event_dir.join("events.db")).expect("event store"));
     let event_writer = Arc::new(
         EventWriter::new(
             event_store.clone(),
@@ -885,7 +1218,7 @@ fn build_handler(
     );
     let session_id = format!("session-test-{suffix}");
     let handler = McpHandler::new(
-        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
         Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
         memory_store.clone(),
         Arc::new(Mutex::new(
@@ -984,4 +1317,112 @@ fn unique_test_path(prefix: &str) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+}
+
+#[tokio::test]
+async fn public_supersession_revalidates_replacement_before_committing() {
+    let (handler, memory_store, _events, workspace_root, cache_path, _session) =
+        build_handler("supersession-replacement-cas");
+    for failure in ["changed", "deleted", "foreign", "checkout"] {
+        let (source_id, replacement_id) = {
+            let store = memory_store.lock().await;
+            let mut source = seed_memory(&format!("old decision {failure}"), MemoryScope::Repo);
+            source.workspace_id = Some(workspace_root.to_string_lossy().to_string());
+            let mut replacement =
+                seed_memory(&format!("new decision {failure}"), MemoryScope::Repo);
+            replacement.workspace_id = source.workspace_id.clone();
+            (
+                store.store(source).unwrap(),
+                store.store(replacement).unwrap(),
+            )
+        };
+        let proposed = handler
+            .handle(
+                "tools/call",
+                json!({
+                    "name":"remember", "arguments":{
+                        "kind":"evolution", "action":"propose", "memory_id":source_id,
+                        "superseded_by_memory_id":replacement_id
+                    }
+                }),
+            )
+            .await
+            .expect("valid replacement can be proposed");
+        let proposal_id = parse_tool_payload(&proposed)["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        {
+            let store = memory_store.lock().await;
+            match failure {
+                "deleted" => store.invalidate(&replacement_id).unwrap(),
+                "checkout" => store.with_connection(|conn| {
+                    conn.execute("UPDATE memories SET applicable_checkout_id='different-checkout' WHERE id=?1", [&replacement_id])
+                        .map(|_| ())
+                        .map_err(|e| lattice_core::LatticeError::Storage(e.to_string()))
+                }).unwrap(),
+                _ => {
+                    let mut replacement = store.get_by_id(&replacement_id).unwrap().unwrap();
+                    if failure == "foreign" {
+                        replacement.workspace_id = Some("different-repository".to_string());
+                    } else {
+                        replacement.content = "newer authoritative replacement".to_string();
+                    }
+                    store.store(replacement).unwrap();
+                }
+            }
+        }
+        let result = handler
+            .handle(
+                "tools/call",
+                json!({
+                    "name":"remember", "arguments":{
+                        "kind":"evolution", "action":"apply", "proposal_id":proposal_id
+                    }
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "{failure} replacement must reject stale proposal"
+        );
+        let store = memory_store.lock().await;
+        let source = store.get_by_id(&source_id).unwrap().unwrap();
+        assert_eq!(source.content, format!("old decision {failure}"));
+        assert!(!source.is_stale, "failed apply must not supersede source");
+        store
+            .with_connection(|conn| {
+                let decision: String = conn
+                    .query_row(
+                        "SELECT decision FROM consolidation_proposals WHERE proposal_id=?1",
+                        [&proposal_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| lattice_core::LatticeError::Storage(e.to_string()))?;
+                assert_eq!(decision, "pending");
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM consolidation_event_outbox WHERE proposal_id=?1",
+                        [&proposal_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| lattice_core::LatticeError::Storage(e.to_string()))?;
+                assert_eq!(count, 0, "failed proposal has no committed audit event");
+                Ok(())
+            })
+            .unwrap();
+    }
+    cleanup_paths(&workspace_root, &cache_path);
+}
+#[test]
+fn structured_remediation_token_rejects_multibyte_prefix_without_panicking() {
+    assert!(!super::get_task_memory::is_structured_remediation_token(
+        "🧭資料"
+    ));
+    assert!(super::get_task_memory::is_structured_remediation_token(
+        "IU-0030"
+    ));
+    assert!(super::get_task_memory::is_structured_remediation_token(
+        "PX0040"
+    ));
 }

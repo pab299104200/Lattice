@@ -8,8 +8,8 @@
 //! and proposed state.
 
 use lattice_core::consolidation::{
-    empty_state, ConsolidationJobMode, ConsolidationProposal, EpisodeOutcome, EpisodeTemplate,
-    ProposalKind, ProposalTarget,
+    episode_memory_states, ConsolidationJobMode, ConsolidationProposal, EpisodeOutcome,
+    EpisodeTemplate, ProposalKind, ProposalTarget,
 };
 use lattice_core::events::{EventEnvelope, StableRef};
 use lattice_core::memory::{Memory, MemoryScope, MemoryStore, MemoryType};
@@ -230,16 +230,19 @@ pub fn build_episode_proposal(
     };
     let proposed_memory =
         build_episode_memory(existing.as_ref(), template, &refresh_key, workspace_id);
+    let (prior_state, proposed_state) =
+        episode_memory_states(memory_store, existing.as_ref(), proposed_memory)
+            .map_err(|error| format!("Failed to capture canonical episode state: {error}"))?;
     Ok(ConsolidationProposal {
         proposal_id: format!(
             "episode-proposal-{}-{}",
-            task_id_slug(&template.task_id.value),
+            lattice_core::consolidation::session::episode_task_key(&template.task_id.value),
             template.event_window.end.ulid
         ),
         job_id: format!(
             "session-consolidation-{}-{}-{}",
             mode.as_str(),
-            task_id_slug(&template.task_id.value),
+            lattice_core::consolidation::session::episode_task_key(&template.task_id.value),
             template.event_window.end.ulid
         ),
         target: existing
@@ -247,11 +250,8 @@ pub fn build_episode_proposal(
             .map(|memory| ProposalTarget::ExistingMemory(memory.id.clone()))
             .unwrap_or(ProposalTarget::NewMemory),
         proposal_kind,
-        prior_state: existing
-            .as_ref()
-            .map(memory_with_episode_metadata)
-            .unwrap_or_else(empty_state),
-        proposed_state: memory_state_with_episode(&proposed_memory, template),
+        prior_state,
+        proposed_state,
         evidence: episode_evidence(template),
         provenance: None,
     })
@@ -267,7 +267,7 @@ fn build_episode_memory(
         id: existing.map(|memory| memory.id.clone()).unwrap_or_else(|| {
             format!(
                 "episode-{}-{}",
-                task_id_slug(&template.task_id.value),
+                lattice_core::consolidation::session::episode_task_key(&template.task_id.value),
                 template.event_window.end.ulid
             )
         }),
@@ -318,39 +318,6 @@ fn build_episode_memory(
     }
 }
 
-fn memory_state_with_episode(memory: &Memory, template: &EpisodeTemplate) -> Value {
-    let mut state = serde_json::to_value(memory).expect("episode memory serializes");
-    if let Some(object) = state.as_object_mut() {
-        object.insert("episode_task_id".to_string(), json!(template.task_id));
-        object.insert("episode_session_id".to_string(), json!(template.session_id));
-        object.insert(
-            "episode_outcome".to_string(),
-            json!(template.outcome.as_str()),
-        );
-        object.insert(
-            "event_window".to_string(),
-            json!({
-                "start": template.event_window.start,
-                "end": template.event_window.end,
-            }),
-        );
-        object.insert(
-            "salient_anchors".to_string(),
-            serde_json::to_value(&template.salient_anchors).expect("anchors serialize"),
-        );
-        object.insert(
-            "tools_used".to_string(),
-            serde_json::to_value(&template.tools_used).expect("tools serialize"),
-        );
-        object.insert("summary_text".to_string(), json!(template.summary_text));
-    }
-    state
-}
-
-fn memory_with_episode_metadata(memory: &Memory) -> Value {
-    serde_json::to_value(memory).expect("memory serializes")
-}
-
 fn episode_evidence(template: &EpisodeTemplate) -> Value {
     json!({
         "task_id": template.task_id.value,
@@ -377,12 +344,35 @@ fn episode_refresh_key(template: &EpisodeTemplate) -> String {
     )
 }
 
-fn task_id_slug(task_id: &str) -> String {
-    task_id
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
-            _ => '-',
-        })
-        .collect()
+#[cfg(test)]
+#[test]
+fn episode_task_keys_round_trip_long_and_distinct_inputs_as_memory_identities() {
+    use lattice_core::identity::{decode_identity, encode_identity, Identity, MemoryId};
+    let inputs = [
+        "a".to_string(),
+        "A".to_string(),
+        "a/b".to_string(),
+        "a-b".to_string(),
+        "重复🙂".repeat(10_000),
+        "x".repeat(10_000),
+        format!("{}y", "x".repeat(10_000)),
+    ];
+    let mut ids = std::collections::HashSet::new();
+    for input in inputs {
+        let key = lattice_core::consolidation::session::episode_task_key(&input);
+        let local_id = format!("episode-{key}-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(local_id.len() <= 128);
+        assert!(
+            ids.insert(local_id.clone()),
+            "distinct task inputs must stay distinct"
+        );
+        let identity = Identity::Memory(MemoryId {
+            workspace_id: "repository".to_string(),
+            ulid: local_id,
+        });
+        assert_eq!(
+            decode_identity(&encode_identity(&identity)).unwrap(),
+            identity
+        );
+    }
 }

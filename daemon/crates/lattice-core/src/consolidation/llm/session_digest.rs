@@ -7,18 +7,18 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::{
     complete_structured_with_provenance, create_memory, malformed_with_event, memory_state,
-    structured_fields, submit_memory_proposal, BudgetCatalog, ConsolidationJobKind, LlmJobContext,
-    LlmJobError, LlmJobServices,
+    stable_id, structured_fields, BudgetCatalog, ConsolidationJobKind, LlmJobContext, LlmJobError,
+    LlmJobServices,
 };
 use crate::consolidation::{
-    empty_state, ConsolidationJobMode, ConsolidationSkipReason, ProposalKind, ProposalTarget,
+    empty_state, ConsolidationJobMode, ConsolidationSkipReason, ProposalKind,
 };
 use crate::error::LatticeError;
 use crate::memory::model::{MemoryAssertionType, MemoryFreshnessPolicy, MemoryProvenance};
@@ -140,6 +140,50 @@ impl SessionDigestLlmConsolidator {
         repository_id: &str,
         services: &mut LlmJobServices<'_>,
     ) -> Result<SessionDigestConsolidationOutcome, LlmJobError> {
+        Self::run_selected(config, repository_id, services, None)
+    }
+
+    /// Process exactly the capture leased by the repository worker.
+    pub fn run_for_capture(
+        config: &SessionDigestConsolidationConfig,
+        repository_id: &str,
+        services: &mut LlmJobServices<'_>,
+        delivery_key: &str,
+    ) -> Result<SessionDigestConsolidationOutcome, LlmJobError> {
+        if delivery_key.is_empty() {
+            return Err(LlmJobError::Storage(
+                "capture delivery key must not be empty".into(),
+            ));
+        }
+        Self::run_selected(config, repository_id, services, Some(delivery_key))
+    }
+
+    /// Commit a terminal capture completion in canonical storage before a
+    /// scheduler releases its separate lease. Existing completion wins.
+    pub fn complete_capture_without_proposals(
+        store: &crate::memory::MemoryStore,
+        authority: &crate::consolidation::EvolutionAuthority<'_>,
+        delivery_key: &str,
+    ) -> Result<(), LlmJobError> {
+        commit_capture_batch(store, authority, Some(delivery_key), Vec::new(), &[], 0).map(|_| ())
+    }
+
+    fn run_selected(
+        config: &SessionDigestConsolidationConfig,
+        repository_id: &str,
+        services: &mut LlmJobServices<'_>,
+        delivery_key: Option<&str>,
+    ) -> Result<SessionDigestConsolidationOutcome, LlmJobError> {
+        if let Some(key) = delivery_key {
+            if let Some(proposal_ids) =
+                completed_capture(services.memory_store, services.authority, key)?
+            {
+                return Ok(SessionDigestConsolidationOutcome::Proposed {
+                    proposal_ids,
+                    source_fact_count: 0,
+                });
+            }
+        }
         if !config.enabled {
             return skip(services, repository_id, ConsolidationSkipReason::Disabled);
         }
@@ -158,9 +202,11 @@ impl SessionDigestLlmConsolidator {
             );
         }
 
-        let available_review_slots = services
-            .runtime
-            .available_review_slots(repository_id, config.max_pending_review_proposals)?;
+        let available_review_slots = services.runtime.available_review_slots(
+            services.memory_store,
+            repository_id,
+            config.max_pending_review_proposals,
+        )?;
         if available_review_slots == 0 {
             return skip(services, repository_id, ConsolidationSkipReason::QueueFull);
         }
@@ -170,8 +216,19 @@ impl SessionDigestLlmConsolidator {
             repository_id,
             config.retention_window,
             config.max_source_facts,
+            delivery_key,
         )?;
         if facts.is_empty() {
+            if let Some(key) = delivery_key {
+                commit_capture_batch(
+                    services.memory_store,
+                    services.authority,
+                    Some(key),
+                    Vec::new(),
+                    &[],
+                    config.max_pending_review_proposals,
+                )?;
+            }
             return skip(
                 services,
                 repository_id,
@@ -215,9 +272,14 @@ impl SessionDigestLlmConsolidator {
             .into_iter()
             .collect::<Vec<_>>();
 
-        let mut proposal_ids = Vec::with_capacity(candidates.len());
+        let mut proposals = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let proposed = proposed_state(&ctx, &candidate, &source_memory_ids)?;
+            let proposed = proposed_state(
+                &ctx,
+                services.authority.branch,
+                &candidate,
+                &source_memory_ids,
+            )?;
             let evidence = json!({
                 "source_kind": "sanitized_persisted_session_capture",
                 "source_capture_ids": source_capture_ids,
@@ -228,30 +290,131 @@ impl SessionDigestLlmConsolidator {
                 "model": services.driver.name(),
                 "budget_outcome": "within"
             });
-            let proposal = submit_memory_proposal(
-                &ctx,
-                services,
-                ConsolidationJobKind::SessionDigestConsolidation,
-                ProposalTarget::NewMemory,
-                ProposalKind::CreateMemory,
-                empty_state(),
-                proposed,
-                evidence,
-                Some(completion.provenance.clone()),
-            )?
-            .ok_or_else(|| {
-                LlmJobError::Storage(
-                    "session-digest consolidation did not persist its proposal".to_string(),
-                )
-            })?;
-            proposal_ids.push(proposal.proposal_id);
+            let job_id = stable_id(SESSION_DIGEST_JOB_KIND, "job");
+            let mut proposal = crate::consolidation::proposal::proposal_from_pending(
+                &job_id,
+                repository_id,
+                crate::consolidation::PendingProposalSpec {
+                    proposal_id: stable_id(SESSION_DIGEST_JOB_KIND, "proposal"),
+                    target_memory_id: None,
+                    proposal_kind: ProposalKind::CreateMemory,
+                    prior_state: empty_state(),
+                    proposed_state: proposed,
+                    evidence,
+                    provenance: Some(completion.provenance.clone()),
+                },
+            );
+            crate::consolidation::bind_proposal_authority(&mut proposal, services.authority)?;
+            proposals.push(proposal);
         }
+        let proposal_ids = commit_capture_batch(
+            services.memory_store,
+            services.authority,
+            delivery_key,
+            proposals,
+            &facts,
+            config.max_pending_review_proposals,
+        )?;
 
         Ok(SessionDigestConsolidationOutcome::Proposed {
             proposal_ids,
             source_fact_count: facts.len(),
         })
     }
+}
+
+fn completed_capture(
+    store: &crate::memory::MemoryStore,
+    authority: &crate::consolidation::EvolutionAuthority<'_>,
+    delivery_key: &str,
+) -> Result<Option<Vec<String>>, LlmJobError> {
+    store
+        .with_connection(|conn| completed_capture_on_connection(conn, authority, delivery_key))
+        .map_err(Into::into)
+}
+
+fn completed_capture_on_connection(
+    conn: &rusqlite::Connection,
+    authority: &crate::consolidation::EvolutionAuthority<'_>,
+    delivery_key: &str,
+) -> Result<Option<Vec<String>>, LatticeError> {
+    let row: Option<(String,String,String,String)> = conn.query_row(
+        "SELECT repository_id,checkout_id,branch,proposal_ids FROM consolidation_capture_receipts WHERE delivery_key=?1",
+        [delivery_key], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional().map_err(source_storage_error)?;
+    row.map(|(repo, checkout, branch, ids)| {
+        if repo != authority.repository_id
+            || checkout != authority.checkout_id
+            || branch != authority.branch
+        {
+            return Err(LatticeError::Storage(
+                "capture completion receipt authority mismatch".into(),
+            ));
+        }
+        serde_json::from_str(&ids)
+            .map_err(|e| LatticeError::Storage(format!("invalid capture completion receipt: {e}")))
+    })
+    .transpose()
+}
+
+fn commit_capture_batch(
+    store: &crate::memory::MemoryStore,
+    authority: &crate::consolidation::EvolutionAuthority<'_>,
+    delivery_key: Option<&str>,
+    proposals: Vec<crate::consolidation::ConsolidationProposal>,
+    facts: &[PersistedFact],
+    max_pending: usize,
+) -> Result<Vec<String>, LlmJobError> {
+    store.with_connection(|conn| {
+        let tx=rusqlite::Transaction::new_unchecked(conn,TransactionBehavior::Immediate).map_err(source_storage_error)?;
+        if let Some(key)=delivery_key {
+            if let Some(ids)=completed_capture_on_connection(&tx,authority,key)? {
+                tx.commit().map_err(source_storage_error)?;
+                return Ok(ids);
+            }
+            let valid:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_digest_deliveries WHERE delivery_key=?1 AND repository_id=?2 AND checkout_id=?3 AND COALESCE(branch,'unknown')=?4 AND committed_count=candidate_count)",
+                params![key,authority.repository_id,authority.checkout_id,authority.branch], |r|r.get(0),
+            ).map_err(source_storage_error)?;
+            if !valid { return Err(LatticeError::Storage("claimed capture was retired or changed authority before consolidation committed".into())); }
+        }
+        for fact in facts {
+            let state_hash=crate::consolidation::proposal::state_hash_for_memory(store,&fact.source_memory_id)?;
+            let evidence_current:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_evidence e JOIN session_digest_capture_commits c ON c.memory_id=e.memory_id
+                 WHERE e.memory_id=?1 AND e.kind='session_digest' AND e.reference=?2 AND e.detail=?3
+                   AND c.delivery_key=?4 AND c.candidate_idempotency_key=?2)",
+                params![fact.source_memory_id,fact.evidence_reference,fact.evidence_detail,fact.source_capture_id],|row|row.get(0),
+            ).map_err(source_storage_error)?;
+            if state_hash!=fact.expected_state_hash || !evidence_current {
+                return Err(LatticeError::Storage("session capture source changed while the provider was running; retry from current evidence".into()));
+            }
+        }
+        if !proposals.is_empty() {
+            let pending=crate::consolidation::review_queue::pending_manual_review_count_up_to(&tx,authority.repository_id,max_pending)?;
+            if pending.saturating_add(proposals.len())>max_pending {
+                return Err(LatticeError::Storage("session consolidation review capacity changed while provider was running; capture remains pending".into()));
+            }
+        }
+        let mut ids=Vec::with_capacity(proposals.len());
+        for proposal in proposals {
+            proposal.validate_creation_authority(store,authority)?;
+            tx.execute(
+                "INSERT INTO consolidation_jobs(job_id,workspace_id,kind,mode,status,enqueued_at,proposal_id) VALUES(?1,?2,?3,'background','proposed',?4,?5)",
+                params![proposal.job_id,authority.repository_id,SESSION_DIGEST_JOB_KIND,crate::consolidation::now_unix_micros(),proposal.proposal_id],
+            ).map_err(source_storage_error)?;
+            proposal.insert_pending(&tx)?;
+            ids.push(proposal.proposal_id);
+        }
+        if let Some(key)=delivery_key {
+            tx.execute(
+                "INSERT INTO consolidation_capture_receipts(delivery_key,repository_id,checkout_id,branch,proposal_ids,completed_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![key,authority.repository_id,authority.checkout_id,authority.branch,serde_json::to_string(&ids).map_err(|e|LatticeError::Storage(e.to_string()))?,crate::consolidation::now_unix_micros()],
+            ).map_err(source_storage_error)?;
+        }
+        tx.commit().map_err(source_storage_error)?;
+        Ok(ids)
+    }).map_err(Into::into)
 }
 
 fn is_usable_provider_key(key: &str) -> bool {
@@ -281,6 +444,9 @@ struct PersistedFact {
     source_memory_id: String,
     claim: String,
     evidence: SessionDigestEvidence,
+    expected_state_hash: [u8; 32],
+    evidence_reference: String,
+    evidence_detail: String,
 }
 
 fn load_persisted_facts(
@@ -288,6 +454,7 @@ fn load_persisted_facts(
     repository_id: &str,
     retention_window: Duration,
     limit: usize,
+    delivery_key: Option<&str>,
 ) -> Result<Vec<PersistedFact>, LlmJobError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -302,9 +469,8 @@ fn load_persisted_facts(
     services
         .memory_store
         .with_connection(|conn| {
-            let mut statement = conn
-                .prepare(
-                    "SELECT d.delivery_key,
+            let delivery_filter = if delivery_key.is_some() { "d.delivery_key = ?6" } else { "?6 IS NULL" };
+            let query = format!("SELECT d.delivery_key,
                             c.memory_id,
                             m.content,
                             c.candidate_idempotency_key,
@@ -319,17 +485,22 @@ fn load_persisted_facts(
                      LEFT JOIN session_capture_tombstones t
                         ON t.delivery_key = d.delivery_key
                      WHERE d.repository_id = ?1
+                       AND {delivery_filter}
+                       AND d.checkout_id = ?4
+                       AND COALESCE(d.branch, 'unknown') = ?5
                        AND d.created_at >= ?2
                        AND d.committed_count = d.candidate_count
                        AND m.workspace_id = ?1
                        AND m.source_query = 'automatic_session_digest'
+                       AND m.is_invalidated = 0
+                       AND (m.applicable_checkout_id IS NULL OR m.applicable_checkout_id = ?4)
+                       AND (m.scope = 'repo' OR (m.scope = 'branch' AND m.branch = ?5))
                        AND t.delivery_key IS NULL
                      ORDER BY d.created_at DESC, c.candidate_ordinal ASC
-                     LIMIT ?3",
-                )
-                .map_err(source_storage_error)?;
+                     LIMIT ?3");
+            let mut statement = conn.prepare(&query).map_err(source_storage_error)?;
             let rows = statement
-                .query_map(params![repository_id, cutoff, limit], |row| {
+                .query_map(params![repository_id, cutoff, limit, services.authority.checkout_id, services.authority.branch, delivery_key], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -366,16 +537,23 @@ fn load_persisted_facts(
                             "Failed to decode persisted session-digest evidence: {error}"
                         ))
                     })?;
-                if evidence.repository_id != repository_id {
+                if evidence.repository_id != repository_id
+                    || evidence.checkout_id.as_deref() != Some(services.authority.checkout_id)
+                    || evidence.branch.as_deref().unwrap_or("unknown") != services.authority.branch
+                {
                     return Err(LatticeError::Storage(
-                        "persisted session-digest evidence crossed repository authority"
+                        "persisted session-digest evidence crossed repository, checkout, or branch authority"
                             .to_string(),
                     ));
                 }
                 let Some(claim) = prompt_claim(&persisted_claim, &evidence) else {
                     continue;
                 };
+                let expected_state_hash=crate::consolidation::proposal::state_hash_for_memory(services.memory_store,&source_memory_id)?;
                 facts.push(PersistedFact {
+                    expected_state_hash,
+                    evidence_reference: committed_reference,
+                    evidence_detail: evidence_detail.expect("typed evidence detail was validated above"),
                     source_capture_id,
                     source_memory_id,
                     claim,
@@ -548,12 +726,14 @@ fn validate_candidates(
 
 fn proposed_state(
     ctx: &LlmJobContext,
+    branch: &str,
     candidate: &ValidatedCandidate,
     source_memory_ids: &[String],
 ) -> Result<serde_json::Value, LlmJobError> {
     let refresh_key = refresh_key(candidate, source_memory_ids);
     let mut memory = create_memory(
         ctx,
+        branch,
         candidate.content.clone(),
         MemoryType::Decision,
         refresh_key,

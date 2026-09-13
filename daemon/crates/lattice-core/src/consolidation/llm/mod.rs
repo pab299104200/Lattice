@@ -156,6 +156,7 @@ pub struct LlmJobServices<'a> {
     pub runtime: &'a mut ConsolidationJobRuntime,
     pub memory_store: &'a MemoryStore,
     pub event_writer: &'a EventWriter,
+    pub authority: &'a crate::consolidation::EvolutionAuthority<'a>,
 }
 
 pub enum LlmJobInput {
@@ -293,6 +294,7 @@ where
         let _ = emit_failure(
             ctx,
             services.event_writer,
+            services.authority.branch,
             services.driver.name(),
             kind,
             &job_error,
@@ -311,6 +313,7 @@ fn fail_driver<T>(
     emit_failure(
         ctx,
         services.event_writer,
+        services.authority.branch,
         services.driver.name(),
         kind,
         &job_error,
@@ -346,7 +349,10 @@ pub(crate) fn submit_memory_proposal(
             provenance,
         }),
     };
-    let (_, proposal) = services.runtime.submit_inline(job)?;
+    let (_, proposal) =
+        services
+            .runtime
+            .submit_inline(job, services.memory_store, services.authority)?;
     Ok(proposal)
 }
 
@@ -364,6 +370,7 @@ fn enforce_budget(
             emit_failure(
                 ctx,
                 services.event_writer,
+                services.authority.branch,
                 services.driver.name(),
                 kind,
                 &job_error,
@@ -411,6 +418,7 @@ fn estimate_cost_micro_usd(prompt_tokens: u32, response_tokens: u32) -> u32 {
 pub(crate) fn emit_failure(
     ctx: &LlmJobContext,
     event_writer: &EventWriter,
+    branch: &str,
     model_name: &str,
     kind: ConsolidationJobKind,
     error: &LlmJobError,
@@ -435,7 +443,7 @@ pub(crate) fn emit_failure(
         .append(PartialEnvelope {
             workspace_id: Some(ctx.workspace_id.clone()),
             branch: BranchRef {
-                name: "main".to_string(),
+                name: branch.to_string(),
             },
             session_id: SessionId {
                 value: "llm-consolidation".to_string(),
@@ -466,6 +474,7 @@ pub(crate) fn malformed_with_event(
     let _ = emit_failure(
         ctx,
         services.event_writer,
+        services.authority.branch,
         services.driver.name(),
         kind,
         &error,
@@ -491,6 +500,7 @@ pub(crate) fn memory_state(
 
 pub(crate) fn create_memory(
     ctx: &LlmJobContext,
+    branch: &str,
     content: String,
     memory_type: MemoryType,
     refresh_key: String,
@@ -507,7 +517,7 @@ pub(crate) fn create_memory(
         linked_symbols: Vec::new(),
         linked_files: Vec::new(),
         workspace_id: Some(ctx.workspace_id.clone()),
-        branch: Some("main".to_string()),
+        branch: Some(branch.to_string()),
         scope_organization_id: None,
         refresh_key: Some(refresh_key),
         source_query: Some(source_query),

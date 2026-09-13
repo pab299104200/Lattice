@@ -7,13 +7,15 @@ use tempfile::tempdir;
 
 use super::{VerificationStatus, VerifierCore, WorkspaceFileReader};
 use crate::consolidation::{
-    ConsolidationConfig, ConsolidationJobRuntime, ConsolidationProposal, ProposalKind,
+    ConsolidationConfig, ConsolidationJobRuntime, ConsolidationProposal, EvolutionAuthority,
+    ProposalKind,
 };
 use crate::events::{EventStore, EventWriter, FlushPolicy};
 use crate::graph::CodeGraph;
-use crate::identity::{FileId, SymbolId};
+use crate::identity::{encode_identity, FileId, Identity, SymbolId};
 use crate::memory::{
-    Memory, MemoryEvidence, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryType,
+    BehavioralValidationRecord, BehavioralValidationStatus, EvidenceFreshnessStatus, Memory,
+    MemoryEvidence, MemoryScope, MemoryStore, MemoryStructuredFields, MemoryType,
     MemoryVerificationStatus,
 };
 use crate::storage::graph_store::{
@@ -136,7 +138,7 @@ fn existing_doc_section_emits_verified_proposal() {
 #[test]
 fn deleted_test_emits_invalidated_proposal() {
     let fixture = Fixture::new();
-    let file_id = fixture.file_id("tests/auth.test.ts", "hash-test");
+    let file_id = fixture.file_id("tests/auth.test.ts", "abcdef12");
     let test_symbol_id = fixture.symbol_id(&file_id, "loginUserTest", 4, "test");
     let memory_id = fixture.seed_memory(
         "memory-test",
@@ -150,7 +152,7 @@ fn deleted_test_emits_invalidated_proposal() {
         }],
     );
     let graph = fixture.graph_with_auth(false);
-    let file_index = fixture.file_index(&[("tests/auth.test.ts", "hash-test", 120)]);
+    let file_index = fixture.file_index(&[("tests/auth.test.ts", "abcdef12", 120)]);
     let parsed_files = HashMap::new();
 
     let verdict = fixture.verify(&memory_id, &graph, &file_index, &parsed_files);
@@ -160,6 +162,244 @@ fn deleted_test_emits_invalidated_proposal() {
         fixture.latest_proposal_kind(),
         ProposalKind::MarkInvalidated
     );
+}
+
+#[test]
+fn no_evidence_does_not_promote_claim_even_when_scope_holds() {
+    let fixture = Fixture::new();
+    let memory_id = fixture.seed_memory("memory-no-evidence", Vec::new());
+
+    let verdict = fixture.verify(
+        &memory_id,
+        &CodeGraph::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(verdict.status, VerificationStatus::Unverified);
+    assert_eq!(verdict.evidence_freshness, EvidenceFreshnessStatus::Unknown);
+    assert_eq!(
+        verdict.behavioral_validation,
+        BehavioralValidationStatus::Unverified
+    );
+    assert_eq!(fixture.proposal_count(), 0);
+}
+
+#[test]
+fn unsupported_evidence_does_not_promote_claim() {
+    let fixture = Fixture::new();
+    let memory_id = fixture.seed_memory(
+        "memory-unsupported",
+        vec![MemoryEvidence {
+            kind: "shell_command".to_string(),
+            reference: Some("cargo test".to_string()),
+            detail: None,
+            captured_at: Some(100),
+            span: None,
+            evidence_content_hash: None,
+        }],
+    );
+
+    let verdict = fixture.verify(
+        &memory_id,
+        &CodeGraph::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(verdict.status, VerificationStatus::Unverified);
+    assert_eq!(
+        verdict.behavioral_validation,
+        BehavioralValidationStatus::Unverified
+    );
+    assert_eq!(fixture.proposal_count(), 0);
+}
+
+#[test]
+fn existing_test_requires_current_bound_passing_result() {
+    let fixture = Fixture::new();
+    let file_id = fixture.file_id("tests/auth.test.ts", "abcdef12");
+    let test_symbol_id = fixture.symbol_id(&file_id, "loginUserTest", 4, "test");
+    let evidence = MemoryEvidence {
+        kind: "test".to_string(),
+        reference: Some(encode_identity(&Identity::Symbol(test_symbol_id))),
+        detail: None,
+        captured_at: Some(100),
+        span: None,
+        evidence_content_hash: None,
+    };
+    let reference = evidence.reference.clone().unwrap();
+    let memory_id = fixture.seed_memory("memory-live-test", vec![evidence]);
+    let graph = fixture.graph_with_auth(true);
+    assert!(graph
+        .get_node(&crate::symbols::SymbolId {
+            file: "tests/auth.test.ts".to_string(),
+            name: "loginUserTest".to_string(),
+            byte_offset: 4,
+        })
+        .is_some());
+    let file_index = fixture.file_index(&[("tests/auth.test.ts", "abcdef12", 120)]);
+
+    let no_result = fixture.verify(&memory_id, &graph, &file_index, &HashMap::new());
+    assert_eq!(
+        no_result.status,
+        VerificationStatus::Unverified,
+        "{}",
+        no_result.reason
+    );
+    assert_eq!(no_result.evidence_freshness, EvidenceFreshnessStatus::Fresh);
+
+    let failed = BehavioralValidationRecord {
+        repository_id: "repository-main".to_string(),
+        checkout_id: "checkout-main".to_string(),
+        evidence_reference: reference.clone(),
+        status: BehavioralValidationStatus::Failed,
+        revision: Some("rev-current".to_string()),
+        graph_generation: Some(42),
+        observed_at: 200,
+    };
+    let failed_result = fixture.verify_with_validations(
+        &memory_id,
+        &graph,
+        &file_index,
+        &HashMap::new(),
+        std::slice::from_ref(&failed),
+        Some("rev-current"),
+        Some(42),
+    );
+    assert_eq!(failed_result.status, VerificationStatus::Invalidated);
+    assert_eq!(
+        failed_result.behavioral_validation,
+        BehavioralValidationStatus::Failed
+    );
+
+    let stale_pass = BehavioralValidationRecord {
+        repository_id: "repository-main".to_string(),
+        checkout_id: "checkout-main".to_string(),
+        evidence_reference: reference.clone(),
+        status: BehavioralValidationStatus::Passed,
+        revision: Some("rev-old".to_string()),
+        graph_generation: Some(42),
+        observed_at: 150,
+    };
+    let stale_result = fixture.verify_with_validations(
+        &memory_id,
+        &graph,
+        &file_index,
+        &HashMap::new(),
+        &[stale_pass],
+        Some("rev-current"),
+        None,
+    );
+    assert_eq!(stale_result.status, VerificationStatus::Unverified);
+
+    let current_pass = BehavioralValidationRecord {
+        repository_id: "repository-main".to_string(),
+        checkout_id: "checkout-main".to_string(),
+        evidence_reference: reference,
+        status: BehavioralValidationStatus::Passed,
+        revision: Some("rev-current".to_string()),
+        graph_generation: Some(42),
+        observed_at: 250,
+    };
+    let passed_result = fixture.verify_with_validations(
+        &memory_id,
+        &graph,
+        &file_index,
+        &HashMap::new(),
+        std::slice::from_ref(&current_pass),
+        Some("rev-current"),
+        Some(42),
+    );
+    assert_eq!(passed_result.status, VerificationStatus::Verified);
+    assert_eq!(
+        passed_result.behavioral_validation,
+        BehavioralValidationStatus::Passed
+    );
+
+    let wrong_checkout = BehavioralValidationRecord {
+        checkout_id: "checkout-other".to_string(),
+        ..current_pass.clone()
+    };
+    assert_eq!(
+        fixture
+            .verify_with_validations(
+                &memory_id,
+                &graph,
+                &file_index,
+                &HashMap::new(),
+                &[wrong_checkout],
+                Some("rev-current"),
+                Some(42),
+            )
+            .behavioral_validation,
+        BehavioralValidationStatus::Unverified
+    );
+
+    let revision_only = BehavioralValidationRecord {
+        graph_generation: None,
+        ..current_pass.clone()
+    };
+    assert_eq!(
+        fixture
+            .verify_with_validations(
+                &memory_id,
+                &graph,
+                &file_index,
+                &HashMap::new(),
+                &[revision_only],
+                Some("rev-current"),
+                Some(42),
+            )
+            .behavioral_validation,
+        BehavioralValidationStatus::Unverified,
+        "same revision without dirty-content generation cannot certify a check"
+    );
+
+    let expired = BehavioralValidationRecord {
+        observed_at: 100,
+        ..current_pass.clone()
+    };
+    assert_eq!(
+        fixture
+            .verify_with_validations(
+                &memory_id,
+                &graph,
+                &file_index,
+                &HashMap::new(),
+                &[expired],
+                Some("rev-current"),
+                Some(42),
+            )
+            .behavioral_validation,
+        BehavioralValidationStatus::Unverified
+    );
+
+    let later_failure = BehavioralValidationRecord {
+        status: BehavioralValidationStatus::Failed,
+        observed_at: 260,
+        ..current_pass.clone()
+    };
+    for records in [
+        vec![current_pass.clone(), later_failure.clone()],
+        vec![later_failure.clone(), current_pass.clone()],
+    ] {
+        assert_eq!(
+            fixture
+                .verify_with_validations(
+                    &memory_id,
+                    &graph,
+                    &file_index,
+                    &HashMap::new(),
+                    &records,
+                    Some("rev-current"),
+                    Some(42),
+                )
+                .behavioral_validation,
+            BehavioralValidationStatus::Failed,
+            "newest bound observation wins independently of input order"
+        );
+    }
 }
 
 #[test]
@@ -282,6 +522,7 @@ impl Fixture {
         )
         .expect("runtime opens");
         let reader = WorkspaceFileReader::new(self.workspace_root.clone());
+        let authority = self.authority();
         let mut verifier = VerifierCore::new(
             &self.memory_store,
             &mut runtime,
@@ -290,6 +531,7 @@ impl Fixture {
             parsed_files,
             &reader,
             "workspace-main",
+            &authority,
         );
         verifier
             .verify_memory(memory_id)
@@ -297,21 +539,86 @@ impl Fixture {
     }
 
     fn latest_proposal_kind(&self) -> ProposalKind {
-        let conn = Connection::open(&self.runtime_db).expect("runtime db opens");
-        let proposal_id: String = conn
-            .query_row(
-                "SELECT proposal_id
+        self.memory_store
+            .with_connection(|conn| {
+                let proposal_id: String = conn
+                    .query_row(
+                        "SELECT proposal_id
                  FROM consolidation_proposals
                  ORDER BY rowid DESC
                  LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .expect("proposal id reads");
-        ConsolidationProposal::load(&conn, &proposal_id)
-            .expect("proposal loads")
-            .expect("proposal exists")
-            .proposal_kind
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| crate::LatticeError::Storage(error.to_string()))?;
+                ConsolidationProposal::load(&conn, &proposal_id)
+                    .map(|proposal| proposal.expect("proposal exists").proposal_kind)
+            })
+            .expect("canonical proposal loads")
+    }
+
+    fn proposal_count(&self) -> i64 {
+        self.memory_store
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM consolidation_proposals", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| crate::LatticeError::Storage(error.to_string()))
+            })
+            .expect("canonical proposal count reads")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_with_validations(
+        &self,
+        memory_id: &str,
+        graph: &CodeGraph,
+        file_index: &HashMap<String, FileIndexEntry>,
+        parsed_files: &HashMap<String, ParsedFile>,
+        validations: &[BehavioralValidationRecord],
+        revision: Option<&str>,
+        generation: Option<u64>,
+    ) -> super::VerificationVerdict {
+        let conn = Connection::open(&self.runtime_db).expect("runtime db opens");
+        let mut runtime = ConsolidationJobRuntime::new(
+            conn,
+            ConsolidationConfig {
+                max_queue_depth: 16,
+                llm_budget_catalog: None,
+            },
+        )
+        .expect("runtime opens");
+        let reader = WorkspaceFileReader::new(self.workspace_root.clone());
+        let authority = self.authority();
+        VerifierCore::new(
+            &self.memory_store,
+            &mut runtime,
+            graph,
+            file_index,
+            parsed_files,
+            &reader,
+            "workspace-main",
+            &authority,
+        )
+        .with_behavioral_validations(
+            validations,
+            "repository-main",
+            "checkout-main",
+            revision,
+            generation,
+            300,
+            120,
+        )
+        .verify_memory(memory_id)
+        .expect("verification succeeds")
+    }
+
+    fn authority(&self) -> EvolutionAuthority<'static> {
+        EvolutionAuthority {
+            repository_id: "workspace-main",
+            checkout_id: "checkout-main",
+            branch: "main",
+        }
     }
 
     fn graph_with_auth(&self, include_test: bool) -> CodeGraph {

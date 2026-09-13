@@ -23,7 +23,11 @@ fn test_synchronous_session_consolidation_emits_proposal_not_silent_write() {
     let outcome = harness
         .session_consolidator()
         .on_task_complete(
-            "workspace-main",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
             &task_id("task-sync"),
             EpisodeOutcome::Success,
         )
@@ -38,7 +42,7 @@ fn test_synchronous_session_consolidation_emits_proposal_not_silent_write() {
 }
 
 #[test]
-fn test_deterministic_supersession_proposal_apply_then_reject_round_trip() {
+fn test_deterministic_supersession_applies_and_checkout_bound_reverse_fails_closed() {
     let harness = ConsolidationHarness::new();
     let older_id = harness.seed_memory(
         "mem-older",
@@ -60,13 +64,9 @@ fn test_deterministic_supersession_proposal_apply_then_reject_round_trip() {
 
     harness.apply_proposal(&proposal_id);
     assert_superseded_state(&harness, &older_id, &newer_id);
-    assert_eq!(
-        harness.reverse_proposal(&proposal_id),
-        ReverseOutcome::Reverted {
-            memory_id: older_id.clone(),
-        }
-    );
-    assert_restored_state(&harness, &older_id);
+    let error = harness.reverse_proposal_result(&proposal_id).unwrap_err();
+    assert!(error.to_string().contains("checkout-bound"));
+    assert_superseded_state(&harness, &older_id, &newer_id);
 }
 
 #[test]
@@ -135,7 +135,18 @@ fn test_bounded_queue_overflow_drops_jobs_with_warning_event() {
     let mut queue = harness.llm_queue(2);
 
     let outcomes = (0..5)
-        .map(|index| queue.enqueue_llm(llm_queue_job(index), &harness.event_writer, "fake-llm"))
+        .map(|index| {
+            queue.enqueue_llm(
+                llm_queue_job(index),
+                &harness.event_writer,
+                "fake-llm",
+                &EvolutionAuthority {
+                    repository_id: "workspace-main",
+                    checkout_id: "checkout-main",
+                    branch: "main",
+                },
+            )
+        })
         .collect::<Result<Vec<_>, _>>()
         .expect("enqueue succeeds");
 
@@ -173,16 +184,17 @@ fn test_high_scope_proposal_routes_to_manual_review_queue() {
 fn test_replay_from_genesis_reconstructs_memory_state() {
     let harness = ConsolidationHarness::new();
     let cache = harness.apply_replay_mix();
-    let expected_hash = harness.store_hash();
+    let mut expected = harness.memories();
+    expected.sort_by(|left, right| left.id.cmp(&right.id));
     let driver = CountingDriver::default();
 
-    harness.clear_memory_tables();
-    harness
-        .replay_driver_with_cache(cache, &driver)
+    let replay = harness.replay_driver_with_cache(cache, &driver);
+    replay
         .replay(ReplayMode::FromGenesis)
         .expect("replay succeeds");
-
-    assert_eq!(harness.store_hash(), expected_hash);
+    let mut derived = replay.derived_memories().expect("derived memories list");
+    derived.sort_by(|left, right| left.id.cmp(&right.id));
+    assert_eq!(derived, expected);
     assert_eq!(driver.call_count(), 0);
 }
 
@@ -207,7 +219,7 @@ fn assert_superseded_state(harness: &ConsolidationHarness, older_id: &str, newer
         MemoryVerificationStatus::Superseded
     );
     assert_eq!(fields.superseded_by_memory_id.as_deref(), Some(newer_id));
-    assert_eq!(harness.memory_links_from(older_id).len(), 1);
+    assert!(harness.memory_links_from(older_id).is_empty());
 }
 
 fn assert_restored_state(harness: &ConsolidationHarness, older_id: &str) {

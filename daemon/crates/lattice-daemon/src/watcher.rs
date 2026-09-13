@@ -4,25 +4,44 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::info;
 
-use lattice_core::embeddings::EmbeddingEngine;
+use lattice_core::embeddings::EmbeddingProvider;
 use lattice_core::indexer::{IndexFailure, IndexFailureKind, Indexer};
 use lattice_core::query::QueryEngine;
-use lattice_core::storage::{GraphStore, SharedVectorIndex};
+use lattice_core::storage::{
+    FileIndexEntry, GraphStore, SharedVectorIndex, FILE_INDEX_PARSER_VERSION,
+    FILE_INDEX_SCHEMA_VERSION,
+};
 use lattice_core::workspace::{repo_rel_path, WorkspaceManager};
 
 use crate::adoption_metrics::AdoptionMetricsStore;
 use crate::git_intelligence_runtime::GitIntelligenceRefreshHandle;
 use crate::health_facts_runtime::HealthFactsRefreshHandle;
 use crate::index_health::IndexHealth;
-use crate::index_work::{IndexReadiness, IndexWorkCoordinator};
+use crate::index_work::{
+    IndexReadiness, IndexWorkCoordinator, IndexWorkPermit, RuntimeWorkTracker,
+};
 use crate::repo_state::RepoStateTracker;
 use crate::runtime_support::{parse_with_repository_cache, ParsedCacheRuntime};
 use crate::watcher_health::WatcherHealth;
+
+// Native watcher destruction may wait for its callback thread. Close the
+// bounded receiver first so a callback blocked on backpressure can exit even
+// when the owning async task is cancelled during runtime shutdown.
+struct NativeWatchReceiver {
+    receiver: mpsc::Receiver<notify::Result<Event>>,
+    _watcher: RecommendedWatcher,
+}
+
+impl Drop for NativeWatchReceiver {
+    fn drop(&mut self) {
+        self.receiver.close();
+    }
+}
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 const WORKSPACE_INVALIDATION_BATCH_THRESHOLD: usize = 20;
@@ -72,7 +91,7 @@ pub struct FileWatcher {
     workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
     graph_store: Arc<Mutex<GraphStore>>,
     query_engine: Arc<Mutex<QueryEngine>>,
-    embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+    embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>>,
     vector_index: Option<SharedVectorIndex>,
     repo_state: Arc<Mutex<RepoStateTracker>>,
     indexing: Arc<AtomicBool>,
@@ -85,6 +104,9 @@ pub struct FileWatcher {
     health_facts: Option<HealthFactsRefreshHandle>,
     adoption_metrics: Arc<AdoptionMetricsStore>,
     session_id: String,
+    runtime_work: Arc<RuntimeWorkTracker>,
+    source_snapshot: StdMutex<HashMap<PathBuf, PollFileState>>,
+    pending_source_snapshot: StdMutex<HashMap<PathBuf, Option<PollFileState>>>,
     /// This baseline is intentionally owned by the watcher rather than the
     /// shared repo-state tracker.  It is updated only after a successful Git
     /// read, so transient rebase/checkout writes cannot manufacture an epoch.
@@ -92,7 +114,13 @@ pub struct FileWatcher {
     #[cfg(test)]
     forced_watch_failure: Option<String>,
     #[cfg(test)]
+    forced_poll_interval: Option<Duration>,
+    #[cfg(test)]
     head_read_count: AtomicU64,
+    #[cfg(test)]
+    observed_source_event_count: AtomicU64,
+    #[cfg(test)]
+    observed_events: StdMutex<Vec<String>>,
 }
 
 impl FileWatcher {
@@ -103,7 +131,7 @@ impl FileWatcher {
         workspace_manager: Option<Arc<Mutex<WorkspaceManager>>>,
         graph_store: Arc<Mutex<GraphStore>>,
         query_engine: Arc<Mutex<QueryEngine>>,
-        embedding_engine: Arc<OnceLock<Arc<EmbeddingEngine>>>,
+        embedding_engine: Arc<OnceLock<Arc<dyn EmbeddingProvider>>>,
         vector_index: Option<SharedVectorIndex>,
         repo_state: Arc<Mutex<RepoStateTracker>>,
         indexing: Arc<AtomicBool>,
@@ -136,11 +164,20 @@ impl FileWatcher {
             health_facts,
             adoption_metrics,
             session_id,
+            runtime_work: Arc::new(RuntimeWorkTracker::default()),
+            source_snapshot: StdMutex::new(HashMap::new()),
+            pending_source_snapshot: StdMutex::new(HashMap::new()),
             observed_head: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             forced_watch_failure: None,
             #[cfg(test)]
+            forced_poll_interval: None,
+            #[cfg(test)]
             head_read_count: AtomicU64::new(0),
+            #[cfg(test)]
+            observed_source_event_count: AtomicU64::new(0),
+            #[cfg(test)]
+            observed_events: StdMutex::new(Vec::new()),
         }
     }
 
@@ -149,10 +186,32 @@ impl FileWatcher {
         self
     }
 
+    pub(crate) fn with_runtime_work_tracker(
+        mut self,
+        runtime_work: Arc<RuntimeWorkTracker>,
+    ) -> Self {
+        self.runtime_work = runtime_work;
+        self
+    }
+
     pub async fn run(&self) -> anyhow::Result<()> {
-        if let Err(error) = self.run_notify().await {
+        self.run_with_registration_sender(None).await
+    }
+
+    pub(crate) async fn run_with_registration(
+        &self,
+        registration: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        self.run_with_registration_sender(Some(registration)).await
+    }
+
+    async fn run_with_registration_sender(
+        &self,
+        mut registration: Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = self.run_notify(&mut registration).await {
             let reason = error.to_string();
-            let interval = poll_interval();
+            let interval = self.configured_poll_interval();
             tracing::warn!(
                 workspace = %self.workspace_root.display(),
                 reason = %reason,
@@ -161,7 +220,7 @@ impl FileWatcher {
             );
             self.watcher_health
                 .mark_degraded(reason, interval.as_secs());
-            return self.run_polling(interval).await;
+            return self.run_polling(interval, &mut registration).await;
         }
         Ok(())
     }
@@ -172,26 +231,50 @@ impl FileWatcher {
         self
     }
 
-    async fn run_notify(&self) -> anyhow::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn with_forced_poll_interval(mut self, interval: Duration) -> Self {
+        self.forced_poll_interval = Some(interval);
+        self
+    }
+
+    fn configured_poll_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(interval) = self.forced_poll_interval {
+            return interval;
+        }
+        poll_interval()
+    }
+
+    async fn run_notify(
+        &self,
+        registration: &mut Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(reason) = &self.forced_watch_failure {
             anyhow::bail!("{}", reason);
         }
 
-        let (tx, mut rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(100);
 
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-            if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
-            }
+        let watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+            let _ = tx.blocking_send(res);
         })?;
 
-        watcher.watch(&self.workspace_root, RecursiveMode::Recursive)?;
+        let mut native = NativeWatchReceiver {
+            receiver: rx,
+            _watcher: watcher,
+        };
+        native
+            ._watcher
+            .watch(&self.workspace_root, RecursiveMode::Recursive)?;
         for control_path in checkout_git_control_paths(&self.workspace_root) {
             if !control_path.exists() {
                 continue;
             }
-            if let Err(error) = watcher.watch(&control_path, RecursiveMode::NonRecursive) {
+            if let Err(error) = native
+                ._watcher
+                .watch(&control_path, RecursiveMode::NonRecursive)
+            {
                 tracing::warn!(
                     workspace = %self.workspace_root.display(),
                     path = %control_path.display(),
@@ -205,22 +288,46 @@ impl FileWatcher {
         // therefore represented by the first observed state, not by a
         // synthetic startup invalidation.
         self.capture_head_baseline().await;
+        self.capture_source_baseline()?;
         self.watcher_health.mark_healthy();
+        signal_registration(registration);
         info!("File watcher started for: {:?}", self.workspace_root);
 
         let mut changed_paths: Vec<PathBuf> = Vec::new();
         let debounce_timer = tokio::time::sleep(DEBOUNCE_DURATION);
         tokio::pin!(debounce_timer);
+        let reconcile_interval = self.configured_poll_interval();
+        let mut reconciliation = tokio::time::interval_at(
+            tokio::time::Instant::now() + reconcile_interval,
+            reconcile_interval,
+        );
 
         loop {
             tokio::select! {
-                Some(event) = rx.recv() => {
+                event = native.receiver.recv() => {
+                    let Some(event) = event else { break; };
+                    let event = event.map_err(|error| anyhow::anyhow!("Native filesystem watcher failed: {error}"))?;
                     self.handle_event(event, &mut changed_paths);
                     debounce_timer.as_mut().reset(tokio::time::Instant::now() + DEBOUNCE_DURATION);
                 },
                 _ = &mut debounce_timer, if !changed_paths.is_empty() => {
                     let paths = std::mem::take(&mut changed_paths);
                     self.process_changes(paths).await;
+                },
+                _ = reconciliation.tick() => {
+                    match self.diff_source_snapshot_subtree(&self.workspace_root) {
+                        Ok(paths) if !paths.is_empty() => {
+                            #[cfg(test)]
+                            self.observed_source_event_count
+                                .fetch_add(paths.len() as u64, Ordering::AcqRel);
+                            self.process_changes(paths).await
+                        },
+                        Ok(_) => {}
+                        Err(error) => self.watcher_health.mark_degraded(
+                            format!("native watcher reconciliation inventory failed: {error}"),
+                            reconcile_interval.as_secs(),
+                        ),
+                    }
                 },
                 else => {
                     if !changed_paths.is_empty() {
@@ -235,37 +342,39 @@ impl FileWatcher {
         Ok(())
     }
 
-    async fn run_polling(&self, interval: Duration) -> anyhow::Result<()> {
+    async fn run_polling(
+        &self,
+        interval: Duration,
+        registration: &mut Option<oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
         self.capture_head_baseline().await;
-        let mut previous = self.poll_snapshot();
+        self.capture_source_baseline()?;
         self.watcher_health.mark_poll();
+        signal_registration(registration);
         let mut ticker = tokio::time::interval(interval);
 
         loop {
             ticker.tick().await;
-            let current = self.poll_snapshot();
-            let mut changed = Vec::new();
-            for (path, state) in &current {
-                if previous.get(path) != Some(state) {
-                    changed.push(path.clone());
+            let changed = match self.diff_source_snapshot_subtree(&self.workspace_root) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.watcher_health.mark_degraded(
+                        format!("polling source inventory failed: {error}"),
+                        interval.as_secs(),
+                    );
+                    continue;
                 }
-            }
-            for path in previous.keys() {
-                if !current.contains_key(path) {
-                    changed.push(path.clone());
-                }
-            }
+            };
             self.watcher_health.mark_poll();
             if !changed.is_empty() {
                 self.process_changes(changed).await;
             }
-            previous = current;
         }
     }
 
-    fn poll_snapshot(&self) -> HashMap<PathBuf, PollFileState> {
+    fn poll_snapshot(&self) -> std::io::Result<HashMap<PathBuf, PollFileState>> {
         let mut snapshot = HashMap::new();
-        self.collect_poll_snapshot(&self.workspace_root, &mut snapshot);
+        self.collect_poll_snapshot(&self.workspace_root, &mut snapshot)?;
         // Native notification setup can fail on remote or constrained file
         // systems. Preserve HEAD transition behavior in degraded polling mode
         // by observing the same exact checkout-owned control paths.
@@ -286,44 +395,54 @@ impl FileWatcher {
                 );
             }
         }
-        snapshot
+        Ok(snapshot)
     }
 
-    fn collect_poll_snapshot(&self, dir: &Path, snapshot: &mut HashMap<PathBuf, PollFileState>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
+    fn collect_poll_snapshot(
+        &self,
+        dir: &Path,
+        snapshot: &mut HashMap<PathBuf, PollFileState>,
+    ) -> std::io::Result<()> {
+        let entries = std::fs::read_dir(dir)?;
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
                     if lattice_core::watcher::is_excluded_dir(dir_name) {
                         continue;
                     }
                 }
-                self.collect_poll_snapshot(&path, snapshot);
-            } else if path.is_file() && self.should_process(&path) {
-                if let Ok(metadata) = std::fs::metadata(&path) {
-                    let modified_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_nanos())
-                        .unwrap_or_default();
-                    snapshot.insert(
-                        path,
-                        PollFileState {
-                            modified_ns,
-                            size_bytes: metadata.len(),
-                        },
-                    );
-                }
+                self.collect_poll_snapshot(&path, snapshot)?;
+            } else if file_type.is_file() && self.should_process(&path) {
+                let metadata = entry.metadata()?;
+                let modified_ns = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                snapshot.insert(
+                    path,
+                    PollFileState {
+                        modified_ns,
+                        size_bytes: metadata.len(),
+                    },
+                );
             }
         }
+        Ok(())
     }
 
     fn handle_event(&self, event: Event, changed_paths: &mut Vec<PathBuf>) {
+        #[cfg(test)]
+        if let Ok(mut observed) = self.observed_events.lock() {
+            observed.push(format!("kind={:?} paths={:?}", event.kind, event.paths));
+        }
         if matches!(
             event.kind,
             notify::EventKind::Create(_)
@@ -331,11 +450,135 @@ impl FileWatcher {
                 | notify::EventKind::Remove(_)
         ) {
             for path in event.paths {
-                if !changed_paths.contains(&path) && self.should_process(&path) {
+                let path = self.normalize_event_path(path);
+                if self.should_process(&path) {
+                    self.stage_source_snapshot_path(&path);
+                    if changed_paths.contains(&path) {
+                        continue;
+                    }
                     changed_paths.push(path);
+                    #[cfg(test)]
+                    self.observed_source_event_count
+                        .fetch_add(1, Ordering::AcqRel);
+                } else if self.is_directory_notification(&event.kind, &path) {
+                    let sources = match self.diff_source_snapshot_subtree(&path) {
+                        Ok(sources) => sources,
+                        Err(error) => {
+                            self.watcher_health.mark_degraded(
+                                format!("watcher subtree inventory failed: {error}"),
+                                DEFAULT_POLL_INTERVAL.as_secs(),
+                            );
+                            continue;
+                        }
+                    };
+                    for source in sources {
+                        if !changed_paths.contains(&source) {
+                            changed_paths.push(source);
+                            #[cfg(test)]
+                            self.observed_source_event_count
+                                .fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn capture_source_baseline(&self) -> std::io::Result<()> {
+        let snapshot = self.poll_snapshot()?;
+        if let Ok(mut stored) = self.source_snapshot.lock() {
+            *stored = snapshot;
+        }
+        Ok(())
+    }
+
+    fn stage_source_snapshot_path(&self, path: &Path) {
+        let Ok(mut pending) = self.pending_source_snapshot.lock() else {
+            return;
+        };
+        pending.insert(path.to_path_buf(), poll_file_state(path));
+    }
+
+    fn is_directory_notification(&self, kind: &notify::EventKind, path: &Path) -> bool {
+        path.starts_with(&self.workspace_root)
+            && (path.is_dir()
+                || matches!(
+                    kind,
+                    notify::EventKind::Create(notify::event::CreateKind::Folder)
+                        | notify::EventKind::Remove(notify::event::RemoveKind::Folder)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                ))
+    }
+
+    fn diff_source_snapshot_subtree(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut current = HashMap::new();
+        if directory == self.workspace_root && !directory.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workspace root is unavailable during watcher reconciliation",
+            ));
+        }
+        if directory.is_dir() {
+            self.collect_poll_snapshot(directory, &mut current)?;
+        }
+        let Ok(previous) = self.source_snapshot.lock() else {
+            return Ok(Vec::new());
+        };
+        let mut changed = current
+            .iter()
+            .filter_map(|(path, state)| (previous.get(path) != Some(state)).then(|| path.clone()))
+            .collect::<Vec<_>>();
+        changed.extend(
+            previous
+                .keys()
+                .filter(|path| path.starts_with(directory) && !current.contains_key(*path))
+                .cloned(),
+        );
+        changed.sort();
+        changed.dedup();
+        if let Ok(mut pending) = self.pending_source_snapshot.lock() {
+            for path in &changed {
+                pending.insert(path.clone(), current.get(path).copied());
+            }
+        }
+        Ok(changed)
+    }
+
+    fn normalize_event_path(&self, path: PathBuf) -> PathBuf {
+        if path.starts_with(&self.workspace_root) {
+            return path;
+        }
+        let Ok(canonical_root) = self.workspace_root.canonicalize() else {
+            return path;
+        };
+        if let Ok(canonical_path) = path.canonicalize() {
+            if let Ok(relative) = canonical_path.strip_prefix(&canonical_root) {
+                return self.workspace_root.join(relative);
+            }
+        }
+        // Removed paths cannot be canonicalized. Canonicalize their surviving
+        // parent and restore the leaf under the configured workspace spelling.
+        if let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Ok(relative_parent) = canonical_parent.strip_prefix(canonical_root) {
+                    return self.workspace_root.join(relative_parent).join(leaf);
+                }
+            }
+        }
+        path
+    }
+
+    #[cfg(test)]
+    fn observed_source_event_count_for_test(&self) -> u64 {
+        self.observed_source_event_count.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn observed_events_for_test(&self) -> Vec<String> {
+        self.observed_events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
     }
 
     fn should_process(&self, path: &Path) -> bool {
@@ -352,6 +595,7 @@ impl FileWatcher {
     async fn process_changes(&self, paths: Vec<PathBuf>) {
         self.index_readiness.wait().await;
         let changes = self.classify_changes(paths).await;
+        let source_snapshot_paths = changes.source_paths.clone();
         self.record_observed_edits(&changes.source_paths);
         let head_changed = if changes.has_owned_git_state {
             self.observe_head_transition().await
@@ -379,7 +623,7 @@ impl FileWatcher {
         }
 
         self.indexing.store(true, Ordering::Relaxed);
-        let Ok(_permit) = self
+        let Ok(permit) = self
             .index_work
             .acquire(
                 self.workspace_root.to_string_lossy().to_string(),
@@ -393,15 +637,41 @@ impl FileWatcher {
             );
             return;
         };
+        let permit = Arc::new(permit);
 
         let workspace_root = self.workspace_root.clone();
         let repo_name = self.repo_name.clone();
         let workspace_manager = self.workspace_manager.clone();
         let indexer = self.indexer.clone();
         let parsed_cache = self.parsed_cache.clone();
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
         let batch_result = tokio::task::spawn_blocking(move || {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
             let batch =
                 prepare_change_batch(&workspace_root, repo_name.as_deref(), changes.source_paths);
+            let manifest_updates = batch
+                .upserts
+                .iter()
+                .map(|(path, content)| FileIndexEntry {
+                    file: repo_name
+                        .as_deref()
+                        .map(|repo| repo_rel_path(repo, path))
+                        .unwrap_or_else(|| path.clone()),
+                    content_hash: lattice_core::storage::content_sha256(content.as_bytes()),
+                    // This batch owns captured bytes, not a stable filesystem mtime.
+                    // Force metadata validation on warm reopen instead of associating
+                    // a newer on-disk timestamp with an older parsed payload.
+                    mtime_ns: 0,
+                    size_bytes: content.len() as i64,
+                    parser_version: FILE_INDEX_PARSER_VERSION,
+                    schema_version: FILE_INDEX_SCHEMA_VERSION,
+                    last_indexed_at: std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                })
+                .collect::<Vec<_>>();
             if batch.upserts.is_empty() && batch.removals.is_empty() {
                 return None;
             }
@@ -419,6 +689,8 @@ impl FileWatcher {
                     Arc::new(manager.unified_graph()),
                     batch.changed_graph_files,
                     report,
+                    manifest_updates,
+                    true,
                 ));
             }
 
@@ -468,14 +740,32 @@ impl FileWatcher {
                 indexer.apply_file_batch_contents(upserts, removals)
             };
             if indexer.graph_snapshot_id() == before_snapshot && !report.is_partial {
-                return None;
+                return Some((
+                    indexer.graph_arc(),
+                    changed_graph_files,
+                    report,
+                    manifest_updates,
+                    false,
+                ));
             }
-            Some((indexer.graph_arc(), changed_graph_files, report))
+            Some((
+                indexer.graph_arc(),
+                changed_graph_files,
+                report,
+                manifest_updates,
+                true,
+            ))
         })
         .await;
 
         match batch_result {
-            Ok(Some((new_graph, changed_graph_files, report))) => {
+            Ok(Some((
+                new_graph,
+                mut changed_graph_files,
+                report,
+                mut manifest_updates,
+                publish,
+            ))) => {
                 self.index_health.merge_change_report(&report);
                 for failure in &report.failures {
                     tracing::warn!(
@@ -488,10 +778,53 @@ impl FileWatcher {
                 // Requested after publication, not before: the runtime reads
                 // the engine's published graph, so triggering earlier would
                 // produce facts for the graph this batch is replacing.
+                changed_graph_files
+                    .retain(|file| !report.failures.iter().any(|failure| &failure.file == file));
+                manifest_updates.retain(|entry| {
+                    !report
+                        .failures
+                        .iter()
+                        .any(|failure| failure.file == entry.file)
+                });
                 let health_changes = changed_graph_files.clone();
-                self.persist_publish_and_sync(new_graph, changed_graph_files, target_epoch)
+                let failed_files = report
+                    .failures
+                    .iter()
+                    .map(|failure| failure.file.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let committed_source_paths = source_snapshot_paths
+                    .into_iter()
+                    .filter(|path| {
+                        path.strip_prefix(&self.workspace_root)
+                            .ok()
+                            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                            .map(|relative| {
+                                self.repo_name
+                                    .as_deref()
+                                    .map(|repo| repo_rel_path(repo, &relative))
+                                    .unwrap_or(relative)
+                            })
+                            .is_some_and(|file| !failed_files.contains(&file))
+                    })
+                    .collect::<Vec<_>>();
+                if !publish {
+                    self.commit_source_snapshot_paths(&committed_source_paths);
+                    self.finish_indexing(target_epoch).await;
+                    return;
+                }
+                let published = self
+                    .persist_publish_and_sync(
+                        new_graph,
+                        changed_graph_files,
+                        manifest_updates,
+                        target_epoch,
+                        Arc::clone(&permit),
+                    )
                     .await;
-                self.request_health_facts_refresh(health_changes);
+                if published {
+                    self.commit_source_snapshot_paths(&committed_source_paths);
+                    self.request_health_facts_refresh(health_changes);
+                }
             }
             Ok(None) => {
                 if let Some(epoch) = target_epoch {
@@ -507,6 +840,26 @@ impl FileWatcher {
                     "Watcher batch worker failed"
                 );
                 self.indexing.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn commit_source_snapshot_paths(&self, paths: &[PathBuf]) {
+        let Ok(mut committed) = self.source_snapshot.lock() else {
+            return;
+        };
+        let Ok(mut pending) = self.pending_source_snapshot.lock() else {
+            return;
+        };
+        for path in paths {
+            match pending.remove(path) {
+                Some(Some(state)) => {
+                    committed.insert(path.clone(), state);
+                }
+                Some(None) => {
+                    committed.remove(path);
+                }
+                None => {}
             }
         }
     }
@@ -645,35 +998,79 @@ impl FileWatcher {
         &self,
         new_graph: Arc<lattice_core::graph::CodeGraph>,
         changed_graph_files: Vec<String>,
+        manifest_updates: Vec<FileIndexEntry>,
         target_epoch: Option<u64>,
-    ) {
+        permit: Arc<IndexWorkPermit>,
+    ) -> bool {
         if let Some(epoch) = target_epoch {
             let repo_state = self.repo_state.lock().await;
             if !repo_state.can_publish_epoch(epoch) {
                 self.indexing.store(false, Ordering::Relaxed);
-                return;
+                return false;
             }
         }
 
         let graph_store = Arc::clone(&self.graph_store);
         let graph_to_persist = Arc::clone(&new_graph);
+        let parse_membership = self.parsed_cache.clone().and_then(|cache| {
+            crate::workspace_identity::WorkspaceIdentity::resolve(&self.workspace_root)
+                .ok()
+                .map(|identity| (cache, identity.checkout_id))
+        });
+        let manifest_removals = changed_graph_files.clone();
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
         match tokio::task::spawn_blocking(move || {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
             let graph_store = graph_store.blocking_lock();
-            graph_store.save_graph(&graph_to_persist)
+            let mut files = graph_store.load_file_index()?;
+            for file in manifest_removals {
+                files.remove(&file);
+            }
+            for entry in manifest_updates {
+                files.insert(entry.file.clone(), entry);
+            }
+            let files = files.into_values().collect::<Vec<_>>();
+            let mut last_error = None;
+            for delay_ms in [0, 25, 100] {
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                match graph_store.save_index_snapshot_with_manifest(&graph_to_persist, &files) {
+                    Ok(snapshot) => {
+                        if let Some((cache, checkout)) = &parse_membership {
+                            if let Err(error) = cache.store.replace_membership(checkout, &files) {
+                                tracing::warn!(%error, "graph committed but derived parse membership failed");
+                            }
+                        }
+                        return Ok(snapshot);
+                    },
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.expect("bounded persistence attempt list is non-empty"))
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                workspace = %self.workspace_root.display(),
-                %error,
-                "Watcher failed to persist graph snapshot"
-            ),
-            Err(error) => tracing::warn!(
-                workspace = %self.workspace_root.display(),
-                %error,
-                "Watcher graph persistence worker failed"
-            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                self.watcher_health.mark_degraded(
+                    format!("graph persistence failed: {error}"),
+                    DEFAULT_POLL_INTERVAL.as_secs(),
+                );
+                self.indexing.store(false, Ordering::Relaxed);
+                tracing::error!(%error, "Watcher retained previous published generation after failed commit");
+                return false;
+            }
+            Err(error) => {
+                self.watcher_health.mark_degraded(
+                    format!("graph persistence worker failed: {error}"),
+                    DEFAULT_POLL_INTERVAL.as_secs(),
+                );
+                self.indexing.store(false, Ordering::Relaxed);
+                tracing::error!(%error, "Watcher retained previous published generation after failed persistence worker");
+                return false;
+            }
         }
 
         let mut engine = self.query_engine.lock().await;
@@ -682,11 +1079,11 @@ impl FileWatcher {
 
         let Some(vector_index) = self.vector_index.as_ref() else {
             self.finish_indexing(target_epoch).await;
-            return;
+            return true;
         };
         let Some(embedding_engine) = self.embedding_engine.get() else {
             self.finish_indexing(target_epoch).await;
-            return;
+            return true;
         };
 
         // Move CPU-intensive embedding work onto the blocking thread pool so the
@@ -699,7 +1096,10 @@ impl FileWatcher {
         let index_for_sync = Arc::clone(vector_index);
 
         let sync_started = std::time::Instant::now();
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
         let sync_result = tokio::task::spawn_blocking(move || {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
             crate::vector_sync::sync_changed_files_embeddings(
                 &graph_for_sync,
                 &files_for_sync,
@@ -739,6 +1139,7 @@ impl FileWatcher {
         }
 
         self.finish_indexing(target_epoch).await;
+        true
     }
 
     async fn finish_indexing(&self, target_epoch: Option<u64>) {
@@ -747,6 +1148,12 @@ impl FileWatcher {
             repo_state.mark_published_epoch(epoch);
         }
         self.indexing.store(false, Ordering::Relaxed);
+    }
+}
+
+fn signal_registration(registration: &mut Option<oneshot::Sender<()>>) {
+    if let Some(registration) = registration.take() {
+        let _ = registration.send(());
     }
 }
 
@@ -772,23 +1179,22 @@ fn prepare_change_batch(
         // Callers pass only paths classified as Source. Keep this guard as a
         // boundary check so a future caller cannot accidentally parse Git
         // metadata into the graph.
-        if !lattice_core::watcher::should_index_file(&rel_path) {
+        if !lattice_core::security::workspace::allows_source_path(workspace_root, relative) {
             continue;
         }
         let graph_path = repo_name
             .map(|repo| repo_rel_path(repo, &rel_path))
             .unwrap_or_else(|| rel_path.clone());
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => upserts.push((rel_path, content)),
-                Err(error) => tracing::warn!(
-                    file = %path.display(),
-                    %error,
-                    "Watcher could not read changed file"
-                ),
+        match lattice_core::security::workspace::read_source(workspace_root, relative) {
+            Ok(content) => upserts.push((rel_path, content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removals.push(rel_path);
             }
-        } else {
-            removals.push(rel_path);
+            Err(error) => tracing::warn!(
+                file = %path.display(),
+                %error,
+                "Watcher could not read changed file"
+            ),
         }
         changed_graph_files.push(graph_path);
     }
@@ -803,6 +1209,20 @@ fn prepare_change_batch(
 struct PollFileState {
     modified_ns: u128,
     size_bytes: u64,
+}
+
+fn poll_file_state(path: &Path) -> Option<PollFileState> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Some(PollFileState {
+        modified_ns,
+        size_bytes: metadata.len(),
+    })
 }
 
 fn poll_interval() -> Duration {
@@ -820,8 +1240,7 @@ fn classify_path(
     path: &Path,
 ) -> PathClassification {
     if let Ok(relative) = path.strip_prefix(workspace_root) {
-        let rel = relative.to_string_lossy().replace('\\', "/");
-        if lattice_core::watcher::should_index_file(&rel) {
+        if lattice_core::security::workspace::allows_source_path(workspace_root, relative) {
             return PathClassification::Source;
         }
     }
@@ -989,7 +1408,6 @@ mod tests {
     use super::*;
     use git2::{Repository, Signature, WorktreeAddOptions};
     use lattice_core::graph::CodeGraph;
-    use lattice_core::memory::MemoryStore;
 
     #[tokio::test]
     async fn forced_watch_failure_enters_degraded_polling_mode() {
@@ -1116,6 +1534,30 @@ mod tests {
             .changed_graph_files
             .iter()
             .any(|path| path.ends_with("native.cpp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_classification_and_reads_honor_nested_ignore_files() {
+        let root = unique_test_root("watch-nested-ignore");
+        std::fs::create_dir_all(root.join("src")).expect("create source directory");
+        std::fs::write(root.join("src/.gitignore"), "ignored.rs\n").expect("write ignore");
+        let ignored = root.join("src/ignored.rs");
+        let visible = root.join("src/visible.rs");
+        std::fs::write(&ignored, "fn ignored() {}").expect("write ignored source");
+        std::fs::write(&visible, "fn visible() {}").expect("write visible source");
+
+        assert_eq!(
+            classify_path(&root, None, &ignored),
+            PathClassification::OutsideWorkspace
+        );
+        assert_eq!(
+            classify_path(&root, None, &visible),
+            PathClassification::Source
+        );
+        let batch = prepare_change_batch(&root, None, vec![ignored, visible]);
+        assert_eq!(batch.upserts.len(), 1);
+        assert_eq!(batch.upserts[0].0, "src/visible.rs");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1630,14 +2072,7 @@ mod tests {
 
     fn test_watcher_with_repo(root: PathBuf, repo_name: Option<String>) -> TestWatcher {
         let graph = Arc::new(CodeGraph::new());
-        let memory_store = Arc::new(std::sync::Mutex::new(
-            MemoryStore::open_in_memory().expect("memory store"),
-        ));
-        let engine = Arc::new(Mutex::new(QueryEngine::new_shared(
-            graph,
-            None,
-            Some(memory_store),
-        )));
+        let engine = Arc::new(Mutex::new(QueryEngine::new_shared(graph, None)));
         let indexer = Arc::new(Mutex::new(Indexer::new(root.clone())));
         let graph_store = Arc::new(Mutex::new(
             GraphStore::open_in_memory().expect("graph store"),
@@ -1680,5 +2115,76 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create test root");
         path
+    }
+}
+
+#[cfg(test)]
+#[path = "watcher_bootstrap_tests.rs"]
+mod watcher_bootstrap_tests;
+
+#[cfg(test)]
+mod native_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_releases_callback_blocked_on_full_event_queue() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Ok(Event::new(notify::EventKind::Any)))
+            .unwrap();
+        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let native = NativeWatchReceiver {
+            receiver,
+            _watcher: watcher,
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let callback = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = sender.blocking_send(Ok(Event::new(notify::EventKind::Any)));
+            finished_tx.send(result.is_err()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(native);
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        callback.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_wrapper_retains_work_and_index_permits_until_blocking_worker_exits() {
+        let tracker = Arc::new(RuntimeWorkTracker::default());
+        let coordinator = IndexWorkCoordinator::new(1);
+        let permit = Arc::new(
+            coordinator
+                .acquire("shutdown-fixture", "test")
+                .await
+                .unwrap(),
+        );
+        let guard = tracker.begin();
+        let child_permit = Arc::clone(&permit);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let (_guard, _permit) = (guard, child_permit);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(permit);
+        worker.abort();
+
+        assert!(coordinator.workspace_is_busy("shutdown-fixture"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), tracker.wait_idle())
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_idle())
+            .await
+            .expect("blocking worker completed");
+        assert!(!coordinator.workspace_is_busy("shutdown-fixture"));
     }
 }

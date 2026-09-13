@@ -256,7 +256,7 @@ fn build_expand_seed(graph: &CodeGraph) -> ExpandContextSeed {
 }
 
 fn context_capsule(graph: &CodeGraph, query: &str) -> ContextCapsule {
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     engine.query(query, None, false)
 }
 

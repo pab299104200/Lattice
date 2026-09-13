@@ -1,13 +1,16 @@
+pub mod workspace;
+
 #[cfg(test)]
 mod tests;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Manages file exclusions from `.gitignore`, `.lattice_ignore`, `.latticeignore`,
 /// and default patterns.
 pub struct SecurityFilter {
     gitignore: Option<Gitignore>,
+    root: PathBuf,
     default_patterns: Vec<String>,
     excluded_dirs: Vec<String>,
 }
@@ -18,7 +21,7 @@ impl SecurityFilter {
 
         // Load .gitignore if it exists
         let gitignore_path = workspace_root.join(".gitignore");
-        if gitignore_path.exists() {
+        if std::fs::symlink_metadata(&gitignore_path).is_ok_and(|m| m.is_file()) {
             builder.add(&gitignore_path);
         }
 
@@ -28,7 +31,7 @@ impl SecurityFilter {
             workspace_root.join(".lattice_ignore"),
             workspace_root.join(".latticeignore"),
         ] {
-            if path.exists() {
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
                 builder.add(&path);
             }
         }
@@ -75,8 +78,6 @@ impl SecurityFilter {
             ".pytest_cache",
             ".ruff_cache",
             "worktrees",
-            "lib",
-            "lib64",
             ".eggs",
             "vendor",
             "third_party",
@@ -90,6 +91,7 @@ impl SecurityFilter {
         .collect();
 
         Self {
+            root: workspace_root.to_path_buf(),
             gitignore,
             default_patterns,
             excluded_dirs,
@@ -105,10 +107,55 @@ impl SecurityFilter {
     /// Combines `.gitignore`, `.lattice_ignore`, `.latticeignore`, excluded dirs,
     /// and default security patterns.
     pub fn is_excluded(&self, rel_path: &str) -> bool {
+        let mut ignored = false;
         // Check .gitignore + Lattice ignore files.
         if let Some(gi) = &self.gitignore {
-            if gi.matched(rel_path, false).is_ignore() {
+            ignored = gi.matched_path_or_any_parents(rel_path, false).is_ignore();
+        }
+
+        // Apply each ancestor's local ignore rules. This also covers direct
+        // watcher and verification reads that do not go through a walker.
+        let relative = Path::new(rel_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return true;
+        }
+        let mut ancestors = relative.ancestors().skip(1).collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            let directory = self.root.join(ancestor);
+            if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_symlink()) {
                 return true;
+            }
+            let mut builder = GitignoreBuilder::new(&directory);
+            for name in [".gitignore", ".lattice_ignore", ".latticeignore"] {
+                let path = directory.join(name);
+                if std::fs::symlink_metadata(&path)
+                    .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+                {
+                    builder.add(path);
+                }
+            }
+            if let Ok(rules) = builder.build() {
+                let nested_relative = self
+                    .root
+                    .join(relative)
+                    .strip_prefix(&directory)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| relative.to_path_buf());
+                let matched = rules.matched_path_or_any_parents(nested_relative, false);
+                if matched.is_ignore() {
+                    ignored = true;
+                }
+                if matched.is_whitelist() {
+                    ignored = false;
+                }
             }
         }
 
@@ -134,7 +181,7 @@ impl SecurityFilter {
             }
         }
 
-        false
+        ignored
     }
 
     /// Redact sensitive content patterns from source code.

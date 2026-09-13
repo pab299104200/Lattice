@@ -18,7 +18,7 @@ use crate::events::{Bootstrap, BootstrapError, EventPayload, EventQueryError, Sn
 
 use super::support::{
     capture_logs, event_envelope, event_envelope_with_refs, missing_memory_ref, missing_symbol_ref,
-    overwrite_snapshot_version, sample_graph, sample_memory_store, HardeningFixture,
+    overwrite_snapshot_version, sample_graph, HardeningFixture,
 };
 
 #[test]
@@ -108,8 +108,7 @@ fn test_invalid_stable_reference_emits_dangling_reference_signal() {
         .append(event_envelope("task-dangling-ref", "session-a", "seed"))
         .expect("seed event appends");
     let snapshot_path = fixture.snapshot_path("snapshot-1-1.bin");
-    Snapshot::write(&snapshot_path, &sample_graph(), &sample_memory_store(), 1)
-        .expect("snapshot writes");
+    Snapshot::write(&snapshot_path, &sample_graph(), 1).expect("snapshot writes");
     fixture
         .writer(4096)
         .append(event_envelope_with_refs(
@@ -166,16 +165,15 @@ fn test_snapshot_version_mismatch_refuses_bootstrap_with_clear_error() {
         .append(event_envelope("task-version", "session-a", "seed"))
         .expect("event appends");
     let snapshot_path = fixture.snapshot_path("snapshot-1-1.bin");
-    Snapshot::write(&snapshot_path, &sample_graph(), &sample_memory_store(), 1)
-        .expect("snapshot writes");
-    overwrite_snapshot_version(&snapshot_path, 2);
+    Snapshot::write(&snapshot_path, &sample_graph(), 1).expect("snapshot writes");
+    overwrite_snapshot_version(&snapshot_path, 3);
 
     let (result, logs) = capture_logs(|| Bootstrap::load(&snapshot_path, &fixture.reopen_store()));
     let error = result.expect_err("snapshot version mismatch rejects bootstrap");
 
     assert!(matches!(
         error,
-        BootstrapError::FormatVersionUnsupported { found: 2, max: 1 }
+        BootstrapError::FormatVersionUnsupported { found: 3, max: 2 }
     ));
     assert!(logs.contains("snapshot format too new"));
 }

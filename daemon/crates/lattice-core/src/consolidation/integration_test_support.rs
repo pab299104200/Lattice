@@ -45,7 +45,7 @@ impl ConsolidationHarness {
         let event_store = Arc::new(EventStore::open_in_memory().expect("event store opens"));
         let memory_db = dir.path().join("memory.sqlite");
         Self {
-            consolidation_db: dir.path().join("consolidation.sqlite"),
+            consolidation_db: memory_db.clone(),
             memory_store: MemoryStore::open(&memory_db).expect("memory store opens"),
             memory_db,
             event_reader: EventReader::new(event_store.clone()),
@@ -78,6 +78,11 @@ impl ConsolidationHarness {
             runtime: &mut runtime,
             memory_store: &self.memory_store,
             event_writer: &self.event_writer,
+            authority: &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
         };
         EpisodeSummaryJob::run(&ctx, &mut services, slice)
     }
@@ -103,7 +108,13 @@ impl ConsolidationHarness {
     pub(crate) fn run_supersession_scan(&self) -> String {
         let mut runtime = self.runtime(32);
         let mut scanner = SupersessionCandidates::new(&self.memory_store, &mut runtime);
-        scanner.scan("workspace-main").expect("scan succeeds");
+        scanner
+            .scan(&EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            })
+            .expect("scan succeeds");
         self.only_proposal_id()
     }
 
@@ -115,22 +126,53 @@ impl ConsolidationHarness {
                 &self.memory_store,
                 &self.event_writer,
                 &self.operator("auto-policy"),
+                &EvolutionAuthority {
+                    repository_id: "workspace-main",
+                    checkout_id: "checkout-main",
+                    branch: "main",
+                },
             )
             .expect("job executes");
         self.only_proposal_id()
     }
 
     pub(crate) fn apply_proposal(&self, proposal_id: &str) -> ApplyOutcome {
-        let conn = self.conn();
-        self.load_proposal(proposal_id)
-            .apply(
-                &conn,
-                &self.memory_store,
-                &self.event_writer,
-                "operator",
-                None,
-            )
-            .expect("proposal applies")
+        let proposal = self.load_proposal(proposal_id);
+        let repository_id = proposal.evidence["repository_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let checkout_id = proposal.evidence["checkout_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let branch = proposal.evidence["branch"].as_str().unwrap().to_string();
+        let authority = EvolutionAuthority {
+            repository_id: &repository_id,
+            checkout_id: &checkout_id,
+            branch: &branch,
+        };
+        let outcome = self
+            .memory_store
+            .with_connection(|conn| {
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| crate::LatticeError::Storage(e.to_string()))?;
+                let outcome = proposal.apply_transactional(
+                    &tx,
+                    &self.memory_store,
+                    &authority,
+                    "operator",
+                    None,
+                )?;
+                tx.commit()
+                    .map_err(|e| crate::LatticeError::Storage(e.to_string()))?;
+                Ok(outcome)
+            })
+            .expect("proposal applies");
+        super::drain_event_outbox(&self.memory_store, &self.event_writer, 64)
+            .expect("event drains");
+        outcome
     }
 
     pub(crate) fn reverse_proposal(&self, proposal_id: &str) -> ReverseOutcome {
@@ -140,20 +182,27 @@ impl ConsolidationHarness {
             .expect("reverse succeeds")
     }
 
+    pub(crate) fn reverse_proposal_result(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ReverseOutcome, super::ReverseError> {
+        let conn = self.conn();
+        self.replay_driver(&conn).reverse(proposal_id)
+    }
+
     pub(crate) fn replay_driver_with_cache<'a>(
         &'a self,
         cache: HashMap<[u8; 32], Vec<u8>>,
         driver: &'a dyn LlmDriver,
     ) -> ReplayDriver<'a> {
-        let conn = Box::leak(Box::new(self.conn()));
         ReplayDriver::new(
             &self.event_reader,
             self.event_store.clone(),
-            conn,
             &self.memory_store,
             &self.event_writer,
             &self.clock,
         )
+        .expect("replay scratch initializes")
         .with_cached_responses(cache)
         .with_live_llm_driver(driver)
     }
@@ -191,7 +240,16 @@ impl ConsolidationHarness {
         for job in jobs {
             runtime.submit(job).expect("job submits");
         }
-        runtime.run_due().expect("jobs run");
+        runtime
+            .run_due(
+                &self.memory_store,
+                &EvolutionAuthority {
+                    repository_id: "workspace-main",
+                    checkout_id: "checkout-main",
+                    branch: "main",
+                },
+            )
+            .expect("jobs run");
         apply_pending(
             runtime,
             &self.memory_store,
@@ -215,7 +273,16 @@ impl ConsolidationHarness {
         for job in [refresh_job, update_job, supersede_job] {
             let mut runtime = self.runtime(64);
             runtime.submit(job).expect("job submits");
-            runtime.run_due().expect("job runs");
+            runtime
+                .run_due(
+                    &self.memory_store,
+                    &EvolutionAuthority {
+                        repository_id: "workspace-main",
+                        checkout_id: "checkout-main",
+                        branch: "main",
+                    },
+                )
+                .expect("job runs");
             apply_pending(
                 runtime,
                 &self.memory_store,
@@ -398,19 +465,23 @@ impl ConsolidationHarness {
         state_hash_from_json(&Value::Array(payload)).expect("hash computes")
     }
 
+    pub(crate) fn memories(&self) -> Vec<Memory> {
+        self.memory_store.list_all().expect("memories list")
+    }
+
     fn conn(&self) -> Connection {
         Connection::open(&self.consolidation_db).expect("db opens")
     }
 
-    fn replay_driver<'a>(&'a self, conn: &'a Connection) -> ReplayDriver<'a> {
+    fn replay_driver<'a>(&'a self, _conn: &'a Connection) -> ReplayDriver<'a> {
         ReplayDriver::new(
             &self.event_reader,
             self.event_store.clone(),
-            conn,
             &self.memory_store,
             &self.event_writer,
             &self.clock,
         )
+        .expect("replay scratch initializes")
     }
 
     fn capture_state(&self, memory_id: &str) -> ConsolidationMemoryState {
@@ -687,6 +758,7 @@ fn apply_pending(
                 memory_store,
                 event_writer,
                 "operator",
+                &test_authority(),
             )
             .expect("decision succeeds");
         assert!(outcome.is_some(), "proposal {proposal_id} did not apply");
@@ -710,7 +782,7 @@ fn create_job(
             proposal_kind: ProposalKind::CreateMemory,
             prior_state: empty_state(),
             proposed_state: encode_memory_state(&state),
-            evidence: json!({ "source_memory_ids": [state.memory.id.clone()] }),
+            evidence: json!({ "source_memory_ids": [] }),
             provenance,
         }),
     }
@@ -794,22 +866,20 @@ fn supersede_job(
     let mut proposed = prior.clone();
     proposed.structured_fields.verification_status = MemoryVerificationStatus::Superseded;
     proposed.structured_fields.superseded_by_memory_id = Some(newer.memory.id.clone());
-    proposed.memory_links.push(MemoryLinkRecord {
-        link_id: format!("supersession:{}:{}", prior.memory.id, newer.memory.id),
-        source_memory_id: prior.memory.id.clone(),
-        target_memory_id: newer.memory.id.clone(),
-        link_type: "supersedes".to_string(),
-        reason: "integration test".to_string(),
-        created_at: newer.memory.created_at,
-        verification_status: "verified".to_string(),
-    });
-    direct_existing_job(
+    let mut job = direct_existing_job(
         job_id,
         proposal_id,
         ProposalKind::Supersede,
         prior,
         &proposed,
+    );
+    let pending = job.proposal.as_mut().expect("proposal exists");
+    pending.evidence["superseded_by_memory_id"] = json!(newer.memory.id);
+    pending.evidence["replacement_state_hash"] = json!(super::proposal::state_hash_from_json(
+        &encode_memory_state(newer)
     )
+    .expect("replacement state hashes"));
+    job
 }
 
 fn direct_existing_job(

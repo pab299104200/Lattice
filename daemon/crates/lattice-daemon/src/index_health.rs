@@ -1,15 +1,15 @@
-use lattice_core::indexer::{BatchIndexReport, IndexFailureKind};
+use lattice_core::indexer::BatchIndexReport;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-/// The bounded, user-visible truth about files that could not be parsed into
-/// the currently published shard.  It is intentionally independent from
-/// watcher availability: a healthy watcher can still leave an incomplete
-/// graph when a source file does not parse.
+/// The bounded, user-visible truth about files that could not be traversed,
+/// read, or parsed into the currently published shard. It is intentionally
+/// independent from watcher availability.
 #[derive(Debug, Default)]
 pub(crate) struct IndexHealth {
     failed_files: Mutex<BTreeSet<String>>,
+    resource_limited: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -17,6 +17,7 @@ pub(crate) struct IndexHealthSnapshot {
     pub(crate) is_partial: bool,
     pub(crate) parse_failures: usize,
     pub(crate) failed_files: Vec<String>,
+    pub(crate) resource_limited: Option<String>,
 }
 
 impl IndexHealth {
@@ -26,12 +27,21 @@ impl IndexHealth {
         let Ok(mut failed_files) = self.failed_files.lock() else {
             return;
         };
-        *failed_files = parse_failure_files(report).collect();
+        *failed_files = failed_file_paths(report).collect();
+        if let Ok(mut limited) = self.resource_limited.lock() {
+            *limited = None;
+        }
+    }
+
+    pub(crate) fn mark_resource_limited(&self, reason: String) {
+        if let Ok(mut limited) = self.resource_limited.lock() {
+            *limited = Some(reason);
+        }
     }
 
     /// Merge a watcher batch into existing state. A successful reparse and a
-    /// deletion both resolve a prior parse failure; a new parse failure adds
-    /// the affected file. This preserves failures from untouched files.
+    /// deletion both resolve a prior failure; a new failure adds the affected
+    /// file. This preserves failures from untouched files.
     pub(crate) fn merge_change_report(&self, report: &BatchIndexReport) {
         let Ok(mut failed_files) = self.failed_files.lock() else {
             return;
@@ -43,7 +53,7 @@ impl IndexHealth {
         {
             failed_files.remove(file);
         }
-        failed_files.extend(parse_failure_files(report));
+        failed_files.extend(failed_file_paths(report));
     }
 
     pub(crate) fn snapshot(&self, failed_file_limit: usize) -> IndexHealthSnapshot {
@@ -57,18 +67,22 @@ impl IndexHealth {
                 )
             })
             .unwrap_or_default();
+        let resource_limited = self
+            .resource_limited
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone());
         IndexHealthSnapshot {
-            is_partial: parse_failures > 0,
+            is_partial: parse_failures > 0 || resource_limited.is_some(),
             parse_failures,
             failed_files,
+            resource_limited,
         }
     }
 }
 
-fn parse_failure_files(report: &BatchIndexReport) -> impl Iterator<Item = String> + '_ {
-    report.failures.iter().filter_map(|failure| {
-        (failure.kind == IndexFailureKind::ParseError).then(|| failure.file.clone())
-    })
+fn failed_file_paths(report: &BatchIndexReport) -> impl Iterator<Item = String> + '_ {
+    report.failures.iter().map(|failure| failure.file.clone())
 }
 
 #[cfg(test)]
@@ -110,6 +124,7 @@ mod tests {
                 is_partial: true,
                 parse_failures: 1,
                 failed_files: vec!["m.rs".to_string()],
+                resource_limited: None,
             }
         );
     }

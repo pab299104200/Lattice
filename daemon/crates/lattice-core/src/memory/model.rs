@@ -211,6 +211,46 @@ pub enum MemoryVerificationStatus {
     Invalidated,
 }
 
+/// Whether the references supporting a memory still resolve in the current
+/// checkout. This is deliberately independent from whether the claim was
+/// behaviorally demonstrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshnessStatus {
+    Unknown,
+    Fresh,
+    Stale,
+    Invalidated,
+}
+
+/// Result of an observed behavioral check. A test file merely existing leaves
+/// this value unverified; only a recorded result bound to the current revision
+/// or graph generation can set it to passed or failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BehavioralValidationStatus {
+    NotRequired,
+    Unverified,
+    Passed,
+    Failed,
+}
+
+/// Daemon-observed validation supplied to the verifier by a trusted runtime.
+/// `command` is intentionally absent: verification consumes results and never
+/// executes commands recovered from memory content. Repository and checkout
+/// authority are mandatory, and consumers require both revision and graph
+/// generation so a clean-commit identity cannot certify different dirty bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehavioralValidationRecord {
+    pub repository_id: String,
+    pub checkout_id: String,
+    pub evidence_reference: String,
+    pub status: BehavioralValidationStatus,
+    pub revision: Option<String>,
+    pub graph_generation: Option<u64>,
+    pub observed_at: u64,
+}
+
 impl MemoryVerificationStatus {
     pub fn as_str(&self) -> &str {
         match self {

@@ -4,17 +4,99 @@ use crate::storage::vector_store::{
     cosine_similarity, decode_vector_name_scope, encode_vector_name_for_scope, StoredVectorRecord,
     VectorStore,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, MutexGuard,
+};
 use tracing::{info, warn};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const ANN_OVERSAMPLE_FACTOR: usize = 4;
+const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
+static MANAGED_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REPLACE: std::cell::RefCell<Option<Box<dyn FnOnce(&super::SecureDir, &str) -> std::io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn read_managed(
+    directory: &super::SecureDir,
+    leaf: &str,
+    limit: u64,
+) -> Result<Vec<u8>, LatticeError> {
+    let file = directory
+        .open_file(leaf, false)
+        .map_err(|e| LatticeError::Storage(e.to_string()))?;
+    if file
+        .metadata()
+        .map_err(|e| LatticeError::Storage(e.to_string()))?
+        .len()
+        > limit
+    {
+        return Err(LatticeError::Storage(format!(
+            "USearch {leaf} exceeds {limit}-byte read limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| LatticeError::Storage(e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(LatticeError::Storage(format!(
+            "USearch {leaf} grew beyond {limit}-byte read limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn replace_managed(
+    directory: &super::SecureDir,
+    leaf: &str,
+    bytes: &[u8],
+) -> Result<(), LatticeError> {
+    let sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = format!(".{leaf}.{}.{sequence}.tmp", std::process::id());
+    let mut file = directory
+        .open_new_file(&temp)
+        .map_err(|e| LatticeError::Storage(e.to_string()))?;
+    let source =
+        super::SecureDir::file_identity(&file).map_err(|e| LatticeError::Storage(e.to_string()))?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        BEFORE_REPLACE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(directory, &temp)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
+        let destination = directory.metadata(leaf)?.map(|entry| entry.identity);
+        directory.replace_from(&temp, directory, leaf, source, destination)?;
+        directory.sync()
+    })();
+    if let Err(error) = result {
+        if let Err(cleanup_error) = directory.remove_file(&temp, source) {
+            if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                warn!(stage = %temp, %cleanup_error, "USearch staging cleanup failed; preserving unproven entry");
+            }
+        }
+        return Err(LatticeError::Storage(format!(
+            "Publish USearch {leaf}: {error}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UsearchDiskMetadata {
+    index_sha256: String,
     generation: u64,
     dimension: usize,
 }
@@ -33,9 +115,41 @@ pub struct UsearchVectorIndex {
     index_path: PathBuf,
     metadata_path: PathBuf,
     state: Mutex<UsearchState>,
+    publication: Option<(
+        super::cache_publication::CachePublicationAuthority,
+        String,
+        String,
+    )>,
+    publication_error: Option<String>,
 }
 
 impl UsearchVectorIndex {
+    fn remove_persisted_files(&self) -> Result<(), LatticeError> {
+        if let Some(error) = &self.publication_error {
+            return Err(LatticeError::Storage(format!(
+                "Cannot access managed USearch persistence: {error}"
+            )));
+        }
+        if let Some((authority, index_leaf, metadata_leaf)) = &self.publication {
+            let directory = authority
+                .cache_dir()
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            for leaf in [index_leaf, metadata_leaf] {
+                if let Some(meta) = directory
+                    .metadata(leaf)
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?
+                {
+                    directory
+                        .remove_file(leaf, meta.identity)
+                        .map_err(|e| LatticeError::Storage(e.to_string()))?;
+                }
+            }
+        } else {
+            let _ = fs::remove_file(&self.index_path);
+            let _ = fs::remove_file(&self.metadata_path);
+        }
+        Ok(())
+    }
     pub fn open(sqlite_path: &str, index_path: PathBuf) -> Result<Self, LatticeError> {
         let store = VectorStore::open(sqlite_path)?;
         Ok(Self::from_store(store, index_path))
@@ -43,6 +157,19 @@ impl UsearchVectorIndex {
 
     pub fn from_store(store: VectorStore, index_path: PathBuf) -> Self {
         let metadata_path = metadata_path_for(&index_path);
+        let (publication, publication_error) =
+            match super::cache_publication::CachePublicationAuthority::for_path(&index_path) {
+                Ok(Some((authority, leaf))) => {
+                    let metadata_leaf = metadata_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("vectors.usearch.meta.json")
+                        .to_owned();
+                    (Some((authority, leaf, metadata_leaf)), None)
+                }
+                Ok(None) => (None, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
         Self {
             store,
             index_path,
@@ -53,6 +180,8 @@ impl UsearchVectorIndex {
                 key_map: HashMap::new(),
                 dirty: false,
             }),
+            publication,
+            publication_error,
         }
     }
 
@@ -109,41 +238,92 @@ impl UsearchVectorIndex {
         dimension: usize,
         generation: u64,
     ) -> Result<bool, LatticeError> {
+        if let Some(error) = &self.publication_error {
+            return Err(LatticeError::Storage(format!(
+                "Cannot access managed USearch persistence: {error}"
+            )));
+        }
+        if let Some((authority, index_leaf, metadata_leaf)) = &self.publication {
+            let directory = authority
+                .cache_dir()
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            let (Some(_), Some(_)) = (
+                directory
+                    .metadata(index_leaf)
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?,
+                directory
+                    .metadata(metadata_leaf)
+                    .map_err(|e| LatticeError::Storage(e.to_string()))?,
+            ) else {
+                return Ok(false);
+            };
+            let metadata_bytes = read_managed(&directory, metadata_leaf, MAX_METADATA_BYTES)?;
+            let metadata: UsearchDiskMetadata = match serde_json::from_slice(&metadata_bytes) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(%error, "Invalid USearch metadata; rebuilding from committed vectors");
+                    return Ok(false);
+                }
+            };
+            if metadata.generation != generation || metadata.dimension != dimension {
+                return Ok(false);
+            }
+            let index = new_usearch_index(dimension)?;
+            let bytes = read_managed(&directory, index_leaf, MAX_INDEX_BYTES)?;
+            if format!("{:x}", Sha256::digest(&bytes)) != metadata.index_sha256 {
+                warn!("USearch index/metadata digest mismatch; rebuilding from committed vectors");
+                return Ok(false);
+            }
+            if let Err(error) = index.load_from_buffer(&bytes) {
+                warn!(%error, "Invalid USearch index; rebuilding from committed vectors");
+                return Ok(false);
+            }
+            return self.install_loaded_index(index, dimension);
+        }
         if !self.index_path.exists() || !self.metadata_path.exists() {
             return Ok(false);
         }
 
-        let metadata: UsearchDiskMetadata =
-            serde_json::from_slice(&fs::read(&self.metadata_path).map_err(|e| {
-                LatticeError::Storage(format!(
-                    "Failed to read USearch metadata '{}': {}",
-                    self.metadata_path.display(),
-                    e
-                ))
-            })?)
-            .map_err(|e| {
-                LatticeError::Storage(format!(
-                    "Failed to parse USearch metadata '{}': {}",
-                    self.metadata_path.display(),
-                    e
-                ))
-            })?;
-
+        let directory = super::SecureDir::open(self.index_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|error| LatticeError::Storage(error.to_string()))?;
+        let metadata_leaf = self
+            .metadata_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| LatticeError::Storage("Invalid USearch metadata filename".into()))?;
+        let metadata: UsearchDiskMetadata = match serde_json::from_slice(&read_managed(
+            &directory,
+            metadata_leaf,
+            MAX_METADATA_BYTES,
+        )?) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(%error, "Invalid USearch metadata; rebuilding from committed vectors");
+                return Ok(false);
+            }
+        };
         if metadata.generation != generation || metadata.dimension != dimension {
             return Ok(false);
         }
-
+        let index_leaf = self
+            .index_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| LatticeError::Storage("Invalid USearch index filename".into()))?;
+        let bytes = read_managed(&directory, index_leaf, MAX_INDEX_BYTES)?;
+        if format!("{:x}", Sha256::digest(&bytes)) != metadata.index_sha256 {
+            return Ok(false);
+        }
         let index = new_usearch_index(dimension)?;
-        index
-            .load(self.index_path.to_string_lossy().as_ref())
-            .map_err(|e| {
-                LatticeError::Storage(format!(
-                    "Failed to load USearch index '{}': {}",
-                    self.index_path.display(),
-                    e
-                ))
-            })?;
+        if let Err(error) = index.load_from_buffer(&bytes) {
+            warn!(%error, "Invalid USearch index; rebuilding from committed vectors");
+            return Ok(false);
+        }
 
+        self.install_loaded_index(index, dimension)
+    }
+
+    fn install_loaded_index(&self, index: Index, dimension: usize) -> Result<bool, LatticeError> {
         let records = self.store.load_all_records()?;
         if index.size() != records.len() {
             return Ok(false);
@@ -192,6 +372,16 @@ impl UsearchVectorIndex {
 }
 
 impl VectorIndex for UsearchVectorIndex {
+    fn begin_publication(
+        &self,
+    ) -> Result<Box<dyn super::vector_index::VectorPublicationLease + '_>, LatticeError> {
+        self.store.begin_publication()
+    }
+    fn bind_embedding_identity(&self, identity: &str) -> Result<(), LatticeError> {
+        self.store.bind_embedding_identity(identity)?;
+        self.warm()
+    }
+
     fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
         self.store.initialize(dimension)?;
         let mut state = self.lock_state("initialize USearch index")?;
@@ -213,8 +403,7 @@ impl VectorIndex for UsearchVectorIndex {
             state.index = Some(new_usearch_index(dimension)?);
             state.key_map.clear();
             state.dirty = false;
-            let _ = fs::remove_file(&self.index_path);
-            let _ = fs::remove_file(&self.metadata_path);
+            self.remove_persisted_files()?;
             return Ok(());
         }
 
@@ -428,12 +617,21 @@ impl VectorIndex for UsearchVectorIndex {
         if !state.dirty {
             return Ok(());
         }
+        if let Some(error) = &self.publication_error {
+            return Err(LatticeError::Storage(format!(
+                "Cannot publish managed USearch persistence: {error}"
+            )));
+        }
+        let _accounting = if self.store.publication_active() {
+            None
+        } else {
+            super::CachePublicationGuard::for_path(&self.index_path)?
+        };
 
         if state.key_map.is_empty() {
             let index_bytes_before = file_size_bytes(&self.index_path);
             let metadata_bytes_before = file_size_bytes(&self.metadata_path);
-            let _ = fs::remove_file(&self.index_path);
-            let _ = fs::remove_file(&self.metadata_path);
+            self.remove_persisted_files()?;
             state.dirty = false;
             info!(
                 implementation = self.implementation_name(),
@@ -464,7 +662,11 @@ impl VectorIndex for UsearchVectorIndex {
         let index_bytes_before = file_size_bytes(&self.index_path);
         let metadata_bytes_before = file_size_bytes(&self.metadata_path);
 
-        if let Some(parent) = self.index_path.parent() {
+        if let Some(parent) = self
+            .index_path
+            .parent()
+            .filter(|_| self.publication.is_none())
+        {
             fs::create_dir_all(parent).map_err(|e| {
                 LatticeError::Storage(format!(
                     "Failed to create USearch directory '{}': {}",
@@ -474,33 +676,43 @@ impl VectorIndex for UsearchVectorIndex {
             })?;
         }
 
-        index
-            .save(self.index_path.to_string_lossy().as_ref())
-            .map_err(|e| {
-                LatticeError::Storage(format!(
-                    "Failed to save USearch index '{}': {}",
-                    self.index_path.display(),
-                    e
-                ))
-            })?;
-
+        if index.serialized_length() as u64 > MAX_INDEX_BYTES {
+            return Err(LatticeError::Storage(format!(
+                "USearch index exceeds {MAX_INDEX_BYTES}-byte publication limit"
+            )));
+        }
+        let mut index_bytes = vec![0; index.serialized_length()];
+        index.save_to_buffer(&mut index_bytes).map_err(|error| {
+            LatticeError::Storage(format!("Failed to serialize USearch index: {error}"))
+        })?;
         let metadata = UsearchDiskMetadata {
+            index_sha256: format!("{:x}", Sha256::digest(&index_bytes)),
             generation,
             dimension,
         };
-        fs::write(
-            &self.metadata_path,
-            serde_json::to_vec_pretty(&metadata).map_err(|e| {
-                LatticeError::Storage(format!("Failed to serialize USearch metadata: {}", e))
-            })?,
-        )
-        .map_err(|e| {
-            LatticeError::Storage(format!(
-                "Failed to write USearch metadata '{}': {}",
-                self.metadata_path.display(),
-                e
-            ))
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|e| {
+            LatticeError::Storage(format!("Failed to serialize USearch metadata: {}", e))
         })?;
+        if let Some((authority, index_leaf, metadata_leaf)) = &self.publication {
+            let directory = authority
+                .cache_dir()
+                .map_err(|e| LatticeError::Storage(e.to_string()))?;
+            replace_managed(&directory, index_leaf, &index_bytes)?;
+            replace_managed(&directory, metadata_leaf, &metadata_bytes)?;
+        } else {
+            fs::write(&self.index_path, &index_bytes).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to save USearch index '{}': {e}",
+                    self.index_path.display()
+                ))
+            })?;
+            fs::write(&self.metadata_path, metadata_bytes).map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to write USearch metadata '{}': {e}",
+                    self.metadata_path.display()
+                ))
+            })?;
+        }
 
         let index_bytes_after = file_size_bytes(&self.index_path);
         let metadata_bytes_after = file_size_bytes(&self.metadata_path);
@@ -598,4 +810,133 @@ fn file_size_bytes(path: &Path) -> u64 {
 
 fn scope_matches(stored: VectorScope, requested: VectorScope) -> bool {
     matches!(requested, VectorScope::All) || stored == requested
+}
+
+#[cfg(test)]
+mod managed_publication_tests {
+    use super::*;
+
+    #[test]
+    fn failed_publication_cleans_owned_stage_and_preserves_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = crate::storage::SecureDir::open(root.path()).unwrap();
+        fs::write(root.path().join("vectors.usearch"), b"previous").unwrap();
+        BEFORE_REPLACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| {
+                Err(std::io::Error::other("injected publication failure"))
+            }))
+        });
+        assert!(replace_managed(&directory, "vectors.usearch", b"replacement").is_err());
+        assert_eq!(
+            fs::read(root.path().join("vectors.usearch")).unwrap(),
+            b"previous"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn interrupted_index_metadata_pair_rebuilds_from_committed_vectors() {
+        for corruption in [
+            "old_metadata",
+            "old_index",
+            "malformed_metadata",
+            "corrupt_index",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let checkout = tempfile::tempdir().unwrap();
+            let id = format!("checkout_{:064x}", 1);
+            let mut registry = crate::storage::StorageRegistry::open(root.path(), "repo").unwrap();
+            let _lease = registry
+                .register_and_lease(&id, checkout.path(), 1)
+                .unwrap();
+            let cache = root.path().join("checkouts").join(&id).join("cache");
+            let database = cache.join("vectors.db");
+            let ann = cache.join("vectors.usearch");
+            {
+                let index =
+                    UsearchVectorIndex::open(database.to_str().unwrap(), ann.clone()).unwrap();
+                index.initialize(3).unwrap();
+                index.warm().unwrap();
+                index
+                    .upsert_vector("old.rs", "old", 0, &[1.0, 0.0, 0.0])
+                    .unwrap();
+                index.flush().unwrap();
+                let old_metadata = fs::read(cache.join("vectors.usearch.meta.json")).unwrap();
+                let old_index = fs::read(&ann).unwrap();
+                index.delete_by_file("old.rs").unwrap();
+                index
+                    .upsert_vector("new.rs", "new", 0, &[0.0, 1.0, 0.0])
+                    .unwrap();
+                index.flush().unwrap();
+                match corruption {
+                    "old_metadata" => {
+                        fs::write(cache.join("vectors.usearch.meta.json"), old_metadata).unwrap()
+                    }
+                    "old_index" => fs::write(&ann, old_index).unwrap(),
+                    "malformed_metadata" => {
+                        fs::write(cache.join("vectors.usearch.meta.json"), b"invalid").unwrap()
+                    }
+                    "corrupt_index" => fs::write(&ann, b"invalid").unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            let index = UsearchVectorIndex::open(database.to_str().unwrap(), ann).unwrap();
+            index.initialize(3).unwrap();
+            index.warm().unwrap();
+            let hits = index.search(&[0.0, 1.0, 0.0], 10).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].0, "new", "{corruption}");
+        }
+    }
+
+    #[test]
+    fn oversized_managed_payload_is_rejected_before_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = crate::storage::SecureDir::open(root.path()).unwrap();
+        for (name, limit) in [
+            ("vectors.usearch", MAX_INDEX_BYTES),
+            ("vectors.usearch.meta.json", MAX_METADATA_BYTES),
+        ] {
+            directory
+                .open_new_file(name)
+                .unwrap()
+                .set_len(limit + 1)
+                .unwrap();
+            assert!(read_managed(&directory, name, limit)
+                .unwrap_err()
+                .to_string()
+                .contains("read limit"));
+        }
+    }
+
+    #[test]
+    fn replaced_staging_identity_is_preserved_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = crate::storage::SecureDir::open(root.path()).unwrap();
+        fs::write(root.path().join("vectors.usearch"), b"previous").unwrap();
+        BEFORE_REPLACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|directory, stage| {
+                let source = directory.metadata(stage)?.unwrap().identity;
+                directory.rename_to(stage, directory, "owned-original", source)?;
+                let mut foreign = directory.open_new_file(stage)?;
+                foreign.write_all(b"foreign")?;
+                Ok(())
+            }))
+        });
+        assert!(replace_managed(&directory, "vectors.usearch", b"replacement").is_err());
+        assert_eq!(
+            fs::read(root.path().join("vectors.usearch")).unwrap(),
+            b"previous"
+        );
+        let entries = directory.read_dir_page(None, 10).unwrap();
+        let stage = entries
+            .entries
+            .iter()
+            .find(|entry| entry.name.ends_with(".tmp"))
+            .unwrap();
+        assert_eq!(
+            read_managed(&directory, &stage.name, 1024).unwrap(),
+            b"foreign"
+        );
+    }
 }

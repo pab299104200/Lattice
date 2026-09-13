@@ -39,9 +39,7 @@ fn a_file_outside_the_git_window_is_still_scored_and_labelled() {
 
     assert_eq!(score.availability, FactAvailability::Degraded);
     assert!(!score.is_exact(), "a missing family must widen the band");
-    assert!(score
-        .inputs_missing
-        .contains(&FactKind::HotspotScore));
+    assert!(score.inputs_missing.contains(&FactKind::HotspotScore));
     assert!(score.inputs_missing.contains(&FactKind::BusFactor));
     assert!(!score.facts.is_empty(), "what was known is still scored");
 }

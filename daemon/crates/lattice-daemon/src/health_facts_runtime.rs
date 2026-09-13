@@ -165,6 +165,7 @@ pub(crate) struct HealthFactsRuntime {
     /// incremental refresh mutates only the changed keys instead of re-reading
     /// every row out of SQLite to rebuild the map.
     complexity: Arc<StdMutex<BTreeMap<String, FileComplexityFacts>>>,
+    runtime_work: Arc<crate::index_work::RuntimeWorkTracker>,
 }
 
 impl HealthFactsRuntime {
@@ -254,8 +255,17 @@ impl HealthFactsRuntime {
                 index_work,
                 snapshots,
                 complexity: Arc::new(StdMutex::new(complexity)),
+                runtime_work: Arc::new(crate::index_work::RuntimeWorkTracker::default()),
             },
         ))
+    }
+
+    pub(crate) fn with_runtime_work_tracker(
+        mut self,
+        runtime_work: Arc<crate::index_work::RuntimeWorkTracker>,
+    ) -> Self {
+        self.runtime_work = runtime_work;
+        self
     }
 
     /// Reads every active generation into the shape the read path consumes.
@@ -337,14 +347,15 @@ impl HealthFactsRuntime {
             return Ok(());
         }
 
-        let _permit = self
-            .index_work
-            .acquire(
-                self.workspace_root.to_string_lossy().to_string(),
-                "health_facts",
-            )
-            .await
-            .context("index work coordinator closed before health-fact production")?;
+        let permit = Arc::new(
+            self.index_work
+                .acquire(
+                    self.workspace_root.to_string_lossy().to_string(),
+                    "health_facts",
+                )
+                .await
+                .context("index work coordinator closed before health-fact production")?,
+        );
 
         // The graph is an immutable `Arc`, so the engine lock is held only long
         // enough to clone the pointer. Producing under it would block every
@@ -358,8 +369,11 @@ impl HealthFactsRuntime {
         let repository_id = self.repository_id.clone();
         let stores = Arc::clone(&self.stores);
         let complexity_cache = Arc::clone(&self.complexity);
+        let runtime_work = self.runtime_work.begin();
+        let child_permit = Arc::clone(&permit);
 
         let published = tokio::task::spawn_blocking(move || -> Result<PublishedHealthFacts> {
+            let (_runtime_work, _child_permit) = (runtime_work, child_permit);
             produce_and_publish(
                 &graph,
                 &workspace_root,
@@ -431,29 +445,23 @@ fn produce_and_publish(
         true,
     );
 
-    let complexity = refresh_complexity(
-        workspace_root,
-        changed,
-        stores,
-        complexity_cache,
-    )
-    .unwrap_or_else(|error| {
-        tracing::warn!(%error, "Complexity refresh failed; retaining the prior generation");
-        complexity_cache
-            .lock()
-            .ok()
-            .map(|cache| cache.clone())
-            .unwrap_or_default()
-    });
+    let complexity = refresh_complexity(workspace_root, changed, stores, complexity_cache)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Complexity refresh failed; retaining the prior generation");
+            complexity_cache
+                .lock()
+                .ok()
+                .map(|cache| cache.clone())
+                .unwrap_or_default()
+        });
 
     let stores = stores
         .lock()
         .map_err(|_| anyhow::anyhow!("health fact store lock was poisoned"))?;
 
-    if let Err(error) =
-        stores
-            .graph
-            .publish(repository_id, None, refreshed_at, &graph_snapshot)
+    if let Err(error) = stores
+        .graph
+        .publish(repository_id, None, refreshed_at, &graph_snapshot)
     {
         tracing::warn!(%error, "Graph-fact publication failed; retaining the prior generation");
     }
@@ -625,7 +633,7 @@ mod tests {
     }
 
     fn engine_for(graph: Arc<CodeGraph>) -> Arc<Mutex<QueryEngine>> {
-        Arc::new(Mutex::new(QueryEngine::new_shared(graph, None, None)))
+        Arc::new(Mutex::new(QueryEngine::new_shared(graph, None)))
     }
 
     /// A burst of saves must collapse into one pass while every touched path
@@ -682,11 +690,7 @@ mod tests {
         .expect("open runtime");
 
         // Nothing is published until the watcher reports a change.
-        assert!(publisher
-            .publications
-            .lock()
-            .expect("recorder")
-            .is_empty());
+        assert!(publisher.publications.lock().expect("recorder").is_empty());
 
         handle.request(["a.rs".to_string()]);
         runtime.refresh(1).await.expect("publish first generation");

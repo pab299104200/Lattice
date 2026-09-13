@@ -2,10 +2,17 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use ort::session::Session;
 use ort::value::Tensor;
+use sha2::{Digest, Sha256};
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokenizers::Tokenizer;
+
+use super::object_cache::{EmbeddingCacheStats, EmbeddingIdentity, EmbeddingObjectCache};
+
+pub const EMBEDDING_NORMALIZATION_VERSION: &str = "mean-pool-l2-v1";
+pub const EMBEDDING_PREPROCESSING_VERSION: &str = "tokenizer-json-special-tokens-v1";
 
 static PROCESS_EMBEDDING_RUNTIME: OnceLock<ProcessEmbeddingRuntime<EmbeddingEngine>> =
     OnceLock::new();
@@ -100,6 +107,7 @@ impl<T> ProcessEmbeddingRuntime<T> {
 pub struct EmbeddingEngine {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
+    identity: EmbeddingIdentity,
 }
 
 impl EmbeddingEngine {
@@ -133,9 +141,17 @@ impl EmbeddingEngine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
+        let identity = EmbeddingIdentity {
+            model_artifact_sha256: sha256_file(Path::new(model_path))?,
+            tokenizer_sha256: sha256_file(&tokenizer_path)?,
+            dimension: 384,
+            normalization_version: EMBEDDING_NORMALIZATION_VERSION.to_string(),
+            preprocessing_version: EMBEDDING_PREPROCESSING_VERSION.to_string(),
+        };
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
+            identity,
         })
     }
 
@@ -265,8 +281,135 @@ impl EmbeddingEngine {
 
     /// Returns the dimensionality of the embedding vectors (384 for all-MiniLM-L6-v2).
     pub fn dimension(&self) -> usize {
-        384
+        self.identity.dimension
     }
+
+    pub fn identity(&self) -> &EmbeddingIdentity {
+        &self.identity
+    }
+}
+
+/// Cache-aware embedding facade used by repository vector synchronization.
+/// Cache failures are returned to the caller so semantic work can degrade while
+/// the exact lexical/path index remains usable.
+pub struct CachedEmbeddingEngine {
+    engine: Arc<EmbeddingEngine>,
+    cache: EmbeddingObjectCache,
+    checkout_id: String,
+}
+
+pub trait EmbeddingProvider: Send + Sync {
+    fn storage_identity(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn publication_lease(&self) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn object_key(&self, _text: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn publish_membership(
+        &self,
+        _members: &BTreeMap<String, String>,
+        _replace: bool,
+        _remove_prefixes: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl EmbeddingProvider for EmbeddingEngine {
+    fn storage_identity(&self) -> Result<Option<String>> {
+        Ok(Some(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(self.identity())?)
+        )))
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        EmbeddingEngine::embed(self, text)
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        EmbeddingEngine::embed_batch(self, texts)
+    }
+}
+
+impl CachedEmbeddingEngine {
+    pub fn new(
+        engine: Arc<EmbeddingEngine>,
+        cache: EmbeddingObjectCache,
+        checkout_id: String,
+    ) -> Self {
+        Self {
+            engine,
+            cache,
+            checkout_id,
+        }
+    }
+
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.embed_batch(&[text])?.0.into_iter().next().unwrap())
+    }
+
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<(Vec<Vec<f32>>, EmbeddingCacheStats)> {
+        self.cache
+            .get_or_compute_batch(self.engine.identity(), texts, |missing| {
+                self.engine.embed_batch(missing)
+            })
+    }
+
+    pub fn identity(&self) -> &EmbeddingIdentity {
+        self.engine.identity()
+    }
+
+    pub fn cache(&self) -> &EmbeddingObjectCache {
+        &self.cache
+    }
+}
+
+impl EmbeddingProvider for CachedEmbeddingEngine {
+    fn storage_identity(&self) -> Result<Option<String>> {
+        self.engine.storage_identity()
+    }
+
+    fn publication_lease(&self) -> Result<Option<std::fs::File>> {
+        Ok(Some(self.cache.publication_lease()?))
+    }
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        CachedEmbeddingEngine::embed(self, text)
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(CachedEmbeddingEngine::embed_batch(self, texts)?.0)
+    }
+    fn object_key(&self, text: &str) -> Result<Option<String>> {
+        Ok(Some(EmbeddingObjectCache::object_key(
+            self.identity(),
+            text,
+        )?))
+    }
+    fn publish_membership(
+        &self,
+        members: &BTreeMap<String, String>,
+        replace: bool,
+        remove_prefixes: &[String],
+    ) -> Result<()> {
+        if replace {
+            self.cache
+                .replace_checkout_membership(&self.checkout_id, members)
+        } else {
+            self.cache
+                .update_checkout_membership(&self.checkout_id, remove_prefixes, members)
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read embedding identity asset `{}`", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// Process-wide semantic runtime state. All workspace shards share this

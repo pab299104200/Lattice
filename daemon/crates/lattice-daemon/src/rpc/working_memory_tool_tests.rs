@@ -299,7 +299,7 @@ fn build_handler(suffix: &str) -> (McpHandler, Arc<Mutex<MemoryStore>>, PathBuf,
         MemoryStore::open_in_memory().expect("memory store"),
     ));
     let handler = McpHandler::new(
-        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None, None))),
+        Arc::new(Mutex::new(QueryEngine::new(CodeGraph::new(), None))),
         Arc::new(Mutex::new(Indexer::new(workspace_root.clone()))),
         memory_store.clone(),
         Arc::new(Mutex::new(

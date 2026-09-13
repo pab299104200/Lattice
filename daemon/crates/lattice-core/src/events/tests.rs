@@ -328,6 +328,7 @@ fn payload_cases() -> Vec<(EventKind, EventPayload, &'static str)> {
                 source_event_ids: vec![event_id("N"), event_id("O")],
                 consolidation_summary: "merged duplicate memories".to_string(),
                 proposal_id: None,
+                transition: None,
                 prior_state_json: None,
                 proposed_state_json: None,
                 post_apply_state_hash: [0; 32],

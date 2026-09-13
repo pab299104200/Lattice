@@ -265,7 +265,7 @@ impl GraphScopeStore {
 #[test]
 fn test_ignored_files_never_appear_in_query_or_workflow_tool_results() {
     let (_dir, graph) = fixture_graph();
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("login auth workflow", None, false);
     let rules = RulesDetector::new().detect_rules(
         &graph
@@ -363,7 +363,7 @@ fn test_ignored_files_never_appear_in_query_or_workflow_tool_results() {
 #[test]
 fn test_unresolved_queries_do_not_fall_back_to_broad_workspace_dump() {
     let (_dir, graph) = fixture_graph();
-    let mut engine = QueryEngine::new(graph.clone(), None, None);
+    let mut engine = QueryEngine::new(graph.clone(), None);
     let capsule = engine.query("completely absent anchor token", None, false);
     let bundle = prepare_change(&graph, &capsule, &[], &[], &[], BundleMode::Compact, None);
 

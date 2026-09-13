@@ -100,7 +100,10 @@ impl Band {
 
     /// Read a band back from its stable identifier.
     pub fn from_code(value: &str) -> Option<Self> {
-        ALL_BANDS.iter().copied().find(|band| band.as_str() == value)
+        ALL_BANDS
+            .iter()
+            .copied()
+            .find(|band| band.as_str() == value)
     }
 
     /// The observed rate of later fix-shaped commits in this band's deciles,

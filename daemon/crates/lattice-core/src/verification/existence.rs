@@ -18,7 +18,10 @@ use crate::graph::CodeGraph;
 use crate::identity::{
     decode_identity, DocId, FileId, Identity, IdentityResolver, ResolveOutcome, SectionId, SymbolId,
 };
-use crate::memory::{MemoryEvidence, MemoryStore, MemoryVerificationStatus};
+use crate::memory::{
+    BehavioralValidationRecord, BehavioralValidationStatus, EvidenceFreshnessStatus,
+    MemoryEvidence, MemoryStore, MemoryVerificationStatus,
+};
 use crate::storage::graph_store::FileIndexEntry;
 use crate::symbols::ParsedFile;
 
@@ -93,6 +96,14 @@ pub struct VerifierCore<'a> {
     parsed_files: &'a HashMap<String, ParsedFile>,
     span_reader: &'a dyn SpanReader,
     workspace_id: &'a str,
+    authority: &'a crate::consolidation::EvolutionAuthority<'a>,
+    behavioral_validations: &'a [BehavioralValidationRecord],
+    current_revision: Option<&'a str>,
+    current_graph_generation: Option<u64>,
+    current_repository_id: Option<&'a str>,
+    current_checkout_id: Option<&'a str>,
+    validation_time: u64,
+    validation_max_age_secs: u64,
 }
 
 impl<'a> VerifierCore<'a> {
@@ -104,6 +115,7 @@ impl<'a> VerifierCore<'a> {
         parsed_files: &'a HashMap<String, ParsedFile>,
         span_reader: &'a dyn SpanReader,
         workspace_id: &'a str,
+        authority: &'a crate::consolidation::EvolutionAuthority<'a>,
     ) -> Self {
         Self {
             store,
@@ -113,7 +125,39 @@ impl<'a> VerifierCore<'a> {
             parsed_files,
             span_reader,
             workspace_id,
+            authority,
+            behavioral_validations: &[],
+            current_revision: None,
+            current_graph_generation: None,
+            current_repository_id: None,
+            current_checkout_id: None,
+            validation_time: 0,
+            validation_max_age_secs: 0,
         }
+    }
+
+    /// Supplies validation results observed by trusted runtime code. Records
+    /// only apply when repository, checkout, revision, and graph generation
+    /// match and their age is within the caller's explicit bound. This method
+    /// never executes a stored command.
+    pub fn with_behavioral_validations(
+        mut self,
+        validations: &'a [BehavioralValidationRecord],
+        current_repository_id: &'a str,
+        current_checkout_id: &'a str,
+        current_revision: Option<&'a str>,
+        current_graph_generation: Option<u64>,
+        validation_time: u64,
+        validation_max_age_secs: u64,
+    ) -> Self {
+        self.behavioral_validations = validations;
+        self.current_revision = current_revision;
+        self.current_graph_generation = current_graph_generation;
+        self.current_repository_id = Some(current_repository_id);
+        self.current_checkout_id = Some(current_checkout_id);
+        self.validation_time = validation_time;
+        self.validation_max_age_secs = validation_max_age_secs;
+        self
     }
 
     pub fn verify_memory(
@@ -129,6 +173,16 @@ impl<'a> VerifierCore<'a> {
     ) -> Result<VerificationOutcome, VerificationError> {
         let job = self.enqueue_job(memory_id)?;
         self.verify_job(job)
+    }
+
+    /// Evaluate current evidence without enqueueing jobs or persisting a
+    /// consolidation proposal. The caller owns any atomic public status commit.
+    pub fn evaluate_memory(
+        &mut self,
+        memory_id: &str,
+    ) -> Result<VerificationOutcome, VerificationError> {
+        self.ensure_graph_snapshot()?;
+        self.verify_memory_inner(memory_id, false)
     }
 
     pub fn run_pending_jobs(
@@ -173,7 +227,7 @@ impl<'a> VerifierCore<'a> {
     ) -> Result<VerificationOutcome, VerificationError> {
         self.ensure_graph_snapshot()?;
         self.mark_job_state(&job.job_id, VerificationJobState::Running, None, None)?;
-        let result = self.verify_memory_inner(&job.target_memory_id);
+        let result = self.verify_memory_inner(&job.target_memory_id, true);
         match &result {
             Ok(outcome) => {
                 self.mark_job_state(
@@ -198,6 +252,7 @@ impl<'a> VerifierCore<'a> {
     fn verify_memory_inner(
         &mut self,
         memory_id: &str,
+        emit_proposal: bool,
     ) -> Result<VerificationOutcome, VerificationError> {
         let memory =
             self.store
@@ -241,17 +296,58 @@ impl<'a> VerifierCore<'a> {
                         kind = entry.kind.as_str(),
                         "unsupported verification evidence kind"
                     );
+                    verdicts.push(
+                        VerificationVerdict::new(
+                            VerificationStatus::Unverified,
+                            format!("unsupported verification evidence kind '{}'", entry.kind),
+                        )
+                        .with_trust_dimensions(
+                            EvidenceFreshnessStatus::Unknown,
+                            BehavioralValidationStatus::Unverified,
+                        ),
+                    );
                     continue;
                 }
             };
             match outcome {
                 Ok(verdict) => {
                     let existence_ok = verdict.status == VerificationStatus::Verified;
+                    let mut verdict = verdict.with_trust_dimensions(
+                        if existence_ok {
+                            EvidenceFreshnessStatus::Fresh
+                        } else {
+                            EvidenceFreshnessStatus::Invalidated
+                        },
+                        BehavioralValidationStatus::NotRequired,
+                    );
+                    if entry.kind == "test" && existence_ok {
+                        let validation = self.behavioral_validation(entry);
+                        verdict.behavioral_validation = validation;
+                        if validation != BehavioralValidationStatus::Passed {
+                            verdict.status = match validation {
+                                BehavioralValidationStatus::Failed => {
+                                    VerificationStatus::Invalidated
+                                }
+                                _ => VerificationStatus::Unverified,
+                            };
+                            verdict.reason = match validation {
+                                BehavioralValidationStatus::Failed => {
+                                    "test exists but its current bound validation failed".to_string()
+                                }
+                                _ => "test exists but has no passing validation bound to the current revision or generation".to_string(),
+                            };
+                        }
+                    }
                     verdicts.push(verdict);
                     if existence_ok {
                         let evidence_id = evidence_row_id(memory_id, index);
-                        let span_verdict =
+                        let mut span_verdict =
                             self.verify_span_evidence(memory_id, &evidence_id, entry)?;
+                        span_verdict.evidence_freshness = match span_verdict.status {
+                            VerificationStatus::Stale => EvidenceFreshnessStatus::Stale,
+                            VerificationStatus::Invalidated => EvidenceFreshnessStatus::Invalidated,
+                            _ => EvidenceFreshnessStatus::Fresh,
+                        };
                         verdicts.push(span_verdict);
                     }
                 }
@@ -265,15 +361,57 @@ impl<'a> VerifierCore<'a> {
             }
         }
 
-        verdicts.push(self.verify_scope(&memory));
-
-        let verdict = aggregate_verdicts(&verdicts);
+        let scope_verdict = self.verify_scope(&memory);
+        let verdict = aggregate_verdicts(&verdicts, &scope_verdict);
         span.record("verdict", verdict.status.as_str());
-        let proposal_id = self.emit_proposal(memory_id, &prior_state, &verdict)?;
+        let proposal_id = if emit_proposal {
+            self.emit_proposal(memory_id, &prior_state, &verdict)?
+        } else {
+            None
+        };
         Ok(VerificationOutcome {
             verdict,
             proposal_id,
         })
+    }
+
+    fn behavioral_validation(&self, evidence: &MemoryEvidence) -> BehavioralValidationStatus {
+        let Some(reference) = evidence.reference.as_deref() else {
+            return BehavioralValidationStatus::Unverified;
+        };
+        self.behavioral_validations
+            .iter()
+            .filter(|record| {
+                // A Git revision alone does not describe dirty checkout bytes.
+                // Require both daemon-resolved revision and graph generation.
+                let has_binding = record.revision.is_some() && record.graph_generation.is_some();
+                let revision_matches = record
+                    .revision
+                    .as_deref()
+                    .is_none_or(|revision| Some(revision) == self.current_revision);
+                let generation_matches = record
+                    .graph_generation
+                    .is_none_or(|generation| Some(generation) == self.current_graph_generation);
+                let authority_matches = Some(record.repository_id.as_str())
+                    == self.current_repository_id
+                    && Some(record.checkout_id.as_str()) == self.current_checkout_id;
+                let age = self.validation_time.checked_sub(record.observed_at);
+                let fresh = age.is_some_and(|age| age <= self.validation_max_age_secs);
+                record.evidence_reference == reference
+                    && has_binding
+                    && authority_matches
+                    && revision_matches
+                    && generation_matches
+                    && fresh
+            })
+            .max_by_key(|record| {
+                (
+                    record.observed_at,
+                    matches!(record.status, BehavioralValidationStatus::Failed),
+                )
+            })
+            .map(|record| record.status)
+            .unwrap_or(BehavioralValidationStatus::Unverified)
     }
 
     fn verify_span_evidence(
@@ -315,9 +453,8 @@ impl<'a> VerifierCore<'a> {
         };
         let job_id = format!("verify-proposal-{}-{}", memory_id, now_unix_micros());
         let proposal_id = format!("verify-proposal-{}-{}", memory_id, now_unix_micros());
-        let _ = self
-            .runtime
-            .submit_inline(crate::consolidation::ConsolidationJobSpec {
+        let _ = self.runtime.submit_inline(
+            crate::consolidation::ConsolidationJobSpec {
                 job_id,
                 workspace_id: self.workspace_id.to_string(),
                 kind: "verify durable memory evidence".to_string(),
@@ -335,7 +472,10 @@ impl<'a> VerifierCore<'a> {
                     }),
                     provenance: None,
                 }),
-            })?;
+            },
+            self.store,
+            self.authority,
+        )?;
         Ok(Some(proposal_id))
     }
 
@@ -600,6 +740,16 @@ impl TestExistenceCheck {
         graph: &CodeGraph,
     ) -> Result<VerificationVerdict, VerificationError> {
         let reference = required_reference(evidence, "test")?;
+        if let Ok(Identity::Symbol(symbol_id)) = decode_identity(reference) {
+            if graph.get_node(&legacy_symbol_id(&symbol_id)).is_some() {
+                return stale_or_verified(
+                    evidence,
+                    &symbol_id.file.repo_relative_path,
+                    file_index,
+                    format!("test `{}` exists", symbol_id),
+                );
+            }
+        }
         let symbol_id = match resolver.resolve_test(resolver.default_workspace_id(), reference) {
             ResolveOutcome::Unique(symbol_id) => symbol_id,
             ResolveOutcome::Ambiguous(report) => {
@@ -642,11 +792,21 @@ impl TestExistenceCheck {
     }
 }
 
-fn aggregate_verdicts(verdicts: &[VerificationVerdict]) -> VerificationVerdict {
+fn aggregate_verdicts(
+    verdicts: &[VerificationVerdict],
+    scope_verdict: &VerificationVerdict,
+) -> VerificationVerdict {
+    if scope_verdict.status != VerificationStatus::Verified {
+        return scope_verdict.clone();
+    }
     if verdicts.is_empty() {
         return VerificationVerdict::new(
-            VerificationStatus::Verified,
+            VerificationStatus::Unverified,
             "memory has no existence evidence to verify",
+        )
+        .with_trust_dimensions(
+            EvidenceFreshnessStatus::Unknown,
+            BehavioralValidationStatus::Unverified,
         );
     }
     if let Some(verdict) = verdicts
@@ -665,15 +825,41 @@ fn aggregate_verdicts(verdicts: &[VerificationVerdict]) -> VerificationVerdict {
         .iter()
         .all(|verdict| verdict.status == VerificationStatus::Verified)
     {
+        let behavioral_validation = if verdicts
+            .iter()
+            .any(|verdict| verdict.behavioral_validation == BehavioralValidationStatus::Passed)
+        {
+            BehavioralValidationStatus::Passed
+        } else {
+            BehavioralValidationStatus::NotRequired
+        };
         return VerificationVerdict::new(
             VerificationStatus::Verified,
             "all existence evidence still resolves",
-        );
+        )
+        .with_trust_dimensions(EvidenceFreshnessStatus::Fresh, behavioral_validation);
     }
+    let freshness = if verdicts
+        .iter()
+        .all(|verdict| verdict.evidence_freshness == EvidenceFreshnessStatus::Fresh)
+    {
+        EvidenceFreshnessStatus::Fresh
+    } else {
+        EvidenceFreshnessStatus::Unknown
+    };
+    let behavioral_validation = if verdicts
+        .iter()
+        .any(|verdict| verdict.behavioral_validation == BehavioralValidationStatus::Failed)
+    {
+        BehavioralValidationStatus::Failed
+    } else {
+        BehavioralValidationStatus::Unverified
+    };
     VerificationVerdict::new(
         VerificationStatus::Unverified,
         "verification completed with non-deterministic evidence results",
     )
+    .with_trust_dimensions(freshness, behavioral_validation)
 }
 
 fn project_state(

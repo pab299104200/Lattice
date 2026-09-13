@@ -8,7 +8,8 @@ use tempfile::tempdir;
 
 use super::{
     ConsolidationConfig, ConsolidationJobMode, ConsolidationJobRuntime, EpisodeOutcome,
-    SessionConsolidationConfig, SessionConsolidationOutcome, SessionConsolidator,
+    EvolutionAuthority, SessionConsolidationConfig, SessionConsolidationOutcome,
+    SessionConsolidator,
 };
 use crate::events::{
     Actor, AssistantTaskStartedPayload, BranchRef, CompactSummary, EventKind, EventPayload,
@@ -25,7 +26,11 @@ fn small_task_slice_emits_create_memory_proposal_with_deterministic_summary() {
     let mut consolidator = fixture.consolidator();
     let outcome = consolidator
         .on_task_complete(
-            "workspace-main",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
             &task_id("task-small"),
             EpisodeOutcome::Success,
         )
@@ -43,20 +48,13 @@ fn small_task_slice_emits_create_memory_proposal_with_deterministic_summary() {
             assert_eq!(
                 proposal
                     .1
-                    .get("summary_text")
+                    .get("memory")
+                    .and_then(|memory| memory.get("content"))
                     .and_then(Value::as_str)
-                    .expect("summary text present"),
+                    .expect("canonical memory content present"),
                 "Task task-small: 1 tools, 1 files, outcome=success"
             );
-            assert_eq!(
-                proposal
-                    .1
-                    .get("tools_used")
-                    .and_then(Value::as_array)
-                    .expect("tools array present")
-                    .len(),
-                1
-            );
+            assert!(proposal.1.get("structured_fields").is_some());
         }
         other => panic!("expected proposed outcome, got {other:?}"),
     }
@@ -69,7 +67,11 @@ fn oversized_task_slice_redirects_to_background_mode() {
     let mut consolidator = fixture.consolidator();
     let outcome = consolidator
         .on_task_complete(
-            "workspace-main",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
             &task_id("task-large"),
             EpisodeOutcome::Success,
         )
@@ -101,7 +103,11 @@ fn session_consolidation_never_mutates_memories_directly() {
 
     consolidator
         .on_task_complete(
-            "workspace-main",
+            &EvolutionAuthority {
+                repository_id: "workspace-main",
+                checkout_id: "checkout-main",
+                branch: "main",
+            },
             &task_id("task-no-mutate"),
             EpisodeOutcome::Success,
         )
@@ -128,7 +134,15 @@ fn session_consolidation_hot_path_stays_under_five_milliseconds_p99() {
         fixture.append_small_task(&task);
         fixture
             .consolidator
-            .on_task_complete("workspace-main", &task_id(&task), EpisodeOutcome::Success)
+            .on_task_complete(
+                &EvolutionAuthority {
+                    repository_id: "workspace-main",
+                    checkout_id: "checkout-main",
+                    branch: "main",
+                },
+                &task_id(&task),
+                EpisodeOutcome::Success,
+            )
             .expect("warmup task consolidates");
     }
 
@@ -138,7 +152,15 @@ fn session_consolidation_hot_path_stays_under_five_milliseconds_p99() {
         let started = Instant::now();
         fixture
             .consolidator
-            .on_task_complete("workspace-main", &task_id(&task), EpisodeOutcome::Success)
+            .on_task_complete(
+                &EvolutionAuthority {
+                    repository_id: "workspace-main",
+                    checkout_id: "checkout-main",
+                    branch: "main",
+                },
+                &task_id(&task),
+                EpisodeOutcome::Success,
+            )
             .expect("task consolidates");
         samples.push(started.elapsed());
     }

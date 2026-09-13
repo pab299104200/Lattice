@@ -18,7 +18,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::git_intelligence::{canonical_repository_path, GitIntelligenceSnapshot, GitMiningReport};
+use crate::git_intelligence::{
+    canonical_repository_path, GitIntelligenceSnapshot, GitMiningReport,
+};
 
 /// Availability of one persisted health fact.
 ///
@@ -87,7 +89,11 @@ where
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        facts.push(line_churn_fact(snapshot, &canonical, window_reason.as_deref()));
+        facts.push(line_churn_fact(
+            snapshot,
+            &canonical,
+            window_reason.as_deref(),
+        ));
     }
     facts
 }
@@ -123,9 +129,13 @@ pub fn line_churn_fact(
             lines_deleted: 0,
             line_churn: 0,
             hotspot_score: 0,
-            reason: Some(window_degraded_reason.map(str::to_owned).unwrap_or_else(|| {
-                "file has no observed commits in the sampled Git window".to_owned()
-            })),
+            reason: Some(
+                window_degraded_reason
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        "file has no observed commits in the sampled Git window".to_owned()
+                    }),
+            ),
         },
     }
 }
@@ -177,10 +187,8 @@ mod tests {
 
     #[test]
     fn available_fact_reports_observed_counts() {
-        let snapshot = GitHistoryMiner::default().mine(vec![commit(
-            "c1",
-            vec![change("src/a.rs", 12, 3)],
-        )]);
+        let snapshot =
+            GitHistoryMiner::default().mine(vec![commit("c1", vec![change("src/a.rs", 12, 3)])]);
 
         let facts = line_churn_facts(&snapshot, ["src/a.rs"]);
         assert_eq!(facts.len(), 1);
@@ -195,10 +203,8 @@ mod tests {
 
     #[test]
     fn file_outside_the_git_window_is_degraded_never_a_silent_zero() {
-        let snapshot = GitHistoryMiner::default().mine(vec![commit(
-            "c1",
-            vec![change("src/a.rs", 5, 1)],
-        )]);
+        let snapshot =
+            GitHistoryMiner::default().mine(vec![commit("c1", vec![change("src/a.rs", 5, 1)])]);
 
         let facts = line_churn_facts(&snapshot, ["src/never-touched.rs"]);
         assert_eq!(facts.len(), 1);
@@ -246,17 +252,21 @@ mod tests {
 
         let a = facts.iter().find(|fact| fact.path == "src/a.rs").unwrap();
         assert_eq!(a.availability, FactAvailability::Degraded);
-        assert_eq!(a.lines_added, 0, "the excluded commit contributes no signal at all");
+        assert_eq!(
+            a.lines_added, 0,
+            "the excluded commit contributes no signal at all"
+        );
     }
 
     #[test]
     fn requested_paths_deduplicate_after_canonicalization_and_skip_invalid_paths() {
-        let snapshot = GitHistoryMiner::default().mine(vec![commit(
-            "c1",
-            vec![change("src/a.rs", 1, 1)],
-        )]);
+        let snapshot =
+            GitHistoryMiner::default().mine(vec![commit("c1", vec![change("src/a.rs", 1, 1)])]);
 
-        let facts = line_churn_facts(&snapshot, ["./src/a.rs", "src\\a.rs", "../outside", "src/a.rs"]);
+        let facts = line_churn_facts(
+            &snapshot,
+            ["./src/a.rs", "src\\a.rs", "../outside", "src/a.rs"],
+        );
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].path, "src/a.rs");
     }

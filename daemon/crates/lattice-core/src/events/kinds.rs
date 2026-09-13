@@ -490,10 +490,14 @@ pub struct MemoryConsolidatedPayload {
     /// Proposal whose explicit decision materialized this consolidation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_id: Option<String>,
-    /// Exact pre-decision memory state preserved for replay and audit.
+    /// Immutable transition represented by this event (`applied` or `reverted`).
+    /// Events without this field are historical audit records and are not replay authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
+    /// Historical inline pre-decision state. New events resolve canonical proposal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_state_json: Option<String>,
-    /// Exact proposed state preserved for replay and audit.
+    /// Historical inline proposed state. New events resolve canonical proposal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposed_state_json: Option<String>,
     /// Canonical post-apply state hash recorded at the original decision time.

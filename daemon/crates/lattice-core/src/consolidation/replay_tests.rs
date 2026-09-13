@@ -70,11 +70,11 @@ fn replay_from_genesis_reconstructs_same_state_for_fifty_mixed_proposals() {
     let driver = ReplayDriver::new(
         &fixture.event_reader,
         fixture.event_store.clone(),
-        &fixture.conn,
         &fixture.memory_store,
         &fixture.event_writer,
         &fixture.clock,
     )
+    .expect("replay scratch initializes")
     .with_cached_responses(cache);
     let report = driver
         .replay(ReplayMode::FromGenesis)
@@ -162,7 +162,11 @@ fn reverse_supersede_restores_status_and_clears_memory_links() {
         proposal_kind: ProposalKind::Supersede,
         prior_state: encode_memory_state(&older),
         proposed_state: encode_memory_state(&proposed),
-        evidence: json!({ "source_memory_ids": ["mem-older", "mem-newer"] }),
+        evidence: json!({
+            "source_memory_ids": ["mem-older", "mem-newer"],
+            "superseded_by_memory_id": "mem-newer",
+            "replacement_state_hash": state_hash_for_memory(&fixture.memory_store, "mem-newer").unwrap()
+        }),
         provenance: None,
     };
     fixture.insert_job("job-supersede");
@@ -315,9 +319,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempdir().expect("tempdir");
-        let conn = Connection::open(dir.path().join("consolidation.sqlite")).expect("db opens");
+        let memory_path = dir.path().join("memory.sqlite");
+        let memory_store = MemoryStore::open(&memory_path).unwrap();
+        let conn = Connection::open(memory_path).expect("db opens");
         initialize_schema(&conn).expect("schema initializes");
-        let memory_store = MemoryStore::open(&dir.path().join("memory.sqlite")).unwrap();
         let event_store = Arc::new(EventStore::open_in_memory().unwrap());
         let event_reader = EventReader::new(event_store.clone());
         let event_writer =
@@ -349,11 +354,11 @@ impl Fixture {
         ReplayDriver::new(
             &self.event_reader,
             self.event_store.clone(),
-            &self.conn,
             &self.memory_store,
             &self.event_writer,
             &self.clock,
         )
+        .expect("replay scratch initializes")
     }
 
     fn store_hash(&self) -> [u8; 32] {

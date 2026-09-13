@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use super::store::EventStoreError;
 
 pub const EVENT_SCHEMA_MIGRATION_ID: &str = "p2_001_events";
-pub const EVENT_SCHEMA_TARGET_VERSION: i64 = 2;
+pub const EVENT_SCHEMA_TARGET_VERSION: i64 = 4;
 
 const EVENT_SCHEMA_SQL: &str = include_str!("schema.sql");
 
@@ -45,6 +45,32 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), EventStoreError> {
 
     if current_version < 2 {
         apply_compaction_control_migration(conn)?;
+    }
+    if current_version < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_events_payload_spill
+             ON events(payload_spill_id) WHERE payload_spill_id IS NOT NULL;
+             CREATE TRIGGER IF NOT EXISTS events_reclaim_payload
+             AFTER DELETE ON events WHEN OLD.payload_spill_id IS NOT NULL
+             BEGIN
+               DELETE FROM event_payloads WHERE row_id = OLD.payload_spill_id
+               AND NOT EXISTS (SELECT 1 FROM events WHERE payload_spill_id = OLD.payload_spill_id);
+             END;",
+        )?;
+        tx.execute(
+            "INSERT INTO event_schema_version(version, applied_ts_unix_micros) VALUES (3, ?1)",
+            params![now_unix_micros()],
+        )?;
+        tx.commit()?;
+    }
+    if current_version < 4 {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO event_schema_version(version, applied_ts_unix_micros) VALUES (4, ?1)",
+            params![now_unix_micros()],
+        )?;
+        tx.commit()?;
     }
     Ok(())
 }

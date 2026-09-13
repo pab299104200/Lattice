@@ -100,12 +100,99 @@ pub struct EventStore {
 }
 
 impl EventStore {
+    pub fn insert_envelope_with_payload_idempotent(
+        &self,
+        row: InsertEnvelopeRow,
+        inline_ceiling: usize,
+    ) -> Result<i64, EventStoreError> {
+        if let Some(existing) = self.query_event_by_identity(&row.workspace_id, &row.event_uuid)? {
+            if event_row_matches_insert(&existing, &row) {
+                return Ok(existing.event_id);
+            }
+            return Err(EventStoreError::EnvelopeInvalid {
+                reason: format!(
+                    "event identity '{}' already belongs to a different envelope",
+                    row.event_uuid
+                ),
+            });
+        }
+        match self.insert_envelope_with_payload(row.clone(), inline_ceiling) {
+            Ok(id) => Ok(id),
+            Err(EventStoreError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ConstraintViolation)
+                ) =>
+            {
+                let existing = self
+                    .query_event_by_identity(&row.workspace_id, &row.event_uuid)?
+                    .ok_or(EventStoreError::Sqlite(error))?;
+                if event_row_matches_insert(&existing, &row) {
+                    Ok(existing.event_id)
+                } else {
+                    Err(EventStoreError::EnvelopeInvalid {
+                        reason: format!(
+                            "event identity '{}' raced with a different envelope",
+                            row.event_uuid
+                        ),
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Persist payload membership and the envelope under the same write lock.
+    /// Compaction can never invalidate a spill handle between these writes.
+    pub fn insert_envelope_with_payload(
+        &self,
+        mut row: InsertEnvelopeRow,
+        inline_ceiling: usize,
+    ) -> Result<i64, EventStoreError> {
+        validate_envelope_row(&row)?;
+        let bytes =
+            row.payload_inline
+                .as_ref()
+                .ok_or_else(|| EventStoreError::EnvelopeInvalid {
+                    reason: "atomic append requires inline source payload bytes".into(),
+                })?;
+        validate_payload(&row.payload_hash, bytes, row.ts_unix_micros)?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if bytes.len() > inline_ceiling {
+            tx.execute(
+                "INSERT OR IGNORE INTO event_payloads(payload_hash, bytes, bytes_len, created_ts_unix_micros)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![row.payload_hash, bytes, checked_len(bytes)?, row.ts_unix_micros],
+            )?;
+            let (spill_id, identical): (i64, bool) = tx.query_row(
+                "SELECT row_id, bytes = ?2 FROM event_payloads WHERE payload_hash = ?1",
+                params![row.payload_hash, bytes],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if !identical {
+                return Err(EventStoreError::EnvelopeInvalid {
+                    reason: "payload hash already identifies different bytes; refusing corrupt event append".into(),
+                });
+            }
+            row.payload_inline = None;
+            row.payload_spill_id = Some(spill_id);
+        }
+        execute_insert(&tx, &row, INSERT_ENVELOPE_SQL)?;
+        let row_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(row_id)
+    }
+
     pub fn open(path: &Path) -> Result<Self, EventStoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let mut conn = Connection::open(path)?;
+        // Takes effect without rewriting only for a new database. Existing
+        // stores retain their mode until explicit offline maintenance.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         configure_connection(&conn, true)?;
         run_migrations(&mut conn)?;
         info!(
@@ -127,6 +214,7 @@ impl EventStore {
         })
     }
 
+    #[cfg(test)]
     pub fn insert_or_get_payload(
         &self,
         payload_hash: &[u8],
@@ -338,6 +426,14 @@ impl EventStore {
         )
     }
 
+    pub fn latest_event_row_id(&self) -> Result<i64, EventStoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .map_err(EventStoreError::from)
+    }
+
     pub fn row_id_for_event_uuid(&self, event_uuid: &str) -> Result<Option<i64>, EventStoreError> {
         let conn = self.lock_conn()?;
         conn.query_row(
@@ -347,6 +443,26 @@ impl EventStore {
         )
         .optional()
         .map_err(EventStoreError::from)
+    }
+
+    /// Loads one exact event identity through the unique event UUID index.
+    /// The workspace predicate prevents a caller from treating a foreign
+    /// repository's UUID as local authority.
+    pub fn query_event_by_identity(
+        &self,
+        workspace_id: &str,
+        event_uuid: &str,
+    ) -> Result<Option<EventEnvelopeRow>, EventStoreError> {
+        validate_scope_value("workspace_id", workspace_id)?;
+        validate_scope_value("event_uuid", event_uuid)?;
+        let mut rows = self.query_events(
+            "SELECT event_id, event_uuid, workspace_id, branch, session_id, task_id, actor_kind,
+                    actor_detail, kind, ts_unix_micros, payload_hash, summary, payload_inline,
+                    payload_spill_id, references_json, schema_version
+             FROM events WHERE workspace_id = ?1 AND event_uuid = ?2 LIMIT 1",
+            params![workspace_id, event_uuid],
+        )?;
+        Ok(rows.pop())
     }
 
     pub fn truncate_through(&self, row_id: i64) -> Result<u64, EventStoreError> {
@@ -362,6 +478,16 @@ impl EventStore {
             [],
         )?;
         let deleted = deleted?;
+        // Also retire orphans produced by older, non-atomic writers. Bound the
+        // batch independently of the event count being compacted.
+        tx.execute(
+            "DELETE FROM event_payloads WHERE row_id IN (
+               SELECT p.row_id FROM event_payloads p
+               WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.payload_spill_id = p.row_id)
+               ORDER BY p.row_id LIMIT 256
+             )",
+            [],
+        )?;
         tx.commit()?;
         Ok(deleted as u64)
     }
@@ -403,6 +529,57 @@ impl EventStore {
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
+
+    /// Release at most `max_pages` free pages without a full-database copy.
+    /// A held WAL reader can delay physical reclamation; return the checkpoint
+    /// backlog rather than claiming those bytes have left the filesystem.
+    pub fn reclaim_free_pages(&self, max_pages: u32) -> Result<(u64, u64), EventStoreError> {
+        if max_pages == 0 || max_pages > 4096 {
+            return Err(EventStoreError::EnvelopeInvalid {
+                reason: "reclamation page budget must be between 1 and 4096".into(),
+            });
+        }
+        let conn = self.lock_conn()?;
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if mode != 2 {
+            return Err(EventStoreError::EnvelopeInvalid {
+                reason: "event store requires offline conversion to incremental auto-vacuum before bounded physical reclamation".into(),
+            });
+        }
+        let before: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        for _ in 0..max_pages {
+            let free: u64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            if free == 0 {
+                break;
+            }
+            conn.execute_batch("PRAGMA incremental_vacuum(1)")?;
+        }
+        let after: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let (_, log, checkpointed): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        Ok((
+            before.saturating_sub(after),
+            log.saturating_sub(checkpointed).max(0) as u64,
+        ))
+    }
+}
+
+fn event_row_matches_insert(existing: &EventEnvelopeRow, candidate: &InsertEnvelopeRow) -> bool {
+    existing.event_uuid == candidate.event_uuid
+        && existing.workspace_id == candidate.workspace_id
+        && existing.branch == candidate.branch
+        && existing.session_id == candidate.session_id
+        && existing.task_id == candidate.task_id
+        && existing.actor_kind == candidate.actor_kind
+        && existing.actor_detail == candidate.actor_detail
+        && existing.kind == candidate.kind
+        && existing.ts_unix_micros == candidate.ts_unix_micros
+        && existing.payload_hash == candidate.payload_hash
+        && existing.summary == candidate.summary
+        && existing.references_json == candidate.references_json
+        && existing.schema_version == candidate.schema_version
 }
 
 fn execute_insert(

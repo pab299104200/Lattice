@@ -28,6 +28,7 @@ pub mod duplicates;
 pub mod episode;
 pub mod llm;
 pub mod proposal;
+pub mod proposal_references;
 pub mod queue;
 pub mod refresh;
 pub mod replay;
@@ -38,6 +39,8 @@ pub mod supersession;
 
 #[cfg(test)]
 mod deterministic_tests;
+#[cfg(test)]
+mod evolution_acceptance_tests;
 #[cfg(test)]
 mod integration_test_support;
 #[cfg(test)]
@@ -55,8 +58,9 @@ pub use demotion::DemotionScanner;
 pub use duplicates::DuplicateDetector;
 pub use episode::{EpisodeError, EpisodeOutcome, EpisodeTemplate, ToolName};
 pub use proposal::{
-    empty_state, ApplyOutcome, ConsolidationProposal, ConsolidationProposalRecord,
-    ProposalDecision, ProposalKind, ProposalTarget, RejectOutcome,
+    drain_event_outbox, empty_state, state_hash_for_memory, ApplyOutcome, ConsolidationProposal,
+    ConsolidationProposalRecord, EvolutionAuthority, OutboxDrainReport, ProposalDecision,
+    ProposalKind, ProposalTarget, RejectOutcome,
 };
 pub use queue::{
     BoundedJobQueue, ConsolidationJobMode, ConsolidationJobRecord, ConsolidationJobSpec,
@@ -136,6 +140,47 @@ pub(crate) fn encode_memory_state(state: &ConsolidationMemoryState) -> Value {
     serde_json::to_value(state).unwrap_or_else(|_| json!({}))
 }
 
+/// Build canonical proposal snapshots for an episode create or refresh.
+/// Episode-specific provenance belongs in proposal evidence; memory state uses
+/// the same complete representation as apply-time CAS and replay.
+pub fn episode_memory_states(
+    store: &MemoryStore,
+    existing: Option<&Memory>,
+    proposed: Memory,
+) -> Result<(Value, Value), LatticeError> {
+    let captured = existing
+        .map(|memory| capture_memory_state(store, memory))
+        .transpose()?;
+    let prior = captured
+        .as_ref()
+        .map(encode_memory_state)
+        .unwrap_or_else(empty_state);
+    let mut next = if let Some(state) = captured {
+        state
+    } else {
+        let mut structured_fields = MemoryStructuredFields::default();
+        structured_fields.memory_class = crate::memory::MemoryClass::WorkflowOutcome;
+        ConsolidationMemoryState {
+            memory: proposed.clone(),
+            structured_fields,
+            last_verified_at: None,
+            last_verified_graph_snapshot_id: None,
+            expires_at: None,
+            memory_links: Vec::new(),
+        }
+    };
+    let content_changed = next.memory.content != proposed.content;
+    next.memory = proposed;
+    if content_changed {
+        next.memory.verification_status = crate::memory::MemoryVerificationStatus::Unverified;
+        next.structured_fields.verification_status =
+            crate::memory::MemoryVerificationStatus::Unverified;
+        next.last_verified_at = None;
+        next.last_verified_graph_snapshot_id = None;
+    }
+    Ok((prior, encode_memory_state(&next)))
+}
+
 pub(crate) fn mark_state_stale(
     state: &ConsolidationMemoryState,
     reason: String,
@@ -172,6 +217,33 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), LatticeError> {
 }
 
 fn migrate_consolidation_schema(conn: &Connection) -> Result<(), LatticeError> {
+    if !column_exists(conn, "consolidation_event_outbox", "transition")? {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE consolidation_event_outbox RENAME TO consolidation_event_outbox_legacy;
+             CREATE TABLE consolidation_event_outbox (
+               outbox_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL,
+               transition TEXT NOT NULL CHECK (transition IN ('applied','reverted')),
+               workspace_id TEXT NOT NULL, event_uuid TEXT NOT NULL UNIQUE,
+               event_ts_unix_micros INTEGER NOT NULL,
+               envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+               created_at INTEGER NOT NULL, delivered_at INTEGER,
+               attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0), last_error TEXT,
+               FOREIGN KEY (proposal_id) REFERENCES consolidation_proposals(proposal_id) ON DELETE CASCADE);
+             INSERT INTO consolidation_event_outbox
+               (outbox_id,proposal_id,transition,workspace_id,event_uuid,event_ts_unix_micros,envelope_json,created_at,delivered_at,attempt_count,last_error)
+             SELECT outbox_id,proposal_id,'applied',workspace_id,event_uuid,event_ts_unix_micros,envelope_json,created_at,delivered_at,attempt_count,last_error
+             FROM consolidation_event_outbox_legacy;
+             DROP TABLE consolidation_event_outbox_legacy;
+             COMMIT;",
+        ).map_err(|e| LatticeError::Storage(format!("Failed to migrate consolidation outbox transition contract: {e}")))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_consolidation_event_outbox_pending
+           ON consolidation_event_outbox(delivered_at, workspace_id, attempt_count, created_at, outbox_id);
+         CREATE INDEX IF NOT EXISTS idx_consolidation_event_outbox_proposal_transition
+           ON consolidation_event_outbox(proposal_id, transition);",
+    ).map_err(|e| LatticeError::Storage(format!("Failed to initialize consolidation outbox indexes: {e}")))?;
     if !column_exists(conn, "consolidation_proposals", "provenance_json")? {
         conn.execute(
             "ALTER TABLE consolidation_proposals ADD COLUMN provenance_json TEXT CHECK (provenance_json IS NULL OR json_valid(provenance_json))",
@@ -265,20 +337,27 @@ pub struct ConsolidationJobRuntime {
 }
 
 pub fn persist_pending_proposal(
-    conn: &Connection,
-    workspace_id: &str,
+    memory_store: &MemoryStore,
+    authority: &EvolutionAuthority<'_>,
     kind: &str,
     mode: ConsolidationJobMode,
     proposal: &ConsolidationProposal,
 ) -> Result<ConsolidationProposalRecord, LatticeError> {
-    initialize_schema(conn)?;
-    conn.execute(
+    let mut proposal = proposal.clone();
+    bind_proposal_authority(&mut proposal, authority)?;
+    memory_store.with_connection(|conn| {
+    let tx = conn.unchecked_transaction().map_err(|e| LatticeError::Storage(format!("Failed to begin pending proposal transaction: {e}")))?;
+    proposal.validate_creation_authority(memory_store, authority)?;
+    let changed = tx.execute(
         "INSERT INTO consolidation_jobs
             (job_id, workspace_id, kind, mode, status, enqueued_at, proposal_id)
-         VALUES (?1, ?2, ?3, ?4, 'proposed', ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, 'proposed', ?5, ?6)
+         ON CONFLICT(job_id) DO UPDATE SET status='proposed',proposal_id=excluded.proposal_id
+         WHERE consolidation_jobs.workspace_id=excluded.workspace_id AND consolidation_jobs.kind=excluded.kind
+           AND consolidation_jobs.mode=excluded.mode AND consolidation_jobs.status='queued'",
         params![
             proposal.job_id,
-            workspace_id,
+            authority.repository_id,
             kind,
             mode.as_str(),
             now_unix_micros(),
@@ -286,12 +365,15 @@ pub fn persist_pending_proposal(
         ],
     )
     .map_err(|e| LatticeError::Storage(format!("Failed to persist consolidation job: {e}")))?;
-    proposal.insert_pending(conn)?;
+    if changed != 1 { return Err(LatticeError::Storage(format!("Consolidation job '{}' conflicts with an existing non-identical job", proposal.job_id))); }
+    proposal.insert_pending(&tx)?;
+    tx.commit().map_err(|e| LatticeError::Storage(format!("Failed to commit pending proposal: {e}")))?;
     ConsolidationProposal::load_record(conn, &proposal.proposal_id)?.ok_or_else(|| {
         LatticeError::Storage(format!(
             "Proposal '{}' was not readable after persistence",
             proposal.proposal_id
         ))
+    })
     })
 }
 
@@ -321,20 +403,26 @@ impl ConsolidationJobRuntime {
     pub(crate) fn submit_inline(
         &mut self,
         job_spec: ConsolidationJobSpec,
+        memory_store: &MemoryStore,
+        authority: &EvolutionAuthority<'_>,
     ) -> Result<(EnqueueOutcome, Option<ConsolidationProposal>), LatticeError> {
-        let enqueue = self.queue.persist_enqueued_only(&job_spec)?;
-        let proposal = self.run_job(job_spec, None)?;
-        Ok((enqueue, proposal))
+        let proposal = persist_canonical_proposal(memory_store, &job_spec, authority)?;
+        Ok((
+            EnqueueOutcome::Queued {
+                depth: self.queue.depth(),
+            },
+            Some(proposal),
+        ))
     }
 
-    pub fn run_due(&mut self) -> Result<Vec<ConsolidationProposal>, LatticeError> {
+    pub fn run_due(
+        &mut self,
+        memory_store: &MemoryStore,
+        authority: &EvolutionAuthority<'_>,
+    ) -> Result<Vec<ConsolidationProposal>, LatticeError> {
         let mut proposals = Vec::new();
         while let Some(job) = self.queue.pop() {
-            match self.run_job(job, None) {
-                Ok(Some(proposal)) => proposals.push(proposal),
-                Ok(None) => {}
-                Err(error) => return Err(error),
-            }
+            proposals.push(persist_canonical_proposal(memory_store, &job, authority)?);
         }
         Ok(proposals)
     }
@@ -344,10 +432,14 @@ impl ConsolidationJobRuntime {
         memory_store: &MemoryStore,
         event_writer: &EventWriter,
         decided_by: &crate::identity::OperatorId,
+        authority: &EvolutionAuthority<'_>,
     ) -> Result<Vec<ConsolidationProposal>, LatticeError> {
         let mut proposals = Vec::new();
         while let Some(job) = self.queue.pop() {
-            match self.run_job(job, Some((memory_store, event_writer, decided_by))) {
+            match self.run_job(
+                job,
+                Some((memory_store, event_writer, decided_by, authority)),
+            ) {
                 Ok(Some(proposal)) => proposals.push(proposal),
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -363,25 +455,53 @@ impl ConsolidationJobRuntime {
         memory_store: &MemoryStore,
         event_writer: &EventWriter,
         decided_by: &str,
+        authority: &EvolutionAuthority<'_>,
     ) -> Result<Option<ApplyOutcome>, LatticeError> {
-        let conn = self.lock_conn()?;
-        let proposal = match ConsolidationProposal::load(&conn, proposal_id)? {
-            Some(proposal) => proposal,
-            None => return Ok(None),
+        let runtime_has_proposal = {
+            let conn = self.lock_conn()?;
+            ConsolidationProposal::load(&conn, proposal_id)?.is_some()
         };
-        match decision {
-            ProposalDecision::Pending => Ok(None),
-            ProposalDecision::Applied => {
-                let outcome =
-                    proposal.apply(&conn, memory_store, event_writer, decided_by, None)?;
-                Ok(Some(outcome))
-            }
-            ProposalDecision::Rejected => {
-                proposal.reject(&conn, event_writer, decided_by, None)?;
-                Ok(None)
-            }
-            ProposalDecision::Reverted => Ok(None),
+        if authority.repository_id != event_writer.workspace_id() {
+            return Err(LatticeError::Storage(
+                "decision authority repository does not match event writer".into(),
+            ));
         }
+        let outcome = memory_store.with_connection(|conn| {
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                LatticeError::Storage(format!(
+                    "Failed to begin consolidation decision transaction: {e}"
+                ))
+            })?;
+            let proposal = match ConsolidationProposal::load(&tx, proposal_id)? {
+                Some(proposal) => proposal,
+                None if runtime_has_proposal => {
+                    return Err(LatticeError::Storage(format!(
+                    "Proposal '{proposal_id}' is stored outside the canonical MemoryStore database"
+                )))
+                }
+                None => return Ok(None),
+            };
+            let outcome = match decision {
+                ProposalDecision::Pending | ProposalDecision::Reverted => None,
+                ProposalDecision::Applied => Some(proposal.apply_transactional(
+                    &tx,
+                    memory_store,
+                    authority,
+                    decided_by,
+                    None,
+                )?),
+                ProposalDecision::Rejected => {
+                    proposal.reject_transactional(&tx, authority, decided_by, None)?;
+                    None
+                }
+            };
+            tx.commit().map_err(|e| {
+                LatticeError::Storage(format!("Failed to commit consolidation decision: {e}"))
+            })?;
+            Ok(outcome)
+        })?;
+        drain_event_outbox(memory_store, event_writer, 64)?;
+        Ok(outcome)
     }
 
     pub fn replay_from(&mut self, event_id: EventId) -> Result<EnqueueOutcome, LatticeError> {
@@ -404,14 +524,25 @@ impl ConsolidationJobRuntime {
     /// closes admission so expensive producers can check before doing work.
     pub(crate) fn available_review_slots(
         &self,
+        memory_store: &MemoryStore,
         workspace_id: &str,
         max_pending_review_proposals: usize,
     ) -> Result<usize, LatticeError> {
         if !self.queue.has_capacity() || max_pending_review_proposals == 0 {
             return Ok(0);
         }
-        let conn = self.lock_conn()?;
-        let pending = review_queue::pending_manual_review_count(&conn, workspace_id)?;
+        if max_pending_review_proposals > 4096 {
+            return Err(LatticeError::Storage(
+                "manual-review proposal admission limit must be at most 4096".into(),
+            ));
+        }
+        let pending = memory_store.with_connection(|conn| {
+            review_queue::pending_manual_review_count_up_to(
+                conn,
+                workspace_id,
+                max_pending_review_proposals,
+            )
+        })?;
         Ok(max_pending_review_proposals.saturating_sub(pending))
     }
 
@@ -434,7 +565,12 @@ impl ConsolidationJobRuntime {
     fn run_job(
         &self,
         job: ConsolidationJobSpec,
-        auto_apply: Option<(&MemoryStore, &EventWriter, &crate::identity::OperatorId)>,
+        auto_apply: Option<(
+            &MemoryStore,
+            &EventWriter,
+            &crate::identity::OperatorId,
+            &EvolutionAuthority<'_>,
+        )>,
     ) -> Result<Option<ConsolidationProposal>, LatticeError> {
         let proposal_id = job
             .proposal
@@ -449,6 +585,26 @@ impl ConsolidationJobRuntime {
             outcome = field::Empty
         );
         let _entered = span.enter();
+        if let Some((memory_store, event_writer, decided_by, authority)) = auto_apply {
+            if job.workspace_id != authority.repository_id {
+                return Err(LatticeError::Storage(format!(
+                    "consolidation job '{}' workspace does not match explicit decision authority",
+                    job.job_id
+                )));
+            }
+            let proposal = persist_canonical_proposal(memory_store, &job, authority)?;
+            if !ReviewQueue::should_gate(&proposal) {
+                let _ = self.decide(
+                    &proposal.proposal_id,
+                    ProposalDecision::Applied,
+                    memory_store,
+                    event_writer,
+                    decided_by.value.as_str(),
+                    authority,
+                )?;
+            }
+            return Ok(Some(proposal));
+        }
         let conn = self.lock_conn()?;
         mark_running(&conn, &job.job_id)?;
         let Some(pending) = job.proposal else {
@@ -456,7 +612,7 @@ impl ConsolidationJobRuntime {
             span.record("outcome", "failed");
             return Ok(None);
         };
-        let proposal = proposal::proposal_from_pending(&job.job_id, pending);
+        let proposal = proposal::proposal_from_pending(&job.job_id, &job.workspace_id, pending);
         proposal.insert_pending(&conn)?;
         proposal::mark_job_status(
             &conn,
@@ -465,19 +621,6 @@ impl ConsolidationJobRuntime {
             Some(&proposal.proposal_id),
             None,
         )?;
-        if let Some((memory_store, event_writer, decided_by)) = auto_apply {
-            if !ReviewQueue::should_gate(&proposal) {
-                let _ = proposal.apply(
-                    &conn,
-                    memory_store,
-                    event_writer,
-                    decided_by.value.as_str(),
-                    None,
-                )?;
-                span.record("outcome", "applied");
-                return Ok(Some(proposal));
-            }
-        }
         span.record("outcome", "proposed");
         Ok(Some(proposal))
     }
@@ -500,6 +643,68 @@ fn mark_running(conn: &Connection, job_id: &str) -> Result<(), LatticeError> {
     Ok(())
 }
 
+fn bind_proposal_authority(
+    proposal: &mut ConsolidationProposal,
+    authority: &EvolutionAuthority<'_>,
+) -> Result<(), LatticeError> {
+    let evidence = proposal.evidence.as_object_mut().ok_or_else(|| {
+        LatticeError::Storage("consolidation proposal evidence must be a JSON object".into())
+    })?;
+    evidence.insert(
+        "repository_id".into(),
+        serde_json::Value::String(authority.repository_id.into()),
+    );
+    evidence.insert(
+        "checkout_id".into(),
+        serde_json::Value::String(authority.checkout_id.into()),
+    );
+    evidence.insert(
+        "branch".into(),
+        serde_json::Value::String(authority.branch.into()),
+    );
+    Ok(())
+}
+
+fn persist_canonical_proposal(
+    memory_store: &MemoryStore,
+    job: &ConsolidationJobSpec,
+    authority: &EvolutionAuthority<'_>,
+) -> Result<ConsolidationProposal, LatticeError> {
+    if job.workspace_id != authority.repository_id {
+        return Err(LatticeError::Storage(format!(
+            "consolidation job '{}' workspace does not match explicit authority",
+            job.job_id
+        )));
+    }
+    let pending = job.proposal.clone().ok_or_else(|| {
+        LatticeError::Storage(format!(
+            "consolidation job '{}' has no proposal",
+            job.job_id
+        ))
+    })?;
+    let mut proposal = proposal::proposal_from_pending(&job.job_id, &job.workspace_id, pending);
+    bind_proposal_authority(&mut proposal, authority)?;
+    memory_store.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(|e| LatticeError::Storage(format!("Failed to begin canonical proposal transaction: {e}")))?;
+        proposal.validate_creation_authority(memory_store, authority)?;
+        let changed = tx.execute("INSERT INTO consolidation_jobs(job_id,workspace_id,kind,mode,status,enqueued_at,proposal_id) VALUES(?1,?2,?3,?4,'proposed',?5,?6) ON CONFLICT(job_id) DO UPDATE SET status='proposed',proposal_id=excluded.proposal_id WHERE consolidation_jobs.workspace_id=excluded.workspace_id AND consolidation_jobs.kind=excluded.kind AND consolidation_jobs.mode=excluded.mode AND consolidation_jobs.status='queued'", params![job.job_id,job.workspace_id,job.kind,job.mode.as_str(),now_unix_micros(),proposal.proposal_id])
+            .map_err(|e| LatticeError::Storage(format!("Failed to persist canonical consolidation job: {e}")))?;
+        if changed != 1 { return Err(LatticeError::Storage(format!("Consolidation job '{}' conflicts with an existing non-identical job", job.job_id))); }
+        proposal.insert_pending(&tx)?;
+        tx.commit().map_err(|e| LatticeError::Storage(format!("Failed to commit canonical proposal transaction: {e}")))
+    })?;
+    Ok(proposal)
+}
+
 pub(crate) fn now_unix_micros() -> i64 {
     queue::now_unix_micros()
+}
+
+#[cfg(test)]
+pub(crate) fn test_authority() -> EvolutionAuthority<'static> {
+    EvolutionAuthority {
+        repository_id: "workspace-main",
+        checkout_id: "checkout-main",
+        branch: "main",
+    }
 }

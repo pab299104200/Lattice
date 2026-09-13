@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -23,6 +24,10 @@ pub(crate) struct WorkspaceIdentity {
     /// The primary checkout associated with the Git common directory.
     pub(crate) repository_root: PathBuf,
     pub(crate) repository_lattice_dir: PathBuf,
+    /// Historical authorities proven to name this exact Git repository.
+    pub(crate) proven_repository_identities: BTreeSet<String>,
+    pub(crate) is_git_repository: bool,
+    pub(crate) git_common_dir: Option<PathBuf>,
 }
 
 impl WorkspaceIdentity {
@@ -34,17 +39,36 @@ impl WorkspaceIdentity {
             )
         })?;
 
-        let Some((common_git_dir, primary_checkout)) = git_identity(&checkout_root)? else {
+        let Some(git) = git_identity(&checkout_root)? else {
             return Ok(Self::standalone(checkout_root));
         };
-        let repository_id = encoded_id("repo", common_git_dir.as_os_str().as_encoded_bytes());
+        let repository_id = encoded_id("repo", git.common_dir.as_os_str().as_encoded_bytes());
         let checkout_id = encoded_checkout_id(&repository_id, &checkout_root);
+        let mut proven_repository_identities = git.proven_identities;
+        // A completed relocation is durable, explicit proof that its former
+        // authority names this exact repository.  Never infer this from a
+        // path or remote: only the moved home's recorded proof is accepted.
+        let registry = git.storage_home.join("storage-registry.db");
+        if std::fs::symlink_metadata(&registry)
+            .ok()
+            .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            if let Some(recorded) = lattice_core::storage::resolve_recorded_relocation(
+                &git.storage_home,
+                &repository_id,
+            )? {
+                proven_repository_identities.insert(recorded.old_repository_id);
+            }
+        }
         Ok(Self {
             checkout_root,
             repository_id,
             checkout_id,
-            repository_lattice_dir: primary_checkout.join(".lattice"),
-            repository_root: primary_checkout,
+            repository_lattice_dir: git.storage_home,
+            repository_root: git.primary_root,
+            proven_repository_identities,
+            is_git_repository: true,
+            git_common_dir: Some(git.common_dir),
         })
     }
 
@@ -57,6 +81,9 @@ impl WorkspaceIdentity {
             checkout_root,
             repository_id,
             checkout_id,
+            proven_repository_identities: BTreeSet::new(),
+            is_git_repository: false,
+            git_common_dir: None,
         }
     }
 
@@ -70,16 +97,32 @@ impl WorkspaceIdentity {
             .join(&self.checkout_id)
     }
 
+    pub(crate) fn checkout_cache_dir(&self) -> PathBuf {
+        self.checkout_lattice_dir().join("cache")
+    }
+
     pub(crate) fn parsed_cache_path(&self) -> PathBuf {
         self.repository_lattice_dir.join("parsed-cache.db")
     }
 }
 
-fn git_identity(checkout_root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+struct GitIdentity {
+    common_dir: PathBuf,
+    primary_root: PathBuf,
+    storage_home: PathBuf,
+    proven_identities: BTreeSet<String>,
+}
+
+fn git_identity(checkout_root: &Path) -> Result<Option<GitIdentity>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(checkout_root)
-        .args(["rev-parse", "--git-common-dir", "--show-toplevel"])
+        .args([
+            "rev-parse",
+            "--git-common-dir",
+            "--git-dir",
+            "--is-bare-repository",
+        ])
         .output()
         .with_context(|| format!("failed to execute git for `{}`", checkout_root.display()))?;
     if !output.status.success() {
@@ -99,12 +142,13 @@ fn git_identity(checkout_root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
         .next()
         .filter(|line| !line.is_empty())
         .ok_or_else(|| anyhow!("git did not return a common directory"))?;
-    let raw_toplevel = lines
+    let raw_git_dir = lines
         .next()
         .filter(|line| !line.is_empty())
-        .ok_or_else(|| anyhow!("git did not return a checkout root"))?;
+        .ok_or_else(|| anyhow!("git did not return its Git directory"))?;
+    let is_bare = lines.next().is_some_and(|line| line == "true");
     let common_dir = absolute_from_checkout(checkout_root, raw_common_dir)?;
-    let toplevel = absolute_from_checkout(checkout_root, raw_toplevel)?;
+    let git_dir = absolute_from_checkout(checkout_root, raw_git_dir)?;
 
     // In a normal linked-worktree repository, the common git directory is
     // `<primary>/.git`; its parent is the only safe canonical home for the
@@ -116,9 +160,44 @@ fn git_identity(checkout_root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
             .map(Path::to_path_buf)
             .ok_or_else(|| anyhow!("Git common directory has no repository parent"))?
     } else {
-        toplevel
+        checkout_root.to_path_buf()
     };
-    Ok(Some((common_dir, primary_checkout)))
+    let storage_home = if common_dir.file_name().is_some_and(|name| name == ".git") {
+        primary_checkout.join(".lattice")
+    } else {
+        common_dir.join("lattice")
+    };
+    let mut proven = BTreeSet::from([
+        common_dir.to_string_lossy().into_owned(),
+        git_dir.to_string_lossy().into_owned(),
+        checkout_root.to_string_lossy().into_owned(),
+    ]);
+    let worktrees = Command::new("git")
+        .arg("--git-dir")
+        .arg(&common_dir)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("failed to inventory Git worktrees")?;
+    if worktrees.status.success() {
+        for line in String::from_utf8_lossy(&worktrees.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                if let Ok(path) = PathBuf::from(path).canonicalize() {
+                    proven.insert(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    // Prior releases used canonical path strings directly. Only those paths
+    // reported by this common Git directory enter the proof set.
+    if is_bare {
+        proven.insert(common_dir.to_string_lossy().into_owned());
+    }
+    Ok(Some(GitIdentity {
+        common_dir,
+        primary_root: primary_checkout,
+        storage_home,
+        proven_identities: proven,
+    }))
 }
 
 fn encoded_checkout_id(repository_id: &str, checkout_root: &Path) -> String {
@@ -162,6 +241,7 @@ mod tests {
     use lattice_core::memory::{
         Memory, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus,
     };
+    use lattice_core::storage::{CachePolicy, StorageRegistry};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -360,8 +440,18 @@ mod tests {
 
         fs::create_dir_all(primary.checkout_lattice_dir()).unwrap();
         fs::create_dir_all(linked.checkout_lattice_dir()).unwrap();
-        let primary_graph_path = primary.checkout_lattice_dir().join("graph.db");
-        let linked_graph_path = linked.checkout_lattice_dir().join("graph.db");
+        fs::create_dir_all(primary.checkout_cache_dir()).unwrap();
+        fs::create_dir_all(linked.checkout_cache_dir()).unwrap();
+        let mut registry =
+            StorageRegistry::open(&primary.repository_lattice_dir, &primary.repository_id).unwrap();
+        let _primary_lease = registry
+            .register_and_lease(&primary.checkout_id, &root, 1)
+            .unwrap();
+        let _linked_lease = registry
+            .register_and_lease(&linked.checkout_id, &worktree, 1)
+            .unwrap();
+        let primary_graph_path = primary.checkout_cache_dir().join("graph.db");
+        let linked_graph_path = linked.checkout_cache_dir().join("graph.db");
         assert_ne!(primary_graph_path, linked_graph_path);
         let primary_graph = lattice_core::storage::GraphStore::open(&primary_graph_path).unwrap();
         primary_graph.save_graph(&primary_index.graph).unwrap();
@@ -389,6 +479,73 @@ mod tests {
 
         let _ = fs::remove_dir_all(&worktree);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hundred_real_git_worktrees_register_edit_close_and_reclaim() {
+        let root = unique_temp_dir("worktree-churn");
+        let worktrees = unique_temp_dir("worktree-churn-linked");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&worktrees).unwrap();
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "lattice@example.test"]);
+        git(&root, &["config", "user.name", "Lattice Test"]);
+        fs::write(root.join("fixture.rs"), "pub fn initial() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "fixture"]);
+        let primary = WorkspaceIdentity::resolve(&root).unwrap();
+        fs::create_dir_all(&primary.repository_lattice_dir).unwrap();
+        let mut registry =
+            StorageRegistry::open(&primary.repository_lattice_dir, &primary.repository_id).unwrap();
+        for index in 0..100 {
+            let checkout = worktrees.join(format!("checkout-{index}"));
+            git(
+                &root,
+                &["worktree", "add", "--detach", checkout.to_str().unwrap()],
+            );
+            let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+            let lease = registry
+                .register_and_lease(&identity.checkout_id, &checkout, 1)
+                .unwrap();
+            fs::write(
+                checkout.join("fixture.rs"),
+                format!("pub fn edit_{index}() {{}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                identity.checkout_cache_dir().join("graph.db"),
+                [index as u8; 64],
+            )
+            .unwrap();
+            drop(lease);
+            git(
+                &root,
+                &["worktree", "remove", "--force", checkout.to_str().unwrap()],
+            );
+        }
+        let policy = CachePolicy {
+            high_bytes: 1,
+            low_bytes: 0,
+            idle_grace_secs: 1,
+            batch_files: 64,
+        };
+        loop {
+            registry.advance_inventory(10, &policy, 256).unwrap();
+            let plan = registry.plan_gc(10, &policy).unwrap();
+            if plan.is_empty() {
+                break;
+            }
+            registry.execute_gc(&plan, 10, &policy).unwrap();
+        }
+        assert_eq!(
+            registry
+                .inventory(10, &policy)
+                .unwrap()
+                .derived_logical_bytes,
+            0
+        );
+        let _ = fs::remove_dir_all(worktrees);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn graph_facts(graph: &lattice_core::graph::CodeGraph) -> (Vec<String>, Vec<String>) {
@@ -446,6 +603,56 @@ mod tests {
         let error = WorkspaceIdentity::resolve(&root).unwrap_err().to_string();
         assert!(error.contains("invalid or inaccessible"), "{error}");
         assert!(error.contains(root.to_string_lossy().as_ref()), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn separate_git_directory_uses_metadata_owned_storage_home() {
+        let root = unique_temp_dir("separate-worktree");
+        let metadata = unique_temp_dir("separate-metadata");
+        fs::create_dir_all(&root).unwrap();
+        let output = Command::new("git")
+            .args(["init", "--separate-git-dir"])
+            .arg(&metadata)
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let identity = WorkspaceIdentity::resolve(&root).unwrap();
+        let canonical = metadata.canonicalize().unwrap();
+        assert!(identity.is_git_repository);
+        assert_eq!(identity.repository_lattice_dir, canonical.join("lattice"));
+        assert!(identity
+            .proven_repository_identities
+            .contains(&canonical.to_string_lossy().into_owned()));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(metadata);
+    }
+
+    #[test]
+    fn bare_repository_uses_common_directory_storage_home() {
+        let root = unique_temp_dir("bare-repository");
+        let output = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let identity = WorkspaceIdentity::resolve(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        assert!(identity.is_git_repository);
+        assert_eq!(identity.repository_lattice_dir, canonical.join("lattice"));
+        assert!(identity
+            .proven_repository_identities
+            .contains(&canonical.to_string_lossy().into_owned()));
         let _ = fs::remove_dir_all(root);
     }
 }

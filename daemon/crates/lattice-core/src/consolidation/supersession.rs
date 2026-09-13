@@ -14,7 +14,7 @@ use super::{
     capture_memory_state, encode_memory_state, ConsolidationJobMode, ConsolidationJobRuntime,
     PendingProposalSpec, ProposalKind, ScanError, ScanReport,
 };
-use crate::memory::{Memory, MemoryLinkRecord, MemoryStore, MemoryVerificationStatus};
+use crate::memory::{Memory, MemoryStore, MemoryVerificationStatus};
 
 pub struct SupersessionCandidates<'a> {
     store: &'a MemoryStore,
@@ -26,7 +26,11 @@ impl<'a> SupersessionCandidates<'a> {
         Self { store, runtime }
     }
 
-    pub fn scan(&mut self, workspace_id: &str) -> Result<ScanReport, ScanError> {
+    pub fn scan(
+        &mut self,
+        authority: &super::EvolutionAuthority<'_>,
+    ) -> Result<ScanReport, ScanError> {
+        let workspace_id = authority.repository_id;
         let started = Instant::now();
         let span = info_span!(
             "consolidation.supersession.scan",
@@ -34,7 +38,15 @@ impl<'a> SupersessionCandidates<'a> {
             kind = "detect supersession candidates"
         );
         let _entered = span.enter();
-        let memories = self.store.list_workspace_memories(workspace_id)?;
+        let memories: Vec<Memory> = self
+            .store
+            .list_applicable_workspace_memories(workspace_id, authority.checkout_id)?
+            .into_iter()
+            .filter(|memory| {
+                memory.scope != crate::memory::MemoryScope::Branch
+                    || memory.branch.as_deref() == Some(authority.branch)
+            })
+            .collect();
         let mut proposals_enqueued = 0u32;
         let mut skipped = 0u32;
 
@@ -65,15 +77,6 @@ impl<'a> SupersessionCandidates<'a> {
                 proposed_state.structured_fields.verification_status =
                     MemoryVerificationStatus::Superseded;
                 proposed_state.structured_fields.superseded_by_memory_id = Some(newer.id.clone());
-                proposed_state.memory_links.push(MemoryLinkRecord {
-                    link_id: format!("supersession:{}:{}", older.id, newer.id),
-                    source_memory_id: older.id.clone(),
-                    target_memory_id: newer.id.clone(),
-                    link_type: "supersedes".to_string(),
-                    reason: "newer memory replaced overlapping anchors".to_string(),
-                    created_at: newer.created_at,
-                    verification_status: "verified".to_string(),
-                });
 
                 self.runtime.submit(crate::consolidation::ConsolidationJobSpec {
                     job_id: format!("supersession-{}-{}", older.id, newer.id),
@@ -88,6 +91,8 @@ impl<'a> SupersessionCandidates<'a> {
                         proposed_state: encode_memory_state(&proposed_state),
                         evidence: json!({
                             "source_memory_ids": [older.id.clone(), newer.id.clone()],
+                                "superseded_by_memory_id": newer.id.clone(),
+                                "replacement_state_hash": super::state_hash_for_memory(self.store, &newer.id)?,
                             "shared_files": shared_values(&older.linked_files, &newer.linked_files),
                             "shared_symbols": shared_values(&older.linked_symbols, &newer.linked_symbols),
                         }),
@@ -98,7 +103,7 @@ impl<'a> SupersessionCandidates<'a> {
             }
         }
 
-        let _ = self.runtime.run_due()?;
+        let _ = self.runtime.run_due(self.store, authority)?;
         Ok(ScanReport::from_counts(
             proposals_enqueued,
             skipped,

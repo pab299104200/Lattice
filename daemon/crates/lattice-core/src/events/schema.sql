@@ -78,3 +78,15 @@ CREATE INDEX IF NOT EXISTS idx_events_workspace_branch
     ON events(workspace_id, branch, ts_unix_micros);
 CREATE INDEX IF NOT EXISTS idx_events_kind_ts
     ON events(kind, ts_unix_micros);
+
+CREATE INDEX IF NOT EXISTS idx_events_payload_spill
+    ON events(payload_spill_id) WHERE payload_spill_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS events_reclaim_payload
+AFTER DELETE ON events
+WHEN OLD.payload_spill_id IS NOT NULL
+BEGIN
+    DELETE FROM event_payloads
+    WHERE row_id = OLD.payload_spill_id
+      AND NOT EXISTS (SELECT 1 FROM events WHERE payload_spill_id = OLD.payload_spill_id);
+END;

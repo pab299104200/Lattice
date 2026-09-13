@@ -12,6 +12,8 @@ name = "lattice_report"
 path = "src/bin/lattice_report.rs"
 
 [dependencies]
+# Proven worktree commit/index authority and isolated Git fixture tests.
+git2 = { version = "0.19", default-features = false }
 lattice-core = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -26,9 +28,10 @@ rusqlite = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 ureq = { version = "3.2", features = ["json"] }
+toml_edit = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
 [dev-dependencies]
-# Watcher acceptance tests construct linked worktrees through libgit2 so they
-# never depend on a host `git` executable or its configuration.
-git2 = { version = "0.19", default-features = false }
 tempfile = "3"

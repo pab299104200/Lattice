@@ -104,7 +104,7 @@ fn truncated_snapshot_without_fallback_returns_content_hash_mismatch() {
         .expect("event appends");
 
     let path = fixture.tempdir.path().join("snapshot-1-1.bin");
-    Snapshot::write(&path, &sample_graph(), &sample_memory_store(), 1).expect("snapshot writes");
+    Snapshot::write(&path, &sample_graph(), 1).expect("snapshot writes");
     truncate_file(&path);
 
     let error = Bootstrap::load(&path, &fixture.reopen_store()).expect_err("truncated snapshot");
@@ -127,7 +127,7 @@ fn truncated_latest_snapshot_falls_back_to_prior_snapshot() {
         ))
         .expect("first event appends");
     let first = fixture.tempdir.path().join("snapshot-1-1.bin");
-    Snapshot::write(&first, &sample_graph(), &sample_memory_store(), 1).expect("first snapshot");
+    Snapshot::write(&first, &sample_graph(), 1).expect("first snapshot");
 
     writer
         .append(event_envelope(
@@ -139,7 +139,7 @@ fn truncated_latest_snapshot_falls_back_to_prior_snapshot() {
         ))
         .expect("second event appends");
     let second = fixture.tempdir.path().join("snapshot-2-2.bin");
-    Snapshot::write(&second, &sample_graph(), &sample_memory_store(), 2).expect("second snapshot");
+    Snapshot::write(&second, &sample_graph(), 2).expect("second snapshot");
     truncate_file(&second);
 
     let bootstrapped = Bootstrap::load(&second, &fixture.reopen_store()).expect("fallback loads");

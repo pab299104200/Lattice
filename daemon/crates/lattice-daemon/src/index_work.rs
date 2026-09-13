@@ -5,8 +5,46 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+/// Tracks synchronous workers whose `JoinHandle` can outlive an aborted async
+/// task. Runtime shutdown waits for these guards before releasing storage
+/// authority to lifecycle GC.
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeWorkTracker {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl RuntimeWorkTracker {
+    pub(crate) fn begin(self: &Arc<Self>) -> RuntimeWorkGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        RuntimeWorkGuard(Arc::clone(self))
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+pub(crate) struct RuntimeWorkGuard(Arc<RuntimeWorkTracker>);
+
+impl Drop for RuntimeWorkGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
 pub(crate) const INDEX_CONCURRENCY_ENV: &str = "LATTICE_MAX_CONCURRENT_INDEX_JOBS";
+pub(crate) const INDEX_JOB_RESERVATION_ENV: &str = "LATTICE_INDEX_JOB_RESERVATION_BYTES";
 const DEFAULT_INDEX_CONCURRENCY: usize = 1;
+const DEFAULT_INDEX_JOB_RESERVATION_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Process-wide admission control for memory- and CPU-heavy graph rebuilds.
 ///
@@ -21,6 +59,8 @@ pub(crate) struct IndexWorkCoordinator {
     completed_jobs: AtomicU64,
     active_by_workspace: StdMutex<HashMap<String, usize>>,
     queued_by_workspace: StdMutex<HashMap<String, usize>>,
+    resource_budget: Arc<crate::resource_budget::ResourceBudget>,
+    job_reservation_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -35,15 +75,38 @@ pub(crate) struct IndexWorkSnapshot {
 
 impl IndexWorkCoordinator {
     pub(crate) fn from_env() -> Arc<Self> {
+        Self::from_env_with_budget(crate::resource_budget::ResourceBudget::from_env())
+    }
+
+    pub(crate) fn from_env_with_budget(
+        resource_budget: Arc<crate::resource_budget::ResourceBudget>,
+    ) -> Arc<Self> {
         let capacity = std::env::var(INDEX_CONCURRENCY_ENV)
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_INDEX_CONCURRENCY);
-        Self::new(capacity)
+        let bytes = std::env::var(INDEX_JOB_RESERVATION_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_INDEX_JOB_RESERVATION_BYTES);
+        Self::with_resource_budget(capacity, resource_budget, bytes)
     }
 
     pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        Self::with_resource_budget(
+            capacity,
+            Arc::new(crate::resource_budget::ResourceBudget::new(u64::MAX)),
+            1,
+        )
+    }
+
+    pub(crate) fn with_resource_budget(
+        capacity: usize,
+        resource_budget: Arc<crate::resource_budget::ResourceBudget>,
+        job_reservation_bytes: u64,
+    ) -> Arc<Self> {
         let capacity = capacity.max(1);
         Arc::new(Self {
             permits: Arc::new(Semaphore::new(capacity)),
@@ -53,6 +116,8 @@ impl IndexWorkCoordinator {
             completed_jobs: AtomicU64::new(0),
             active_by_workspace: StdMutex::new(HashMap::new()),
             queued_by_workspace: StdMutex::new(HashMap::new()),
+            resource_budget,
+            job_reservation_bytes: job_reservation_bytes.max(1),
         })
     }
 
@@ -60,11 +125,14 @@ impl IndexWorkCoordinator {
         self: &Arc<Self>,
         workspace: impl Into<String>,
         kind: &'static str,
-    ) -> Result<IndexWorkPermit, tokio::sync::AcquireError> {
+    ) -> anyhow::Result<IndexWorkPermit> {
         let workspace = workspace.into();
         let waiting = WaitingJob::new(Arc::clone(self), workspace.clone());
         let queued_at = Instant::now();
         let permit = Arc::clone(&self.permits).acquire_owned().await?;
+        let resource_reservation = self
+            .resource_budget
+            .try_reserve("index_staging_generation", self.job_reservation_bytes)?;
         waiting.promote();
         self.active_jobs.fetch_add(1, Ordering::AcqRel);
         adjust_workspace_count(&self.active_by_workspace, &workspace, 1);
@@ -82,6 +150,7 @@ impl IndexWorkCoordinator {
             workspace,
             kind,
             started_at: Instant::now(),
+            _resource_reservation: resource_reservation,
         })
     }
 
@@ -108,6 +177,14 @@ impl IndexWorkCoordinator {
     pub(crate) fn workspace_is_busy(&self, workspace: &str) -> bool {
         workspace_count(&self.active_by_workspace, workspace) > 0
             || workspace_count(&self.queued_by_workspace, workspace) > 0
+    }
+
+    pub(crate) fn resource_snapshot(&self) -> crate::resource_budget::ResourceBudgetSnapshot {
+        self.resource_budget.snapshot()
+    }
+
+    pub(crate) fn resource_budget(&self) -> Arc<crate::resource_budget::ResourceBudget> {
+        Arc::clone(&self.resource_budget)
     }
 }
 
@@ -148,6 +225,7 @@ pub(crate) struct IndexWorkPermit {
     workspace: String,
     kind: &'static str,
     started_at: Instant,
+    _resource_reservation: crate::resource_budget::ResourceReservation,
 }
 
 impl Drop for IndexWorkPermit {
@@ -289,5 +367,23 @@ mod tests {
         readiness.mark_ready();
         task.await.expect("readiness waiter");
         assert!(observed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn staging_generation_is_rejected_before_overcommit_and_releases_on_cancel() {
+        let budget = Arc::new(crate::resource_budget::ResourceBudget::new(10));
+        let coordinator = IndexWorkCoordinator::with_resource_budget(2, Arc::clone(&budget), 6);
+        let first = coordinator
+            .acquire("/workspace/a", "startup")
+            .await
+            .unwrap();
+        let error = match coordinator.acquire("/workspace/b", "startup").await {
+            Ok(_) => panic!("second staging generation exceeded the byte budget"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("resource-limited"));
+        assert_eq!(budget.snapshot().reserved_bytes, 6);
+        drop(first);
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
     }
 }

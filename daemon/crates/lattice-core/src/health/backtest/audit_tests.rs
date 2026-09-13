@@ -133,7 +133,10 @@ fn an_audit_with_no_commit_of_one_class_reports_unavailable() {
             )
         })
         .collect();
-    assert_eq!(audit_labels(&commits, 50).verdict, AuditVerdict::Unavailable);
+    assert_eq!(
+        audit_labels(&commits, 50).verdict,
+        AuditVerdict::Unavailable
+    );
 
     // No commit co-modifies at all: the independent signal is silent, which is
     // not the same as the classifier failing.

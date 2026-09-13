@@ -398,6 +398,19 @@ pub fn mine_repository(
     Ok(RepositoryGitMiningResult { snapshot, report })
 }
 
+/// Returns the exact ordered commit window that a bounded mining pass would
+/// inspect, without reading trees or diffs.  It is the cache identity boundary
+/// for repository-shared history facts.
+pub fn repository_commit_window(
+    repository_path: &Path,
+    limits: GitMiningLimits,
+) -> Result<Vec<String>, GitMiningError> {
+    let miner = GitHistoryMiner::with_limits(limits);
+    GitHistoryAdapter::new(miner.limits())
+        .commit_ids(repository_path)
+        .map_err(GitMiningError::from)
+}
+
 impl GitHistoryMiner {
     pub fn new(history_limit: usize) -> Self {
         Self::with_limits(GitMiningLimits {
@@ -577,7 +590,13 @@ struct FileAccumulator {
 }
 
 impl FileAccumulator {
-    fn record(&mut self, author: Option<&str>, is_bug_fix: bool, lines_added: u32, lines_deleted: u32) {
+    fn record(
+        &mut self,
+        author: Option<&str>,
+        is_bug_fix: bool,
+        lines_added: u32,
+        lines_deleted: u32,
+    ) {
         self.commits = self.commits.saturating_add(1);
         if is_bug_fix {
             self.bug_fix_commits = self.bug_fix_commits.saturating_add(1);

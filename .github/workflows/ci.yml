@@ -12,10 +12,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -23,10 +31,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             daemon/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('daemon/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ matrix.target }}-debug-default-${{ hashFiles('daemon/Cargo.lock') }}
       - name: Run tests
         working-directory: daemon
-        run: cargo test --workspace
+        run: cargo test --workspace --target ${{ matrix.target }}
 
   rust-build:
     name: Build Daemon (${{ matrix.target }})
@@ -51,6 +59,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: ${{ runner.os }}-cargo-stable-${{ matrix.target }}-release-default-${{ hashFiles('daemon/Cargo.lock') }}
       - name: Build release
         working-directory: daemon
         run: cargo build --release --target ${{ matrix.target }}
@@ -66,21 +82,23 @@ jobs:
           path: |
             daemon/target/${{ matrix.target }}/release/${{ matrix.binary }}
             daemon/target/${{ matrix.target }}/release/${{ matrix.binary }}.sha256
+          retention-days: 14
 
-  extension-build:
-    name: Extension Build
+  shell-harness-tests:
+    name: Shell Harness Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install dependencies
-        working-directory: extension
-        run: npm ci
-      - name: Compile
-        working-directory: extension
-        run: npm run compile
-      - name: Lint
-        working-directory: extension
-        run: npm run lint || true
+      - name: Test Codex and Claude hook packages
+        run: bash integrations/codex/tests/hooks_test.sh
+      - name: Test Codex installer idempotency
+        run: bash integrations/codex/tests/install_test.sh
+      - name: Test worth-it benchmark contract
+        run: bash tools/tests/worth-it-benchmark_test.sh
+      - name: Test storage benchmark measurement contract
+        run: python3 -W error::ResourceWarning tools/tests/storage-benchmark_test.py
+      - name: Test writable agent efficacy harness contract
+        run: |
+          python3 -W error::ResourceWarning tools/tests/efficacy-fixtures_test.py
+          python3 -W error::ResourceWarning tools/tests/agent-efficacy_test.py
+          python3 -W error::ResourceWarning tools/tests/efficacy-supersession_test.py

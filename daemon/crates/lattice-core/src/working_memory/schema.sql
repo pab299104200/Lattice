@@ -20,3 +20,12 @@ CREATE INDEX IF NOT EXISTS idx_working_memory_checkpoints_scope_created
 
 CREATE INDEX IF NOT EXISTS idx_working_memory_checkpoints_state_hash
     ON working_memory_checkpoints(state_hash);
+
+CREATE TABLE IF NOT EXISTS working_memory_checkpoint_memory_refs (
+    checkpoint_id INTEGER NOT NULL REFERENCES working_memory_checkpoints(checkpoint_id) ON DELETE CASCADE,
+    memory_id TEXT NOT NULL,
+    PRIMARY KEY (checkpoint_id, memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_memory_checkpoint_memory_refs_memory
+    ON working_memory_checkpoint_memory_refs(memory_id, checkpoint_id);

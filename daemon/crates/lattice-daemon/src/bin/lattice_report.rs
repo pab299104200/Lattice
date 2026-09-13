@@ -15,6 +15,10 @@ const DEFAULT_BENCHMARK_PATH: &str =
     "docs/plans/2026-05-16-cognitive-workspace-fork-build/baselines/cognitive_workspace_metrics.json";
 
 fn main() {
+    if let Err(error) = lattice_core::storage::managed_sqlite::ManagedSqlite::initialize_process() {
+        eprintln!("Managed SQLite process initialization failed: {error}");
+        std::process::exit(1);
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);

@@ -210,7 +210,32 @@ pub fn save_checkpoint_for_scope(
     .map_err(|e| {
         LatticeError::Storage(format!("Failed to save working memory checkpoint: {}", e))
     })?;
-    Ok(conn.last_insert_rowid())
+    let checkpoint_id = conn.last_insert_rowid();
+    for memory_id in referenced_memory_ids(state) {
+        conn.execute(
+            "INSERT OR IGNORE INTO working_memory_checkpoint_memory_refs(checkpoint_id,memory_id) VALUES(?1,?2)",
+            params![checkpoint_id, memory_id],
+        ).map_err(|e| LatticeError::Storage(format!("Failed to index checkpoint memory references: {e}")))?;
+    }
+    Ok(checkpoint_id)
+}
+
+pub(crate) fn referenced_memory_ids(state: &WorkingMemoryState) -> BTreeSet<String> {
+    state
+        .selected_memories
+        .iter()
+        .chain(state.excluded_memories.iter().map(|item| &item.result))
+        .filter_map(|result| match &result.identity {
+            Identity::Memory(id) => Some(id.ulid.clone()),
+            _ => None,
+        })
+        .chain(state.budget_decisions.pinned_identities.iter().filter_map(
+            |identity| match identity {
+                Identity::Memory(id) => Some(id.ulid.clone()),
+                _ => None,
+            },
+        ))
+        .collect()
 }
 
 pub fn load_checkpoint(

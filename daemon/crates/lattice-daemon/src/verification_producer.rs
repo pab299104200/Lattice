@@ -8,49 +8,21 @@ use lattice_core::memory::{
     parse_session_capture_event, CheckOutcome, ErrorStatus, SessionCaptureEvent,
     SessionCaptureFact, SESSION_CAPTURE_SCHEMA_VERSION,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::trusted_check_runner::{
+    load_verification_config, run_explicit_check, DeclaredCheck, DeclaredError,
+    TrustedCheckRequest, TrustedCheckStatus,
+};
 use crate::workspace_identity::WorkspaceIdentity;
 
 const CONFIG_RELATIVE_PATH: &str = ".lattice/verification-checks.json";
-const MAX_CONFIG_BYTES: usize = 64 * 1024;
-const MAX_CHECKS: usize = 64;
 const MAX_ID_BYTES: usize = 64;
-const MAX_ARGV_ITEMS: usize = 64;
-const MAX_ARG_BYTES: usize = 4 * 1024;
-const MAX_ARGV_BYTES: usize = 16 * 1024;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VerificationConfig {
-    schema_version: u32,
-    checks: Vec<DeclaredCheck>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeclaredCheck {
-    id: String,
-    label: String,
-    argv: Vec<String>,
-    #[serde(default)]
-    error: Option<DeclaredError>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeclaredError {
-    category: String,
-    fingerprint: String,
-}
+const PRODUCER_MAX_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProducerIntegration {
@@ -82,12 +54,6 @@ struct ProducerInvocation {
     check_id: String,
 }
 
-#[derive(Debug)]
-struct CheckExecution {
-    outcome: CheckOutcome,
-    exit_code: i32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerificationConfigHealth {
     Absent,
@@ -110,12 +76,32 @@ fn run_from_args(args: Vec<String>) -> Option<i32> {
     let invocation = parse_invocation(&args)?;
     let identity = checkout_identity_from_cwd()?;
     let check = load_declared_check(&identity.checkout_root, &invocation.check_id)?;
-    let execution = execute_declared_check(&identity.checkout_root, &check);
-    let events = declared_events(&check, execution.outcome)?;
+    let observation = run_explicit_check(TrustedCheckRequest {
+        check_id: &check.id,
+        workspace: &identity,
+        // Hook facts are deliberately not behavioral-validation records. The
+        // future trusted adapter supplies a proven graph generation.
+        graph_generation: 0,
+        max_timeout: PRODUCER_MAX_TIMEOUT,
+    });
+    let (outcome, exit_code) = match observation {
+        Ok(observation) => match observation.status {
+            TrustedCheckStatus::Passed => (CheckOutcome::Passed, 0),
+            TrustedCheckStatus::Failed => (
+                CheckOutcome::Failed,
+                observation
+                    .exit_code
+                    .filter(|code| (1..=255).contains(code))
+                    .unwrap_or(1),
+            ),
+        },
+        Err(_) => (CheckOutcome::Skipped, 126),
+    };
+    let events = declared_events(&check, outcome)?;
     for event in events {
         let _ = emit_event(&identity.checkout_root, &invocation, &event);
     }
-    Some(execution.exit_code)
+    Some(exit_code)
 }
 
 fn parse_invocation(args: &[String]) -> Option<ProducerInvocation> {
@@ -149,7 +135,8 @@ fn checkout_identity_from_cwd() -> Option<WorkspaceIdentity> {
 }
 
 fn load_declared_check(root: &Path, check_id: &str) -> Option<DeclaredCheck> {
-    let config = load_config(root)?;
+    let config = load_verification_config(root).ok()?;
+    validate_producer_mappings(&config.checks)?;
     config.checks.into_iter().find(|check| check.id == check_id)
 }
 
@@ -162,81 +149,19 @@ pub(crate) fn verification_config_health(root: &Path) -> VerificationConfigHealt
         Err(_) => return VerificationConfigHealth::Invalid,
         Ok(_) => {}
     }
-    match load_config(root) {
-        Some(config) => VerificationConfigHealth::Valid {
-            checks: config.checks.len(),
-        },
-        None => VerificationConfigHealth::Invalid,
-    }
-}
-
-fn load_config(root: &Path) -> Option<VerificationConfig> {
-    let config_path = root.join(CONFIG_RELATIVE_PATH);
-    let file = open_config(root, &config_path)?;
-    let metadata = file.metadata().ok()?;
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(MAX_CONFIG_BYTES));
-    file.take((MAX_CONFIG_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > MAX_CONFIG_BYTES {
-        return None;
-    }
-    let config: VerificationConfig = serde_json::from_slice(&bytes).ok()?;
-    validate_config(&config, root)?;
-    Some(config)
-}
-
-#[cfg(unix)]
-fn open_config(root: &Path, config_path: &Path) -> Option<File> {
-    let lattice_dir = root.join(".lattice");
-    let directory = std::fs::symlink_metadata(&lattice_dir).ok()?;
-    if !directory.is_dir()
-        || directory.file_type().is_symlink()
-        || directory.uid() != unsafe { libc::geteuid() }
-        || directory.mode() & 0o022 != 0
-    {
-        return None;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(config_path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.nlink() != 1
-    {
-        return None;
-    }
-    Some(file)
-}
-
-#[cfg(not(unix))]
-fn open_config(root: &Path, config_path: &Path) -> Option<File> {
-    let directory = std::fs::symlink_metadata(root.join(".lattice")).ok()?;
-    let metadata = std::fs::symlink_metadata(config_path).ok()?;
-    if !directory.is_dir()
-        || directory.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.file_type().is_symlink()
-    {
-        return None;
-    }
-    File::open(config_path).ok()
-}
-
-fn validate_config(config: &VerificationConfig, root: &Path) -> Option<()> {
-    if config.schema_version != 1 || config.checks.is_empty() || config.checks.len() > MAX_CHECKS {
-        return None;
-    }
-    let mut ids = BTreeSet::new();
-    for check in &config.checks {
-        if !valid_check_id(&check.id) || !ids.insert(check.id.as_str()) {
-            return None;
+    match load_verification_config(root) {
+        Ok(config) if validate_producer_mappings(&config.checks).is_some() => {
+            VerificationConfigHealth::Valid {
+                checks: config.checks.len(),
+            }
         }
-        validate_argv(root, &check.argv)?;
+        Ok(_) => VerificationConfigHealth::Invalid,
+        Err(_) => VerificationConfigHealth::Invalid,
+    }
+}
+
+fn validate_producer_mappings(checks: &[DeclaredCheck]) -> Option<()> {
+    for check in checks {
         for outcome in [
             CheckOutcome::Passed,
             CheckOutcome::Failed,
@@ -250,93 +175,6 @@ fn validate_config(config: &VerificationConfig, root: &Path) -> Option<()> {
         }
     }
     Some(())
-}
-
-fn validate_argv(root: &Path, argv: &[String]) -> Option<()> {
-    if argv.is_empty() || argv.len() > MAX_ARGV_ITEMS {
-        return None;
-    }
-    let mut total = 0_usize;
-    for arg in argv {
-        if arg.is_empty()
-            || arg.len() > MAX_ARG_BYTES
-            || arg.bytes().any(|byte| byte == 0 || byte.is_ascii_control())
-        {
-            return None;
-        }
-        total = total.checked_add(arg.len())?;
-        if total > MAX_ARGV_BYTES {
-            return None;
-        }
-    }
-    let executable = Path::new(&argv[0]);
-    if executable.is_absolute()
-        || executable.components().any(|part| {
-            matches!(
-                part,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return None;
-    }
-    let basename = executable.file_name()?.to_str()?;
-    if matches!(
-        basename,
-        "sh" | "bash"
-            | "dash"
-            | "zsh"
-            | "fish"
-            | "ksh"
-            | "csh"
-            | "tcsh"
-            | "pwsh"
-            | "powershell"
-            | "cmd"
-            | "cmd.exe"
-    ) {
-        return None;
-    }
-    if executable.components().count() > 1 {
-        let resolved = root.join(executable).canonicalize().ok()?;
-        if !resolved.starts_with(root) || !resolved.is_file() {
-            return None;
-        }
-    }
-    Some(())
-}
-
-fn execute_declared_check(root: &Path, check: &DeclaredCheck) -> CheckExecution {
-    let executable = Path::new(&check.argv[0]);
-    let executable: PathBuf = if executable.components().count() > 1 {
-        root.join(executable)
-    } else {
-        executable.to_path_buf()
-    };
-    match Command::new(executable)
-        .args(&check.argv[1..])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => CheckExecution {
-            outcome: CheckOutcome::Passed,
-            exit_code: 0,
-        },
-        Ok(status) => CheckExecution {
-            outcome: CheckOutcome::Failed,
-            exit_code: status
-                .code()
-                .filter(|code| (1..=255).contains(code))
-                .unwrap_or(1),
-        },
-        Err(_) => CheckExecution {
-            outcome: CheckOutcome::Skipped,
-            exit_code: 126,
-        },
-    }
 }
 
 fn declared_events(
@@ -457,6 +295,7 @@ fn valid_opaque_session_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -472,17 +311,19 @@ mod tests {
     #[test]
     fn strict_manifest_selects_one_declared_check() {
         let root = temp_root("manifest");
+        let executable = std::env::current_exe().unwrap();
         fs::write(
             root.join(CONFIG_RELATIVE_PATH),
-            r#"{
-              "schema_version":1,
+            json!({
+              "schema_version":2,
               "checks":[{
                 "id":"core-tests",
                 "label":"lattice core tests",
-                "argv":["cargo","test","-p","lattice-core"],
+                "argv":[executable],
+                "timeout_ms": 1000,
                 "error":{"category":"test","fingerprint":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}
               }]
-            }"#,
+            }).to_string(),
         )
         .unwrap();
         let check = load_declared_check(&root, "core-tests").unwrap();
@@ -495,49 +336,22 @@ mod tests {
     fn manifest_rejects_unknown_fields_duplicate_ids_shells_and_escaping_programs() {
         let root = temp_root("reject");
         for checks in [
-            json!([{"id":"a","label":"safe","argv":["cargo"],"extra":true}]),
+            json!([{"id":"a","label":"safe","argv":["/bin/true"],"timeout_ms":100,"extra":true}]),
             json!([
-                {"id":"a","label":"safe","argv":["cargo"]},
-                {"id":"a","label":"safe","argv":["cargo"]}
+                {"id":"a","label":"safe","argv":["/bin/true"],"timeout_ms":100},
+                {"id":"a","label":"safe","argv":["/bin/true"],"timeout_ms":100}
             ]),
-            json!([{"id":"a","label":"safe","argv":["sh","-c","false"]}]),
-            json!([{"id":"a","label":"safe","argv":["../private/check"]}]),
-            json!([{"id":"Upper","label":"safe","argv":["cargo"]}]),
+            json!([{"id":"a","label":"safe","argv":["/bin/sh","-c","false"],"timeout_ms":100}]),
+            json!([{"id":"a","label":"safe","argv":["../private/check"],"timeout_ms":100}]),
+            json!([{"id":"Upper","label":"safe","argv":["/bin/true"],"timeout_ms":100}]),
         ] {
             fs::write(
                 root.join(CONFIG_RELATIVE_PATH),
-                json!({"schema_version":1,"checks":checks}).to_string(),
+                json!({"schema_version":2,"checks":checks}).to_string(),
             )
             .unwrap();
             assert!(load_declared_check(&root, "a").is_none());
         }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execution_maps_only_categorical_outcomes() {
-        let root = temp_root("execute");
-        let passed = DeclaredCheck {
-            id: "passed".into(),
-            label: "declared pass".into(),
-            argv: vec!["true".into()],
-            error: None,
-        };
-        let failed = DeclaredCheck {
-            id: "failed".into(),
-            label: "declared fail".into(),
-            argv: vec!["false".into()],
-            error: None,
-        };
-        assert_eq!(
-            execute_declared_check(&root, &passed).outcome,
-            CheckOutcome::Passed
-        );
-        assert_eq!(
-            execute_declared_check(&root, &failed).outcome,
-            CheckOutcome::Failed
-        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -547,6 +361,9 @@ mod tests {
             id: "private-id".into(),
             label: "stable public label".into(),
             argv: vec!["private-command".into(), "private-argument".into()],
+            timeout_ms: 100,
+            env: Default::default(),
+            evidence_reference: None,
             error: Some(DeclaredError {
                 category: "test".into(),
                 fingerprint: format!("sha256:{}", "2".repeat(64)),

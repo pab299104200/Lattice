@@ -24,7 +24,37 @@ CREATE TABLE IF NOT EXISTS parsed_file_cache (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_parsed_file_cache_identity
 ON parsed_file_cache(content_hash, language, parser_version, schema_version, config_version);
+CREATE TABLE IF NOT EXISTS parsed_file_cache_memberships (
+    checkout_id TEXT NOT NULL,
+    cache_key TEXT NOT NULL REFERENCES parsed_file_cache(cache_key) ON DELETE CASCADE,
+    referenced_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (checkout_id, cache_key)
+);
+CREATE INDEX IF NOT EXISTS idx_parsed_file_cache_memberships_key
+ON parsed_file_cache_memberships(cache_key);
 "#;
+
+enum ParsedConnection {
+    Persistent(super::managed_sqlite::ManagedSqlite),
+    Ephemeral(Connection),
+}
+impl std::ops::Deref for ParsedConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Persistent(connection) => connection,
+            Self::Ephemeral(connection) => connection,
+        }
+    }
+}
+impl std::ops::DerefMut for ParsedConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Persistent(connection) => connection,
+            Self::Ephemeral(connection) => connection,
+        }
+    }
+}
 
 /// Repository-level, content-addressed parsed-file cache.
 ///
@@ -32,7 +62,7 @@ ON parsed_file_cache(content_hash, language, parser_version, schema_version, con
 /// the requesting path after a validated hit. One SQLite transaction publishes
 /// the complete payload and its checksum atomically.
 pub struct ParsedFileCache {
-    connection: Mutex<Connection>,
+    connection: Mutex<ParsedConnection>,
     path: Option<PathBuf>,
     recovered_corrupt: bool,
 }
@@ -63,22 +93,25 @@ impl ParsedFileCache {
                 path.display()
             )));
         }
-        match open_file(path) {
-            Ok(connection) => Ok(Self {
-                connection: Mutex::new(connection),
-                path: Some(path.to_path_buf()),
-                recovered_corrupt: false,
-            }),
-            Err(LatticeError::CorruptStorage { .. }) => {
-                remove_cache_files(path)?;
-                Ok(Self {
-                    connection: Mutex::new(open_file(path)?),
-                    path: Some(path.to_path_buf()),
-                    recovered_corrupt: true,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        let directory = super::SecureDir::open(path.parent().unwrap_or_else(|| Path::new(".")))
+            .map_err(|error| {
+                LatticeError::Storage(format!("Cannot pin parsed cache parent: {error}"))
+            })?;
+        let leaf = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| LatticeError::Storage("Invalid parsed cache database name".into()))?;
+        Self::open_in(&directory, leaf)
+    }
+
+    pub fn open_in(directory: &super::SecureDir, leaf: &str) -> Result<Self, LatticeError> {
+        let path = directory.path().join(leaf);
+        let connection = open_file_in(directory, leaf, &path)?;
+        Ok(Self {
+            connection: Mutex::new(ParsedConnection::Persistent(connection)),
+            path: Some(path),
+            recovered_corrupt: false,
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, LatticeError> {
@@ -89,11 +122,123 @@ impl ParsedFileCache {
         connection.execute_batch(SCHEMA).map_err(|error| {
             LatticeError::Storage(format!("Failed to initialize parsed-file cache: {error}"))
         })?;
+        super::commit_manifest::CommitManifestStore::initialize(&connection)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Mutex::new(ParsedConnection::Ephemeral(connection)),
             path: None,
             recovered_corrupt: false,
         })
+    }
+
+    pub fn find_commit_manifest(
+        &self,
+        identity: &super::commit_manifest::CommitManifestIdentity,
+    ) -> Result<Option<super::commit_manifest::PublishedManifest>, LatticeError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::find_complete(&connection, identity)
+    }
+
+    pub fn publish_and_bind_commit_manifest(
+        &self,
+        identity: &super::commit_manifest::CommitManifestIdentity,
+        entries: &[super::commit_manifest::CommitManifestEntry],
+        limits: super::commit_manifest::ManifestLimits,
+        checkout_id: &str,
+    ) -> Result<super::commit_manifest::PublishedManifest, LatticeError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::publish_for_checkout(
+            &mut connection,
+            identity,
+            entries,
+            limits,
+            checkout_id,
+        )
+    }
+
+    pub fn publish_commit_manifest(
+        &self,
+        identity: &super::commit_manifest::CommitManifestIdentity,
+        entries: &[super::commit_manifest::CommitManifestEntry],
+        limits: super::commit_manifest::ManifestLimits,
+    ) -> Result<super::commit_manifest::PublishedManifest, LatticeError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::publish(
+            &mut connection,
+            identity,
+            entries,
+            limits,
+        )
+    }
+
+    pub fn lookup_commit_paths(
+        &self,
+        identity: &super::commit_manifest::CommitManifestIdentity,
+        paths: &[String],
+        limits: super::commit_manifest::ManifestLimits,
+    ) -> Result<Vec<Option<super::commit_manifest::CommitManifestEntry>>, LatticeError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::lookup_paths(
+            &connection,
+            identity,
+            paths,
+            limits,
+        )
+    }
+
+    pub fn bind_commit_manifest(
+        &self,
+        checkout_id: &str,
+        generation_id: &str,
+    ) -> Result<(), LatticeError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::bind_checkout(
+            &mut connection,
+            checkout_id,
+            generation_id,
+        )
+    }
+
+    pub fn release_commit_manifest(&self, checkout_id: &str) -> Result<(), LatticeError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::release_checkout(&connection, checkout_id)
+    }
+
+    pub fn retire_commit_manifests(
+        &self,
+        max_generations: usize,
+        max_entries: usize,
+    ) -> Result<super::commit_manifest::ManifestRetirement, LatticeError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("Parsed-file cache lock was poisoned".into()))?;
+        super::commit_manifest::CommitManifestStore::retire_unreferenced(
+            &mut connection,
+            max_generations,
+            max_entries,
+        )
+    }
+
+    pub fn parse_key(content_hash: &str, language: Language) -> String {
+        cache_key(content_hash, language_name(language))
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -196,6 +341,127 @@ impl ParsedFileCache {
         Ok(())
     }
 
+    /// Records that a successfully published checkout graph may refer to this
+    /// immutable parse object.  Graph publication calls this only after its
+    /// manifest transaction commits; a failed index can therefore never keep
+    /// an object alive indefinitely.
+    pub fn record_membership(
+        &self,
+        checkout_id: &str,
+        content_hash: &str,
+        language: Language,
+    ) -> Result<(), LatticeError> {
+        if checkout_id.trim().is_empty() {
+            return Err(LatticeError::Storage(
+                "Parsed-cache checkout id is empty".to_string(),
+            ));
+        }
+        let key = cache_key(content_hash, language_name(language));
+        let connection = self.connection.lock().map_err(|_| {
+            LatticeError::Storage("Parsed-file cache lock was poisoned".to_string())
+        })?;
+        connection
+            .execute(
+                "INSERT INTO parsed_file_cache_memberships (checkout_id, cache_key)\
+             SELECT ?1, cache_key FROM parsed_file_cache WHERE cache_key = ?2\
+             ON CONFLICT(checkout_id, cache_key) DO UPDATE SET referenced_at = unixepoch()",
+                params![checkout_id, key],
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to record parsed-cache membership: {error}"))
+            })?;
+        Ok(())
+    }
+
+    /// Atomically replace one checkout's exact committed manifest membership.
+    pub fn replace_membership(
+        &self,
+        checkout_id: &str,
+        files: &[super::FileIndexEntry],
+    ) -> Result<(), LatticeError> {
+        let error =
+            |e: rusqlite::Error| LatticeError::Storage(format!("parsed manifest publication: {e}"));
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| LatticeError::Storage("parsed cache mutex poisoned".into()))?;
+        let tx = connection.transaction().map_err(error)?;
+        tx.execute(
+            "DELETE FROM parsed_file_cache_memberships WHERE checkout_id=?1",
+            [checkout_id],
+        )
+        .map_err(error)?;
+        for file in files {
+            let language = Language::from_extension(
+                Path::new(&file.file)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+            );
+            let key = cache_key(&file.content_hash, language_name(language));
+            tx.execute("INSERT OR IGNORE INTO parsed_file_cache_memberships(checkout_id,cache_key) SELECT ?1,cache_key FROM parsed_file_cache WHERE cache_key=?2",params![checkout_id,key]).map_err(error)?;
+        }
+        tx.commit().map_err(error)
+    }
+
+    /// Reclaim a bounded batch only when no durable checkout membership or
+    /// commit pin references the object. Membership retirement is authorized by
+    /// the repository GC journal, never inferred from a truncated live-ID list.
+    pub fn gc_unreferenced(&self, limit: usize) -> Result<usize, LatticeError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut connection = self.connection.lock().map_err(|_| {
+            LatticeError::Storage("Parsed-file cache lock was poisoned".to_string())
+        })?;
+        let tx = connection.transaction().map_err(|error| {
+            LatticeError::Storage(format!("Failed to begin parsed-cache GC: {error}"))
+        })?;
+        let mut statement = tx
+            .prepare(
+                "SELECT c.cache_key
+                 FROM parsed_file_cache c
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM parsed_file_cache_memberships m
+                   WHERE m.cache_key = c.cache_key
+                 )
+                 AND NOT EXISTS (SELECT 1 FROM commit_parse_pins p WHERE p.cache_key=c.cache_key)
+                 ORDER BY c.created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to select parsed-cache GC candidates: {error}"
+                ))
+            })?;
+        let keys = statement
+            .query_map(params![limit.min(i64::MAX as usize) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                LatticeError::Storage(format!(
+                    "Failed to query parsed-cache GC candidates: {error}"
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                LatticeError::Storage(format!("Failed to read parsed-cache GC candidate: {error}"))
+            })?;
+        drop(statement);
+        for key in &keys {
+            tx.execute("DELETE FROM parsed_file_cache WHERE cache_key = ?1", [key])
+                .map_err(|error| {
+                    LatticeError::Storage(format!(
+                        "Failed to delete parsed-cache GC candidate: {error}"
+                    ))
+                })?;
+        }
+        tx.commit().map_err(|error| {
+            LatticeError::Storage(format!("Failed to commit parsed-cache GC: {error}"))
+        })?;
+        Ok(keys.len())
+    }
+
     #[cfg(test)]
     fn corrupt_payload(&self, content_hash: &str, language: Language) {
         let language = language_name(language);
@@ -217,6 +483,13 @@ pub fn content_sha256(bytes: &[u8]) -> String {
 
 fn configure(connection: &Connection) -> Result<(), LatticeError> {
     connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| {
+            LatticeError::Storage(format!(
+                "Failed to enable parsed cache reference integrity: {error}"
+            ))
+        })?;
+    connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|error| {
             LatticeError::Storage(format!("Failed to set parsed cache timeout: {error}"))
@@ -234,8 +507,17 @@ fn configure(connection: &Connection) -> Result<(), LatticeError> {
     Ok(())
 }
 
-fn open_file(path: &Path) -> Result<Connection, LatticeError> {
-    let connection = Connection::open(path).map_err(|error| map_open_error(path, error))?;
+fn open_file_in(
+    directory: &super::SecureDir,
+    leaf: &str,
+    path: &Path,
+) -> Result<super::managed_sqlite::ManagedSqlite, LatticeError> {
+    let connection = super::managed_sqlite::ManagedSqlite::open(
+        directory,
+        leaf,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .map_err(|error| map_open_error(path, error))?;
     let integrity: String =
         retry_while_busy(|| connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0)))
             .map_err(|error| map_open_error(path, error))?;
@@ -249,6 +531,7 @@ fn open_file(path: &Path) -> Result<Connection, LatticeError> {
     retry_while_busy(|| connection.execute_batch(SCHEMA)).map_err(|error| {
         LatticeError::Storage(format!("Failed to initialize parsed-file cache: {error}"))
     })?;
+    super::commit_manifest::CommitManifestStore::initialize(&connection)?;
     Ok(connection)
 }
 
@@ -289,26 +572,6 @@ fn map_open_error(path: &Path, error: rusqlite::Error) -> LatticeError {
             path.display()
         ))
     }
-}
-
-fn remove_cache_files(path: &Path) -> Result<(), LatticeError> {
-    for target in [
-        path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", path.display())),
-        PathBuf::from(format!("{}-shm", path.display())),
-    ] {
-        match std::fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(LatticeError::Storage(format!(
-                    "Failed to remove corrupt parsed cache {}: {error}",
-                    target.display()
-                )))
-            }
-        }
-    }
-    Ok(())
 }
 
 fn cache_key(content_hash: &str, language: &str) -> String {
@@ -442,16 +705,43 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_database_is_rebuilt_without_touching_other_repository_state() {
+    fn corrupt_database_is_reported_without_deleting_shared_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parsed-cache.db");
         std::fs::write(&path, b"not a sqlite database").unwrap();
-        let cache = ParsedFileCache::open(&path).unwrap();
-        assert!(cache.recovered_corrupt());
-        let (lookup, parsed) = cache
-            .get(&content_sha256(b"missing"), Language::Rust, "src/lib.rs")
+        assert!(matches!(
+            ParsedFileCache::open(&path),
+            Err(LatticeError::CorruptStorage { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a sqlite database");
+    }
+
+    #[test]
+    fn membership_gc_keeps_live_checkout_objects_only() {
+        let cache = ParsedFileCache::open_in_memory().unwrap();
+        let first = parser::parse_file("src/one.rs", "fn one() {}\n").unwrap();
+        let second = parser::parse_file("src/two.rs", "fn two() {}\n").unwrap();
+        let first_hash = content_sha256(b"fn one() {}\n");
+        let second_hash = content_sha256(b"fn two() {}\n");
+        cache.put(&first_hash, &first).unwrap();
+        cache.put(&second_hash, &second).unwrap();
+        cache
+            .record_membership("checkout-a", &first_hash, Language::Rust)
             .unwrap();
-        assert_eq!(lookup, ParsedCacheLookup::Miss);
-        assert!(parsed.is_none());
+        assert_eq!(cache.gc_unreferenced(8).unwrap(), 1);
+        assert_eq!(
+            cache
+                .get(&first_hash, Language::Rust, "src/one.rs")
+                .unwrap()
+                .0,
+            ParsedCacheLookup::Hit
+        );
+        assert_eq!(
+            cache
+                .get(&second_hash, Language::Rust, "src/two.rs")
+                .unwrap()
+                .0,
+            ParsedCacheLookup::Miss
+        );
     }
 }

@@ -2,6 +2,7 @@ use crate::error::LatticeError;
 use crate::storage::vector_index::{VectorIndex, VectorScope, VectorSearchResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
 
 const CREATE_VECTORS_SCHEMA: &str = r#"
@@ -35,6 +36,28 @@ const FILE_SUMMARY_SCOPE_PREFIX: &str = "__lattice_file_summary__::";
 
 type CacheKey = (String, String, usize);
 
+enum VectorConnection {
+    Managed(super::managed_sqlite::ManagedSqlite),
+    Direct(Connection),
+}
+impl Deref for VectorConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Managed(value) => value,
+            Self::Direct(value) => value,
+        }
+    }
+}
+impl std::ops::DerefMut for VectorConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Managed(value) => value,
+            Self::Direct(value) => value,
+        }
+    }
+}
+
 pub(crate) struct StoredVectorRecord {
     pub ann_key: u64,
     pub file: String,
@@ -44,28 +67,89 @@ pub(crate) struct StoredVectorRecord {
 }
 
 struct SqliteVectorState {
-    conn: Connection,
+    conn: VectorConnection,
     cache: HashMap<CacheKey, Vec<f32>>,
+    bound_identity: Option<String>,
+    batch_depth: usize,
+    batch_guard: Option<super::CachePublicationGuard>,
 }
 
 /// Compatibility vector backend that stores embeddings as SQLite BLOBs and
 /// performs an exact brute-force cosine search.
 pub struct VectorStore {
+    publication: Option<super::cache_publication::CachePublicationAuthority>,
     state: Mutex<SqliteVectorState>,
 }
 
 impl VectorStore {
+    fn mutation_guard(
+        &self,
+        state: &SqliteVectorState,
+    ) -> Result<Option<super::CachePublicationGuard>, LatticeError> {
+        if state.batch_depth > 0 {
+            Ok(None)
+        } else {
+            self.publication.as_ref().map(|a| a.begin()).transpose()
+        }
+    }
+
+    fn begin_batch(&self) -> Result<VectorStorePublication<'_>, LatticeError> {
+        let mut state = self.lock_state("begin vector publication")?;
+        if state.batch_depth == 0 {
+            state.batch_guard = self.publication.as_ref().map(|a| a.begin()).transpose()?;
+        }
+        state.batch_depth += 1;
+        Ok(VectorStorePublication { store: self })
+    }
+    pub(crate) fn publication_active(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.batch_depth > 0)
+            .unwrap_or(false)
+    }
     pub fn open(path: &str) -> Result<Self, LatticeError> {
-        let conn = Connection::open(path)
-            .map_err(|e| LatticeError::Storage(format!("Failed to open vector store: {}", e)))?;
+        let path_value = std::path::PathBuf::from(path);
+        let (conn, publication, _opening_guard) =
+            match super::cache_publication::CachePublicationAuthority::for_path(&path_value)? {
+                Some((authority, leaf)) => {
+                    let guard = authority.begin()?;
+                    let conn = authority
+                        .open_sqlite(
+                            &leaf,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                        )
+                        .map_err(|e| {
+                            LatticeError::Storage(format!(
+                                "Failed to open managed vector store: {e}"
+                            ))
+                        })?;
+                    (
+                        VectorConnection::Managed(conn),
+                        Some(authority),
+                        Some(guard),
+                    )
+                }
+                None => (
+                    VectorConnection::Direct(Connection::open(path).map_err(|e| {
+                        LatticeError::Storage(format!("Failed to open vector store: {e}"))
+                    })?),
+                    None,
+                    None,
+                ),
+            };
 
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| LatticeError::Storage(format!("Failed to set WAL mode: {}", e)))?;
 
         Ok(Self {
+            publication,
             state: Mutex::new(SqliteVectorState {
                 conn,
                 cache: HashMap::new(),
+                bound_identity: None,
+                batch_depth: 0,
+                batch_guard: None,
             }),
         })
     }
@@ -76,14 +160,23 @@ impl VectorStore {
         })?;
 
         Ok(Self {
+            publication: None,
             state: Mutex::new(SqliteVectorState {
-                conn,
+                conn: VectorConnection::Direct(conn),
                 cache: HashMap::new(),
+                bound_identity: None,
+                batch_depth: 0,
+                batch_guard: None,
             }),
         })
     }
 
     pub fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
+        let _accounting = self
+            .publication
+            .as_ref()
+            .map(|authority| authority.begin())
+            .transpose()?;
         let state = self.lock_state("initialize vector store")?;
         state
             .conn
@@ -171,12 +264,15 @@ impl VectorStore {
         vector: &[f32],
     ) -> Result<u64, LatticeError> {
         let mut state = self.lock_state("upsert vector")?;
+        let _accounting = self.mutation_guard(&state)?;
+        let bound_identity = state.bound_identity.clone();
         let blob = f32_slice_to_bytes(vector);
         let stored_name = encode_vector_name_for_scope(name, scope);
 
         let tx = state.conn.transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to start vector upsert transaction: {}", e))
         })?;
+        validate_bound_identity(&tx, bound_identity.as_deref())?;
         let ann_key = load_or_create_ann_key(&tx, file, &stored_name, byte_offset)?;
         tx.execute(
             "INSERT INTO vectors (file, name, byte_offset, embedding)
@@ -199,6 +295,21 @@ impl VectorStore {
 
     pub fn delete_by_file(&self, file: &str) -> Result<(), LatticeError> {
         let mut state = self.lock_state("delete vectors by file")?;
+        let exists: bool = state
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM vectors WHERE file=?1)",
+                [file],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to inspect vectors for deletion: {e}"))
+            })?;
+        let _accounting = if exists {
+            self.mutation_guard(&state)?
+        } else {
+            None
+        };
         let tx = state.conn.transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to start vector delete transaction: {}", e))
         })?;
@@ -230,8 +341,62 @@ impl VectorStore {
         Ok(())
     }
 
+    pub fn bind_embedding_identity(&self, identity: &str) -> Result<(), LatticeError> {
+        if identity.is_empty() {
+            return Err(LatticeError::Storage(
+                "embedding identity must not be empty".into(),
+            ));
+        }
+        let error = |e: rusqlite::Error| {
+            LatticeError::Storage(format!("binding vector model identity: {e}"))
+        };
+        let mut state = self.lock_state("bind embedding model identity")?;
+        let current: Option<String> = state
+            .conn
+            .query_row(
+                "SELECT value FROM vector_index_meta WHERE key='embedding_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        let changed = current.as_deref() != Some(identity);
+        let _accounting = if changed {
+            self.mutation_guard(&state)?
+        } else {
+            None
+        };
+        let tx = state
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(error)?;
+        if changed {
+            tx.execute("DELETE FROM vectors", []).map_err(error)?;
+            tx.execute("DELETE FROM vector_keys", []).map_err(error)?;
+            tx.execute("INSERT INTO vector_index_meta(key,value) VALUES('embedding_identity',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[identity]).map_err(error)?;
+            bump_generation(&tx)?;
+        }
+        tx.commit().map_err(error)?;
+        if changed {
+            state.cache.clear();
+        }
+        state.bound_identity = Some(identity.to_owned());
+        Ok(())
+    }
+
     pub fn clear_all(&self) -> Result<(), LatticeError> {
         let mut state = self.lock_state("clear vector store")?;
+        let exists: bool = state
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM vectors)", [], |row| row.get(0))
+            .map_err(|e| {
+                LatticeError::Storage(format!("Failed to inspect vectors before clear: {e}"))
+            })?;
+        let _accounting = if exists {
+            self.mutation_guard(&state)?
+        } else {
+            None
+        };
         let tx = state.conn.transaction().map_err(|e| {
             LatticeError::Storage(format!("Failed to start vector clear transaction: {}", e))
         })?;
@@ -270,6 +435,7 @@ impl VectorStore {
         }
 
         let state = self.lock_state("search vectors")?;
+        validate_bound_identity(&state.conn, state.bound_identity.as_deref())?;
         if !state.cache.is_empty() {
             let mut results: Vec<VectorSearchResult> = state
                 .cache
@@ -416,6 +582,7 @@ impl VectorStore {
 
     pub(crate) fn current_generation(&self) -> Result<u64, LatticeError> {
         let state = self.lock_state("load vector generation")?;
+        validate_bound_identity(&state.conn, state.bound_identity.as_deref())?;
         Ok(meta_u64(&state.conn, VECTOR_META_GENERATION)?.unwrap_or(0))
     }
 
@@ -448,6 +615,15 @@ fn scope_matches(stored: VectorScope, requested: VectorScope) -> bool {
 }
 
 impl VectorIndex for VectorStore {
+    fn begin_publication(
+        &self,
+    ) -> Result<Box<dyn super::vector_index::VectorPublicationLease + '_>, LatticeError> {
+        Ok(Box::new(self.begin_batch()?))
+    }
+    fn bind_embedding_identity(&self, identity: &str) -> Result<(), LatticeError> {
+        VectorStore::bind_embedding_identity(self, identity)
+    }
+
     fn initialize(&self, dimension: usize) -> Result<(), LatticeError> {
         VectorStore::initialize(self, dimension)
     }
@@ -500,6 +676,21 @@ impl VectorIndex for VectorStore {
 
     fn implementation_name(&self) -> &'static str {
         "sqlite-exact"
+    }
+}
+
+struct VectorStorePublication<'a> {
+    store: &'a VectorStore,
+}
+impl super::vector_index::VectorPublicationLease for VectorStorePublication<'_> {}
+impl Drop for VectorStorePublication<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.store.state.lock() {
+            state.batch_depth = state.batch_depth.saturating_sub(1);
+            if state.batch_depth == 0 {
+                state.batch_guard = None;
+            }
+        }
     }
 }
 
@@ -669,4 +860,54 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     dot / (norm_a * norm_b)
+}
+
+fn validate_bound_identity(conn: &Connection, identity: Option<&str>) -> Result<(), LatticeError> {
+    if let Some(identity) = identity {
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT value FROM vector_index_meta WHERE key='embedding_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| LatticeError::Storage(format!("read vector model identity: {e}")))?;
+        if current.as_deref() != Some(identity) {
+            return Err(LatticeError::Storage("vector model identity changed in another owner; semantic generation must be reinitialized".into()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod model_identity_tests {
+    use super::*;
+    #[test]
+    fn equal_dimension_model_switch_retires_old_vectors_and_fences_prior_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.db");
+        let a = VectorStore::open(path.to_str().unwrap()).unwrap();
+        a.initialize(3).unwrap();
+        a.bind_embedding_identity("model-a-tokenizer-a-preprocess-a")
+            .unwrap();
+        a.upsert_vector("a.rs", "symbol", 0, &[1.0, 0.0, 0.0])
+            .unwrap();
+        a.bind_embedding_identity("model-a-tokenizer-a-preprocess-a")
+            .unwrap();
+        assert_eq!(a.search(&[1.0, 0.0, 0.0], 10).unwrap().len(), 1);
+        let b = VectorStore::open(path.to_str().unwrap()).unwrap();
+        b.initialize(3).unwrap();
+        b.bind_embedding_identity("model-b-tokenizer-a-preprocess-a")
+            .unwrap();
+        assert!(b.search(&[1.0, 0.0, 0.0], 10).unwrap().is_empty());
+        assert!(a
+            .search(&[1.0, 0.0, 0.0], 10)
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed"));
+        assert!(a
+            .upsert_vector("a.rs", "stale", 0, &[1.0, 0.0, 0.0])
+            .is_err());
+        assert_eq!(b.vector_count().unwrap(), 0);
+    }
 }

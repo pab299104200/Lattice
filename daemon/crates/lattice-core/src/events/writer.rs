@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::to_string;
 use thiserror::Error;
-use tracing::{debug, trace_span, warn};
+use tracing::{trace_span, warn};
 
 use crate::events::kinds::EventKind;
 use crate::events::store::MAX_EVENT_PAYLOAD_BYTES;
@@ -23,7 +23,7 @@ use crate::identity::{EventId, WorkspaceId};
 use crate::{DateTime, Utc};
 
 const DEFAULT_INLINE_CEILING_BYTES: usize = 4096;
-const EVENT_SCHEMA_VERSION: i64 = 2;
+const EVENT_SCHEMA_VERSION: i64 = 3;
 const ULID_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 static ULID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +50,8 @@ pub struct PartialEnvelope {
 pub enum IdentityError {
     #[error("{field} must not be empty")]
     EmptyField { field: &'static str },
+    #[error("event identity must be a canonical 26-character uppercase ULID")]
+    InvalidUlid,
 }
 
 #[derive(Debug, Error)]
@@ -75,7 +77,6 @@ pub struct EventWriter {
     inline_ceiling_bytes: usize,
     flush_policy: FlushPolicy,
     monotonic_state: Mutex<MonotonicState>,
-    payload_spill_cache: Mutex<HashMap<crate::events::PayloadHash, i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +107,6 @@ impl EventWriter {
             },
             flush_policy: default_flush_policy(),
             monotonic_state: Mutex::new(MonotonicState::default()),
-            payload_spill_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,6 +129,50 @@ impl EventWriter {
 
     pub fn append(&self, envelope: PartialEnvelope) -> Result<EventId, EventWriteError> {
         self.append_with_flush_policy(envelope, self.flush_policy)
+    }
+
+    /// Append a recoverable event with a caller-owned stable identity.
+    ///
+    /// Repeating an identical append is a success. Reusing the identity for a
+    /// different envelope is rejected, so an outbox can retry after an
+    /// uncertain process boundary without duplicating or corrupting history.
+    pub fn append_idempotent(
+        &self,
+        event_uuid: &str,
+        ts_unix_micros: i64,
+        envelope: PartialEnvelope,
+    ) -> Result<EventId, EventWriteError> {
+        if event_uuid.len() != 26 || !event_uuid.bytes().all(|byte| ULID_ALPHABET.contains(&byte)) {
+            return Err(EventWriteError::Identity(IdentityError::InvalidUlid));
+        }
+        let workspace_id = self.resolve_workspace(&envelope.workspace_id)?;
+        let event_id = EventId {
+            workspace_id: workspace_id.clone(),
+            ulid: event_uuid.to_string(),
+        };
+        let payload_bytes = serde_json::to_vec(&envelope.payload)?;
+        if payload_bytes.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(EventWriteError::PayloadTooLarge {
+                ceiling: MAX_EVENT_PAYLOAD_BYTES,
+                actual: payload_bytes.len(),
+            });
+        }
+        let payload_hash = crate::events::hash_canonical_payload_bytes(&payload_bytes);
+        let row = build_insert_row(
+            &event_id,
+            &workspace_id,
+            &envelope,
+            payload_hash.as_bytes().to_vec(),
+            PayloadLocation::Inline {
+                bytes_len: payload_bytes.len() as u32,
+            },
+            payload_bytes,
+            ts_unix_micros,
+        )?;
+        self.store
+            .insert_envelope_with_payload_idempotent(row, self.inline_ceiling_bytes)?;
+        self.flush_if_needed(self.flush_policy)?;
+        Ok(event_id)
     }
 
     pub fn append_with_flush_policy(
@@ -171,8 +215,9 @@ impl EventWriter {
             });
         }
         let payload_hash = crate::events::hash_canonical_payload_bytes(&payload_bytes);
-        let payload_location =
-            self.persist_payload(&payload_hash, &payload_bytes, prepared.ts_unix_micros)?;
+        let payload_location = PayloadLocation::Inline {
+            bytes_len: payload_bytes.len() as u32,
+        };
         let row = build_insert_row(
             &prepared.event_id,
             &prepared.workspace_id,
@@ -183,7 +228,8 @@ impl EventWriter {
             prepared.ts_unix_micros,
         )?;
 
-        self.store.insert_envelope_row_cached(&row)?;
+        self.store
+            .insert_envelope_with_payload(row, self.inline_ceiling_bytes)?;
         self.flush_if_needed(flush_policy)?;
         Ok(prepared.event_id)
     }
@@ -241,60 +287,6 @@ impl EventWriter {
             DateTime::from_unix_seconds(next_micros / 1_000_000),
             next_micros,
         ))
-    }
-
-    fn persist_payload(
-        &self,
-        payload_hash: &crate::events::PayloadHash,
-        payload_bytes: &[u8],
-        ts_unix_micros: i64,
-    ) -> Result<PayloadLocation, EventWriteError> {
-        if payload_bytes.len() <= self.inline_ceiling_bytes {
-            let bytes_len = u32::try_from(payload_bytes.len()).map_err(|_| {
-                EventWriteError::PayloadTooLarge {
-                    ceiling: u32::MAX as usize,
-                    actual: payload_bytes.len(),
-                }
-            })?;
-            return Ok(PayloadLocation::Inline { bytes_len });
-        }
-
-        if let Some(row_id) = self.cached_payload_row_id(payload_hash)? {
-            return Ok(PayloadLocation::Spilled { row_id });
-        }
-
-        let row_id = self.store.insert_or_get_payload(
-            payload_hash.as_bytes(),
-            payload_bytes,
-            ts_unix_micros,
-        )?;
-        self.payload_spill_cache
-            .lock()
-            .map_err(|_| EventStoreError::EnvelopeInvalid {
-                reason: "event writer payload cache lock was poisoned".to_string(),
-            })?
-            .insert(*payload_hash, row_id);
-        debug!(
-            bytes_len = payload_bytes.len(),
-            inline_ceiling_bytes = self.inline_ceiling_bytes,
-            payload_row_id = row_id,
-            "event payload spilled to side table"
-        );
-        Ok(PayloadLocation::Spilled { row_id })
-    }
-
-    fn cached_payload_row_id(
-        &self,
-        payload_hash: &crate::events::PayloadHash,
-    ) -> Result<Option<i64>, EventWriteError> {
-        Ok(self
-            .payload_spill_cache
-            .lock()
-            .map_err(|_| EventStoreError::EnvelopeInvalid {
-                reason: "event writer payload cache lock was poisoned".to_string(),
-            })?
-            .get(payload_hash)
-            .copied())
     }
 
     fn flush_if_needed(&self, flush_policy: FlushPolicy) -> Result<(), EventWriteError> {
@@ -410,7 +402,7 @@ fn next_ulid(ts_unix_micros: i64) -> String {
     encode_ulid((millis << 80) | sequence)
 }
 
-fn encode_ulid(mut value: u128) -> String {
+pub(crate) fn encode_ulid(mut value: u128) -> String {
     let mut output = [b'0'; 26];
     for slot in (0..26).rev() {
         let index = (value & 0x1f) as usize;

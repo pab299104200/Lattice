@@ -87,6 +87,7 @@ pub struct IncrementalVerifier<'a> {
     span_reader: &'a dyn SpanReader,
     event_writer: &'a EventWriter,
     decided_by: &'a OperatorId,
+    authority: &'a crate::consolidation::EvolutionAuthority<'a>,
     workspace_id: &'a str,
     work_budget: usize,
     observer: Option<&'a dyn VerificationObserver>,
@@ -104,6 +105,7 @@ impl<'a> IncrementalVerifier<'a> {
         span_reader: &'a dyn SpanReader,
         event_writer: &'a EventWriter,
         decided_by: &'a OperatorId,
+        authority: &'a crate::consolidation::EvolutionAuthority<'a>,
         workspace_id: &'a str,
         work_budget: usize,
     ) -> Self {
@@ -116,6 +118,7 @@ impl<'a> IncrementalVerifier<'a> {
             span_reader,
             event_writer,
             decided_by,
+            authority,
             workspace_id,
             work_budget,
             observer: None,
@@ -195,8 +198,13 @@ impl<'a> IncrementalVerifier<'a> {
         workspace_id: &str,
         now: DateTime<Utc>,
     ) -> Result<super::expiry::ExpiryReport, IncrementalError> {
-        let mut scanner =
-            ExpiryScanner::new(self.store, self.runtime, self.event_writer, self.decided_by);
+        let mut scanner = ExpiryScanner::new(
+            self.store,
+            self.runtime,
+            self.event_writer,
+            self.decided_by,
+            self.authority,
+        );
         Ok(scanner.scan(workspace_id, now)?)
     }
 
@@ -238,6 +246,7 @@ impl<'a> IncrementalVerifier<'a> {
             self.parsed_files,
             self.span_reader,
             self.workspace_id,
+            self.authority,
         );
         let outcome = verifier.verify_memory_with_outcome(&task.memory_id)?;
         if let Some(proposal_id) = outcome.proposal_id.as_deref() {
@@ -267,8 +276,13 @@ impl<'a> IncrementalVerifier<'a> {
         if expires_at.timestamp() > Utc::now().timestamp() {
             return Ok(false);
         }
-        let mut scanner =
-            ExpiryScanner::new(self.store, self.runtime, self.event_writer, self.decided_by);
+        let mut scanner = ExpiryScanner::new(
+            self.store,
+            self.runtime,
+            self.event_writer,
+            self.decided_by,
+            self.authority,
+        );
         if scanner
             .expire_memory(memory_id, self.workspace_id, Utc::now())?
             .is_some()
@@ -329,9 +343,8 @@ impl<'a> IncrementalVerifier<'a> {
             memory_id,
             now_unix_micros()
         );
-        let _ = self
-            .runtime
-            .submit_inline(crate::consolidation::ConsolidationJobSpec {
+        let _ = self.runtime.submit_inline(
+            crate::consolidation::ConsolidationJobSpec {
                 job_id,
                 workspace_id: self.workspace_id.to_string(),
                 kind: "refresh verified memory after incremental verification".to_string(),
@@ -348,7 +361,10 @@ impl<'a> IncrementalVerifier<'a> {
                     }),
                     provenance: None,
                 }),
-            })?;
+            },
+            self.store,
+            self.authority,
+        )?;
         Ok(proposal_id)
     }
 
@@ -359,6 +375,7 @@ impl<'a> IncrementalVerifier<'a> {
             self.store,
             self.event_writer,
             self.decided_by.value.as_str(),
+            self.authority,
         )?;
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 use tempfile::TempDir;
@@ -253,36 +253,24 @@ pub(crate) fn missing_symbol_ref(path: &str, name: &str) -> StableRef {
 }
 
 pub(crate) fn capture_logs<R>(run: impl FnOnce() -> R) -> (R, String) {
-    // Use one process-wide subscriber so tracing's per-callsite Interest cache
-    // resolves against a stable dispatcher. Per-test routing happens via a
-    // thread-local writer slot; tests that do not register a slot get the
-    // events discarded, which leaves third-party tracing setup undisturbed.
-    install_global_capture_subscriber();
+    // A scoped subscriber makes log assertions independent of other suites
+    // that install a global subscriber earlier in this test process.
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(ThreadLocalWriter)
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
     let logs = Arc::new(Mutex::new(Vec::new()));
     CAPTURE_BUFFER.with(|cell| {
         cell.borrow_mut().replace(logs.clone());
     });
-    let result = run();
+    let result = tracing::subscriber::with_default(subscriber, run);
     CAPTURE_BUFFER.with(|cell| {
         cell.borrow_mut().take();
     });
     let output = String::from_utf8(logs.lock().expect("log lock").clone()).expect("utf8 logs");
     (result, output)
 }
-
-fn install_global_capture_subscriber() {
-    CAPTURE_SUBSCRIBER_INIT.get_or_init(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(ThreadLocalWriter)
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-    });
-}
-
-static CAPTURE_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
 
 thread_local! {
     static CAPTURE_BUFFER: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };

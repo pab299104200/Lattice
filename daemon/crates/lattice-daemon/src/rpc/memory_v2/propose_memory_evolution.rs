@@ -83,26 +83,79 @@ pub fn tool_definition() -> Value {
 
 pub fn parse_args(args: &Value) -> Result<ProposeMemoryEvolutionArgs, String> {
     serde_json::from_value(args.clone())
-        .map_err(|error| format!("Invalid propose_memory_evolution arguments: {error}"))
+        .map_err(|error| format!("Invalid remember(kind=evolution) arguments: {error}"))
 }
 
 pub fn validate_args(args: &ProposeMemoryEvolutionArgs) -> Result<(), String> {
     match args.action {
         EvolutionAction::Propose => {
+            if args.proposal_id.is_some() {
+                return Err(
+                    "remember(kind=evolution, action=propose) does not accept proposal_id"
+                        .to_string(),
+                );
+            }
             if args.memory_id.as_deref().unwrap_or("").trim().is_empty() {
                 return Err(
-                    "propose_memory_evolution(action=propose) requires memory_id".to_string(),
+                    "remember(kind=evolution, action=propose) requires memory_id".to_string(),
                 );
+            }
+            if args.content.is_none()
+                && args.linked_files.is_empty()
+                && args.linked_symbols.is_empty()
+                && args.linked_docs.is_empty()
+                && args.linked_tests.is_empty()
+                && args.linked_memories.is_empty()
+                && args.validity_conditions.is_empty()
+                && args.invalidation_triggers.is_empty()
+                && args.superseded_by_memory_id.is_none()
+                && args.invalidate_reason.is_none()
+            {
+                return Err(
+                    "remember(kind=evolution, action=propose) requires an evolution delta"
+                        .to_string(),
+                );
+            }
+            if args
+                .content
+                .as_deref()
+                .is_some_and(|content| content.trim().is_empty())
+            {
+                return Err("remember(kind=evolution) content must be non-empty".to_string());
+            }
+            if args.superseded_by_memory_id.as_deref() == args.memory_id.as_deref() {
+                return Err("a memory cannot supersede itself".to_string());
             }
         }
         EvolutionAction::Apply | EvolutionAction::Reject => {
             if args.proposal_id.as_deref().unwrap_or("").trim().is_empty() {
                 return Err(format!(
-                    "propose_memory_evolution(action={}) requires proposal_id",
+                    "remember(kind=evolution, action={}) requires proposal_id",
                     match args.action {
                         EvolutionAction::Apply => "apply",
                         EvolutionAction::Reject => "reject",
                         EvolutionAction::Propose => "propose",
+                    }
+                ));
+            }
+            if args.memory_id.is_some()
+                || args.content.is_some()
+                || !args.linked_files.is_empty()
+                || !args.linked_symbols.is_empty()
+                || !args.linked_docs.is_empty()
+                || !args.linked_tests.is_empty()
+                || !args.linked_memories.is_empty()
+                || !args.validity_conditions.is_empty()
+                || !args.invalidation_triggers.is_empty()
+                || args.superseded_by_memory_id.is_some()
+                || args.invalidate_reason.is_some()
+            {
+                return Err(format!(
+                    "remember(kind=evolution, action={}) does not accept proposal delta fields",
+                    match args.action {
+                        EvolutionAction::Apply => "apply",
+                        EvolutionAction::Reject => "reject",
+                        EvolutionAction::Propose => unreachable!(),
                     }
                 ));
             }
@@ -122,7 +175,9 @@ pub fn proposal_kind(args: &ProposeMemoryEvolutionArgs) -> ProposalKind {
 }
 
 pub fn build_proposal(
-    _workspace_id: &str,
+    workspace_id: &str,
+    checkout_id: &str,
+    branch: &str,
     store: &MemoryStore,
     args: &ProposeMemoryEvolutionArgs,
 ) -> Result<ConsolidationProposal, String> {
@@ -134,13 +189,36 @@ pub fn build_proposal(
         .get_by_id(memory_id)
         .map_err(|error| format!("Failed to load source memory: {error}"))?
         .ok_or_else(|| format!("Memory `{memory_id}` was not found"))?;
+    validate_memory_authority(store, memory_id, &memory, workspace_id, checkout_id)?;
+    let mut replacement_state_hash = None;
+    if let Some(replacement_id) = args.superseded_by_memory_id.as_deref() {
+        let replacement = store
+            .get_by_id(replacement_id)
+            .map_err(|error| format!("Failed to load replacement memory: {error}"))?
+            .ok_or_else(|| format!("Replacement memory `{replacement_id}` was not found"))?;
+        validate_memory_authority(
+            store,
+            replacement_id,
+            &replacement,
+            workspace_id,
+            checkout_id,
+        )?;
+        replacement_state_hash = Some(
+            lattice_core::consolidation::state_hash_for_memory(store, replacement_id)
+                .map_err(|error| format!("Failed to bind replacement state: {error}"))?,
+        );
+    }
     let prior_fields = store
         .get_structured_fields(memory_id)
         .map_err(|error| format!("Failed to load source structured fields: {error}"))?
         .unwrap_or_default();
     let prior_state = capture_state_json(store, &memory, &prior_fields)?;
     let next = apply_delta(memory.clone(), prior_fields, args);
-    let proposed_state = capture_state_json(store, &next.0, &next.1)?;
+    let mut proposed_state = capture_state_json(store, &next.0, &next.1)?;
+    if args.content.is_some() {
+        proposed_state["last_verified_at"] = Value::Null;
+        proposed_state["last_verified_graph_snapshot_id"] = Value::Null;
+    }
     Ok(ConsolidationProposal {
         proposal_id: format!("memory-evolution-{}-{}", memory_id, now_unix_micros()),
         job_id: format!("memory-evolution-job-{}-{}", memory_id, now_unix_micros()),
@@ -150,12 +228,49 @@ pub fn build_proposal(
         proposed_state,
         evidence: json!({
             "source_memory_ids": [memory_id],
+            "repository_id": workspace_id,
+            "checkout_id": checkout_id,
+            "branch": branch,
             "reason": args.reason,
             "invalidate_reason": args.invalidate_reason,
             "superseded_by_memory_id": args.superseded_by_memory_id,
+            "replacement_state_hash": replacement_state_hash,
         }),
         provenance: None,
     })
+}
+
+pub fn validate_memory_authority(
+    store: &MemoryStore,
+    memory_id: &str,
+    memory: &Memory,
+    workspace_id: &str,
+    checkout_id: &str,
+) -> Result<(), String> {
+    if memory.workspace_id.as_deref() != Some(workspace_id) {
+        return Err(format!(
+            "Memory `{memory_id}` does not belong to repository authority `{workspace_id}`"
+        ));
+    }
+    let applicable_checkout = store
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT applicable_checkout_id FROM memories WHERE id=?1 AND is_invalidated=0",
+                [memory_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| lattice_core::LatticeError::Storage(error.to_string()))
+        })
+        .map_err(|error| format!("Failed to validate memory authority: {error}"))?;
+    if applicable_checkout
+        .as_deref()
+        .is_some_and(|id| id != checkout_id)
+    {
+        return Err(format!(
+            "Memory `{memory_id}` does not belong to checkout authority `{checkout_id}`"
+        ));
+    }
+    Ok(())
 }
 
 fn apply_delta(
@@ -165,6 +280,8 @@ fn apply_delta(
 ) -> (Memory, MemoryStructuredFields) {
     if let Some(content) = args.content.as_ref() {
         memory.content = content.clone();
+        memory.verification_status = MemoryVerificationStatus::Unverified;
+        fields.verification_status = MemoryVerificationStatus::Unverified;
     }
     if !args.linked_files.is_empty() {
         memory.linked_files = args.linked_files.clone();
