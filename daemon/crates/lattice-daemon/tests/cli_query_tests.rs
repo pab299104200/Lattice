@@ -268,7 +268,89 @@ fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
 }
 
 #[test]
-fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
+fn stdio_proxy_stays_connected_while_client_stdin_is_open_and_idle() {
+    let workspace = unique_workspace("proxy-idle-client");
+    std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener
+        .local_addr()
+        .expect("fake daemon address")
+        .to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept proxy");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone proxy stream"));
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("read proxy hello");
+        acknowledge_hello(&mut stream, &hello);
+
+        let mut request = String::new();
+        reader.read_line(&mut request).expect("read later request");
+        let request: Value = serde_json::from_str(request.trim()).expect("request json");
+        assert_eq!(request["method"], "tools/list");
+        assert_eq!(request["id"], 7);
+        writeln!(
+            stream,
+            r#"{{"jsonrpc":"2.0","id":7,"result":{{"tools":[]}}}}"#
+        )
+        .expect("write later response");
+
+        let mut remainder = String::new();
+        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
+            remainder.clear();
+        }
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
+        .args(["--stdio", "--workspace"])
+        .arg(&workspace)
+        .env("LATTICE_DAEMON_ADDR", &addr)
+        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
+        // The removed idle reaper honored this small value. Keeping it in the
+        // regression fixture proves stale operator configuration is harmless.
+        .env("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stdio proxy");
+
+    thread::sleep(Duration::from_millis(1200));
+    assert!(
+        child.try_wait().expect("poll idle proxy").is_none(),
+        "stdio proxy exited while its owning client's stdin remained open"
+    );
+    writeln!(
+        child.stdin.as_mut().expect("proxy stdin"),
+        r#"{{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{{}}}}"#
+    )
+    .expect("write request after idle gap");
+    child
+        .stdin
+        .as_mut()
+        .expect("proxy stdin")
+        .flush()
+        .expect("flush request after idle gap");
+
+    let mut response = String::new();
+    BufReader::new(child.stdout.take().expect("proxy stdout"))
+        .read_line(&mut response)
+        .expect("read response after idle gap");
+    let response: Value = serde_json::from_str(response.trim()).expect("response json");
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"]["tools"], json!([]));
+
+    let closed_at = Instant::now();
+    drop(child.stdin.take());
+    assert!(wait_for_exit(&mut child, Duration::from_secs(2)).success());
+    assert!(
+        closed_at.elapsed() <= Duration::from_secs(2),
+        "stdio proxy did not exit promptly after post-idle EOF"
+    );
+    server.join().expect("fake daemon joins");
+}
+
+#[test]
+fn stdio_proxy_keeps_an_in_flight_request_connected_until_response() {
     let workspace = unique_workspace("proxy-in-flight");
     std::fs::create_dir_all(workspace.join(".git")).expect("create git marker");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -302,7 +384,6 @@ fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
         .arg(&workspace)
         .env("LATTICE_DAEMON_ADDR", &addr)
         .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
-        .env("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "2")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -327,7 +408,7 @@ fn stdio_proxy_idle_timeout_does_not_terminate_an_in_flight_request() {
     thread::sleep(Duration::from_millis(2100));
     assert!(
         child.try_wait().expect("poll proxy").is_none(),
-        "proxy idle timeout terminated the outstanding request"
+        "proxy exited while a daemon response was outstanding"
     );
     response_sent_rx
         .recv_timeout(Duration::from_secs(1))

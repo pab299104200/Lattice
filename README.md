@@ -243,6 +243,14 @@ done
 
 Inspect graph counts, parse failures, watcher health, `is_partial`, `graph_storage_state`, `index_work`, and `semantic_retrieval`. `index_work` reports queued, active, and completed jobs. Status does not provide a percentage-complete estimate or ETA. Parsed-source counts and files represented by graph nodes can differ.
 
+Inspect analysis availability separately:
+
+```bash
+lattice status --workspace /path/to/project --scope health --json
+```
+
+Health facts refresh after graph startup, including a warm startup with no file changes. Failed background production retries with bounded backoff. Git availability is reported separately for file history, symbol history, and co-change: commits too broad for co-change analysis do not suppress complete per-file churn history. Stale history remains excluded. Coverage uses all indexed files as its denominator; test proximity covers eligible production files, and complexity excludes documentation without executable control flow. These counts are not test execution coverage.
+
 A fast startup may reuse a persisted graph and immutable cached objects. It is not evidence of a full source scan. During bootstrap, status reports stages that have not been evaluated. During eligible same-checkout refreshes, queries can use the last published snapshot with explicit refreshing metadata. Branch or substantial workspace changes invalidate incompatible snapshots and handles. Deadline or capacity limits return bounded partial results rather than pretending discovery completed.
 
 ### Linked worktrees and multiple roots
@@ -356,7 +364,7 @@ See [storage operations](docs/operator-storage.md), [memory recovery](docs/memor
 
 ## Operate the daemon
 
-One long-lived local daemon serves multiple workspace proxies. Its loopback endpoint defaults to `127.0.0.1:47659`. Proxies coordinate startup through a cross-process lock, exit on client stdin closure, and have a default five-minute idle timeout that does not interrupt an active request.
+One long-lived local daemon serves multiple workspace proxies. Its loopback endpoint defaults to `127.0.0.1:47659`. Proxies coordinate startup through a cross-process lock and remain connected while client stdin is open, including long gaps between tool calls. Closing client stdin ends the proxy. After a proxy-only update, reconnect the MCP client to launch the new proxy; the shared daemon can remain running.
 
 After rebuilding or changing the ONNX environment, stop the daemon and reconnect clients so the fresh process loads the new binary and configuration. On macOS/Linux:
 
@@ -370,7 +378,6 @@ This affects every workspace served by that daemon. Coordinate shared-service re
 | --- | --- |
 | `LATTICE_DAEMON_ADDR` | `127.0.0.1:47659`; alternate loopback endpoint |
 | `LATTICE_DAEMON_EXE` | Explicit absolute binary path for proxy startup |
-| `LATTICE_PROXY_IDLE_TIMEOUT_SECS` | `300` |
 | `LATTICE_MAX_LOADED_SHARDS` | `3`; inactive non-indexing shards can be evicted |
 | `LATTICE_WORKSPACE_IDLE_TTL_SECS` | `1800` |
 | `LATTICE_MAX_CONCURRENT_INDEX_JOBS` | `1`; shared indexing capacity |

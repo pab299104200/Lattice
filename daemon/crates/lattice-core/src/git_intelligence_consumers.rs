@@ -69,14 +69,46 @@ impl<'a> GitIntelligenceView<'a> {
         self.availability
     }
 
-    /// Returns the snapshot only when history signals are safe to consume.
-    pub const fn usable_snapshot(self) -> Option<&'a GitIntelligenceSnapshot> {
+    fn family_availability(
+        self,
+        complete: impl FnOnce(&GitIntelligenceSnapshot) -> bool,
+    ) -> GitIntelligenceAvailability {
         match self.availability {
-            GitIntelligenceAvailability::Available => self.snapshot,
-            GitIntelligenceAvailability::Unavailable
-            | GitIntelligenceAvailability::Stale
-            | GitIntelligenceAvailability::Degraded => None,
+            GitIntelligenceAvailability::Available | GitIntelligenceAvailability::Degraded => {
+                if self.snapshot.is_some_and(complete) {
+                    GitIntelligenceAvailability::Available
+                } else {
+                    GitIntelligenceAvailability::Degraded
+                }
+            }
+            GitIntelligenceAvailability::Unavailable | GitIntelligenceAvailability::Stale => {
+                self.availability
+            }
         }
+    }
+
+    pub fn file_history_availability(self) -> GitIntelligenceAvailability {
+        self.family_availability(|snapshot| snapshot.report.file_history_complete())
+    }
+
+    pub fn symbol_history_availability(self) -> GitIntelligenceAvailability {
+        self.family_availability(|snapshot| snapshot.report.symbol_history_complete())
+    }
+
+    pub fn co_change_availability(self) -> GitIntelligenceAvailability {
+        self.family_availability(|snapshot| snapshot.report.co_change_history_complete())
+    }
+
+    pub fn usable_file_history_snapshot(self) -> Option<&'a GitIntelligenceSnapshot> {
+        (self.file_history_availability() == GitIntelligenceAvailability::Available)
+            .then_some(self.snapshot)
+            .flatten()
+    }
+
+    pub fn usable_co_change_snapshot(self) -> Option<&'a GitIntelligenceSnapshot> {
+        (self.co_change_availability() == GitIntelligenceAvailability::Available)
+            .then_some(self.snapshot)
+            .flatten()
     }
 
     /// Metadata suitable for a response even when signals are suppressed.
@@ -84,12 +116,20 @@ impl<'a> GitIntelligenceView<'a> {
         let Some(snapshot) = self.snapshot else {
             return GitIntelligenceMetadata {
                 availability: self.availability,
+                file_history_availability: self.file_history_availability(),
+                symbol_history_availability: self.symbol_history_availability(),
+                co_change_availability: self.co_change_availability(),
+                co_change_width_exclusions: 0,
                 window_commits: 0,
                 head_commit_id: None,
             };
         };
         GitIntelligenceMetadata {
             availability: self.availability,
+            file_history_availability: self.file_history_availability(),
+            symbol_history_availability: self.symbol_history_availability(),
+            co_change_availability: self.co_change_availability(),
+            co_change_width_exclusions: snapshot.report.co_change_width_exclusions,
             window_commits: u32::try_from(snapshot.processed_commits.len()).unwrap_or(u32::MAX),
             head_commit_id: snapshot.head_commit_id().map(str::to_owned),
         }
@@ -100,6 +140,10 @@ impl<'a> GitIntelligenceView<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitIntelligenceMetadata {
     pub availability: GitIntelligenceAvailability,
+    pub file_history_availability: GitIntelligenceAvailability,
+    pub symbol_history_availability: GitIntelligenceAvailability,
+    pub co_change_availability: GitIntelligenceAvailability,
+    pub co_change_width_exclusions: u32,
     pub window_commits: u32,
     pub head_commit_id: Option<String>,
 }
@@ -133,14 +177,16 @@ pub fn secondary_ranking_evidence(
     file_path: &str,
     stable_symbol: Option<&str>,
 ) -> Option<SecondaryRankingEvidence> {
-    let snapshot = view.usable_snapshot()?;
+    let snapshot = view.usable_file_history_snapshot()?;
     let window_commits = window_commits(snapshot)?;
     if window_commits == 0 {
         return None;
     }
 
     let file = snapshot.file(file_path);
-    let symbol = stable_symbol.and_then(|symbol| snapshot.symbol(symbol));
+    let symbol = stable_symbol
+        .filter(|_| view.symbol_history_availability() == GitIntelligenceAvailability::Available)
+        .and_then(|symbol| snapshot.symbol(symbol));
     let file_hotspot = file.and_then(|signal| normalized_hotspot(signal, window_commits));
     let symbol_hotspot =
         symbol.and_then(|signal| normalized_symbol_hotspot(signal, window_commits));
@@ -190,7 +236,7 @@ where
     S: AsRef<str>,
 {
     let metadata = view.metadata();
-    let Some(snapshot) = view.usable_snapshot() else {
+    let Some(snapshot) = view.usable_co_change_snapshot() else {
         return ImpactHistoryAdvisory {
             metadata,
             missing_cochange_partners: Vec::new(),
@@ -335,6 +381,79 @@ mod tests {
             left_path: left_path.into(),
             right_path: right_path.into(),
             commit_count,
+        }
+    }
+
+    #[test]
+    fn broad_commits_keep_file_history_without_fabricating_co_change_evidence() {
+        use crate::git_intelligence::{CommitSample, GitHistoryMiner, PathChange};
+        let commits = (0..500).map(|index| {
+            let mut changes = vec![PathChange {
+                path: "src/a.rs".into(),
+                lines_added: 1,
+                lines_deleted: 0,
+                symbols: vec!["a::run".into()],
+            }];
+            if index < 4 {
+                changes.extend((0..256).map(|path| PathChange {
+                    path: format!("src/wide-{path}.rs"),
+                    lines_added: 1,
+                    lines_deleted: 0,
+                    symbols: vec![],
+                }));
+            }
+            CommitSample {
+                id: format!("commit-{index}"),
+                author: Some("A".into()),
+                subject: if index % 2 == 0 { "fix bug" } else { "feature" }.into(),
+                changes,
+            }
+        });
+        let snapshot = GitHistoryMiner::default().mine(commits);
+        assert_eq!(snapshot.report.co_change_width_exclusions, 4);
+        let view = GitIntelligenceView::from_snapshot(&snapshot, true);
+        assert_eq!(view.availability(), GitIntelligenceAvailability::Degraded);
+        assert_eq!(
+            view.file_history_availability(),
+            GitIntelligenceAvailability::Available
+        );
+        let evidence = secondary_ranking_evidence(view, "src/a.rs", Some("a::run")).unwrap();
+        assert_eq!(evidence.file_hotspot.unwrap().observed_commits, 500);
+        assert_eq!(evidence.bug_fix_density_per_mille, Some(500));
+        assert!(view.usable_co_change_snapshot().is_none());
+        assert!(missing_cochange_partners(view, ["src/a.rs"])
+            .missing_cochange_partners
+            .is_empty());
+        assert!(GitIntelligenceView::from_snapshot(&snapshot, false)
+            .usable_file_history_snapshot()
+            .is_none());
+    }
+
+    #[test]
+    fn symbol_overflow_only_suppresses_symbol_evidence() {
+        let mut history = snapshot();
+        history.report.symbol_overflow_commits = 1;
+        let view = GitIntelligenceView::from_snapshot(&history, true);
+        let evidence = secondary_ranking_evidence(view, "src/a.rs", Some("a::high")).unwrap();
+        assert!(evidence.file_hotspot.is_some());
+        assert!(evidence.symbol_hotspot.is_none());
+        assert!(view.usable_co_change_snapshot().is_some());
+    }
+
+    #[test]
+    fn invalid_or_incomplete_file_observations_never_feed_a_family() {
+        for kind in 0..4 {
+            let mut history = snapshot();
+            match kind {
+                0 => history.report.invalid_path_entries = 1,
+                1 => history.report.invalid_commit_ids = 1,
+                2 => history.report.path_overflow_commits = 1,
+                _ => history.report.included_commits = 0,
+            }
+            let view = GitIntelligenceView::from_snapshot(&history, true);
+            assert!(view.usable_file_history_snapshot().is_none());
+            assert!(view.usable_co_change_snapshot().is_none());
+            assert!(secondary_ranking_evidence(view, "src/a.rs", Some("a::high")).is_none());
         }
     }
 

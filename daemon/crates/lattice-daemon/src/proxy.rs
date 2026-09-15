@@ -22,28 +22,6 @@ pub(crate) fn daemon_addr() -> String {
     std::env::var("LATTICE_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:47659".to_string())
 }
 
-const DEFAULT_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Returns the bounded lifetime for a connected but inactive stdio client.
-///
-/// A proxy only exits after this interval when no request is awaiting a daemon
-/// response, so a slow tool call cannot be terminated by the idle reaper.
-fn proxy_idle_timeout() -> Duration {
-    proxy_idle_timeout_from(
-        std::env::var("LATTICE_PROXY_IDLE_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn proxy_idle_timeout_from(value: Option<&str>) -> Duration {
-    value
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_PROXY_IDLE_TIMEOUT)
-}
-
 pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -76,8 +54,6 @@ pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
     let stdout = std::io::stdout();
     let mut pending_message: Option<String> = None;
     let mut in_flight_requests = HashSet::new();
-    let idle_timeout = proxy_idle_timeout();
-    let mut last_activity = tokio::time::Instant::now();
 
     loop {
         if let Some(message) = pending_message.take() {
@@ -102,7 +78,6 @@ pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
                 }
             }
             record_outbound_request(&message, &mut in_flight_requests);
-            last_activity = tokio::time::Instant::now();
             continue;
         }
 
@@ -126,7 +101,6 @@ pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
                         if let Some(id) = response_id(&line) {
                             in_flight_requests.remove(&id);
                         }
-                        last_activity = tokio::time::Instant::now();
                         let mut out = stdout.lock();
                         out.write_all(line.as_bytes())?;
                         out.write_all(b"\n")?;
@@ -157,15 +131,6 @@ pub(crate) async fn run_stdio_proxy(request: ProxyRequest) -> Result<()> {
                         lifecycle_log::log_event("proxy", "daemon_reconnected", &[]);
                     }
                 }
-            }
-            _ = tokio::time::sleep_until(last_activity + idle_timeout), if in_flight_requests.is_empty() => {
-                lifecycle_log::log_event(
-                    "proxy",
-                    "idle_exit",
-                    &[("idle_timeout_secs", serde_json::json!(idle_timeout.as_secs()))],
-                );
-                write_half.shutdown().await?;
-                break;
             }
         }
     }
@@ -431,8 +396,7 @@ fn format_message_frame(message: &str) -> Vec<u8> {
 mod tests {
     use super::{
         acquire_lock_at, daemon_start_lock_path, json_rpc_id_key,
-        normalize_deleted_executable_path, proxy_idle_timeout_from, response_id,
-        DEFAULT_PROXY_IDLE_TIMEOUT,
+        normalize_deleted_executable_path, response_id,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -515,19 +479,6 @@ mod tests {
         waiter.join().expect("waiter thread");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().expect("lock parent"));
-    }
-
-    #[test]
-    fn proxy_idle_timeout_accepts_only_positive_seconds() {
-        assert_eq!(proxy_idle_timeout_from(Some("17")), Duration::from_secs(17));
-        assert_eq!(
-            proxy_idle_timeout_from(Some("0")),
-            DEFAULT_PROXY_IDLE_TIMEOUT
-        );
-        assert_eq!(
-            proxy_idle_timeout_from(Some("invalid")),
-            DEFAULT_PROXY_IDLE_TIMEOUT
-        );
     }
 
     #[test]

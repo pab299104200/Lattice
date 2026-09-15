@@ -308,6 +308,41 @@ fn pruning_keeps_recent_generations_and_never_the_active_one() {
 }
 
 #[test]
+fn discard_removes_only_unpublished_non_active_generations() {
+    let store = store();
+    let active = store
+        .begin_generation(HEALTH_CONFIG_VERSION)
+        .expect("active gen");
+    store
+        .write_file_facts(active, &facts("src/alpha.rs", SAMPLE_A))
+        .expect("write active");
+    store.publish_generation(active).expect("publish active");
+    let abandoned = store
+        .begin_generation(HEALTH_CONFIG_VERSION)
+        .expect("abandoned gen");
+    store
+        .write_file_facts(abandoned, &facts("src/beta.rs", SAMPLE_B))
+        .expect("write abandoned");
+
+    assert!(store.discard_unpublished_generation(active).is_err());
+    store
+        .discard_unpublished_generation(abandoned)
+        .expect("discard abandoned");
+    assert!(store
+        .generation_status(abandoned)
+        .expect("abandoned status")
+        .is_none());
+    assert_eq!(
+        store.active_generation().expect("active pointer"),
+        Some(active)
+    );
+    assert!(store
+        .file_facts("src/alpha.rs")
+        .expect("active facts")
+        .is_some());
+}
+
+#[test]
 fn file_backed_store_persists_across_reopen() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().join("health.db");

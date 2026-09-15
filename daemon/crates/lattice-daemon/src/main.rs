@@ -347,6 +347,7 @@ pub(crate) async fn build_workspace_runtime(
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
     let mut completion_tasks: Vec<JoinHandle<()>> = Vec::new();
     let runtime_work = Arc::new(crate::index_work::RuntimeWorkTracker::default());
+    let index_health = Arc::new(IndexHealth::default());
 
     // Validate every Git store before spawning its worker. A failed schema or
     // active-generation audit must fail workspace construction, not surface
@@ -379,6 +380,8 @@ pub(crate) async fn build_workspace_runtime(
                 identity.repository_id,
                 Arc::clone(&engine),
                 Arc::clone(&index_work),
+                Arc::clone(&index_health),
+                is_multi_repo.then(|| repo_name_for_root(root)),
                 health_fact_snapshots.clone(),
             )?;
         validated_runtimes.push((
@@ -425,7 +428,6 @@ pub(crate) async fn build_workspace_runtime(
     let indexing = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let index_readiness = Arc::new(IndexReadiness::default());
     let watcher_health = Arc::new(WatcherHealth::default());
-    let index_health = Arc::new(IndexHealth::default());
     let repo_state = Arc::new(Mutex::new(crate::repo_state::RepoStateTracker::new(
         &workspace_root,
     )));
@@ -498,6 +500,7 @@ pub(crate) async fn build_workspace_runtime(
         let index_health_bg = Arc::clone(&index_health);
         let parsed_cache_bg = parsed_cache_runtime.clone();
         let runtime_work_bg = Arc::clone(&runtime_work);
+        let health_refresh_handles_bg = health_refresh_handles.clone();
         let base_reuse = memory_identity
             .git_common_dir
             .as_ref()
@@ -595,6 +598,14 @@ pub(crate) async fn build_workspace_runtime(
                 }
                 let mut eng = engine_bg.lock().await;
                 eng.update_graph_arc(new_graph);
+            }
+
+            // A successful startup publication is itself a health-fact input,
+            // even when no source file changed relative to the warm manifest.
+            // Each repository runtime derives its bounded local file set from
+            // this immutable graph snapshot.
+            for refresh in health_refresh_handles_bg.values() {
+                refresh.request_full();
             }
 
             if let Some(model_path) = verified_shared_embedding_model_path() {

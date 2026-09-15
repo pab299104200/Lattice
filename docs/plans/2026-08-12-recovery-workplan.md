@@ -213,3 +213,7 @@ Delete `daemon/crates/lattice-core/src/query/watcher.rs` (unwired, cannot compil
 2. Committing in a worktree causes **zero** full reindex of the main workspace; a new worktree cold-starts mostly from cache and shares the repo's memory store (measured in C1/C2 tests).
 3. A memory saved in one repo/session resurfaces — unprompted, via hooks — in a later session where it's relevant, and `lattice metrics --memory` proves retrieval and follow-through are nonzero.
 4. `context` output passes the readability bar; default-call token cost is down vs the hybrid baseline; `impact` carries history-backed signal grep cannot produce.
+
+## Proxy lifecycle correction — September 14, 2026
+
+The idle-exit proposal above is superseded. Tool inactivity does not mean the MCP client has disconnected. Proxies remain alive until client stdin closes; there is no idle timeout setting. See [the lifecycle contract](../architecture/2026-09-14-mcp-proxy-lifetime.md).

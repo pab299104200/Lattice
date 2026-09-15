@@ -325,3 +325,17 @@ every fact to compute populations; it is not a graph traversal.
   narrow revision of git intelligence's "paths only" component boundary — no
   blob content, blame, or rename similarity was added. See the corresponding
   entry in `docs/architecture/2026-08-13-git-intelligence.md`'s Decision log.
+
+## Startup production and history completeness
+
+Graph publication schedules an initial full health refresh even when a persisted graph needs no changes. Refresh work runs under index admission; graph localization and analysis execute on blocking workers. Failures retain prior persisted generations for diagnosis, omit failed families from the live handoff, and retry with exponential backoff capped at 60 seconds. Incremental source read errors retry; confirmed watcher deletions remove facts. Full generation replacement removes files absent from the published graph.
+
+Complexity generations live in a repository-specific `health-complexity-<repository_id>.db` beside the graph database, avoiding a shared active-generation pointer across roots. These are derived caches: startup regenerates them from the graph and source, so old graph-database complexity rows are not authoritative and no live source or memory data is migrated or deleted.
+
+Git freshness gates every history family. Complete per-file history remains usable when broad commits exceed co-change limits. Symbol overflow suppresses symbol evidence; missing or invalid file observations suppress file-dependent evidence; incomplete co-change observations suppress partner advisories. Status preserves aggregate Git metadata alongside these family-specific availability fields. Rendering uses the family supplying the delivered evidence.
+
+Health coverage denominators count indexed graph files. Test proximity describes production files and excludes tests/support files; it does not assert tests were executed. Complexity has no applicable measurement for documentation without executable control flow. Other missing measurements degrade the family rather than manufacturing zero complexity.
+
+The runtime publishes complexity replacements only after all scoped source reads succeed; partial database writes remain unpublished and are discarded on failure. Old generations are pruned after successful publication and on startup, preserving the active pointer. No retry renews source truth from a partial cache.
+
+Run the real CLI/daemon startup regression with `python3 daemon/tests/health_startup_smoke.py daemon/target/debug/lattice` from the repository root after building. It uses a private Git repository, loopback listener and transport directory, checks cold and warm startup without edits, and terminates only its own daemon. It needs local socket permission; it does not restart the shared daemon.

@@ -1082,7 +1082,7 @@ impl McpHandler {
                 .ok()
                 .and_then(|value| {
                     value
-                        .get("availability")
+                        .get("file_history_availability")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 })
@@ -1101,6 +1101,12 @@ impl McpHandler {
             .map_err(|error| (-32603, format!("Serialization error: {error}")))?;
         if let Some(object) = value.as_object_mut() {
             object.insert("git_generation".to_string(), json!(inputs.git_generation));
+            object.insert("git_intelligence".to_string(), json!(metadata));
+            object.insert("coverage_basis".to_string(), json!({
+                "denominator": "all_indexed_files",
+                "test_proximity": "production_files_only; test and test-support files are excluded",
+                "complexity": "files with executable control flow; documentation is not applicable"
+            }));
         }
         Ok(wrap_tool_result(value))
     }
@@ -9719,7 +9725,7 @@ fn health_fact_index(
         builder = builder.with_shared_complexity_facts(facts);
     }
 
-    if let Some(snapshot) = git_intelligence_view(git).usable_snapshot() {
+    if let Some(snapshot) = git_intelligence_view(git).usable_file_history_snapshot() {
         builder = builder.with_git_intelligence(snapshot.clone());
     }
     builder.build()
@@ -18573,6 +18579,24 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
     }
 
     #[test]
+    fn git_summary_uses_delivered_history_family() {
+        let metadata = json!({"availability": "degraded", "file_history_availability": "available",
+            "co_change_availability": "degraded", "window_commits": 500,
+            "co_change_width_exclusions": 4});
+        let payload = json!({"git_intelligence": {"metadata": metadata.clone(),
+            "secondary_ranking_evidence": [{"file_path": "src/hot.rs"}]}});
+        let summary = super::git_intelligence_summary(payload.as_object().unwrap()).unwrap();
+        assert!(summary.contains("available across 500 commit(s)"));
+        assert!(summary.contains("1 ranked pivot evidence"));
+        assert!(summary.contains("Other history families are degraded"));
+        assert!(!summary.contains("signals suppressed"));
+        let impact = json!({"git_intelligence": {"impact_advisory": {
+            "metadata": metadata, "missing_cochange_partners": []}}});
+        assert_eq!(super::git_intelligence_summary(impact.as_object().unwrap()).unwrap(),
+            "degraded; signals suppressed.");
+    }
+
+    #[test]
     fn unavailable_and_stale_history_are_explicit_and_never_affect_results() {
         let mut unavailable = git_presentation_bundle();
         super::enrich_context_bundle_with_git_intelligence(&mut unavailable, None, None);
@@ -19624,7 +19648,12 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
         git.get("impact_advisory")
             .and_then(|advisory| advisory.get("metadata"))
     })?;
-    let availability = metadata.get("availability")?.as_str()?;
+    let family = if git.get("secondary_ranking_evidence").is_some() {
+        "file_history_availability"
+    } else {
+        "co_change_availability"
+    };
+    let availability = metadata.get(family).or_else(|| metadata.get("availability"))?.as_str()?;
     if availability != "available" {
         return Some(format!("{availability}; signals suppressed."));
     }
@@ -19647,7 +19676,12 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
         (_, Some(count)) => format!("{count} missing co-change partner(s)"),
         _ => "no applicable presentation evidence".to_string(),
     };
-    Some(format!("available across {window} commit(s); {detail}."))
+    let qualification = if metadata.get("availability").and_then(Value::as_str) == Some("degraded") {
+        " Other history families are degraded."
+    } else {
+        ""
+    };
+    Some(format!("available across {window} commit(s); {detail}.{qualification}"))
 }
 
 /// Markdown lines for the `health` section, bounded to what a reader can act

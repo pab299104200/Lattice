@@ -284,3 +284,47 @@ fn the_index_reports_which_files_it_knows() {
     assert!(paths.contains(&"src/leaf.rs"));
     assert_eq!(index.file_count(), paths.len());
 }
+
+#[test]
+fn broad_commit_exclusions_do_not_degrade_valid_file_risk_facts() {
+    let mut history = git_snapshot();
+    history.report.co_change_width_exclusions = 4;
+    let index = HealthFactIndex::builder()
+        .with_git_intelligence(history)
+        .build();
+    let fact = index
+        .facts("src/core.rs")
+        .unwrap()
+        .get(FactKind::LineChurn)
+        .unwrap();
+    assert_eq!(fact.value, 1200);
+    assert_eq!(fact.availability, FactAvailability::Available);
+}
+
+#[test]
+fn documentation_without_control_flow_does_not_disable_code_health() {
+    let mut complexity = complexity_facts();
+    complexity.insert(
+        "README.md".into(),
+        compute_file_complexity_facts("README.md", "# Documentation\n"),
+    );
+    let index = HealthFactIndex::builder()
+        .with_complexity_facts(complexity)
+        .build();
+    assert_eq!(index.availability(), FactAvailability::Available);
+    assert!(index
+        .facts("src/core.rs")
+        .unwrap()
+        .get(FactKind::MaxCyclomaticComplexity)
+        .is_some());
+    assert!(index.facts("README.md").is_none());
+}
+
+#[test]
+fn unavailable_code_complexity_degrades_without_fabricating_measurements() {
+    let mut complexity = complexity_facts();
+    complexity.insert("unsupported.xyz".into(), compute_file_complexity_facts("unsupported.xyz", "opaque"));
+    let index = HealthFactIndex::builder().with_complexity_facts(complexity).build();
+    assert_eq!(index.availability(), FactAvailability::Degraded);
+    assert!(index.facts("src/core.rs").unwrap().get(FactKind::MaxCyclomaticComplexity).is_some());
+}

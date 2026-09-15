@@ -188,8 +188,9 @@ impl HealthComplexityFactsStore {
     /// Write one file's facts into a generation, replacing anything previously
     /// written for that file in that generation.
     ///
-    /// Writing into the published generation is how an incremental re-index
-    /// refreshes a single file: only that file's rows change.
+    /// This primitive can replace one file in an existing generation. The
+    /// daemon stages complete replacements in an unpublished generation so
+    /// a multi-file refresh becomes visible only after successful publication.
     pub fn write_file_facts(
         &self,
         generation: u64,
@@ -339,6 +340,65 @@ impl HealthComplexityFactsStore {
         self.generation_status(generation)?.ok_or_else(|| {
             LatticeError::Storage(format!("Generation {} vanished during publish", generation))
         })
+    }
+
+    /// Removes an unpublished generation after a failed producer pass.
+    /// Published or active generations are immutable recovery evidence and
+    /// cannot be discarded through this API.
+    pub fn discard_unpublished_generation(&self, generation: u64) -> Result<(), LatticeError> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| LatticeError::Storage(format!("Failed to begin transaction: {e}")))?;
+        let active: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM health_complexity_active_generation WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| LatticeError::Storage(format!("Failed to read active generation: {e}")))?;
+        if active == Some(generation as i64) {
+            return Err(LatticeError::Storage(format!(
+                "Cannot discard active generation {generation}"
+            )));
+        }
+        let published: Option<i64> = tx
+            .query_row(
+                "SELECT published FROM health_complexity_generations WHERE generation = ?1",
+                params![generation as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| LatticeError::Storage(format!("Failed to inspect generation: {e}")))?;
+        match published {
+            None => return Ok(()),
+            Some(0) => {}
+            Some(_) => {
+                return Err(LatticeError::Storage(format!(
+                    "Cannot discard published generation {generation}"
+                )))
+            }
+        }
+        tx.execute(
+            "DELETE FROM health_complexity_symbol_facts WHERE generation = ?1",
+            params![generation as i64],
+        )
+        .and_then(|_| {
+            tx.execute(
+                "DELETE FROM health_complexity_file_facts WHERE generation = ?1",
+                params![generation as i64],
+            )
+        })
+        .and_then(|_| {
+            tx.execute(
+                "DELETE FROM health_complexity_generations WHERE generation = ?1",
+                params![generation as i64],
+            )
+        })
+        .map_err(|e| LatticeError::Storage(format!("Failed to discard generation: {e}")))?;
+        tx.commit()
+            .map_err(|e| LatticeError::Storage(format!("Failed to commit discard: {e}")))
     }
 
     /// The published generation readers see, if any generation was ever published.

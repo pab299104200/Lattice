@@ -83,23 +83,33 @@ pub struct GitMiningReport {
 }
 
 impl GitMiningReport {
-    /// Complete snapshots are the only snapshots eligible to affect consumers.
-    /// Degraded aggregates remain useful for diagnostics and a later rebuild.
+    /// Whether every family is complete. Consumers of a single family must
+    /// use its own completeness gate rather than discard unrelated evidence.
     pub fn is_complete(&self) -> bool {
         !self.is_degraded()
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.sampled_commits
-            != self
-                .included_commits
-                .saturating_add(self.path_overflow_commits)
-            || self.invalid_commit_ids > 0
-            || self.invalid_path_entries > 0
-            || self.path_overflow_commits > 0
-            || self.symbol_overflow_commits > 0
-            || self.co_change_width_exclusions > 0
-            || !self.co_changes_complete
+        !self.symbol_history_complete() || !self.co_change_history_complete()
+    }
+
+    /// Broad commits still contribute complete file churn and authorship even
+    /// when their quadratic co-change expansion is deliberately excluded.
+    pub fn file_history_complete(&self) -> bool {
+        self.sampled_commits == self.included_commits
+            && self.invalid_commit_ids == 0
+            && self.invalid_path_entries == 0
+            && self.path_overflow_commits == 0
+    }
+
+    pub fn symbol_history_complete(&self) -> bool {
+        self.file_history_complete() && self.symbol_overflow_commits == 0
+    }
+
+    pub fn co_change_history_complete(&self) -> bool {
+        self.file_history_complete()
+            && self.co_change_width_exclusions == 0
+            && self.co_changes_complete
     }
 }
 
@@ -197,7 +207,7 @@ impl GitIntelligenceSnapshot {
 
     /// Looks up an unordered co-change pair when that signal is complete.
     pub fn co_change(&self, left_path: &str, right_path: &str) -> Option<&CoChangeSignal> {
-        if self.report.is_degraded() {
+        if !self.report.co_change_history_complete() {
             return None;
         }
         let left = canonical_repository_path(left_path)?;
@@ -229,7 +239,7 @@ impl GitIntelligenceSnapshot {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        if self.report.is_degraded() || limit == 0 {
+        if !self.report.co_change_history_complete() || limit == 0 {
             return Vec::new();
         }
         let changed: BTreeSet<String> = changed_paths

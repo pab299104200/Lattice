@@ -303,7 +303,7 @@ impl HealthFactIndexBuilder {
             self.collect_graph_facts(graph, &mut raw);
         }
         let git_availability = self.git.as_ref().map(|git| {
-            if git.report.is_complete() {
+            if git.report.file_history_complete() {
                 FactAvailability::Available
             } else {
                 FactAvailability::Degraded
@@ -533,8 +533,16 @@ impl HealthFactIndexBuilder {
         availability: &mut FactAvailability,
     ) {
         for (path, facts) in self.complexity.iter() {
+            if facts.unavailable_reason == Some(crate::health::complexity_facts::ComplexityUnavailableReason::NoExecutableControlFlow) {
+                continue;
+            }
             let file_availability: FactAvailability = facts.availability.into();
-            *availability = availability.worst(file_availability);
+            // An unmeasurable file is missing evidence, not a loss of all
+            // independently available facts in the workspace.
+            *availability = availability.worst(match file_availability {
+                FactAvailability::Unavailable => FactAvailability::Degraded,
+                other => other,
+            });
             let Some(rollup) = &facts.rollup else {
                 continue;
             };

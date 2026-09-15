@@ -143,3 +143,7 @@ Ordering principle: nothing in Tiers 2–4 matters while Tier 1 keeps every chan
 2. Breakage is loud: a stale path, dead daemon, malformed hook call, or partial index is visible in doctor, in `status`, and (one line) in-session — verified by tests that force each failure.
 3. `context` output passes the readability bar and the token cost of a default call is lower than today's hybrid render.
 4. `impact` carries history-backed hotspot/co-change signal no grep can produce — the differentiated value the 2026-06-11 spec promised, now actually present.
+
+## Proxy lifecycle correction — September 14, 2026
+
+The idle-exit proposal above is superseded. Tool inactivity does not mean the MCP client has disconnected. Proxies remain alive until client stdin closes; there is no idle timeout setting. See [the lifecycle contract](../architecture/2026-09-14-mcp-proxy-lifetime.md).
