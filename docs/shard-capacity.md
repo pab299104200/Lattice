@@ -62,6 +62,20 @@ when nothing else was loading at the same time.
 Raise the budget if `lattice status` reports deferrals by memory while the machine has memory to
 spare. Lower it if the daemon competes with builds for memory.
 
+## Memory that is not in a shard
+
+Unloading a shard frees what the shard owned. Two things stay:
+
+- **The embedding model**, about 265 MiB once semantic retrieval has run, shared by every
+  workspace for the life of the daemon. The model runs over at most 16 texts at a time
+  (`EMBEDDING_RUN_BATCH`). Before September 2026 it ran over a whole workspace's file summaries
+  in one pass, and ONNX Runtime kept that pass's peak for good: 2,000 texts in one run left the
+  process at 7 GiB. That, not the shards, was the daemon's steady growth.
+- **Allocator slack.** The macOS system allocator keeps freed pages and still counts them in the
+  footprint; it does not return them on request (`malloc_zone_pressure_relief` was measured to
+  release nothing on macOS 26). Expect some tens of MiB to stay after an unload. The next load
+  reuses them.
+
 ## What to watch
 
 `lattice status` prints one `shard_capacity` line, for example:

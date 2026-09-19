@@ -241,29 +241,29 @@ impl ShardEntry {
         }
         let runtime = lock_owned(&self.runtime).take();
         if let Some(runtime) = runtime {
+            let before = crate::daemon_settings::process_memory_footprint_bytes();
             runtime.shutdown().await;
-            release_freed_memory_after_unload(&self.root).await;
+            log_unload_footprint(&self.root, before);
         }
     }
 }
 
-/// Return an unloaded shard's freed memory to the system and record what the
-/// footprint did, so growth that survives unloading is visible in the
-/// lifecycle log rather than inferred from `top`.
-async fn release_freed_memory_after_unload(root: &PathBuf) {
-    let before = crate::daemon_settings::process_memory_footprint_bytes();
-    let released = tokio::task::spawn_blocking(crate::daemon_settings::release_freed_memory)
-        .await
-        .unwrap_or_default();
-    let after = crate::daemon_settings::process_memory_footprint_bytes();
+/// Record the daemon's footprint either side of unloading a shard. When it
+/// does not fall, memory is outliving its shard, and the lifecycle log shows
+/// it without anyone having to sample `top`. (The system allocator on macOS
+/// keeps freed pages, and `malloc_zone_pressure_relief` was measured to
+/// release nothing on macOS 26, so no release is attempted here.)
+fn log_unload_footprint(root: &PathBuf, before: Option<u64>) {
     lifecycle_log::log_event(
         "daemon",
         "shard_memory_released",
         &[
             ("shard_key", serde_json::json!(shard_key(root))),
-            ("allocator_released_bytes", serde_json::json!(released)),
             ("footprint_before_bytes", serde_json::json!(before)),
-            ("footprint_after_bytes", serde_json::json!(after)),
+            (
+                "footprint_after_bytes",
+                serde_json::json!(crate::daemon_settings::process_memory_footprint_bytes()),
+            ),
         ],
     );
 }
