@@ -34,6 +34,7 @@ static ISOLATE_TEST_PROCESS: extern "C" fn() = isolate_test_process;
 
 /// Set on every isolated process, and so inherited by its children.
 const SANDBOX_ENV: &str = "LATTICE_TEST_SANDBOX";
+const SANDBOX_PREFIX: &str = "lattice-test-home-";
 
 extern "C" fn isolate_test_process() {
     // Some tests run this test binary again as a child, and time-out tests
@@ -48,7 +49,8 @@ extern "C" fn isolate_test_process() {
         }
     }
     let real_home = std::env::var_os("HOME").map(PathBuf::from);
-    let sandbox = std::env::temp_dir().join(format!("lattice-test-home-{}", std::process::id()));
+    remove_orphaned_sandboxes();
+    let sandbox = std::env::temp_dir().join(format!("{SANDBOX_PREFIX}{}", std::process::id()));
     for name in ["home", "state", "config", "cache", "data", "run"] {
         let dir = sandbox.join(name);
         // A process that cannot isolate itself must not run against the
@@ -96,6 +98,48 @@ extern "C" fn remove_sandbox() {
     if let Some(sandbox) = SANDBOX.get() {
         let _ = std::fs::remove_dir_all(sandbox);
     }
+}
+
+/// Remove sandboxes whose process has gone without reaching `atexit`.
+///
+/// Trusted checks run their command with a cleared environment, so a test
+/// binary run as a check cannot inherit its parent's sandbox, and the
+/// time-out tests then kill it. Its sandbox is empty but would otherwise be
+/// left behind on every run.
+fn remove_orphaned_sandboxes() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(SANDBOX_PREFIX))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !process_is_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 performs only the existence and permission check.
+    // Anything but "no such process" is treated as alive, so a sandbox is
+    // never removed from under a process that may still own it.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Keep `variable` pointing at an existing real location, unless the
@@ -167,6 +211,23 @@ mod tests {
             "the child did not reuse its parent's sandbox"
         );
         assert!(sandbox.is_dir(), "and must not remove it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandbox_left_by_a_dead_process_is_removed_and_a_live_one_is_not() {
+        // A pid that is certainly gone: a child that has been reaped.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let orphan = std::env::temp_dir().join(format!("{SANDBOX_PREFIX}{dead}"));
+        std::fs::create_dir_all(orphan.join("home")).unwrap();
+        let ours = SANDBOX.get().expect("isolation ran before main").clone();
+
+        remove_orphaned_sandboxes();
+        assert!(!orphan.exists(), "{}", orphan.display());
+        assert!(ours.is_dir(), "a live process keeps its sandbox");
+        assert!(process_is_alive(std::process::id()));
     }
 
     #[test]
