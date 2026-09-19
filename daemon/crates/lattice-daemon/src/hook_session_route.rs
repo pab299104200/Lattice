@@ -312,6 +312,14 @@ impl HookSessionRoute {
         .map_err(|_| HookSessionRouteError::Unavailable)?;
         let repository_state = resolve_repository_state(&resolved.checkout_root)?;
         let resume = params.resume.map(decode_resume).transpose()?;
+        // Binding identifiers are re-minted whenever an idle binding expires.
+        // The keyed fingerprint of integration, host session and checkout is
+        // the only content-free identity that is stable for a host session.
+        let workflow_session =
+            *self
+                .cryptography
+                .authority_fingerprint(&integration, &host_session_id, &checkout)
+                .as_bytes();
         let presentation_request = params.presentation;
         let enforcement_request = params.enforcement;
         let request = registry_open_request(
@@ -335,7 +343,7 @@ impl HookSessionRoute {
             .map(|request| {
                 self.decide_enforcement(
                     &resolved,
-                    outcome.internal_session_id.as_bytes(),
+                    &workflow_session,
                     request,
                     &index_state,
                 )
@@ -3416,6 +3424,43 @@ mod tests {
         let after_compact = fixture.edit();
         assert_eq!(after_compact["decision"], "deny");
         assert_eq!(after_compact["plan_state"], "missing");
+    }
+
+    #[test]
+    fn a_plan_survives_binding_regeneration_within_one_host_session() {
+        let mut fixture = EnforcementFixture::new("regeneration");
+        let hello = fixture.hello.clone();
+        fixture.edit();
+        fixture
+            .route
+            .record_workflow_step(&hello, WorkflowStep::PrepareChange);
+        assert_eq!(fixture.edit()["decision"], "allow");
+
+        // An idle binding expires after thirty minutes and the next hook mints
+        // a new one. Revoking reproduces that without waiting.
+        let binding_hex = fixture.resume.as_ref().unwrap()["binding_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let binding_id =
+            RegistryId::from_bytes(decode_hex::<16>(&binding_hex).unwrap().to_vec()).unwrap();
+        fixture
+            .route
+            .registry
+            .lock()
+            .unwrap()
+            .revoke(&binding_id)
+            .unwrap();
+        fixture.resume = None;
+        let regenerated = fixture.edit();
+        assert_ne!(
+            fixture.resume.as_ref().unwrap()["binding_id"]
+                .as_str()
+                .unwrap(),
+            binding_hex
+        );
+        assert_eq!(regenerated["decision"], "allow");
+        assert_eq!(regenerated["plan_state"], "current");
     }
 
     #[test]
