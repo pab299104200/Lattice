@@ -55,8 +55,18 @@ This file is the resume point. Update it and commit after every task.
 - [x] (c) Status and doctor visibility (unit-tested; exercised by the acceptance run)
 - [x] (f) Memory growth found and fixed: the embedding model ran whole workspaces in one pass — `c6e49ab`
 - [x] (g) Docs: `docs/shard-capacity.md`, README daemon settings, resource budgets, shard architecture, hook-enforcement — `c588d20`, `ab22819`
-- [ ] Full suite three times with `--no-fail-fast`, fmt, clippy, no orphan processes, real HOME untouched
-- [ ] Private-daemon acceptance: N workspaces load, idle eviction, reconnect reload, memory pressure
+- [x] Full suite three times, `cargo test --workspace --no-fail-fast` at `3eba78b`: 0 failed each
+      time, 40 ignored, 141–147 s; the same 2,366 named tests pass in every run (the summed
+      "passed" count reads 2,367 or 2,368 because child test processes print their own result
+      lines into the output). No leftover processes or sandboxes after any run. `cargo fmt --check`
+      clean. No new compiler warnings in the files this branch touches. (CI runs tests only.)
+- [x] Private-daemon acceptance with real stdio proxies (`acceptance.py` in the session
+      scratchpad): 15 of 15 checks. A: four workspaces and five agents (two on one checkout) all
+      loaded, nothing deferred, no ceiling. C: agents leave, all four shards go after the grace
+      period, footprint 424 → 200 MiB with a `shard_memory_released` event per unload. B: under a
+      600 MiB budget a silent connected shard is unloaded for a newcomer and its agent stays
+      connected; an immediate retry is deferred honestly with nothing busy unloaded; after the
+      other agent falls silent the deferred agent heals on its next request without reconnecting.
 
 ## Findings so far
 
@@ -157,4 +167,6 @@ rebuild as in step 3, and restart as in step 5.
 ## Lattice's own tools
 
 The first builder ran `lattice context`, `prepare_change` and `impact` on the Lattice repository
-before editing (pivot files `daemon_settings.rs`, `socket_server.rs`; no relevant memories).
+before editing (pivot files `daemon_settings.rs`, `socket_server.rs`; no relevant memories). The
+session that finished the branch did not run them again; it worked from the builder's plan, the
+commits and direct reading of the code.
