@@ -137,7 +137,10 @@ struct HostFact {
 enum ToolFact {
     NotATool,
     /// An edit tool that names its target.
-    Edit { path: String, scratch: Option<PathBuf> },
+    Edit {
+        path: String,
+        scratch: Option<PathBuf>,
+    },
     /// An edit tool whose host exposes no target (Codex `apply_patch` carries
     /// only patch text, which is not read).
     EditWithoutPath,
@@ -304,9 +307,7 @@ async fn run(invocation: &Invocation, prepared: &Prepared) -> Result<HookOutput>
     let identity = &prepared.identity;
     let enforcing = prepared.policy.enforcing();
     let mut output = HookOutput::default();
-    if matches!(prepared.policy, PolicyState::Unreadable(_))
-        && invocation.kind != HookKind::Stop
-    {
+    if matches!(prepared.policy, PolicyState::Unreadable(_)) && invocation.kind != HookKind::Stop {
         output = notice_output(invocation, prepared, NoticeCondition::PolicyUnreadable);
     }
 
@@ -347,7 +348,12 @@ async fn run(invocation: &Invocation, prepared: &Prepared) -> Result<HookOutput>
                 .open_or_resume(fact.presentation.as_ref(), enforcement)
                 .await?;
             push_presentation(&mut output, answer.presentation);
-            push_index_notice(&mut output, invocation, prepared, answer.enforcement.as_ref());
+            push_index_notice(
+                &mut output,
+                invocation,
+                prepared,
+                answer.enforcement.as_ref(),
+            );
         }
         HookKind::UserPromptSubmit => {
             let answer = session
@@ -446,14 +452,17 @@ async fn run_post_tool_use(
         &identity.checkout_root,
     );
 
-    let inspect_repository = enforcing
-        && matches!(fact.tool, ToolFact::Shell | ToolFact::EditWithoutPath);
+    let inspect_repository =
+        enforcing && matches!(fact.tool, ToolFact::Shell | ToolFact::EditWithoutPath);
     if !inspect_repository {
         let Some(payload) = fact.payload.clone() else {
             return Ok(());
         };
         if enforcing {
-            if let Some(path) = fact.presentation.as_ref().and_then(|request| request.path.as_deref())
+            if let Some(path) = fact
+                .presentation
+                .as_ref()
+                .and_then(|request| request.path.as_deref())
             {
                 // Best effort: a stale snapshot only costs one extra mention.
                 let _ = crate::hook_shell_changes::absorb_tool_edit(
@@ -485,7 +494,11 @@ async fn run_post_tool_use(
         Ok(crate::hook_shell_changes::ShellDetection::Degraded) | Err(_) => {
             merge_output(
                 output,
-                notice_output(invocation, prepared, NoticeCondition::ShellDetectionDegraded),
+                notice_output(
+                    invocation,
+                    prepared,
+                    NoticeCondition::ShellDetectionDegraded,
+                ),
             );
             Vec::new()
         }
@@ -502,12 +515,10 @@ async fn run_post_tool_use(
 
     let presentation = HostPresentationRequest {
         kind: HookKind::PostToolUse,
-        request_id: fact
-            .presentation
-            .as_ref()
-            .map_or_else(|| format!("evt_{marker}_{}", session.now_ms), |request| {
-                request.request_id.clone()
-            }),
+        request_id: fact.presentation.as_ref().map_or_else(
+            || format!("evt_{marker}_{}", session.now_ms),
+            |request| request.request_id.clone(),
+        ),
         prompt: None,
         path: Some(forwarded[0].clone()),
         acted_on_injection_id: None,
@@ -1182,8 +1193,10 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8], checkout_root: &Path) -> Resu
             }),
         // A shell call has no path yet, but keeps the host's request id so
         // the repository-derived presentation stays idempotent per tool call.
-        HookKind::PostToolUse if payload.is_some() || tool == ToolFact::Shell
-            || tool == ToolFact::EditWithoutPath =>
+        HookKind::PostToolUse
+            if payload.is_some()
+                || tool == ToolFact::Shell
+                || tool == ToolFact::EditWithoutPath =>
         {
             Some(HostPresentationRequest {
                 kind,
@@ -1637,7 +1650,10 @@ mod tests {
             )
             .unwrap();
             let rendered: Value = serde_json::from_str(&rendered).unwrap();
-            assert_eq!(rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+            assert_eq!(
+                rendered["hookSpecificOutput"]["hookEventName"],
+                "PostToolUse"
+            );
             assert_eq!(rendered["hookSpecificOutput"]["additionalContext"], context);
             assert!(rendered["hookSpecificOutput"]
                 .get("permissionDecision")
@@ -1887,11 +1903,26 @@ mod tests {
             ),
             ToolFact::EditWithoutPath
         );
-        assert_eq!(fact_for("Edit", json!({"file_path": "  "})), ToolFact::EditWithoutPath);
-        for other in ["Read", "Grep", "mcp__lattice__prepare_change", "bash", "edit"] {
-            assert_eq!(fact_for(other, json!({"file_path": "src/a.rs"})), ToolFact::Other);
+        assert_eq!(
+            fact_for("Edit", json!({"file_path": "  "})),
+            ToolFact::EditWithoutPath
+        );
+        for other in [
+            "Read",
+            "Grep",
+            "mcp__lattice__prepare_change",
+            "bash",
+            "edit",
+        ] {
+            assert_eq!(
+                fact_for(other, json!({"file_path": "src/a.rs"})),
+                ToolFact::Other
+            );
         }
-        assert_eq!(fact_for("PowerShell", json!({"command": "x"})), ToolFact::Shell);
+        assert_eq!(
+            fact_for("PowerShell", json!({"command": "x"})),
+            ToolFact::Shell
+        );
     }
 
     #[test]
@@ -1899,7 +1930,9 @@ mod tests {
         let source = |kind: HookKind, value: Value| {
             extract_host_fact(
                 kind,
-                json!({"session_id": "s", "source": value}).to_string().as_bytes(),
+                json!({"session_id": "s", "source": value})
+                    .to_string()
+                    .as_bytes(),
                 checkout(),
             )
             .unwrap()
@@ -1908,7 +1941,10 @@ mod tests {
         for known in ["startup", "resume", "clear", "compact"] {
             assert_eq!(source(HookKind::SessionStart, json!(known)), Some(known));
         }
-        assert_eq!(source(HookKind::SessionStart, json!("sentinel-other")), None);
+        assert_eq!(
+            source(HookKind::SessionStart, json!("sentinel-other")),
+            None
+        );
         assert_eq!(source(HookKind::SessionStart, json!(7)), None);
         assert_eq!(source(HookKind::UserPromptSubmit, json!("compact")), None);
 
@@ -1968,7 +2004,9 @@ mod tests {
         )
         .unwrap();
         let noticed: Value = serde_json::from_str(&noticed).unwrap();
-        assert!(noticed["hookSpecificOutput"].get("permissionDecision").is_none());
+        assert!(noticed["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none());
         assert!(noticed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap()
@@ -2121,8 +2159,7 @@ mod tests {
             json!({"session_id":"s","schema_version":1,"kind":"edited_path","path":"src/lib.rs"}),
             json!({"session_id":"s","schema_version":1,"kind":"error","category":"test","fingerprint":format!("sha256:{}", "3".repeat(64)),"status":"resolved","summary":"not producer-declared"}),
         ] {
-            let result =
-                extract_host_fact(
+            let result = extract_host_fact(
                 HookKind::StructuredFact,
                 rejected.to_string().as_bytes(),
                 checkout(),

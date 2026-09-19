@@ -475,11 +475,21 @@ mod tests {
             }
         });
 
-        reconcile_hook_config(&mut config, HookClient::Codex, &paths(), HookMode::BestEffort)
-            .unwrap();
+        reconcile_hook_config(
+            &mut config,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
         let once = render_config(&config).unwrap();
-        reconcile_hook_config(&mut config, HookClient::Codex, &paths(), HookMode::BestEffort)
-            .unwrap();
+        reconcile_hook_config(
+            &mut config,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
 
         assert_eq!(once, render_config(&config).unwrap());
         assert_eq!(
@@ -601,7 +611,9 @@ mod tests {
             reconcile_hook_config(&mut config, client, &paths(), HookMode::Enforcing).unwrap();
             assert_eq!(
                 lattice_commands(&config, "PreToolUse"),
-                vec![format!("/opt/lattice/integrations/{directory}/hooks/pre-tool-use.sh")]
+                vec![format!(
+                    "/opt/lattice/integrations/{directory}/hooks/pre-tool-use.sh"
+                )]
             );
             assert_eq!(
                 config["hooks"]["PreToolUse"][0]["matcher"],
@@ -621,7 +633,11 @@ mod tests {
 
             let once = render_config(&config).unwrap();
             reconcile_hook_config(&mut config, client, &paths(), HookMode::Enforcing).unwrap();
-            assert_eq!(once, render_config(&config).unwrap(), "rerun must be idempotent");
+            assert_eq!(
+                once,
+                render_config(&config).unwrap(),
+                "rerun must be idempotent"
+            );
         }
     }
 
@@ -801,10 +817,14 @@ mod tests {
     fn rejects_invalid_shapes_and_timeout_invariant_violations() {
         let paths = paths();
         let mut invalid = json!({"hooks": []});
-        let error =
-            reconcile_hook_config(&mut invalid, HookClient::ClaudeCode, &paths, HookMode::BestEffort)
-            .unwrap_err()
-            .to_string();
+        let error = reconcile_hook_config(
+            &mut invalid,
+            HookClient::ClaudeCode,
+            &paths,
+            HookMode::BestEffort,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("hook configuration.hooks must be a JSON object"));
 
         let mut invalid_timeout = HOOKS[0];

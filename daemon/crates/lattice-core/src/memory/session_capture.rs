@@ -690,10 +690,9 @@ mod tests {
         );
         assert!(session_capture_turn_summary_from_host(None).is_none());
         // A long message keeps a bounded prefix instead of being lost whole.
-        let long = session_capture_turn_summary_from_host(Some(
-            &"word ".repeat(MAX_TURN_SUMMARY_BYTES),
-        ))
-        .expect("bounded prefix of a long host summary");
+        let long =
+            session_capture_turn_summary_from_host(Some(&"word ".repeat(MAX_TURN_SUMMARY_BYTES)))
+                .expect("bounded prefix of a long host summary");
         let SessionCaptureFact::TurnSummary { summary } = &long.fact else {
             panic!("expected a turn summary");
         };

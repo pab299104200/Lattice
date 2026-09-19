@@ -37,7 +37,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_MCP_TOOL_COUNT: usize = 8;
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct CliRequest {
     tool: String,
@@ -354,8 +353,7 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
     if command.target == InstallTarget::Project {
         let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
         let mode = resolve_hook_mode(&command, config_workspace)?;
-        let installed =
-            crate::install_project::install_project(config_workspace, &paths, mode)?;
+        let installed = crate::install_project::install_project(config_workspace, &paths, mode)?;
         if command.verify {
             for target in [
                 InstallTarget::Mcp,
@@ -949,7 +947,12 @@ fn verify_enforcing_hooks(
         })
         .to_string();
         // The first shell call only records a baseline of repository state.
-        let output = run(&post, &payload, "configured PostToolUse shell hook", state_root)?;
+        let output = run(
+            &post,
+            &payload,
+            "configured PostToolUse shell hook",
+            state_root,
+        )?;
         if !output.is_empty() {
             return Err(anyhow!(
                 "verification failed: the first shell PostToolUse call must record a baseline silently"
@@ -3106,10 +3109,13 @@ mod tests {
             codex_notice,
             "lattice: daemon unreachable — run 'lattice doctor'"
         );
-        assert!(
-            verify_hook_stdout(HookClient::Codex, best_effort, "SessionStart", &codex_notice)
-                .is_ok()
-        );
+        assert!(verify_hook_stdout(
+            HookClient::Codex,
+            best_effort,
+            "SessionStart",
+            &codex_notice
+        )
+        .is_ok());
         assert!(verify_hook_stdout(
             HookClient::Codex,
             best_effort,
@@ -3118,8 +3124,7 @@ mod tests {
         )
         .is_ok());
 
-        let claude_notice =
-            session_start_notice(HookClient::ClaudeCode, BEST_EFFORT_DAEMON_NOTICE);
+        let claude_notice = session_start_notice(HookClient::ClaudeCode, BEST_EFFORT_DAEMON_NOTICE);
         let claude: Value = serde_json::from_str(&claude_notice).unwrap();
         assert_eq!(
             claude["hookSpecificOutput"]["hookEventName"],
@@ -3153,21 +3158,61 @@ mod tests {
         }
 
         for (client, mode, event, output) in [
-            (HookClient::Codex, best_effort, "UserPromptSubmit", codex_notice.as_str()),
-            (HookClient::Codex, best_effort, "SessionStart", "unexpected hook output"),
+            (
+                HookClient::Codex,
+                best_effort,
+                "UserPromptSubmit",
+                codex_notice.as_str(),
+            ),
+            (
+                HookClient::Codex,
+                best_effort,
+                "SessionStart",
+                "unexpected hook output",
+            ),
             (
                 HookClient::Codex,
                 best_effort,
                 "SessionStart",
                 "lattice: daemon unreachable — run 'lattice doctor'\nextra",
             ),
-            (HookClient::Codex, best_effort, "SessionStart", claude_notice.as_str()),
-            (HookClient::ClaudeCode, best_effort, "SessionStart", codex_notice.as_str()),
+            (
+                HookClient::Codex,
+                best_effort,
+                "SessionStart",
+                claude_notice.as_str(),
+            ),
+            (
+                HookClient::ClaudeCode,
+                best_effort,
+                "SessionStart",
+                codex_notice.as_str(),
+            ),
             // Each mode accepts only its own wording, on its own event.
-            (HookClient::ClaudeCode, best_effort, "SessionStart", loud.as_str()),
-            (HookClient::ClaudeCode, enforcing, "SessionStart", claude_notice.as_str()),
-            (HookClient::ClaudeCode, best_effort, "Stop", capture.as_str()),
-            (HookClient::ClaudeCode, enforcing, "PreToolUse", loud.as_str()),
+            (
+                HookClient::ClaudeCode,
+                best_effort,
+                "SessionStart",
+                loud.as_str(),
+            ),
+            (
+                HookClient::ClaudeCode,
+                enforcing,
+                "SessionStart",
+                claude_notice.as_str(),
+            ),
+            (
+                HookClient::ClaudeCode,
+                best_effort,
+                "Stop",
+                capture.as_str(),
+            ),
+            (
+                HookClient::ClaudeCode,
+                enforcing,
+                "PreToolUse",
+                loud.as_str(),
+            ),
             (
                 HookClient::ClaudeCode,
                 enforcing,
@@ -3199,7 +3244,10 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().enforce, None);
         assert_eq!(parse(&["--enforce"]).unwrap().enforce, Some(true));
         assert_eq!(parse(&["--no-enforce"]).unwrap().enforce, Some(false));
-        assert_eq!(parse(&["--enforce", "--enforce"]).unwrap().enforce, Some(true));
+        assert_eq!(
+            parse(&["--enforce", "--enforce"]).unwrap().enforce,
+            Some(true)
+        );
         assert!(parse(&["--enforce", "--no-enforce"])
             .unwrap_err()
             .to_string()
@@ -3298,7 +3346,10 @@ mod tests {
                 &runtime,
             )
             .unwrap_err();
-            assert!(format!("{error:#}").contains("workspace-policy.json"), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("workspace-policy.json"),
+                "{error:#}"
+            );
             assert!(!workspace.join(".claude/settings.json").exists());
             assert_eq!(
                 fs::read_to_string(policy_path(&workspace)).unwrap(),
@@ -3472,7 +3523,11 @@ mod tests {
                 .unwrap();
         assert_eq!(
             mcp["mcpServers"]["lattice"]["args"],
-            json!(["--stdio", "--workspace", workspace.canonicalize().unwrap().to_string_lossy()])
+            json!([
+                "--stdio",
+                "--workspace",
+                workspace.canonicalize().unwrap().to_string_lossy()
+            ])
         );
         let codex = fs::read_to_string(workspace.join(".codex/config.toml")).unwrap();
         assert!(codex.contains("mcp_servers.lattice"));

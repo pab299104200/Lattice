@@ -325,7 +325,9 @@ mod tests {
             None
         );
         assert_eq!(
-            state.latest_step(CHECKOUT, WorkflowStep::Remember, 0).unwrap(),
+            state
+                .latest_step(CHECKOUT, WorkflowStep::Remember, 0)
+                .unwrap(),
             None
         );
     }
@@ -364,10 +366,17 @@ mod tests {
         let state = HookWorkflowState::open_in_memory().unwrap();
         let first = state.session(SESSION, 10_000).unwrap();
         assert_eq!(first.not_before_ms, 10_000);
-        assert_eq!(state.session(SESSION, 99_000).unwrap().not_before_ms, 10_000);
+        assert_eq!(
+            state.session(SESSION, 99_000).unwrap().not_before_ms,
+            10_000
+        );
 
-        state.record_product_edits(SESSION, 2, true, 20_000).unwrap();
-        state.record_product_edits(SESSION, 3, false, 25_000).unwrap();
+        state
+            .record_product_edits(SESSION, 2, true, 20_000)
+            .unwrap();
+        state
+            .record_product_edits(SESSION, 3, false, 25_000)
+            .unwrap();
         let edited = state.session(SESSION, 26_000).unwrap();
         assert_eq!(edited.product_edits, 5);
         assert_eq!(edited.last_covered_edit_ms, Some(20_000));
@@ -402,9 +411,13 @@ mod tests {
             }
         );
         // A step recorded before the session's floor does not count.
-        state.record_step(CHECKOUT, WorkflowStep::Remember, 500).unwrap();
+        state
+            .record_step(CHECKOUT, WorkflowStep::Remember, 500)
+            .unwrap();
         assert!(state.followup_gaps(CHECKOUT, &edited).unwrap().remember);
-        state.record_step(CHECKOUT, WorkflowStep::Remember, 3_000).unwrap();
+        state
+            .record_step(CHECKOUT, WorkflowStep::Remember, 3_000)
+            .unwrap();
         assert_eq!(
             state.followup_gaps(CHECKOUT, &edited).unwrap(),
             FollowupGaps {
@@ -412,7 +425,9 @@ mod tests {
                 remember: false
             }
         );
-        state.record_step(CHECKOUT, WorkflowStep::StaleDocs, 3_500).unwrap();
+        state
+            .record_step(CHECKOUT, WorkflowStep::StaleDocs, 3_500)
+            .unwrap();
         assert!(!state.followup_gaps(CHECKOUT, &edited).unwrap().any());
     }
 

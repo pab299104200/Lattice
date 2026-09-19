@@ -84,8 +84,7 @@ pub(crate) fn absorb_tool_edit(
     let Some(mut snapshot) = load_snapshot(&path) else {
         return Ok(());
     };
-    if snapshot.entries.len() >= MAX_DIRTY_ENTRIES
-        && !snapshot.entries.contains_key(relative_path)
+    if snapshot.entries.len() >= MAX_DIRTY_ENTRIES && !snapshot.entries.contains_key(relative_path)
     {
         return Ok(());
     }
@@ -341,7 +340,9 @@ mod tests {
     }
 
     async fn detect(root: &Path, state: &Path) -> ShellDetection {
-        detect_shell_changes(root, state, MARKER, BUDGET).await.unwrap()
+        detect_shell_changes(root, state, MARKER, BUDGET)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -354,7 +355,11 @@ mod tests {
 
         fs::write(root.join("src/lib.rs"), "pub fn one() { 1; }\n").unwrap();
         fs::create_dir_all(root.join("src/new dir")).unwrap();
-        fs::write(root.join("src/new dir/added file.rs"), "pub fn three() {}\n").unwrap();
+        fs::write(
+            root.join("src/new dir/added file.rs"),
+            "pub fn three() {}\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::write(root.join("target/ignored.o"), "binary").unwrap();
         assert_eq!(

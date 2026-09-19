@@ -315,11 +315,10 @@ impl HookSessionRoute {
         // Binding identifiers are re-minted whenever an idle binding expires.
         // The keyed fingerprint of integration, host session and checkout is
         // the only content-free identity that is stable for a host session.
-        let workflow_session =
-            *self
-                .cryptography
-                .authority_fingerprint(&integration, &host_session_id, &checkout)
-                .as_bytes();
+        let workflow_session = *self
+            .cryptography
+            .authority_fingerprint(&integration, &host_session_id, &checkout)
+            .as_bytes();
         let presentation_request = params.presentation;
         let enforcement_request = params.enforcement;
         let request = registry_open_request(
@@ -341,12 +340,7 @@ impl HookSessionRoute {
             .flatten();
         let enforcement = enforcement_request
             .map(|request| {
-                self.decide_enforcement(
-                    &resolved,
-                    &workflow_session,
-                    request,
-                    &index_state,
-                )
+                self.decide_enforcement(&resolved, &workflow_session, request, &index_state)
             })
             .transpose()?;
         serde_json::to_value(HookSessionOpenResult {
@@ -393,10 +387,17 @@ impl HookSessionRoute {
                 .mark_context_reset(session_id, now)
                 .map_err(unavailable)?;
         }
-        let session = self.workflow.session(session_id, now).map_err(unavailable)?;
+        let session = self
+            .workflow
+            .session(session_id, now)
+            .map_err(unavailable)?;
         let latest_plan = self
             .workflow
-            .latest_step(&checkout_id, WorkflowStep::PrepareChange, session.not_before_ms)
+            .latest_step(
+                &checkout_id,
+                WorkflowStep::PrepareChange,
+                session.not_before_ms,
+            )
             .map_err(unavailable)?;
         let plan_state = evaluate_plan(
             now,
@@ -3535,10 +3536,7 @@ mod tests {
                 }),
                 IndexState::Ready,
             );
-            assert!(matches!(
-                result,
-                Err(HookSessionRouteError::InvalidRequest)
-            ));
+            assert!(matches!(result, Err(HookSessionRouteError::InvalidRequest)));
         }
         let plain = fixture
             .route

@@ -134,7 +134,10 @@ pub(crate) fn write_policy(checkout_root: &Path, hook_enforcement: bool) -> Resu
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create policy directory `{}`", parent.display()))?;
     let staged = path.with_extension("json.lattice-install-tmp");
-    let rendered = format!("{}\n", serde_json::to_string_pretty(&Value::Object(document))?);
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(document))?
+    );
     std::fs::write(&staged, rendered)
         .with_context(|| format!("write staged policy `{}`", staged.display()))?;
     std::fs::rename(&staged, &path)
@@ -644,7 +647,10 @@ mod tests {
             );
             assert!(!state.enforcing());
             assert!(write_policy(&root, true).is_err());
-            assert_eq!(std::fs::read_to_string(policy_path(&root)).unwrap(), corrupt);
+            assert_eq!(
+                std::fs::read_to_string(policy_path(&root)).unwrap(),
+                corrupt
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -665,7 +671,10 @@ mod tests {
             (absolute("docs/diagram.svg"), PathClass::Documentation),
             (absolute("README.md"), PathClass::Documentation),
             (absolute("src/NOTES.MD"), PathClass::Documentation),
-            (absolute(".lattice/workspace-policy.json"), PathClass::ToolState),
+            (
+                absolute(".lattice/workspace-policy.json"),
+                PathClass::ToolState,
+            ),
             (absolute(".claude/settings.json"), PathClass::ToolState),
             (absolute(".codex/hooks.json"), PathClass::ToolState),
             (absolute("tmp/probe.py"), PathClass::Scratch),
@@ -707,10 +716,7 @@ mod tests {
         );
         assert_eq!(checkout_relative_path(&root, "/etc/hosts"), None);
         assert_eq!(checkout_relative_path(&root, "../escape.rs"), None);
-        assert_eq!(
-            checkout_relative_path(&root, &root.to_string_lossy()),
-            None
-        );
+        assert_eq!(checkout_relative_path(&root, &root.to_string_lossy()), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -774,7 +780,12 @@ mod tests {
         }
         // The absolute window still ends it.
         assert_eq!(
-            evaluate_plan(plan_at + PLAN_ABSOLUTE_WINDOW_MS + 1, Some(plan_at), last_edit, 0),
+            evaluate_plan(
+                plan_at + PLAN_ABSOLUTE_WINDOW_MS + 1,
+                Some(plan_at),
+                last_edit,
+                0
+            ),
             PlanState::Stale(PlanStaleReason::Expired)
         );
     }

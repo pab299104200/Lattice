@@ -1801,18 +1801,22 @@ mod tests {
     #[test]
     fn workflow_steps_are_read_from_the_tool_name_and_status_scope_only() {
         use crate::hook_workflow_state::WorkflowStep;
-        let call = |name: &str, arguments: Value| {
-            serde_json::json!({"name": name, "arguments": arguments})
-        };
+        let call = |name: &str, arguments: Value| serde_json::json!({"name": name, "arguments": arguments});
         assert_eq!(
             served_workflow_step(
                 "tools/call",
-                &call("prepare_change", serde_json::json!({"task": "private task text"}))
+                &call(
+                    "prepare_change",
+                    serde_json::json!({"task": "private task text"})
+                )
             ),
             Some(WorkflowStep::PrepareChange)
         );
         assert_eq!(
-            served_workflow_step("tools/call", &call("status", serde_json::json!({"scope": "docs"}))),
+            served_workflow_step(
+                "tools/call",
+                &call("status", serde_json::json!({"scope": "docs"}))
+            ),
             Some(WorkflowStep::StaleDocs)
         );
         assert_eq!(

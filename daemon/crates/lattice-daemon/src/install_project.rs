@@ -1,8 +1,7 @@
 //! Safe, idempotent repository-local Lattice installation.
 
 use crate::install::{
-    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, HookMode,
-    InstallPaths,
+    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, HookMode, InstallPaths,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
@@ -116,8 +115,14 @@ pub(crate) fn install_project(
             }
         })()
         .with_context(|| format!("read pinned project configuration {}", path.display()))?;
-        let content = render(kind, original.as_deref(), &configured_workspace, paths, mode)
-            .with_context(|| format!("preflight {}", path.display()))?;
+        let content = render(
+            kind,
+            original.as_deref(),
+            &configured_workspace,
+            paths,
+            mode,
+        )
+        .with_context(|| format!("preflight {}", path.display()))?;
         plans.push(Plan {
             path,
             original,
@@ -443,7 +448,9 @@ mod tests {
         assert!(fs::read_to_string(root.join(".codex/config.toml"))
             .unwrap()
             .contains("keep = true"));
-        assert!(install_project(&root, &paths, HookMode::BestEffort).unwrap().is_empty());
+        assert!(install_project(&root, &paths, HookMode::BestEffort)
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -496,8 +503,15 @@ mod tests {
         )
         .unwrap();
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-        assert_eq!(install_project(&root, &paths, HookMode::BestEffort).unwrap().len(), 6);
-        assert!(install_project(&root, &paths, HookMode::BestEffort).unwrap().is_empty());
+        assert_eq!(
+            install_project(&root, &paths, HookMode::BestEffort)
+                .unwrap()
+                .len(),
+            6
+        );
+        assert!(install_project(&root, &paths, HookMode::BestEffort)
+            .unwrap()
+            .is_empty());
         assert!(fs::read_to_string(root.join("AGENTS.md"))
             .unwrap()
             .contains("custom"));

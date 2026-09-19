@@ -767,7 +767,10 @@ pub(crate) fn redact_code_spans(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find('`') {
-        let fence_len = rest[start..].bytes().take_while(|byte| *byte == b'`').count();
+        let fence_len = rest[start..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
         let fence = &rest[start..start + fence_len];
         let after = &rest[start + fence_len..];
         let Some(close) = after.find(fence) else {
@@ -940,9 +943,15 @@ mod tests {
             ("```sh\nrm -rf /\n``` after", "[code] after"),
             ("``` fence `inline` still fenced ``` tail", "[code] tail"),
             ("dangling ` backtick", "dangling ` backtick"),
-            ("closed `a` then dangling `b", "closed [code] then dangling `b"),
+            (
+                "closed `a` then dangling `b",
+                "closed [code] then dangling `b",
+            ),
             ("``", "``"),
-            ("multibyte `\u{e9}t\u{e9}` \u{2014} ok", "multibyte [code] \u{2014} ok"),
+            (
+                "multibyte `\u{e9}t\u{e9}` \u{2014} ok",
+                "multibyte [code] \u{2014} ok",
+            ),
         ] {
             assert_eq!(redact_code_spans(input), expected, "{input:?}");
         }
