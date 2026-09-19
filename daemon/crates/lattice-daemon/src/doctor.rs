@@ -509,7 +509,7 @@ fn format_running_settings(
         }
         Some("memory") => {
             return (
-                format!("WARN {usage}. The next workspace to connect would be DEFERRED: memory is at its budget and no loaded workspace is idle. Raise memory_budget_mb or close an agent session"),
+                format!("WARN {usage}. The next workspace to connect would be DEFERRED: memory is too close to its budget to load another workspace and no loaded workspace is idle. Raise memory_budget_mb or close an agent session"),
                 true,
             )
         }
@@ -1441,7 +1441,7 @@ mod tests {
         );
         assert!(warned);
         assert!(
-            line.contains("would be DEFERRED: memory is at its budget"),
+            line.contains("would be DEFERRED: memory is too close to its budget"),
             "{line}"
         );
 

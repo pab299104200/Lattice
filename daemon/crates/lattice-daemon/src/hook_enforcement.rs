@@ -465,8 +465,8 @@ pub(crate) fn notice_text(condition: NoticeCondition) -> String {
              Edits are not blocked. Check progress with `lattice status`."
         }
         NoticeCondition::IndexDeferred => {
-            "Lattice could not load this workspace: the daemon is at its memory budget or its \
-             configured shard ceiling, and every loaded workspace is in use. Plan and impact \
+            "Lattice could not load this workspace: the daemon is too close to its memory budget \
+             or at its configured shard ceiling, and every loaded workspace is in use. Plan and impact \
              answers are partial. Edits are not blocked. Run `lattice status` for the reason \
              and what to raise."
         }

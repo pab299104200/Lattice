@@ -665,8 +665,8 @@ enum DeferralKind {
     /// The operator's `max_loaded_shards` ceiling is reached and every
     /// loaded workspace is busy.
     Ceiling,
-    /// The daemon's real memory is at its budget and no loaded workspace is
-    /// idle enough to unload.
+    /// The daemon's real memory is too close to its budget to load another
+    /// workspace, and no loaded workspace is idle enough to unload.
     Memory,
 }
 
@@ -1763,7 +1763,8 @@ impl GlobalDaemon {
                 self.connected_idle_secs / 60,
             ),
             DeferralKind::Memory => format!(
-                "the daemon's memory is at its budget: {} MiB used of {} MiB (from {}), with {loaded} workspaces loaded and every one of them in use, so {key} cannot be loaded. Raise memory_budget_mb in the daemon settings file, close a workspace's agent session, or wait for one to go idle for {} minutes.",
+                "loading another workspace needs {} MiB of room under the daemon's memory budget, and there is not enough: {} MiB used of {} MiB (from {}). {loaded} workspaces are loaded and every one of them is in use, so {key} cannot be loaded. Raise memory_budget_mb in the daemon settings file, close a workspace's agent session, or wait for one to go idle for {} minutes.",
+                LOAD_HEADROOM_BYTES / (1024 * 1024),
                 (self.footprint)().unwrap_or_default() / (1024 * 1024),
                 self.memory_budget_bytes / (1024 * 1024),
                 self.settings.memory_budget_source.describe(),
@@ -2883,7 +2884,7 @@ mod tests {
         assert_eq!(status["indexing"], false);
         let summary = status["summary"].as_str().unwrap();
         assert!(
-            summary.contains("memory is at its budget: 2048 MiB used of 2048 MiB"),
+            summary.contains("needs 512 MiB of room under the daemon's memory budget, and there is not enough: 2048 MiB used of 2048 MiB"),
             "{summary}"
         );
         assert!(summary.contains("memory_budget_mb"), "{summary}");
