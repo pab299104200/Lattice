@@ -2168,8 +2168,18 @@ mod tests {
             responses.push(result.expect("cold status task must not panic"));
         }
         assert_eq!(responses.len(), roots.len());
+        let mut deferred = 0;
         for status in responses {
-            assert_eq!(status["status"].as_str(), Some("indexing"));
+            // A workspace that was never admitted must not claim to be
+            // indexing: nothing is indexing it.
+            if status["bootstrap"]["state"].as_str() == Some("deferred") {
+                deferred += 1;
+                assert_eq!(status["status"].as_str(), Some("deferred"));
+                assert_eq!(status["indexing"].as_bool(), Some(false));
+            } else {
+                assert_eq!(status["status"].as_str(), Some("indexing"));
+                assert_eq!(status["indexing"].as_bool(), Some(true));
+            }
             assert_eq!(status["graph_snapshot_state"].as_str(), Some("not_loaded"));
             assert!(
                 status["nodes"].is_null(),
@@ -2184,6 +2194,10 @@ mod tests {
                 "cold status must not claim zero files"
             );
         }
+        assert!(
+            deferred > 0,
+            "this fixture opens more workspaces than shard slots, so some must be deferred"
+        );
 
         drop(bootstrap_gate);
         shutdown_all_shards(&daemon).await;

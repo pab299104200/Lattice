@@ -86,8 +86,10 @@ straight after a plan sees it.
 
 Two consequences follow, and both are deliberate:
 
-- The fact is scoped to the **checkout**, not to one session. Two sessions working in the same
-  checkout share plans. Use separate worktrees when sessions must plan independently.
+- The fact is scoped to the **checkout**, not to one session. A plan satisfies every session
+  in that checkout that had already started when the plan was made. A session that starts
+  afterwards needs its own plan, because its floor is its own start (rule 1 below). Use
+  separate worktrees when concurrent sessions must plan independently.
 - A workspace that is still loading gives a partial `prepare_change` answer. That still counts:
   the agent did what was asked of it.
 

@@ -24,7 +24,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use crate::hook_enforcement::{
-    self, checkout_relative_path, classify_edit_path, classify_relative_path, deny_reason,
+    checkout_relative_path, classify_edit_path, classify_relative_path, deny_reason,
     followup_reminder, load_policy, notice_text, FollowupGaps, IndexState, NoticeCondition,
     PathClass, PlanState, PolicyState, BEST_EFFORT_DAEMON_NOTICE, MAX_SHELL_CHANGED_PATHS,
 };
