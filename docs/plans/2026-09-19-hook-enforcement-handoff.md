@@ -231,7 +231,9 @@ cargo build --manifest-path daemon/Cargo.toml --release
 
 # 2. Restart the daemon so it records plans. Until then enforcing workspaces fail open with a
 #    "daemon refused" notice. This ends every live MCP session; clients reconnect on next use.
-pkill -f 'lattice --daemon' ; sleep 2        # proxies restart the daemon on demand
+pkill -f 'lattice --daemon' ; sleep 2        # AGENTS.md says a proxy starts the daemon on
+                                             # demand. Documented, NOT observed by me. If
+                                             # status fails: lattice --daemon &
 lattice status --workspace /Users/pete/Cadres/lattice --timeout 5
 
 # 3. Acceptance, touches nothing live:
@@ -264,8 +266,9 @@ cd /Users/pete/Cadres/lattice && git checkout master
 cargo build --manifest-path daemon/Cargo.toml --release && pkill -f 'lattice --daemon'
 ```
 
-Rolling the binary back while a repository is still enforcing is safe: the old adapter ignores
-an unknown hook kind and prints nothing, so the leftover `PreToolUse` entry is inert. Run
+Rolling the binary back while a repository is still enforcing is safe. **verified**: the old
+binary run as `__hook-adapter claude-code pre-tool-use` exits 0, prints nothing and creates no
+state, so the leftover `PreToolUse` entry is inert. Run
 `--no-enforce` afterwards to remove it. `workflow.db` and the notice and snapshot directories
 under `~/.local/state/lattice` can be deleted at any time.
 
