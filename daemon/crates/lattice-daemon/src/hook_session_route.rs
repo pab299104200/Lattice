@@ -24,6 +24,7 @@ use crate::adoption_metrics::{
     AdoptionMetricsStore, CaptureMetricRecord, CaptureOutcome, MemoryInjectionActionRecord,
     MemoryInjectionRecord,
 };
+use crate::hook_enforcement::{evaluate_plan, FollowupGaps, IndexState, PlanState};
 use crate::hook_session_binding::{
     HookBindingId, HookCheckoutIdentity, HookIntegrationId, HookRepositoryState,
     HookSessionCapability, HookSessionCryptography, HostSessionId,
@@ -33,6 +34,7 @@ use crate::hook_session_registry::{
     RegistryCompletion, RegistryDeliveryKind, RegistryHash, RegistryId, RegistryOpenRequest,
     RegistryReceiptStatus, RegistrySessionResume, RegistryVerification, RegistryVerifyRequest,
 };
+use crate::hook_workflow_state::{HookWorkflowState, WorkflowStep};
 use crate::transport::ProxyRequest;
 use crate::workspace_identity::WorkspaceIdentity;
 
@@ -84,6 +86,7 @@ impl HookSessionRouteError {
 pub(crate) struct HookSessionRoute {
     cryptography: HookSessionCryptography,
     registry: Mutex<HookSessionRegistry>,
+    workflow: HookWorkflowState,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +98,57 @@ struct HookSessionOpenParams {
     resume: Option<HookSessionResumeParams>,
     #[serde(default)]
     presentation: Option<HookPresentationParams>,
+    #[serde(default)]
+    enforcement: Option<HookEnforcementParams>,
+}
+
+/// An enforcing workspace's adapter asks for a workflow decision on the same
+/// authenticated open that carries its presentation request. The adapter has
+/// already classified paths locally; only a category and a bounded count
+/// cross the wire.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookEnforcementParams {
+    event: HookEnforcementEvent,
+    #[serde(default)]
+    session_source: Option<HookSessionSource>,
+    #[serde(default)]
+    product_paths: Option<u32>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum HookEnforcementEvent {
+    SessionStart,
+    PreToolUse,
+    ShellEdit,
+    Stop,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum HookSessionSource {
+    Startup,
+    Resume,
+    Clear,
+    Compact,
+}
+
+#[derive(Serialize)]
+struct HookEnforcementResult {
+    /// `allow` or `deny`. Only a pre-tool-use request can be denied.
+    decision: &'static str,
+    plan_state: &'static str,
+    index_state: &'static str,
+    /// Set only when this request claimed the session's single reminder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    followup: Option<HookFollowupResult>,
+}
+
+#[derive(Serialize)]
+struct HookFollowupResult {
+    stale_docs: bool,
+    remember: bool,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +204,8 @@ struct HookSessionOpenResult {
     checkout_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     presentation: Option<HookPresentationResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforcement: Option<HookEnforcementResult>,
 }
 
 #[derive(Serialize)]
@@ -188,16 +244,52 @@ impl HookSessionRoute {
         let registry = HookSessionRegistry::open(&registry_path, HookRegistryConfig::default())
             .context("failed to open hook-session registry")?;
         validate_private_file(&registry_path, "hook-session registry")?;
+        let workflow_path = directory.join("workflow.db");
+        ensure_private_database_file(&workflow_path)?;
+        let workflow = HookWorkflowState::open(&workflow_path)
+            .context("failed to open hook workflow state")?;
+        validate_private_file(&workflow_path, "hook workflow state")?;
         Ok(Self {
             cryptography: HookSessionCryptography::from_secret(secret),
             registry: Mutex::new(registry),
+            workflow,
         })
     }
 
+    /// Record that the daemon served a workflow step for the checkout this
+    /// connection resolved to. Called by the transport layer after a public
+    /// tool call succeeds, for MCP and CLI clients alike. A connection that
+    /// does not name exactly one checkout records nothing: a fact that cannot
+    /// be attributed to a checkout must not satisfy any checkout's gate.
+    pub(crate) fn record_workflow_step(&self, hello: &ProxyRequest, step: WorkflowStep) {
+        let Ok(identity) = resolve_authority(hello) else {
+            return;
+        };
+        let Ok(now) = now_ms() else {
+            return;
+        };
+        let checkout_id = identity.checkout_root.to_string_lossy();
+        if let Err(error) = self.workflow.record_step(&checkout_id, step, now) {
+            tracing::warn!(%error, "failed to record hook workflow step");
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn handle_open(
         &self,
         hello: &ProxyRequest,
         params: Value,
+    ) -> Result<Value, HookSessionRouteError> {
+        self.handle_open_in(hello, params, IndexState::NotLoaded)
+    }
+
+    /// `index_state` is what the transport layer observed about this
+    /// workspace's shard without loading it.
+    pub(crate) fn handle_open_in(
+        &self,
+        hello: &ProxyRequest,
+        params: Value,
+        index_state: IndexState,
     ) -> Result<Value, HookSessionRouteError> {
         let encoded_len = serde_json::to_vec(&params)
             .map_err(|_| HookSessionRouteError::InvalidRequest)?
@@ -221,6 +313,7 @@ impl HookSessionRoute {
         let repository_state = resolve_repository_state(&resolved.checkout_root)?;
         let resume = params.resume.map(decode_resume).transpose()?;
         let presentation_request = params.presentation;
+        let enforcement_request = params.enforcement;
         let request = registry_open_request(
             integration,
             host_session_id,
@@ -238,6 +331,16 @@ impl HookSessionRoute {
             .map(|request| present_hook_memory(&resolved, &outcome, metric_client, request))
             .transpose()?
             .flatten();
+        let enforcement = enforcement_request
+            .map(|request| {
+                self.decide_enforcement(
+                    &resolved,
+                    outcome.internal_session_id.as_bytes(),
+                    request,
+                    &index_state,
+                )
+            })
+            .transpose()?;
         serde_json::to_value(HookSessionOpenResult {
             binding_id: encode_hex(outcome.binding_id.as_bytes()),
             capability: encode_hex(outcome.capability.as_bytes()),
@@ -248,8 +351,101 @@ impl HookSessionRoute {
             repository_id: resolved.repository_id,
             checkout_id: resolved.checkout_root.to_string_lossy().to_string(),
             presentation,
+            enforcement,
         })
         .map_err(|_| HookSessionRouteError::Unavailable)
+    }
+
+    /// The workflow decision for one authenticated hook request. See
+    /// `docs/hook-enforcement.md`, "Freshness rule" and "Fail-open rule".
+    fn decide_enforcement(
+        &self,
+        identity: &WorkspaceIdentity,
+        session_id: &[u8],
+        request: HookEnforcementParams,
+        index_state: &IndexState,
+    ) -> Result<HookEnforcementResult, HookSessionRouteError> {
+        let unavailable = |error: anyhow::Error| {
+            tracing::warn!(%error, "hook workflow state is unavailable");
+            HookSessionRouteError::Unavailable
+        };
+        let now = now_ms()?;
+        let checkout_id = identity.checkout_root.to_string_lossy().to_string();
+        if request.event == HookEnforcementEvent::SessionStart
+            && matches!(
+                request.session_source,
+                Some(
+                    HookSessionSource::Startup
+                        | HookSessionSource::Clear
+                        | HookSessionSource::Compact
+                )
+            )
+        {
+            self.workflow
+                .mark_context_reset(session_id, now)
+                .map_err(unavailable)?;
+        }
+        let session = self.workflow.session(session_id, now).map_err(unavailable)?;
+        let latest_plan = self
+            .workflow
+            .latest_step(&checkout_id, WorkflowStep::PrepareChange, session.not_before_ms)
+            .map_err(unavailable)?;
+        let plan_state = evaluate_plan(
+            now,
+            latest_plan,
+            session.last_covered_edit_ms,
+            session.not_before_ms,
+        );
+        let covered = plan_state == PlanState::Current;
+        let mut decision = "allow";
+        let mut followup = None;
+        match request.event {
+            HookEnforcementEvent::SessionStart => {}
+            HookEnforcementEvent::PreToolUse => {
+                // A degraded index cannot give a real plan, so the gate fails
+                // open and the adapter tells the agent instead.
+                if covered || index_state.degraded() {
+                    self.workflow
+                        .record_product_edits(session_id, 1, covered, now)
+                        .map_err(unavailable)?;
+                } else {
+                    decision = "deny";
+                }
+            }
+            HookEnforcementEvent::ShellEdit => {
+                let count = u64::from(request.product_paths.unwrap_or(0))
+                    .min(crate::hook_enforcement::MAX_SHELL_CHANGED_PATHS as u64);
+                if count > 0 {
+                    self.workflow
+                        .record_product_edits(session_id, count, covered, now)
+                        .map_err(unavailable)?;
+                }
+            }
+            HookEnforcementEvent::Stop => {
+                let gaps: FollowupGaps = self
+                    .workflow
+                    .followup_gaps(&checkout_id, &session)
+                    .map_err(unavailable)?;
+                if gaps.any()
+                    && !session.followup_reminded
+                    && self
+                        .workflow
+                        .claim_followup_reminder(session_id, now)
+                        .map_err(unavailable)?
+                {
+                    followup = Some(HookFollowupResult {
+                        stale_docs: gaps.stale_docs,
+                        remember: gaps.remember,
+                    });
+                }
+            }
+        }
+        Ok(HookEnforcementResult {
+            decision,
+            plan_state: plan_state.wire(),
+            index_state: index_state.wire(),
+            followup,
+        })
     }
 
     pub(crate) fn handle_event(
@@ -3089,6 +3285,235 @@ mod tests {
         let normalized = normalized_event_value(&event).unwrap();
         assert!(normalized.get("summary").is_none());
         assert!(parse_session_capture_event(&normalized.to_string()).is_ok());
+    }
+
+    struct EnforcementFixture {
+        directory: PathBuf,
+        checkout: PathBuf,
+        hello: ProxyRequest,
+        route: HookSessionRoute,
+        resume: Option<Value>,
+    }
+
+    impl EnforcementFixture {
+        fn new(label: &str) -> Self {
+            let directory = test_directory(&format!("{label}-state"));
+            let checkout = committed_repository(&format!("{label}-checkout"));
+            let identity = WorkspaceIdentity::resolve(&checkout).unwrap();
+            let hello = ProxyRequest {
+                workspace_roots: vec![identity.checkout_root.to_string_lossy().to_string()],
+                focus_files: Vec::new(),
+                focus_dirs: Vec::new(),
+            };
+            let route = HookSessionRoute::open_at(&directory).unwrap();
+            Self {
+                directory,
+                checkout,
+                hello,
+                route,
+                resume: None,
+            }
+        }
+
+        /// One authenticated hook request for the same host session.
+        fn ask(&mut self, enforcement: Value, index_state: IndexState) -> Value {
+            let mut params = serde_json::json!({
+                "integration": "claude-code-hooks/v1",
+                "host_session_id": "enforced-host-session",
+                "enforcement": enforcement,
+            });
+            if let Some(resume) = &self.resume {
+                params["resume"] = resume.clone();
+            }
+            let opened = self
+                .route
+                .handle_open_in(&self.hello, params, index_state)
+                .unwrap();
+            self.resume = Some(serde_json::json!({
+                "binding_id": opened["binding_id"],
+                "capability": opened["capability"],
+            }));
+            opened["enforcement"].clone()
+        }
+
+        fn edit(&mut self) -> Value {
+            self.ask(
+                serde_json::json!({"event": "pre-tool-use"}),
+                IndexState::Ready,
+            )
+        }
+    }
+
+    impl Drop for EnforcementFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+            let _ = std::fs::remove_dir_all(&self.checkout);
+        }
+    }
+
+    #[test]
+    fn product_edit_is_denied_until_a_plan_is_served_and_one_plan_covers_many_edits() {
+        let mut fixture = EnforcementFixture::new("gate");
+        let denied = fixture.edit();
+        assert_eq!(denied["decision"], "deny");
+        assert_eq!(denied["plan_state"], "missing");
+
+        // Another checkout's plan never satisfies this checkout's gate.
+        let other = committed_repository("gate-other-checkout");
+        let other_identity = WorkspaceIdentity::resolve(&other).unwrap();
+        fixture.route.record_workflow_step(
+            &ProxyRequest {
+                workspace_roots: vec![other_identity.checkout_root.to_string_lossy().to_string()],
+                focus_files: Vec::new(),
+                focus_dirs: Vec::new(),
+            },
+            WorkflowStep::PrepareChange,
+        );
+        assert_eq!(fixture.edit()["decision"], "deny");
+        // Neither does a different workflow step.
+        let hello = fixture.hello.clone();
+        fixture
+            .route
+            .record_workflow_step(&hello, WorkflowStep::Remember);
+        assert_eq!(fixture.edit()["decision"], "deny");
+
+        fixture
+            .route
+            .record_workflow_step(&hello, WorkflowStep::PrepareChange);
+        for _ in 0..5 {
+            let allowed = fixture.edit();
+            assert_eq!(allowed["decision"], "allow");
+            assert_eq!(allowed["plan_state"], "current");
+        }
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_model_context_needs_a_new_plan_but_a_resume_does_not() {
+        let mut fixture = EnforcementFixture::new("context-reset");
+        let hello = fixture.hello.clone();
+        fixture.ask(
+            serde_json::json!({"event": "session-start", "session_source": "startup"}),
+            IndexState::Ready,
+        );
+        fixture
+            .route
+            .record_workflow_step(&hello, WorkflowStep::PrepareChange);
+        assert_eq!(fixture.edit()["decision"], "allow");
+
+        fixture.ask(
+            serde_json::json!({"event": "session-start", "session_source": "resume"}),
+            IndexState::Ready,
+        );
+        assert_eq!(fixture.edit()["decision"], "allow");
+
+        // Compaction replaces the context that held the plan.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fixture.ask(
+            serde_json::json!({"event": "session-start", "session_source": "compact"}),
+            IndexState::Ready,
+        );
+        let after_compact = fixture.edit();
+        assert_eq!(after_compact["decision"], "deny");
+        assert_eq!(after_compact["plan_state"], "missing");
+    }
+
+    #[test]
+    fn a_degraded_index_never_blocks_and_reports_its_state() {
+        for (state, wire) in [
+            (IndexState::Indexing, "indexing"),
+            (IndexState::Deferred, "deferred"),
+            (IndexState::Failed, "failed"),
+        ] {
+            let mut fixture = EnforcementFixture::new(&format!("degraded-{wire}"));
+            let answer = fixture.ask(serde_json::json!({"event": "pre-tool-use"}), state);
+            assert_eq!(answer["decision"], "allow", "{wire}");
+            assert_eq!(answer["plan_state"], "missing");
+            assert_eq!(answer["index_state"], wire);
+        }
+        // A workspace that simply is not loaded yet still requires the plan:
+        // asking for one is what loads it.
+        let mut fixture = EnforcementFixture::new("not-loaded");
+        let answer = fixture.ask(
+            serde_json::json!({"event": "pre-tool-use"}),
+            IndexState::NotLoaded,
+        );
+        assert_eq!(answer["decision"], "deny");
+        assert_eq!(answer["index_state"], "not-loaded");
+    }
+
+    #[test]
+    fn shell_edits_are_never_denied_and_the_stop_reminder_is_claimed_once() {
+        let mut fixture = EnforcementFixture::new("shell-stop");
+        let hello = fixture.hello.clone();
+        let stop = serde_json::json!({"event": "stop"});
+
+        // No product edit yet: nothing to remind about.
+        assert!(fixture.ask(stop.clone(), IndexState::Ready)["followup"].is_null());
+
+        let shell = fixture.ask(
+            serde_json::json!({"event": "shell-edit", "product_paths": 3}),
+            IndexState::Ready,
+        );
+        assert_eq!(shell["decision"], "allow");
+        assert_eq!(shell["plan_state"], "missing");
+
+        fixture
+            .route
+            .record_workflow_step(&hello, WorkflowStep::StaleDocs);
+        let reminded = fixture.ask(stop.clone(), IndexState::Ready);
+        assert_eq!(
+            reminded["followup"],
+            serde_json::json!({"stale_docs": false, "remember": true})
+        );
+        assert_eq!(reminded["decision"], "allow");
+        // Exactly once per session, even though the gap remains.
+        assert!(fixture.ask(stop, IndexState::Ready)["followup"].is_null());
+    }
+
+    #[test]
+    fn enforcement_params_are_strict_and_absent_by_default() {
+        let mut fixture = EnforcementFixture::new("strict");
+        for invalid in [
+            serde_json::json!({"event": "pre-tool-use", "command": "rm -rf /"}),
+            serde_json::json!({"event": "pre-tool-use", "path": "src/lib.rs"}),
+            serde_json::json!({"event": "unknown"}),
+            serde_json::json!({"event": "session-start", "session_source": "other"}),
+            serde_json::json!({"event": "shell-edit", "product_paths": -1}),
+        ] {
+            let result = fixture.route.handle_open_in(
+                &fixture.hello,
+                serde_json::json!({
+                    "integration": "claude-code-hooks/v1",
+                    "host_session_id": "strict-host-session",
+                    "enforcement": invalid,
+                }),
+                IndexState::Ready,
+            );
+            assert!(matches!(
+                result,
+                Err(HookSessionRouteError::InvalidRequest)
+            ));
+        }
+        let plain = fixture
+            .route
+            .handle_open(
+                &fixture.hello,
+                serde_json::json!({
+                    "integration": "claude-code-hooks/v1",
+                    "host_session_id": "plain-host-session",
+                }),
+            )
+            .unwrap();
+        assert!(plain.get("enforcement").is_none());
+        // The workflow database holds categories and times only.
+        let bytes = std::fs::read(fixture.directory.join("workflow.db")).unwrap();
+        for forbidden in ["rm -rf", "src/lib.rs", "strict-host-session"] {
+            assert!(!bytes
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes()));
+        }
+        fixture.edit();
     }
 
     fn committed_repository(label: &str) -> PathBuf {

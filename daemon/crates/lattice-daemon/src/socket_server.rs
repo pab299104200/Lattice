@@ -187,6 +187,24 @@ impl RequestHandler for ShardEntry {
     }
 }
 
+/// The workflow step a request satisfies if it succeeds. Only the tool name
+/// and the `status` scope are inspected; no argument is retained.
+fn served_workflow_step(
+    method: &str,
+    params: &Value,
+) -> Option<crate::hook_workflow_state::WorkflowStep> {
+    if method != "tools/call" {
+        return None;
+    }
+    let tool = params.get("name").and_then(Value::as_str)?;
+    let scope = params.pointer("/arguments/scope").and_then(Value::as_str);
+    crate::hook_workflow_state::WorkflowStep::from_tool_call(tool, scope)
+}
+
+fn tool_result_is_error(result: &Value) -> bool {
+    result.get("isError").and_then(Value::as_bool) == Some(true)
+}
+
 /// A bounded response for a workspace whose durable runtime has not published
 /// yet.  This deliberately reports unknown graph counts rather than an empty
 /// graph: zero is a claim about the repository, while bootstrap has no graph
@@ -286,8 +304,16 @@ fn cold_index_status_payload(
         "starting"
     };
     serde_json::json!({
-        "status": if bootstrap_error.is_some() { "degraded" } else { "indexing" },
-        "indexing": bootstrap_error.is_none(),
+        "status": if bootstrap_error.is_some() {
+            "degraded"
+        } else if deferred_reason.is_some() {
+            "deferred"
+        } else {
+            "indexing"
+        },
+        // A deferred workspace has no index job at all. Reporting it as
+        // indexing sends the operator to wait for work that was never queued.
+        "indexing": bootstrap_error.is_none() && deferred_reason.is_none(),
         "version": env!("CARGO_PKG_VERSION"),
         "workspace": workspace.to_string_lossy(),
         "nodes": Value::Null,
@@ -1098,6 +1124,39 @@ impl GlobalDaemon {
         });
     }
 
+    /// Report a workspace's index state without loading, retaining or
+    /// evicting any shard. Hooks fire constantly; they must never be the
+    /// reason a shard is admitted.
+    pub(crate) async fn index_state_for(
+        &self,
+        request: &ProxyRequest,
+    ) -> crate::hook_enforcement::IndexState {
+        use crate::hook_enforcement::IndexState;
+        let Ok(roots) = canonical_roots(&request.workspace_roots) else {
+            return IndexState::NotLoaded;
+        };
+        let [root] = roots.as_slice() else {
+            return IndexState::NotLoaded;
+        };
+        let shards = self.shards.lock().await;
+        match shards.get(&shard_key(root)) {
+            Some(entry) if entry.bootstrap_error().is_some() => IndexState::Failed,
+            Some(entry) => match entry.published_handler() {
+                Ok(Some(_)) if !entry.index_work.workspace_is_busy(&shard_key(root)) => {
+                    IndexState::Ready
+                }
+                Ok(_) => IndexState::Indexing,
+                Err(_) => IndexState::Failed,
+            },
+            None if shards.len() >= self.max_loaded_shards
+                && !shards.values().any(|entry| entry.is_evictable()) =>
+            {
+                IndexState::Deferred
+            }
+            None => IndexState::NotLoaded,
+        }
+    }
+
     async fn shard_for(
         &self,
         root: PathBuf,
@@ -1454,10 +1513,19 @@ async fn run_json_rpc_connection(
                             let route = Arc::clone(route);
                             let hook_request = proxy_request.clone();
                             let method = request.method;
+                            let index_state = if method == HOOK_SESSION_OPEN_METHOD {
+                                daemon.index_state_for(&proxy_request).await
+                            } else {
+                                crate::hook_enforcement::IndexState::NotLoaded
+                            };
                             match tokio::task::spawn_blocking(move || {
                                 match method.as_str() {
                                     HOOK_SESSION_OPEN_METHOD => {
-                                        route.handle_open(&hook_request, request.params)
+                                        route.handle_open_in(
+                                            &hook_request,
+                                            request.params,
+                                            index_state,
+                                        )
                                     }
                                     HOOK_EVENT_METHOD => {
                                         route.handle_event(&hook_request, request.params)
@@ -1577,9 +1645,23 @@ async fn run_json_rpc_connection(
                         .as_ref()
                         .expect("runtime lease was loaded for ordinary RPC")
                         .begin_work();
+                    let workflow_step = served_workflow_step(&method, &params)
+                        .zip(daemon.hook_session_route.clone());
+                    let workflow_hello = proxy_request.clone();
                     let task = tokio::spawn(async move {
                         let _request_work = request_work;
-                        let response = match handler.handle(&method, params).await {
+                        let outcome = handler.handle(&method, params).await;
+                        if let (Ok(result), Some((step, route))) = (&outcome, workflow_step) {
+                            if !tool_result_is_error(result) {
+                                // Recorded before the response is written, so an
+                                // edit retried straight after a plan sees it.
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    route.record_workflow_step(&workflow_hello, step);
+                                })
+                                .await;
+                            }
+                        }
+                        let response = match outcome {
                             Ok(result) => JsonRpcResponse::success(id, result),
                             Err((code, message)) => JsonRpcResponse::error(id, code, message),
                         };
@@ -1688,6 +1770,62 @@ mod tests {
     use crate::transport::{client_handshake, ClientKind};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn deferred_workspace_status_does_not_claim_to_be_indexing() {
+        let root = unique_test_root("deferred-status");
+        let index_work = crate::index_work::IndexWorkCoordinator::new(1);
+        let deferred = cold_index_status_payload(
+            &root,
+            &index_work,
+            None,
+            Some("3 loaded workspace shards and all are active"),
+        );
+        assert_eq!(deferred["status"], "deferred");
+        assert_eq!(deferred["indexing"], false);
+        assert_eq!(deferred["bootstrap"]["state"], "deferred");
+        assert_eq!(deferred["graph_snapshot_state"], "not_loaded");
+        // A merged view must still treat the deferred shard as incomplete.
+        assert!(is_indexing_payload(&deferred));
+
+        let starting = cold_index_status_payload(&root, &index_work, None, None);
+        assert_eq!(starting["status"], "indexing");
+        assert_eq!(starting["indexing"], true);
+
+        let failed =
+            cold_index_status_payload(&root, &index_work, Some("bootstrap failed".into()), None);
+        assert_eq!(failed["status"], "degraded");
+        assert_eq!(failed["indexing"], false);
+    }
+
+    #[test]
+    fn workflow_steps_are_read_from_the_tool_name_and_status_scope_only() {
+        use crate::hook_workflow_state::WorkflowStep;
+        let call = |name: &str, arguments: Value| {
+            serde_json::json!({"name": name, "arguments": arguments})
+        };
+        assert_eq!(
+            served_workflow_step(
+                "tools/call",
+                &call("prepare_change", serde_json::json!({"task": "private task text"}))
+            ),
+            Some(WorkflowStep::PrepareChange)
+        );
+        assert_eq!(
+            served_workflow_step("tools/call", &call("status", serde_json::json!({"scope": "docs"}))),
+            Some(WorkflowStep::StaleDocs)
+        );
+        assert_eq!(
+            served_workflow_step("tools/call", &call("status", serde_json::json!({}))),
+            None
+        );
+        assert_eq!(
+            served_workflow_step("lattice/status", &call("prepare_change", Value::Null)),
+            None
+        );
+        assert!(tool_result_is_error(&serde_json::json!({"isError": true})));
+        assert!(!tool_result_is_error(&serde_json::json!({"content": []})));
+    }
 
     #[test]
     fn poisoned_ownership_mutex_preserves_value_for_shutdown() {
@@ -3705,7 +3843,9 @@ fn is_indexing_payload(value: &Value) -> bool {
         || value
             .get("status")
             .and_then(Value::as_str)
-            .is_some_and(|status| status == "indexing")
+            // A deferred shard has no answer either: it is incomplete for a
+            // merged view even though nothing is indexing it.
+            .is_some_and(|status| status == "indexing" || status == "deferred")
 }
 
 fn shard_incomplete_value(root: &PathBuf, payload: &Value) -> Value {
