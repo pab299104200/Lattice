@@ -310,6 +310,38 @@ runs above.
 rebuilt, the old daemon (pid 57458) replaced by pid 97609. **verified** from the new daemon:
 `max_loaded_shards=6 from settings file ...; 6 loaded, 5 pinned; daemon memory 1443 MiB`.
 
+## Fourth follow-up, 2026-09-19: tests must not write to the operator's real log
+
+Branch `fix/test-lifecycle-log-isolation` at d0f19c7, off `master` at 836ba91. Not merged.
+
+The coordinator asked for a sandbox for "every test that can spawn a proxy". **verified**: only
+`tests/cli_query_tests.rs` launches the real binary, and that is isolated in 836ba91. Other uses
+of `current_exe()` in tests re-exec the test harness itself, not Lattice, and no test calls
+doctor's self-handshake or the proxy's auto-start.
+
+Checking that empirically found a second leak of the same kind. The in-process daemon unit tests
+wrote `role: daemon` events for throwaway workspaces into the real
+`~/.lattice/logs/lifecycle.jsonl`. **verified**: 88 such lines from one full run (shard bootstrap,
+leases, capacity evictions). No real daemon or proxy is involved, but this is the log read first
+when diagnosing the live daemon, and I tripped over such entries while investigating the 00:43
+restart. Fix: under `cfg(test)` the log path defaults to a per-process directory under the system
+temp directory; `LATTICE_LIFECYCLE_LOG_DIR` still wins. One new test.
+
+Three runs of `cargo test --workspace --no-fail-fast` in this worktree:
+
+| Run | Load average at start | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| 1 | 12.1 | 2,345 | 0 | 39 |
+| 2 | 23.1 | 2,345 | 0 | 39 |
+| 3 | 19.3 | 2,345 | 0 | 39 |
+
+Lines added to the real lifecycle log by test artefacts across all three: **0**. Orphan
+processes: **0**. `cargo fmt --check` passes.
+
+An earlier third run, in the previous worktree, failed 9 tests. **verified** cause: that worktree
+was removed while the run was executing in it, and cargo then reported that its working
+directory no longer existed. It is not a code failure; the first two runs there were clean.
+
 ## Design decisions
 
 ### How the daemon knows a `prepare_change` happened
