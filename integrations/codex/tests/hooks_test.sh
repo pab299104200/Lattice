@@ -48,6 +48,7 @@ exercise_package() {
   local -a cases=(
     'session-start.sh:session-start'
     'user-prompt-submit.sh:user-prompt-submit'
+    'pre-tool-use.sh:pre-tool-use'
     'post-tool-use.sh:post-tool-use'
     'stop.sh:stop'
     'session-end.sh:session-end'
@@ -80,7 +81,8 @@ exercise_package claude-code "$claude_hooks_dir"
 
 # No package may retain the former unauthenticated outcome write or public
 # query fan-out.
-if rg -n 'remember|recall|context|impact|status' \
+# grep, not rg: a missing rg made this condition false and the guard vacuous.
+if grep -rnE 'remember|recall|context|impact|status' \
   "$codex_hooks_dir" "$claude_hooks_dir" >/dev/null; then
   printf 'hook package retained a public CLI call\n' >&2
   exit 1

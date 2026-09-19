@@ -1556,13 +1556,28 @@ mod tests {
     }
 
     #[test]
-    fn stop_drops_missing_non_string_and_oversized_summary_fields() {
+    fn stop_drops_missing_and_non_string_summaries_and_bounds_a_long_one() {
+        let long = extract_host_fact(
+            HookKind::Stop,
+            json!({"session_id":"opaque-session","last_assistant_message":"a".repeat(2_001)})
+                .to_string()
+                .as_bytes(),
+            checkout(),
+        )
+        .unwrap();
+        let HookClientCapturePayload::TurnSummary(event) = long.payload.unwrap() else {
+            panic!("expected a bounded turn summary");
+        };
+        assert_eq!(
+            encode_event(&event)["summary"].as_str().unwrap().len(),
+            2_000
+        );
+
         for value in [
             json!({"session_id":"opaque-session"}),
             json!({"session_id":"opaque-session","last_assistant_message":42}),
             json!({"session_id":"opaque-session","summary":"alias"}),
             json!({"session_id":"opaque-session","nested":{"last_assistant_message":"nested"}}),
-            json!({"session_id":"opaque-session","last_assistant_message":"a".repeat(2_001)}),
         ] {
             let extracted =
                 extract_host_fact(HookKind::Stop, value.to_string().as_bytes(), checkout())
@@ -1757,7 +1772,322 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_tool_yields_a_category_and_nothing_from_its_input_or_output() {
+        let input = br#"{
+            "session_id":"opaque-session",
+            "tool_use_id":"toolu_shell_1",
+            "cwd":"/forged/root",
+            "tool_name":"Bash",
+            "tool_input":{
+                "command":"sed -i s/a/b/ src/sentinel-command-path.rs && echo sentinel-secret",
+                "description":"sentinel-description",
+                "file_path":"src/sentinel-decoy.rs"
+            },
+            "tool_response":{
+                "stdout":"sentinel-output",
+                "bashEditDiff":{"changedFiles":["/x/src/sentinel-host-list.rs"]}
+            }
+        }"#;
+        for kind in [HookKind::PreToolUse, HookKind::PostToolUse] {
+            let fact = extract_host_fact(kind, input, checkout()).unwrap();
+            assert_eq!(fact.tool, ToolFact::Shell);
+            assert!(fact.payload.is_none());
+            let retained = format!("{fact:?}");
+            assert!(!retained.contains("sentinel"), "{retained}");
+            assert!(!retained.contains("forged"));
+        }
+        let post = extract_host_fact(HookKind::PostToolUse, input, checkout()).unwrap();
+        let presentation = post.presentation.unwrap();
+        assert_eq!(presentation.request_id, "toolu_shell_1");
+        assert_eq!(presentation.path, None);
+        assert_eq!(presentation.prompt, None);
+    }
+
+    #[test]
+    fn absolute_claude_code_edit_paths_become_checkout_relative_facts() {
+        let input = json!({
+            "session_id": "opaque-session",
+            "tool_name": "Edit",
+            "scratchpad_dir": "/private/tmp/session-scratch",
+            "tool_input": {
+                "file_path": "/lattice-test-checkout/src/lib.rs",
+                "old_string": "sentinel-old",
+                "new_string": "sentinel-new"
+            },
+        });
+        let fact = extract_host_fact(
+            HookKind::PostToolUse,
+            input.to_string().as_bytes(),
+            checkout(),
+        )
+        .unwrap();
+        let HookClientCapturePayload::Event(event) = fact.payload.unwrap() else {
+            panic!("expected an edit event");
+        };
+        assert_eq!(
+            encode_event(&event),
+            json!({"schema_version": 1, "kind": "edited_path", "path": "src/lib.rs"})
+        );
+        assert_eq!(
+            fact.presentation.unwrap().path.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            fact.tool,
+            ToolFact::Edit {
+                path: "/lattice-test-checkout/src/lib.rs".into(),
+                scratch: Some(PathBuf::from("/private/tmp/session-scratch")),
+            }
+        );
+
+        // Outside the checkout: no fact, no presentation, still an edit.
+        let outside = json!({
+            "session_id": "opaque-session",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/etc/hosts", "content": "sentinel"},
+        });
+        let fact = extract_host_fact(
+            HookKind::PostToolUse,
+            outside.to_string().as_bytes(),
+            checkout(),
+        )
+        .unwrap();
+        assert!(fact.payload.is_none());
+        assert!(fact.presentation.is_none());
+    }
+
+    #[test]
+    fn edit_tools_are_categorised_with_their_dedicated_path_field_only() {
+        let fact_for = |tool_name: &str, tool_input: Value| {
+            extract_host_fact(
+                HookKind::PreToolUse,
+                json!({"session_id": "s", "tool_name": tool_name, "tool_input": tool_input})
+                    .to_string()
+                    .as_bytes(),
+                checkout(),
+            )
+            .unwrap()
+            .tool
+        };
+        for tool in ["Edit", "Write", "MultiEdit"] {
+            assert!(matches!(
+                fact_for(tool, json!({"file_path": "src/a.rs"})),
+                ToolFact::Edit { path, scratch: None } if path == "src/a.rs"
+            ));
+        }
+        assert!(matches!(
+            fact_for("NotebookEdit", json!({"notebook_path": "nb/a.ipynb"})),
+            ToolFact::Edit { path, .. } if path == "nb/a.ipynb"
+        ));
+        // Codex apply_patch carries only patch text. It is not read.
+        assert_eq!(
+            fact_for(
+                "apply_patch",
+                json!({"command": "*** Update File: src/sentinel.rs"})
+            ),
+            ToolFact::EditWithoutPath
+        );
+        assert_eq!(fact_for("Edit", json!({"file_path": "  "})), ToolFact::EditWithoutPath);
+        for other in ["Read", "Grep", "mcp__lattice__prepare_change", "bash", "edit"] {
+            assert_eq!(fact_for(other, json!({"file_path": "src/a.rs"})), ToolFact::Other);
+        }
+        assert_eq!(fact_for("PowerShell", json!({"command": "x"})), ToolFact::Shell);
+    }
+
+    #[test]
+    fn session_source_and_stop_flag_are_categorical() {
+        let source = |kind: HookKind, value: Value| {
+            extract_host_fact(
+                kind,
+                json!({"session_id": "s", "source": value}).to_string().as_bytes(),
+                checkout(),
+            )
+            .unwrap()
+            .session_source
+        };
+        for known in ["startup", "resume", "clear", "compact"] {
+            assert_eq!(source(HookKind::SessionStart, json!(known)), Some(known));
+        }
+        assert_eq!(source(HookKind::SessionStart, json!("sentinel-other")), None);
+        assert_eq!(source(HookKind::SessionStart, json!(7)), None);
+        assert_eq!(source(HookKind::UserPromptSubmit, json!("compact")), None);
+
+        let active = |value: Value| {
+            extract_host_fact(
+                HookKind::Stop,
+                json!({"session_id": "s", "stop_hook_active": value})
+                    .to_string()
+                    .as_bytes(),
+                checkout(),
+            )
+            .unwrap()
+            .stop_hook_active
+        };
+        assert!(active(json!(true)));
+        assert!(!active(json!(false)));
+        assert!(!active(json!("true")));
+    }
+
+    #[test]
+    fn a_denial_uses_the_documented_pre_tool_use_contract_on_both_hosts() {
+        let reason = deny_reason(PlanState::Missing, true);
+        for integration in [Integration::ClaudeCode, Integration::Codex] {
+            let rendered = render_output(
+                integration,
+                HookKind::PreToolUse,
+                HookOutput {
+                    deny: Some(reason.clone()),
+                    ..HookOutput::default()
+                },
+            )
+            .unwrap();
+            let rendered: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(
+                rendered,
+                json!({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }})
+            );
+        }
+        // An allowed edit with nothing to say renders nothing at all: no
+        // "allow" decision is ever emitted, so Lattice never grants permission.
+        assert_eq!(
+            render_output(
+                Integration::ClaudeCode,
+                HookKind::PreToolUse,
+                HookOutput::default()
+            ),
+            None
+        );
+        let noticed = render_output(
+            Integration::ClaudeCode,
+            HookKind::PreToolUse,
+            HookOutput::context(notice_text(NoticeCondition::DaemonUnreachable)),
+        )
+        .unwrap();
+        let noticed: Value = serde_json::from_str(&noticed).unwrap();
+        assert!(noticed["hookSpecificOutput"].get("permissionDecision").is_none());
+        assert!(noticed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("Edits are not blocked"));
+    }
+
+    #[test]
+    fn stop_output_never_uses_a_blocking_decision() {
+        let reminder = followup_reminder(FollowupGaps {
+            stale_docs: true,
+            remember: true,
+        })
+        .unwrap();
+        let claude: Value = serde_json::from_str(
+            &render_output(
+                Integration::ClaudeCode,
+                HookKind::Stop,
+                HookOutput::context(reminder.clone()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude["hookSpecificOutput"]["hookEventName"], "Stop");
+        assert_eq!(claude["hookSpecificOutput"]["additionalContext"], reminder);
+        let operator: Value = serde_json::from_str(
+            &render_output(
+                Integration::Codex,
+                HookKind::Stop,
+                HookOutput {
+                    system_message: Some(reminder.clone()),
+                    ..HookOutput::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(operator, json!({"systemMessage": reminder}));
+        for rendered in [claude, operator] {
+            assert!(rendered.get("decision").is_none());
+            assert!(rendered.get("continue").is_none());
+        }
+        // SessionEnd can carry nothing, whatever was collected.
+        assert_eq!(
+            render_output(
+                Integration::ClaudeCode,
+                HookKind::SessionEnd,
+                HookOutput::context("ignored".into())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rendered_context_is_capped_below_the_host_spill_limit() {
+        let rendered = render_output(
+            Integration::ClaudeCode,
+            HookKind::PostToolUse,
+            HookOutput {
+                contexts: vec!["é".repeat(8_000), "x".repeat(8_000)],
+                ..HookOutput::default()
+            },
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_str(&rendered).unwrap();
+        let context = rendered["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(context.chars().count(), MAX_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn shell_change_summary_is_bounded_and_counts_what_it_omits() {
+        let paths = (0..MAX_SHELL_CHANGED_PATHS)
+            .map(|index| format!("src/file_{index}.rs"))
+            .collect::<Vec<_>>();
+        let summary = shell_change_summary(&paths, 57);
+        assert!(summary.contains("changed 57 product file(s)"));
+        assert!(summary.contains("src/file_0.rs"));
+        assert!(summary.contains(&format!("src/file_{}.rs", MAX_LISTED_SHELL_PATHS - 1)));
+        assert!(!summary.contains(&format!("src/file_{MAX_LISTED_SHELL_PATHS}.rs")));
+        assert!(summary.contains(&format!("and {} more", 57 - MAX_LISTED_SHELL_PATHS)));
+        let one = shell_change_summary(&paths[..1], 1);
+        assert!(one.contains("changed 1 product file(s): src/file_0.rs."));
+        assert!(!one.contains("more."));
+    }
+
+    #[test]
+    fn an_uninterpretable_enforcement_answer_is_an_error_not_a_decision() {
+        let wire = |decision: &str, plan: &str, index: &str| EnforcementWire {
+            decision: decision.into(),
+            plan_state: plan.into(),
+            index_state: index.into(),
+            followup: None,
+        };
+        let denied = decode_enforcement(wire("deny", "missing", "ready")).unwrap();
+        assert!(denied.deny);
+        assert_eq!(denied.plan_state, PlanState::Missing);
+        let allowed = decode_enforcement(wire("allow", "current", "deferred")).unwrap();
+        assert!(!allowed.deny);
+        assert_eq!(allowed.index_state, IndexState::Deferred);
+        for (decision, plan, index) in [
+            ("block", "missing", "ready"),
+            ("", "missing", "ready"),
+            ("deny", "unknown", "ready"),
+            ("deny", "missing", "warm"),
+        ] {
+            assert!(decode_enforcement(wire(decision, plan, index)).is_err());
+        }
+        // Unknown fields from a newer daemon are refused rather than guessed at.
+        assert!(serde_json::from_value::<EnforcementWire>(json!({
+            "decision": "deny", "plan_state": "missing", "index_state": "ready",
+            "override": true
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn stop_is_supported_but_session_end_remains_the_terminal_hook() {
+        assert_eq!(HookKind::parse("pre-tool-use"), Some(HookKind::PreToolUse));
         assert_eq!(HookKind::parse("stop"), Some(HookKind::Stop));
         assert_eq!(HookKind::parse("session-end"), Some(HookKind::SessionEnd));
     }

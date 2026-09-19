@@ -1,7 +1,8 @@
 //! Safe, idempotent repository-local Lattice installation.
 
 use crate::install::{
-    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, InstallPaths,
+    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, HookMode,
+    InstallPaths,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
@@ -20,10 +21,11 @@ For every task, start with `context`; run `prepare_change` before editing. If La
 
 For long plans, subagent work, or context compaction, preserve the task objective, current authority, accepted decisions, completed validation, and remaining work. Give subagents bounded file ownership and require exact findings and tests in their handoff. After compaction or a material branch/workspace change, refresh with `context` and `prepare_change`, then verify subagent findings before applying them.
 <!-- lattice:project-instructions:end -->"#;
-const HOOKS: [&str; 6] = [
+const HOOKS: [&str; 7] = [
     "common.sh",
     "session-start.sh",
     "user-prompt-submit.sh",
+    "pre-tool-use.sh",
     "post-tool-use.sh",
     "stop.sh",
     "session-end.sh",
@@ -49,7 +51,11 @@ impl Drop for StagedFile {
     }
 }
 
-pub(crate) fn install_project(workspace: &Path, paths: &InstallPaths) -> Result<Vec<PathBuf>> {
+pub(crate) fn install_project(
+    workspace: &Path,
+    paths: &InstallPaths,
+    mode: HookMode,
+) -> Result<Vec<PathBuf>> {
     if !workspace.is_absolute() {
         bail!(
             "project workspace must be absolute: {}",
@@ -110,7 +116,7 @@ pub(crate) fn install_project(workspace: &Path, paths: &InstallPaths) -> Result<
             }
         })()
         .with_context(|| format!("read pinned project configuration {}", path.display()))?;
-        let content = render(kind, original.as_deref(), &configured_workspace, paths)
+        let content = render(kind, original.as_deref(), &configured_workspace, paths, mode)
             .with_context(|| format!("preflight {}", path.display()))?;
         plans.push(Plan {
             path,
@@ -245,6 +251,7 @@ fn render(
     bytes: Option<&[u8]>,
     workspace: &Path,
     paths: &InstallPaths,
+    mode: HookMode,
 ) -> Result<String> {
     let text = match bytes {
         Some(bytes) => std::str::from_utf8(bytes).context("configuration is not UTF-8")?,
@@ -266,7 +273,7 @@ fn render(
             } else {
                 serde_json::from_str(text).context("malformed JSON")?
             };
-            reconcile_hook_config(&mut json, client, paths)?;
+            reconcile_hook_config(&mut json, client, paths, mode)?;
             render_config(&json)
         }
         Kind::CodexToml => {
@@ -416,7 +423,7 @@ mod tests {
                 }
             }))
         });
-        let result = install_project(&root, &paths);
+        let result = install_project(&root, &paths, HookMode::BestEffort);
         BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = None);
         let error = format!("{:#}", result.unwrap_err());
         assert!(error.contains("files already updated:"), "{error}");
@@ -432,11 +439,11 @@ mod tests {
                 .to_string_lossy()
                 .contains("lattice-install-"))
         );
-        install_project(&root, &paths).unwrap();
+        install_project(&root, &paths, HookMode::BestEffort).unwrap();
         assert!(fs::read_to_string(root.join(".codex/config.toml"))
             .unwrap()
             .contains("keep = true"));
-        assert!(install_project(&root, &paths).unwrap().is_empty());
+        assert!(install_project(&root, &paths, HookMode::BestEffort).unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -452,7 +459,7 @@ mod tests {
         assets(&assets_root);
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
         symlink(&outside, root.join(".lattice")).unwrap();
-        assert!(install_project(&root, &paths).is_err());
+        assert!(install_project(&root, &paths, HookMode::BestEffort).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         fs::remove_file(root.join(".lattice")).unwrap();
         fs::create_dir(root.join(".lattice")).unwrap();
@@ -462,7 +469,7 @@ mod tests {
             Duration::from_millis(50),
         )
         .unwrap();
-        install_project(&root, &paths).unwrap();
+        install_project(&root, &paths, HookMode::BestEffort).unwrap();
     }
 
     fn assets(root: &Path) {
@@ -489,8 +496,8 @@ mod tests {
         )
         .unwrap();
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-        assert_eq!(install_project(&root, &paths).unwrap().len(), 6);
-        assert!(install_project(&root, &paths).unwrap().is_empty());
+        assert_eq!(install_project(&root, &paths, HookMode::BestEffort).unwrap().len(), 6);
+        assert!(install_project(&root, &paths, HookMode::BestEffort).unwrap().is_empty());
         assert!(fs::read_to_string(root.join("AGENTS.md"))
             .unwrap()
             .contains("custom"));
@@ -507,7 +514,7 @@ mod tests {
         let assets_root = dir.path().join("assets");
         assets(&assets_root);
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-        assert!(install_project(&root, &paths).is_err());
+        assert!(install_project(&root, &paths, HookMode::BestEffort).is_err());
         assert!(!root.join(".mcp.json").exists());
     }
 
@@ -524,7 +531,7 @@ mod tests {
             let assets_root = dir.path().join("assets");
             assets(&assets_root);
             let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-            assert!(install_project(&root, &paths).is_err());
+            assert!(install_project(&root, &paths, HookMode::BestEffort).is_err());
             assert!(!root.join(".mcp.json").exists());
         }
     }
@@ -540,7 +547,7 @@ mod tests {
         assets(&assets_root);
         fs::remove_file(assets_root.join("integrations/claude-code/hooks/session-end.sh")).unwrap();
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-        assert!(install_project(&root, &paths).is_err());
+        assert!(install_project(&root, &paths, HookMode::BestEffort).is_err());
         assert_eq!(fs::read(root.join(".mcp.json")).unwrap(), original);
         assert!(!root.join("AGENTS.md").exists());
     }
@@ -555,6 +562,6 @@ mod tests {
         assets(&assets_root);
         symlink(dir.path().join("outside"), root.join("AGENTS.md")).unwrap();
         let paths = InstallPaths::new(PathBuf::from("/opt/lattice"), assets_root).unwrap();
-        assert!(install_project(&root, &paths).is_err());
+        assert!(install_project(&root, &paths, HookMode::BestEffort).is_err());
     }
 }

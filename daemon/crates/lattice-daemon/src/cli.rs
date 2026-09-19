@@ -13,8 +13,13 @@ use crate::adoption_metrics::{
     render_metrics_for_workspace, AdoptionMetricsStore, MemoryInjectionActionRecord,
     MemoryInjectionRecord, MemoryRetrievalRecord, MemoryUseRecord,
 };
+use crate::hook_enforcement::{
+    load_policy, notice_text, policy_path, write_policy, NoticeCondition, PolicyState,
+    BEST_EFFORT_DAEMON_NOTICE,
+};
 use crate::install::{
-    reconcile_hook_config, reconcile_mcp_config, render_config, HookClient, InstallPaths,
+    installed_hooks, reconcile_hook_config, reconcile_mcp_config, render_config, HookClient,
+    HookMode, InstallPaths,
 };
 use crate::proxy::daemon_addr;
 use crate::transport::{self, ClientKind, ProxyRequest};
@@ -31,15 +36,7 @@ use lattice_core::metrics::{
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const INSTALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPECTED_MCP_TOOL_COUNT: usize = 8;
-const SESSION_START_RECOVERY_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
 
-const INSTALLED_HOOKS: [(&str, &str); 5] = [
-    ("SessionStart", "session-start.sh"),
-    ("UserPromptSubmit", "user-prompt-submit.sh"),
-    ("PostToolUse", "post-tool-use.sh"),
-    ("Stop", "stop.sh"),
-    ("SessionEnd", "session-end.sh"),
-];
 
 #[derive(Debug, Clone)]
 pub(crate) struct CliRequest {
@@ -104,7 +101,7 @@ pub(crate) fn run_usage_or_error() -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--regression] [--output <path>] [--repo <path>]…\n  install [all|mcp|claude-code|codex] [--workspace <path>] [--verify] [--with-embeddings]\n  doctor\n  memory-migrate\n  storage status|cache plan|cache apply|backup|restore|relocate|historical plan|historical apply\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
+    "Usage: lattice <command> [options]\n\nCommands:\n  context\n  prepare_change\n  impact\n  search\n  diagnose\n  remember\n  recall\n  status\n  metrics [--memory|--health]\n  health-backtest [--json] [--regression] [--output <path>] [--repo <path>]…\n  install [all|mcp|claude-code|codex] [--workspace <path>] [--enforce|--no-enforce] [--verify] [--with-embeddings]\n  doctor\n  memory-migrate\n  storage status|cache plan|cache apply|backup|restore|relocate|historical plan|historical apply\n\nRuntime modes (explicit only):\n  --daemon\n  --stdio"
 }
 
 pub(crate) async fn run_from_env() -> i32 {
@@ -163,6 +160,9 @@ struct InstallCommand {
     workspaces: Vec<PathBuf>,
     verify: bool,
     with_embeddings: bool,
+    /// `Some` records the mode in the workspace policy. `None` keeps whatever
+    /// the policy already says, so a plain rerun never changes the mode.
+    enforce: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,11 +219,19 @@ fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
     let mut workspaces = Vec::new();
     let mut verify = false;
     let mut with_embeddings = false;
+    let mut enforce = None;
     let mut index = if explicit_target.is_some() { 3 } else { 2 };
     while index < args.len() {
         match args[index].as_str() {
             "--verify" => verify = true,
             "--with-embeddings" => with_embeddings = true,
+            flag @ ("--enforce" | "--no-enforce") => {
+                let requested = flag == "--enforce";
+                if enforce.is_some_and(|previous| previous != requested) {
+                    return Err(anyhow!("--enforce and --no-enforce cannot be combined"));
+                }
+                enforce = Some(requested);
+            }
             "--workspace" | "-w" => {
                 let value = args
                     .get(index + 1)
@@ -244,12 +252,51 @@ fn parse_install_command(args: Vec<String>) -> Result<InstallCommand> {
             workspaces.len()
         ));
     }
+    if enforce.is_some() && target == InstallTarget::Mcp {
+        return Err(anyhow!(
+            "--enforce and --no-enforce apply to hook installation; use `install`, `install claude-code` or `install codex`"
+        ));
+    }
     Ok(InstallCommand {
         target,
         workspaces,
         verify,
         with_embeddings,
+        enforce,
     })
+}
+
+/// The hook mode this install must produce. Enforcement is a property of the
+/// workspace, recorded in its policy file, and both clients' hooks follow it.
+/// A policy that cannot be read is an error: guessing either way would
+/// install hooks that disagree with what the operator recorded.
+fn resolve_hook_mode(command: &InstallCommand, workspace: &Path) -> Result<HookMode> {
+    if let Some(requested) = command.enforce {
+        return Ok(HookMode::from_enforcing(requested));
+    }
+    match load_policy(workspace) {
+        PolicyState::Absent => Ok(HookMode::BestEffort),
+        PolicyState::Loaded(policy) => Ok(HookMode::from_enforcing(policy.hook_enforcement)),
+        PolicyState::Unreadable(reason) => Err(anyhow!(
+            "workspace policy `{}` is unreadable ({reason}); repair or delete it, then rerun",
+            policy_path(workspace).display()
+        )),
+    }
+}
+
+/// Persist an explicitly requested mode. Runs before any hook configuration
+/// is written: a policy that cannot be written must not leave hooks behind
+/// that claim a mode the workspace never recorded.
+fn record_requested_mode(command: &InstallCommand, workspace: &Path) -> Result<Option<String>> {
+    let Some(requested) = command.enforce else {
+        return Ok(None);
+    };
+    let path = write_policy(workspace, requested)?;
+    Ok(Some(format!(
+        "hook enforcement {} in {}",
+        if requested { "enabled" } else { "disabled" },
+        path.display()
+    )))
 }
 
 /// Resolve all machine-specific installation inputs at the CLI boundary. The
@@ -299,9 +346,16 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
         .workspaces
         .first()
         .expect("install parser guarantees a workspace");
+    let mode_message = if command.target == InstallTarget::Mcp {
+        None
+    } else {
+        record_requested_mode(&command, config_workspace)?
+    };
     if command.target == InstallTarget::Project {
         let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
-        let installed = crate::install_project::install_project(config_workspace, &paths)?;
+        let mode = resolve_hook_mode(&command, config_workspace)?;
+        let installed =
+            crate::install_project::install_project(config_workspace, &paths, mode)?;
         if command.verify {
             for target in [
                 InstallTarget::Mcp,
@@ -326,6 +380,9 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
         for path in installed {
             message.push_str(&format!("\n  {}", path.display()));
         }
+        if let Some(mode_message) = &mode_message {
+            message.push_str(&format!("\n  {mode_message}"));
+        }
         message.push_str("\nRestart/reconnect agent clients to load the configuration. Codex project configuration requires a trusted project; client trust and approval settings are unchanged.");
         if let Some(embedding_message) = embedding_message {
             message.push_str(&format!("\n{embedding_message}"));
@@ -347,7 +404,8 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
             };
             let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
             verify_hook_assets(&paths, client)?;
-            reconcile_hook_config(&mut config, client, &paths)?;
+            let mode = resolve_hook_mode(&command, config_workspace)?;
+            reconcile_hook_config(&mut config, client, &paths, mode)?;
         }
     }
 
@@ -364,6 +422,10 @@ fn run_install_command_with(command: InstallCommand, runtime: &InstallRuntime) -
         },
         config_path.display()
     );
+    let installed = match mode_message {
+        Some(mode_message) => format!("{installed}\n{mode_message}"),
+        None => installed,
+    };
     Ok(match embedding_message {
         Some(message) => format!("{installed}\n{message}"),
         None => installed,
@@ -419,9 +481,12 @@ fn verify_hook_assets(paths: &InstallPaths, client: HookClient) -> Result<()> {
         HookClient::Codex => "codex",
     };
     for script in [
+        "common.sh",
         "session-start.sh",
         "user-prompt-submit.sh",
+        "pre-tool-use.sh",
         "post-tool-use.sh",
+        "stop.sh",
         "session-end.sh",
     ] {
         let path = paths
@@ -462,7 +527,8 @@ fn verify_install_config(
             };
             let paths = InstallPaths::new(runtime.executable.clone(), runtime.asset_root.clone())?;
             verify_hook_assets(&paths, client)?;
-            reconcile_hook_config(&mut actual, client, &paths)?;
+            let mode = resolve_hook_mode(command, config_workspace(command))?;
+            reconcile_hook_config(&mut actual, client, &paths, mode)?;
         }
     }
     if before != render_config(&actual)? {
@@ -744,8 +810,9 @@ fn json_rpc_result_for<'a>(responses: &'a [Value], id: u64, method: &str) -> Res
 }
 
 /// Run every configured hook with a representative client payload. Protected
-/// capture adapters are silent and best-effort, but every installed wrapper
-/// must execute successfully and must not leak host-envelope content.
+/// capture adapters are best-effort, but every installed wrapper must execute
+/// successfully, must say only what its mode allows, and must not leak
+/// host-envelope content.
 fn verify_configured_hooks(
     config: &Value,
     config_path: &Path,
@@ -753,14 +820,14 @@ fn verify_configured_hooks(
     workspace: &Path,
     runtime: &InstallRuntime,
 ) -> Result<()> {
+    let mode = HookMode::from_enforcing(load_policy(workspace).enforcing());
     // Verification must never create a binding, queue a delivery, or connect
     // to the operator's running daemon. The hook wrappers still execute with
     // representative structured host fields, but all protected state is
     // redirected to a disposable root and the loopback endpoint is reserved
     // (port zero), so this check cannot persist capture data.
-    let state_root = install_verify_state_root()?;
-    let result = (|| {
-        for (event, script) in INSTALLED_HOOKS {
+    with_verify_state_root(|state_root| {
+        for (event, script) in installed_hooks(mode) {
             let command = configured_hook_command(config, config_path, script)?;
             let output = run_fixture_process(
                 &command,
@@ -769,14 +836,135 @@ fn verify_configured_hooks(
                 Some(HookProcessContext {
                     workspace,
                     executable: &runtime.executable,
-                    state_root: &state_root,
+                    state_root,
                 }),
                 &format!("configured {event} hook"),
             )?;
-            verify_hook_stdout(client, event, &output)?;
+            verify_hook_stdout(client, mode, event, &output)?;
         }
-        verify_hook_state_contains_no_fixture_data(&state_root)
-    })();
+        Ok(())
+    })?;
+    if mode == HookMode::Enforcing {
+        verify_enforcing_hooks(config, config_path, client, workspace, runtime)?;
+    }
+    Ok(())
+}
+
+/// Exercise what enforcement adds, each probe in its own state root so the
+/// once-per-session notice is observable. The daemon is unreachable by
+/// construction, so these prove the fail-open half of the contract: the gate
+/// runs, classifies the path, never denies without a daemon, and says so. The
+/// deny half needs a daemon and is covered by the route and adapter tests.
+fn verify_enforcing_hooks(
+    config: &Value,
+    config_path: &Path,
+    client: HookClient,
+    workspace: &Path,
+    runtime: &InstallRuntime,
+) -> Result<()> {
+    let gate = configured_hook_command(config, config_path, "pre-tool-use.sh")?;
+    let post = configured_hook_command(config, config_path, "post-tool-use.sh")?;
+    let product = workspace.join("lattice-install-verification-product.rs");
+    let documentation = workspace.join("docs/lattice-install-verification.md");
+    let edit_payload = |path: &Path| {
+        json!({
+            "session_id": "install-verification-enforcement",
+            "tool_name": if client == HookClient::ClaudeCode { "Edit" } else { "apply_patch" },
+            "tool_input": {
+                "file_path": path,
+                "old_string": "lattice-install-verification-tool-input",
+                "new_string": "lattice-install-verification-tool-input",
+            },
+            "transcript_path": "/tmp/lattice-install-verification-transcript",
+        })
+        .to_string()
+    };
+    let run = |command: &Path, payload: &str, label: &str, state_root: &Path| {
+        run_fixture_process(
+            command,
+            &[],
+            payload,
+            Some(HookProcessContext {
+                workspace,
+                executable: &runtime.executable,
+                state_root,
+            }),
+            label,
+        )
+    };
+
+    with_verify_state_root(|state_root| {
+        let output = run(
+            &gate,
+            &edit_payload(&product),
+            "configured PreToolUse gate (product path)",
+            state_root,
+        )?;
+        let expected = json!({"hookSpecificOutput": {
+            "additionalContext": notice_text(NoticeCondition::DaemonUnreachable),
+            "hookEventName": "PreToolUse",
+        }})
+        .to_string();
+        if !output_matches_line_terminated(&output, &expected) {
+            return Err(anyhow!(
+                "verification failed: with the daemon unreachable the PreToolUse gate must allow the edit and emit exactly the unreachable-daemon notice"
+            ));
+        }
+        // Same session, same condition: the notice must not repeat.
+        let repeated = run(
+            &gate,
+            &edit_payload(&product),
+            "configured PreToolUse gate (repeat)",
+            state_root,
+        )?;
+        if !repeated.is_empty() {
+            return Err(anyhow!(
+                "verification failed: the PreToolUse gate repeated a once-per-session notice"
+            ));
+        }
+        Ok(())
+    })?;
+
+    with_verify_state_root(|state_root| {
+        let output = run(
+            &gate,
+            &edit_payload(&documentation),
+            "configured PreToolUse gate (documentation path)",
+            state_root,
+        )?;
+        if !output.is_empty() {
+            return Err(anyhow!(
+                "verification failed: the PreToolUse gate must stay silent for an exempt documentation path"
+            ));
+        }
+        Ok(())
+    })?;
+
+    with_verify_state_root(|state_root| {
+        let payload = json!({
+            "session_id": "install-verification-enforcement",
+            "tool_name": "Bash",
+            "tool_input": {"command": "lattice-install-verification-tool-input"},
+            "tool_response": {"stdout": "lattice-install-verification-tool-output"},
+        })
+        .to_string();
+        // The first shell call only records a baseline of repository state.
+        let output = run(&post, &payload, "configured PostToolUse shell hook", state_root)?;
+        if !output.is_empty() {
+            return Err(anyhow!(
+                "verification failed: the first shell PostToolUse call must record a baseline silently"
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Run `check` against a disposable protected state root, prove nothing from
+/// the fixtures was retained in it, and remove it whatever the outcome.
+fn with_verify_state_root(check: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let state_root = install_verify_state_root()?;
+    let result =
+        check(&state_root).and_then(|()| verify_hook_state_contains_no_fixture_data(&state_root));
     let cleanup = std::fs::remove_dir_all(&state_root);
     result.and(cleanup.with_context(|| {
         format!(
@@ -891,6 +1079,9 @@ fn hook_fixture_payload(event: &str) -> &'static str {
         "UserPromptSubmit" => {
             r#"{"session_id":"install-verification","prompt":"lattice-install-verification-prompt"}"#
         }
+        "PreToolUse" => {
+            r#"{"session_id":"install-verification","tool_name":"Edit","tool_input":{"file_path":"docs/lattice-install-verification.md","old_string":"lattice-install-verification-tool-input"},"transcript_path":"/tmp/lattice-install-verification-transcript"}"#
+        }
         "PostToolUse" => {
             r#"{"session_id":"install-verification","tool_name":"apply_patch","file_path":"README.md","tool_input":"lattice-install-verification-tool-input","tool_response":"lattice-install-verification-tool-output","transcript_path":"/tmp/lattice-install-verification-transcript"}"#
         }
@@ -904,32 +1095,44 @@ fn hook_fixture_payload(event: &str) -> &'static str {
     }
 }
 
-/// Hook verification is silent except for the bounded SessionStart recovery
-/// notice emitted when the deliberately unreachable fixture daemon is used.
-/// Keep this allowlist exact: accepting arbitrary hook output would conceal a
+/// With the fixture daemon deliberately unreachable, a hook may say nothing,
+/// or exactly the one notice its mode defines for its event. Keep this
+/// allowlist exact: accepting arbitrary hook output would conceal a
 /// host-envelope or transcript leak during installation verification.
-fn verify_hook_stdout(client: HookClient, event: &str, output: &str) -> Result<()> {
-    if !output.is_empty()
-        && !(event == "SessionStart"
-            && output_matches_line_terminated(
-                output,
-                &expected_session_start_recovery_notice(client),
-            ))
-    {
-        return Err(anyhow!(
-            "verification failed: {event} capture hook must not write stdout"
-        ));
+fn verify_hook_stdout(client: HookClient, mode: HookMode, event: &str, output: &str) -> Result<()> {
+    if output.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let expected = match (event, mode) {
+        ("SessionStart", HookMode::BestEffort) => {
+            Some(session_start_notice(client, BEST_EFFORT_DAEMON_NOTICE))
+        }
+        ("SessionStart", HookMode::Enforcing) => Some(session_start_notice(
+            client,
+            &notice_text(NoticeCondition::DaemonUnreachable),
+        )),
+        // Stop has no passive channel to the model, so an enforcing workspace
+        // tells the operator that the turn summary was not captured.
+        ("Stop", HookMode::Enforcing) => Some(
+            json!({"systemMessage": notice_text(NoticeCondition::CaptureUnavailable)}).to_string(),
+        ),
+        _ => None,
+    };
+    if expected.is_some_and(|expected| output_matches_line_terminated(output, &expected)) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "verification failed: {event} hook wrote stdout its mode does not allow"
+    ))
 }
 
-fn expected_session_start_recovery_notice(client: HookClient) -> String {
+fn session_start_notice(client: HookClient, text: &str) -> String {
     match client {
-        HookClient::Codex => SESSION_START_RECOVERY_NOTICE.to_string(),
+        HookClient::Codex => text.to_string(),
         HookClient::ClaudeCode => json!({
             "hookSpecificOutput": {
+                "additionalContext": text,
                 "hookEventName": "SessionStart",
-                "additionalContext": SESSION_START_RECOVERY_NOTICE,
             }
         })
         .to_string(),
@@ -2380,7 +2583,7 @@ mod tests {
         for client in ["claude-code", "codex"] {
             let hooks = root.join("integrations").join(client).join("hooks");
             fs::create_dir_all(&hooks).unwrap();
-            for (_event, script) in INSTALLED_HOOKS {
+            for (_event, script) in installed_hooks(HookMode::Enforcing) {
                 write_executable(&hooks.join(script), "#!/bin/sh\nexit 0\n");
             }
             write_executable(&hooks.join("common.sh"), "#!/bin/sh\nexit 0\n");
@@ -2836,6 +3039,7 @@ mod tests {
             workspaces: vec![workspace.clone()],
             verify: true,
             with_embeddings: false,
+            enforce: None,
         };
 
         run_install_command_with(command.clone(), &runtime).unwrap();
@@ -2867,6 +3071,7 @@ mod tests {
             workspaces: vec![workspace.clone()],
             verify: true,
             with_embeddings: false,
+            enforce: None,
         };
 
         run_install_command_with(command.clone(), &runtime).unwrap();
@@ -2894,21 +3099,27 @@ mod tests {
     }
 
     #[test]
-    fn install_verify_allows_only_the_exact_session_start_recovery_notice() {
-        let codex_notice = expected_session_start_recovery_notice(HookClient::Codex);
+    fn install_verify_allows_only_the_exact_notice_each_mode_defines() {
+        let best_effort = HookMode::BestEffort;
+        let codex_notice = session_start_notice(HookClient::Codex, BEST_EFFORT_DAEMON_NOTICE);
         assert_eq!(
             codex_notice,
             "lattice: daemon unreachable — run 'lattice doctor'"
         );
-        assert!(verify_hook_stdout(HookClient::Codex, "SessionStart", &codex_notice).is_ok());
+        assert!(
+            verify_hook_stdout(HookClient::Codex, best_effort, "SessionStart", &codex_notice)
+                .is_ok()
+        );
         assert!(verify_hook_stdout(
             HookClient::Codex,
+            best_effort,
             "SessionStart",
             &(codex_notice.clone() + "\r\n"),
         )
         .is_ok());
 
-        let claude_notice = expected_session_start_recovery_notice(HookClient::ClaudeCode);
+        let claude_notice =
+            session_start_notice(HookClient::ClaudeCode, BEST_EFFORT_DAEMON_NOTICE);
         let claude: Value = serde_json::from_str(&claude_notice).unwrap();
         assert_eq!(
             claude["hookSpecificOutput"]["hookEventName"],
@@ -2918,28 +3129,183 @@ mod tests {
             claude["hookSpecificOutput"]["additionalContext"],
             "lattice: daemon unreachable — run 'lattice doctor'"
         );
-        assert!(verify_hook_stdout(HookClient::ClaudeCode, "SessionStart", &claude_notice).is_ok());
+        assert!(verify_hook_stdout(
+            HookClient::ClaudeCode,
+            best_effort,
+            "SessionStart",
+            &claude_notice
+        )
+        .is_ok());
 
-        for (client, event, output) in [
-            (HookClient::Codex, "UserPromptSubmit", codex_notice.as_str()),
-            (HookClient::Codex, "SessionStart", "unexpected hook output"),
+        let enforcing = HookMode::Enforcing;
+        let loud = session_start_notice(
+            HookClient::ClaudeCode,
+            &notice_text(NoticeCondition::DaemonUnreachable),
+        );
+        let capture =
+            json!({"systemMessage": notice_text(NoticeCondition::CaptureUnavailable)}).to_string();
+        assert!(
+            verify_hook_stdout(HookClient::ClaudeCode, enforcing, "SessionStart", &loud).is_ok()
+        );
+        assert!(verify_hook_stdout(HookClient::ClaudeCode, enforcing, "Stop", &capture).is_ok());
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+            assert!(verify_hook_stdout(HookClient::ClaudeCode, enforcing, event, "").is_ok());
+        }
+
+        for (client, mode, event, output) in [
+            (HookClient::Codex, best_effort, "UserPromptSubmit", codex_notice.as_str()),
+            (HookClient::Codex, best_effort, "SessionStart", "unexpected hook output"),
             (
                 HookClient::Codex,
+                best_effort,
                 "SessionStart",
                 "lattice: daemon unreachable — run 'lattice doctor'\nextra",
             ),
-            (HookClient::Codex, "SessionStart", claude_notice.as_str()),
+            (HookClient::Codex, best_effort, "SessionStart", claude_notice.as_str()),
+            (HookClient::ClaudeCode, best_effort, "SessionStart", codex_notice.as_str()),
+            // Each mode accepts only its own wording, on its own event.
+            (HookClient::ClaudeCode, best_effort, "SessionStart", loud.as_str()),
+            (HookClient::ClaudeCode, enforcing, "SessionStart", claude_notice.as_str()),
+            (HookClient::ClaudeCode, best_effort, "Stop", capture.as_str()),
+            (HookClient::ClaudeCode, enforcing, "PreToolUse", loud.as_str()),
             (
                 HookClient::ClaudeCode,
-                "SessionStart",
-                codex_notice.as_str(),
+                enforcing,
+                "PreToolUse",
+                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"}}"#,
             ),
         ] {
-            let error = verify_hook_stdout(client, event, output)
+            let error = verify_hook_stdout(client, mode, event, output)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("must not write stdout"), "{error}");
+            assert!(error.contains("its mode does not allow"), "{error}");
         }
+    }
+
+    #[test]
+    fn enforce_flags_parse_conflict_and_are_refused_for_the_mcp_target() {
+        let (root, workspace, _runtime) = install_fixture();
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "lattice".to_string(),
+                "install".to_string(),
+                "claude-code".to_string(),
+                "--workspace".to_string(),
+                workspace.to_string_lossy().into_owned(),
+            ];
+            args.extend(extra.iter().map(|value| value.to_string()));
+            parse_install_command(args)
+        };
+        assert_eq!(parse(&[]).unwrap().enforce, None);
+        assert_eq!(parse(&["--enforce"]).unwrap().enforce, Some(true));
+        assert_eq!(parse(&["--no-enforce"]).unwrap().enforce, Some(false));
+        assert_eq!(parse(&["--enforce", "--enforce"]).unwrap().enforce, Some(true));
+        assert!(parse(&["--enforce", "--no-enforce"])
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be combined"));
+        let mcp = parse_install_command(vec![
+            "lattice".into(),
+            "install".into(),
+            "mcp".into(),
+            "--workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+            "--enforce".into(),
+        ]);
+        assert!(mcp.unwrap_err().to_string().contains("hook installation"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enforce_on_off_and_plain_rerun_keep_policy_and_hooks_in_step() {
+        let (root, workspace, runtime) = install_fixture();
+        let settings = workspace.join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            r#"{"permissions":{"allow":["Bash(ls:*)"]},"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/team/guard.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let install = |enforce: Option<bool>| {
+            run_install_command_with(
+                InstallCommand {
+                    target: InstallTarget::ClaudeCode,
+                    workspaces: vec![workspace.clone()],
+                    verify: false,
+                    with_embeddings: false,
+                    enforce,
+                },
+                &runtime,
+            )
+        };
+        let gate_count = || {
+            let config: Value =
+                serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+            assert_eq!(config["permissions"]["allow"][0], "Bash(ls:*)");
+            let commands = config["hooks"]["PreToolUse"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|entry| entry["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|hook| hook["command"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            assert!(commands.contains(&"/team/guard.sh".to_string()));
+            commands
+                .iter()
+                .filter(|command| command.ends_with("/pre-tool-use.sh"))
+                .count()
+        };
+
+        // Default: best-effort, and no policy file is invented.
+        install(None).unwrap();
+        assert_eq!(gate_count(), 0);
+        assert!(!policy_path(&workspace).exists());
+
+        let message = install(Some(true)).unwrap();
+        assert!(message.contains("hook enforcement enabled"), "{message}");
+        assert_eq!(gate_count(), 1);
+        assert!(load_policy(&workspace).enforcing());
+
+        // A plain rerun keeps the recorded mode and changes nothing.
+        let enforced = fs::read_to_string(&settings).unwrap();
+        install(None).unwrap();
+        assert_eq!(enforced, fs::read_to_string(&settings).unwrap());
+        assert!(load_policy(&workspace).enforcing());
+
+        let message = install(Some(false)).unwrap();
+        assert!(message.contains("hook enforcement disabled"), "{message}");
+        assert_eq!(gate_count(), 0);
+        assert!(!load_policy(&workspace).enforcing());
+        install(None).unwrap();
+        assert_eq!(gate_count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_policy_stops_the_install_before_any_hook_is_written() {
+        let (root, workspace, runtime) = install_fixture();
+        fs::create_dir_all(workspace.join(".lattice")).unwrap();
+        fs::write(policy_path(&workspace), "{not json").unwrap();
+        for enforce in [None, Some(true), Some(false)] {
+            let error = run_install_command_with(
+                InstallCommand {
+                    target: InstallTarget::ClaudeCode,
+                    workspaces: vec![workspace.clone()],
+                    verify: false,
+                    with_embeddings: false,
+                    enforce,
+                },
+                &runtime,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("workspace-policy.json"), "{error:#}");
+            assert!(!workspace.join(".claude/settings.json").exists());
+            assert_eq!(
+                fs::read_to_string(policy_path(&workspace)).unwrap(),
+                "{not json"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

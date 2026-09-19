@@ -67,20 +67,75 @@ impl InstallPaths {
     }
 }
 
+/// Whether a workspace has opted in to hook enforcement. It decides which
+/// hooks exist and what the tool matchers cover; see
+/// `docs/hook-enforcement.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookMode {
+    BestEffort,
+    Enforcing,
+}
+
+impl HookMode {
+    pub(crate) fn from_enforcing(enforcing: bool) -> Self {
+        if enforcing {
+            Self::Enforcing
+        } else {
+            Self::BestEffort
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HookDefinition {
     event: &'static str,
     script: &'static str,
     matcher: Option<&'static str>,
+    /// Replaces `matcher` in an enforcing workspace.
+    enforcing_matcher: Option<&'static str>,
+    /// Installed only in an enforcing workspace, and removed otherwise.
+    enforcing_only: bool,
     timeout_secs: u64,
     status_message: &'static str,
 }
 
-const HOOKS: [HookDefinition; 5] = [
+impl HookDefinition {
+    fn matcher_for(self, mode: HookMode) -> Option<&'static str> {
+        match mode {
+            HookMode::Enforcing => self.enforcing_matcher.or(self.matcher),
+            HookMode::BestEffort => self.matcher,
+        }
+    }
+
+    fn installed_in(self, mode: HookMode) -> bool {
+        !self.enforcing_only || mode == HookMode::Enforcing
+    }
+}
+
+/// Every edit tool either host names. `MultiEdit` is no longer documented by
+/// Claude Code; an alternative that matches nothing is harmless.
+const EDIT_TOOL_MATCHER: &str = "apply_patch|Edit|Write|MultiEdit|NotebookEdit";
+/// Edit tools plus the shell tools, whose edits are found from repository
+/// state because their input is never read.
+const EDIT_AND_SHELL_TOOL_MATCHER: &str =
+    "apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell";
+
+/// Scripts the installer owns, in the order `--verify` runs them.
+pub(crate) fn installed_hooks(mode: HookMode) -> Vec<(&'static str, &'static str)> {
+    HOOKS
+        .iter()
+        .filter(|definition| definition.installed_in(mode))
+        .map(|definition| (definition.event, definition.script))
+        .collect()
+}
+
+const HOOKS: [HookDefinition; 6] = [
     HookDefinition {
         event: "SessionStart",
         script: "session-start.sh",
         matcher: Some("startup|resume|clear|compact"),
+        enforcing_matcher: None,
+        enforcing_only: false,
         timeout_secs: 5,
         status_message: "Loading Lattice session context",
     },
@@ -88,13 +143,26 @@ const HOOKS: [HookDefinition; 5] = [
         event: "UserPromptSubmit",
         script: "user-prompt-submit.sh",
         matcher: None,
+        enforcing_matcher: None,
+        enforcing_only: false,
         timeout_secs: 5,
         status_message: "Loading Lattice prompt context",
+    },
+    HookDefinition {
+        event: "PreToolUse",
+        script: "pre-tool-use.sh",
+        matcher: Some(EDIT_TOOL_MATCHER),
+        enforcing_matcher: None,
+        enforcing_only: true,
+        timeout_secs: 5,
+        status_message: "Checking Lattice change plan",
     },
     HookDefinition {
         event: "PostToolUse",
         script: "post-tool-use.sh",
         matcher: Some("apply_patch|Edit|Write"),
+        enforcing_matcher: Some(EDIT_AND_SHELL_TOOL_MATCHER),
+        enforcing_only: false,
         timeout_secs: 5,
         status_message: "Checking Lattice edit impact",
     },
@@ -102,6 +170,8 @@ const HOOKS: [HookDefinition; 5] = [
         event: "Stop",
         script: "stop.sh",
         matcher: None,
+        enforcing_matcher: None,
+        enforcing_only: false,
         timeout_secs: 5,
         status_message: "Capturing bounded Lattice turn summary",
     },
@@ -109,6 +179,8 @@ const HOOKS: [HookDefinition; 5] = [
         event: "SessionEnd",
         script: "session-end.sh",
         matcher: None,
+        enforcing_matcher: None,
+        enforcing_only: false,
         timeout_secs: 3,
         status_message: "Finalizing protected Lattice session capture",
     },
@@ -119,14 +191,60 @@ const HOOKS: [HookDefinition; 5] = [
 /// Existing entries are identified by hook script basename.  This lets an
 /// install replace stale checkout paths, normalize matcher and timeout values,
 /// and collapse duplicate Lattice registrations without touching other hooks.
+///
+/// `mode` selects the hook set. Moving a workspace back to best-effort removes
+/// the enforcing-only hook and restores the narrower tool matcher, so the
+/// mode on disk is always the mode the policy file records.
 pub(crate) fn reconcile_hook_config(
     config: &mut Value,
     client: HookClient,
     paths: &InstallPaths,
+    mode: HookMode,
 ) -> Result<()> {
     for definition in HOOKS {
         validate_outer_timeout(client, definition)?;
-        reconcile_hook(config, client, paths, definition)?;
+        if definition.installed_in(mode) {
+            reconcile_hook(config, client, paths, definition, mode)?;
+        } else {
+            remove_hook(config, definition)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove every registration of one Lattice script, leaving foreign hooks in
+/// the same entry, and the entry itself if it still holds any, untouched.
+fn remove_hook(config: &mut Value, definition: HookDefinition) -> Result<()> {
+    let root = object_mut(config, "hook configuration")?;
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("hook configuration.hooks must be a JSON object"))?;
+    let Some(entries) = hooks.get_mut(definition.event) else {
+        return Ok(());
+    };
+    let entries = entries.as_array_mut().ok_or_else(|| {
+        anyhow!(
+            "hook configuration.{} must be a JSON array",
+            definition.event
+        )
+    })?;
+    for entry in entries.iter_mut() {
+        if let Some(entry_hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+            entry_hooks
+                .retain(|hook| hook_command_basename(hook).as_deref() != Some(definition.script));
+        }
+    }
+    entries.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_none_or(|hooks| !hooks.is_empty())
+    });
+    if entries.is_empty() {
+        hooks.remove(definition.event);
     }
     Ok(())
 }
@@ -205,7 +323,9 @@ fn reconcile_hook(
     client: HookClient,
     paths: &InstallPaths,
     definition: HookDefinition,
+    mode: HookMode,
 ) -> Result<()> {
+    let matcher = definition.matcher_for(mode);
     let command = paths.hook_path(client, definition.script);
     let timeout_secs = hook_timeout_secs(client, definition);
     let desired_hook = json!({
@@ -241,7 +361,7 @@ fn reconcile_hook(
                 .get_mut("hooks")
                 .and_then(Value::as_array_mut)
                 .expect("hook array was checked above")[first] = desired_hook.clone();
-            set_matcher(entry_object, definition.matcher);
+            set_matcher(entry_object, matcher);
             primary = Some(entry_index);
         }
         for hook_index in matches.into_iter().rev() {
@@ -255,7 +375,7 @@ fn reconcile_hook(
 
     if primary.is_none() {
         let mut entry = Map::new();
-        set_matcher(&mut entry, definition.matcher);
+        set_matcher(&mut entry, matcher);
         entry.insert("hooks".into(), Value::Array(vec![desired_hook]));
         entries.push(Value::Object(entry));
     }
@@ -355,9 +475,11 @@ mod tests {
             }
         });
 
-        reconcile_hook_config(&mut config, HookClient::Codex, &paths()).unwrap();
+        reconcile_hook_config(&mut config, HookClient::Codex, &paths(), HookMode::BestEffort)
+            .unwrap();
         let once = render_config(&config).unwrap();
-        reconcile_hook_config(&mut config, HookClient::Codex, &paths()).unwrap();
+        reconcile_hook_config(&mut config, HookClient::Codex, &paths(), HookMode::BestEffort)
+            .unwrap();
 
         assert_eq!(once, render_config(&config).unwrap());
         assert_eq!(
@@ -405,14 +527,14 @@ mod tests {
                 }
             });
 
-            reconcile_hook_config(&mut config, client, &paths()).unwrap();
+            reconcile_hook_config(&mut config, client, &paths(), HookMode::BestEffort).unwrap();
             let once = render_config(&config).unwrap();
             assert_eq!(
                 config["hooks"]["Stop"][0]["hooks"][0]["command"],
                 format!("/opt/lattice/integrations/{stale_client}/hooks/stop.sh")
             );
 
-            reconcile_hook_config(&mut config, client, &paths()).unwrap();
+            reconcile_hook_config(&mut config, client, &paths(), HookMode::BestEffort).unwrap();
             assert_eq!(once, render_config(&config).unwrap());
         }
     }
@@ -420,7 +542,13 @@ mod tests {
     #[test]
     fn fills_empty_stop_event_container_without_removing_foreign_stop_hooks() {
         let mut empty_config = json!({"hooks": {"Stop": []}});
-        reconcile_hook_config(&mut empty_config, HookClient::Codex, &paths()).unwrap();
+        reconcile_hook_config(
+            &mut empty_config,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
         assert_eq!(
             empty_config["hooks"]["Stop"][0]["hooks"][0]["command"],
             "/opt/lattice/integrations/codex/hooks/stop.sh"
@@ -434,7 +562,13 @@ mod tests {
                 }]}]
             }
         });
-        reconcile_hook_config(&mut foreign_config, HookClient::Codex, &paths()).unwrap();
+        reconcile_hook_config(
+            &mut foreign_config,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
         let commands = foreign_config["hooks"]["Stop"]
             .as_array()
             .unwrap()
@@ -449,10 +583,185 @@ mod tests {
             .any(|hook| { hook["command"] == "/opt/lattice/integrations/codex/hooks/stop.sh" }));
     }
 
+    fn lattice_commands(config: &Value, event: &str) -> Vec<String> {
+        config["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|entry| entry["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|hook| hook["command"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn enforce_on_adds_the_gate_and_widens_post_tool_use_for_both_clients() {
+        for client in [HookClient::ClaudeCode, HookClient::Codex] {
+            let directory = client.asset_directory();
+            let mut config = json!({});
+            reconcile_hook_config(&mut config, client, &paths(), HookMode::Enforcing).unwrap();
+            assert_eq!(
+                lattice_commands(&config, "PreToolUse"),
+                vec![format!("/opt/lattice/integrations/{directory}/hooks/pre-tool-use.sh")]
+            );
+            assert_eq!(
+                config["hooks"]["PreToolUse"][0]["matcher"],
+                "apply_patch|Edit|Write|MultiEdit|NotebookEdit"
+            );
+            assert_eq!(config["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 5);
+            assert_eq!(
+                config["hooks"]["PostToolUse"][0]["matcher"],
+                "apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell"
+            );
+            // The gate never matches a shell tool: a shell command cannot be
+            // classified without reading it.
+            assert!(!config["hooks"]["PreToolUse"][0]["matcher"]
+                .as_str()
+                .unwrap()
+                .contains("Bash"));
+
+            let once = render_config(&config).unwrap();
+            reconcile_hook_config(&mut config, client, &paths(), HookMode::Enforcing).unwrap();
+            assert_eq!(once, render_config(&config).unwrap(), "rerun must be idempotent");
+        }
+    }
+
+    #[test]
+    fn enforce_off_removes_only_the_lattice_gate_and_restores_the_narrow_matcher() {
+        let mut config = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "/team/guard-rm.sh"}
+                    ]},
+                    {"matcher": "Edit", "hooks": [
+                        {"type": "command", "command": "/team/lint-before-edit.sh"},
+                        {"type": "command", "command": "/stale/checkout/hooks/pre-tool-use.sh"}
+                    ]}
+                ]
+            }
+        });
+        reconcile_hook_config(
+            &mut config,
+            HookClient::ClaudeCode,
+            &paths(),
+            HookMode::Enforcing,
+        )
+        .unwrap();
+        // The stale registration is replaced in place; foreign hooks survive.
+        assert_eq!(
+            lattice_commands(&config, "PreToolUse"),
+            vec![
+                "/team/guard-rm.sh".to_string(),
+                "/team/lint-before-edit.sh".to_string(),
+                "/opt/lattice/integrations/claude-code/hooks/pre-tool-use.sh".to_string(),
+            ]
+        );
+
+        reconcile_hook_config(
+            &mut config,
+            HookClient::ClaudeCode,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
+        assert_eq!(
+            lattice_commands(&config, "PreToolUse"),
+            vec![
+                "/team/guard-rm.sh".to_string(),
+                "/team/lint-before-edit.sh".to_string()
+            ]
+        );
+        assert_eq!(config["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            config["hooks"]["PostToolUse"][0]["matcher"],
+            "apply_patch|Edit|Write"
+        );
+        let once = render_config(&config).unwrap();
+        reconcile_hook_config(
+            &mut config,
+            HookClient::ClaudeCode,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
+        assert_eq!(once, render_config(&config).unwrap());
+
+        // With no foreign hook left, the event container goes too.
+        let mut only_ours = json!({});
+        reconcile_hook_config(
+            &mut only_ours,
+            HookClient::Codex,
+            &paths(),
+            HookMode::Enforcing,
+        )
+        .unwrap();
+        reconcile_hook_config(
+            &mut only_ours,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
+        assert!(only_ours["hooks"].get("PreToolUse").is_none());
+        let mut best_effort = json!({});
+        reconcile_hook_config(
+            &mut best_effort,
+            HookClient::Codex,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
+        assert_eq!(
+            render_config(&only_ours).unwrap(),
+            render_config(&best_effort).unwrap()
+        );
+    }
+
+    #[test]
+    fn duplicate_gate_registrations_collapse_to_one() {
+        let mut config = json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Edit", "hooks": [
+                    {"type": "command", "command": "/a/pre-tool-use.sh", "timeout": 60},
+                    {"type": "command", "command": "/b/pre-tool-use.sh"}
+                ]},
+                {"hooks": [{"type": "command", "command": "/c/pre-tool-use.sh"}]}
+            ]}
+        });
+        reconcile_hook_config(
+            &mut config,
+            HookClient::ClaudeCode,
+            &paths(),
+            HookMode::Enforcing,
+        )
+        .unwrap();
+        assert_eq!(lattice_commands(&config, "PreToolUse").len(), 1);
+        assert_eq!(config["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(config["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 5);
+    }
+
+    #[test]
+    fn installed_hook_list_follows_the_mode() {
+        let best_effort = installed_hooks(HookMode::BestEffort);
+        assert_eq!(best_effort.len(), 5);
+        assert!(!best_effort.contains(&("PreToolUse", "pre-tool-use.sh")));
+        let enforcing = installed_hooks(HookMode::Enforcing);
+        assert_eq!(enforcing.len(), 6);
+        assert!(enforcing.contains(&("PreToolUse", "pre-tool-use.sh")));
+        assert_eq!(HookMode::from_enforcing(true), HookMode::Enforcing);
+        assert_eq!(HookMode::from_enforcing(false), HookMode::BestEffort);
+    }
+
     #[test]
     fn claude_session_end_retains_query_safe_outer_timeout() {
         let mut config = json!({});
-        reconcile_hook_config(&mut config, HookClient::ClaudeCode, &paths()).unwrap();
+        reconcile_hook_config(
+            &mut config,
+            HookClient::ClaudeCode,
+            &paths(),
+            HookMode::BestEffort,
+        )
+        .unwrap();
         assert_eq!(config["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 5);
     }
 
@@ -492,7 +801,8 @@ mod tests {
     fn rejects_invalid_shapes_and_timeout_invariant_violations() {
         let paths = paths();
         let mut invalid = json!({"hooks": []});
-        let error = reconcile_hook_config(&mut invalid, HookClient::ClaudeCode, &paths)
+        let error =
+            reconcile_hook_config(&mut invalid, HookClient::ClaudeCode, &paths, HookMode::BestEffort)
             .unwrap_err()
             .to_string();
         assert!(error.contains("hook configuration.hooks must be a JSON object"));
