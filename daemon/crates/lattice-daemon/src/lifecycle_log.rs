@@ -96,12 +96,52 @@ pub(crate) fn lifecycle_log_path() -> PathBuf {
         return PathBuf::from(dir).join("lifecycle.jsonl");
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".lattice")
-            .join("logs")
-            .join("lifecycle.jsonl");
+    // Unit tests build daemons in-process. Left to the default, their shard
+    // events for throwaway workspaces landed in the operator's real log,
+    // which is the first thing read when diagnosing the live daemon.
+    #[cfg(test)]
+    {
+        test_lifecycle_log_path()
     }
+    #[cfg(not(test))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".lattice")
+                .join("logs")
+                .join("lifecycle.jsonl");
+        }
+        std::env::temp_dir().join("lattice-lifecycle.jsonl")
+    }
+}
 
-    std::env::temp_dir().join("lattice-lifecycle.jsonl")
+#[cfg(test)]
+fn test_lifecycle_log_path() -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("lattice-test-lifecycle-{}", std::process::id()))
+        .join("lifecycle.jsonl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test_process_never_defaults_to_the_operators_real_log() {
+        if std::env::var_os("LATTICE_LIFECYCLE_LOG_DIR").is_some() {
+            return;
+        }
+        let path = lifecycle_log_path();
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+        if let Some(home) = std::env::var_os("HOME") {
+            assert!(
+                !path.starts_with(PathBuf::from(home).join(".lattice")),
+                "{}",
+                path.display()
+            );
+        }
+        log_event("daemon", "test_event_for_isolation", &[]);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("test_event_for_isolation"));
+    }
 }
