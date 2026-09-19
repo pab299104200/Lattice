@@ -806,6 +806,9 @@ struct LeaseShardHandler {
     focus_files: Vec<String>,
     focus_dirs: Vec<String>,
     retained_shards: Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
+    /// Set while this lease is deferred, so a deferral is logged once per
+    /// episode rather than on every retry.
+    deferred: AtomicBool,
 }
 
 impl LeaseShardHandler {
@@ -844,10 +847,31 @@ impl RequestHandler for LeaseShardHandler {
             {
                 Ok(entry) => {
                     self.adopt(&entry);
+                    if self.deferred.swap(false, Ordering::AcqRel) {
+                        lifecycle_log::log_event(
+                            "daemon",
+                            "shard_admitted_after_deferral",
+                            &[("shard_key", serde_json::json!(shard_key(&self.root)))],
+                        );
+                    }
                     entry
                 }
                 Err(error) if is_shard_capacity_error(&error) => {
                     let reason = error.to_string();
+                    if !self.deferred.swap(true, Ordering::AcqRel) {
+                        let kind = error
+                            .downcast_ref::<ShardDeferred>()
+                            .map_or("resource_limited", |deferred| deferred.kind.label());
+                        lifecycle_log::log_event(
+                            "daemon",
+                            "shard_deferred",
+                            &[
+                                ("shard_key", serde_json::json!(shard_key(&self.root))),
+                                ("pressure", serde_json::json!(kind)),
+                                ("reason", serde_json::json!(reason)),
+                            ],
+                        );
+                    }
                     return cold_start_response(
                         method,
                         &params,
@@ -1411,8 +1435,8 @@ impl GlobalDaemon {
         daemon
     }
 
-    /// A daemon with an explicit shard ceiling, as tests and an operator's
-    /// `max_loaded_shards` both express it.
+    /// A daemon with an explicit shard ceiling, as the older tests express it.
+    #[cfg(test)]
     fn new_with_config(max_loaded_shards: usize, prewarm_view_shards: bool) -> Self {
         Self::new_with_ceiling(Some(max_loaded_shards), prewarm_view_shards)
     }
@@ -1508,6 +1532,7 @@ impl GlobalDaemon {
             focus_files: request.focus_files.clone(),
             focus_dirs: request.focus_dirs.clone(),
             retained_shards: Arc::clone(&retained_shards),
+            deferred: AtomicBool::new(false),
         });
         let handler: Arc<dyn RequestHandler> = if roots.len() > 1 {
             Arc::new(ViewRequestHandler {
@@ -2562,6 +2587,17 @@ mod tests {
         }
     }
 
+    /// This test process's lifecycle events of one kind for one workspace.
+    fn lifecycle_events_for(event: &str, root: &Path) -> Vec<Value> {
+        let key = shard_key(&root.to_path_buf());
+        std::fs::read_to_string(crate::lifecycle_log::lifecycle_log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["event"] == event && entry["shard_key"] == key.as_str())
+            .collect()
+    }
+
     /// Make a shard look as if nothing has asked it for anything for a while.
     fn age(entry: &ShardEntry, secs: u64) {
         entry
@@ -2894,6 +2930,25 @@ mod tests {
             "nothing busy was evicted"
         );
 
+        // Asking again while still deferred is not logged again.
+        let again = extract_tool_json(
+            starved
+                .handler
+                .handle(
+                    "tools/call",
+                    serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["status"], "deferred");
+        assert_eq!(lifecycle_events_for("shard_deferred", &roots[2]).len(), 1);
+        assert_eq!(
+            lifecycle_events_for("shard_deferred", &roots[2])[0]["pressure"],
+            "memory"
+        );
+
         // It is counted as connected even though it has no shard.
         let report = daemon.report().await;
         assert_eq!(report["connected_workspaces"], 3);
@@ -2919,6 +2974,10 @@ mod tests {
         .unwrap();
         assert_ne!(status["status"], "deferred");
         assert_eq!(retained_shard_count(&starved.retained_shards), 1);
+        assert_eq!(
+            lifecycle_events_for("shard_admitted_after_deferral", &roots[2]).len(),
+            1
+        );
         drop(leases);
         drop(starved);
         cleanup(&daemon, roots).await;

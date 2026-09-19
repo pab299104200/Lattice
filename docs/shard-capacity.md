@@ -98,3 +98,5 @@ The lifecycle log (`~/.lattice/logs/lifecycle.jsonl`) records each decision:
 | `shard_evicted_idle` | A shard with no connection passed its grace period |
 | `shard_memory_released` | Footprint before and after a shard was unloaded. If `footprint_after_bytes` does not fall, memory is outliving its shard |
 | `memory_over_budget_nothing_to_unload` | Over budget with nothing idle to unload: the memory is not in any shard |
+| `shard_deferred` | A connected workspace could not be loaded; once per episode, with `pressure` (`memory` or `ceiling`) and the full reason |
+| `shard_admitted_after_deferral` | A deferred workspace was loaded on a later request |
