@@ -7,8 +7,13 @@
 //!
 //! ```toml
 //! # $XDG_CONFIG_HOME/lattice/daemon.toml, default ~/.config/lattice/daemon.toml
-//! max_loaded_shards = 6
+//! memory_budget_mb = 6144     # optional; default is a third of physical memory
+//! max_loaded_shards = 6       # optional hard ceiling; default is no ceiling
 //! ```
+//!
+//! Capacity follows demand: every workspace with a connected agent gets a
+//! shard, and real memory is the limit. `max_loaded_shards` is only a
+//! ceiling an operator may impose. See `docs/shard-capacity.md`.
 //!
 //! Precedence is environment, then file, then built-in default. An invalid
 //! value from either source stops the daemon with an error that names the
@@ -29,7 +34,15 @@ pub(crate) const MAX_LOADED_WORKSPACES_ENV: &str = "LATTICE_MAX_LOADED_WORKSPACE
 /// beyond this is a typo, not a plan.
 pub(crate) const MAX_LOADED_SHARDS_LIMIT: usize = 64;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
-const KNOWN_KEYS: [&str; 1] = [MAX_LOADED_SHARDS_KEY];
+pub(crate) const MEMORY_BUDGET_KEY: &str = "memory_budget_mb";
+pub(crate) const MEMORY_BUDGET_ENV: &str = "LATTICE_MEMORY_BUDGET_MB";
+/// Below this the daemon cannot hold even one large workspace.
+pub(crate) const MIN_MEMORY_BUDGET_MB: u64 = 512;
+pub(crate) const MAX_MEMORY_BUDGET_MB: u64 = 4 * 1024 * 1024;
+/// Used when physical memory cannot be read.
+const FALLBACK_MEMORY_BUDGET_MB: u64 = 4 * 1024;
+const MIN_DEFAULT_MEMORY_BUDGET_MB: u64 = 2 * 1024;
+const KNOWN_KEYS: [&str; 2] = [MAX_LOADED_SHARDS_KEY, MEMORY_BUDGET_KEY];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SettingSource {
@@ -50,8 +63,14 @@ impl SettingSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonSettings {
-    pub(crate) max_loaded_shards: usize,
+    /// An optional hard ceiling on loaded shards. `None` is the default:
+    /// a count is what starved a connected workspace for days, and memory,
+    /// not a number of workspaces, is what actually runs out.
+    pub(crate) max_loaded_shards: Option<usize>,
     pub(crate) max_loaded_shards_source: SettingSource,
+    /// Budget for the daemon's real memory footprint, in bytes.
+    pub(crate) memory_budget_bytes: u64,
+    pub(crate) memory_budget_source: SettingSource,
     /// Where the settings file is looked for, whether or not it exists.
     pub(crate) settings_file: Option<PathBuf>,
     pub(crate) settings_file_present: bool,
@@ -64,16 +83,20 @@ impl DaemonSettings {
         json!({
             "max_loaded_shards": self.max_loaded_shards,
             "max_loaded_shards_source": self.max_loaded_shards_source.describe(),
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "memory_budget_source": self.memory_budget_source.describe(),
             "settings_file": self.settings_file.as_ref().map(|path| path.to_string_lossy()),
             "settings_file_present": self.settings_file_present,
         })
     }
 
-    /// Settings for a daemon built with an explicit cap and no sources.
-    pub(crate) fn unconfigured(max_loaded_shards: usize) -> Self {
+    /// Settings for a daemon built with an explicit ceiling and no sources.
+    pub(crate) fn unconfigured(max_loaded_shards: Option<usize>) -> Self {
         Self {
             max_loaded_shards,
             max_loaded_shards_source: SettingSource::Default,
+            memory_budget_bytes: default_memory_budget_mb(physical_memory_bytes()) * 1024 * 1024,
+            memory_budget_source: SettingSource::Default,
             settings_file: None,
             settings_file_present: false,
         }
@@ -105,14 +128,64 @@ pub(crate) fn settings_file_path(env: &dyn Fn(&str) -> Option<String>) -> Result
 }
 
 /// Load settings for this process from its real environment and home.
-pub(crate) fn load(default_max_loaded_shards: usize) -> Result<DaemonSettings> {
+pub(crate) fn load() -> Result<DaemonSettings> {
     let env = |name: &str| std::env::var(name).ok();
     let path = settings_file_path(&env)?;
     let text = match &path {
         Some(path) => read_settings_file(path)?,
         None => None,
     };
-    resolve(&env, path, text.as_deref(), default_max_loaded_shards)
+    resolve(&env, path, text.as_deref(), physical_memory_bytes())
+}
+
+/// A third of physical memory, and never less than 2 GiB.
+///
+/// Measured on macOS in 2026-09, a freshly loaded workspace costs about
+/// 0.12 MB of real footprint per indexed file: 360 MB for 3,066 files, so six
+/// mid-sized repositories need roughly 3 to 4 GiB. A third of a 16 GiB machine
+/// is 5.3 GiB, which holds that with room for growth between sweeps, and
+/// leaves two thirds for the editor, the agents and the builds they run.
+pub(crate) fn default_memory_budget_mb(physical_memory_bytes: Option<u64>) -> u64 {
+    match physical_memory_bytes {
+        Some(bytes) => (bytes / (1024 * 1024) / 3).max(MIN_DEFAULT_MEMORY_BUDGET_MB),
+        None => FALLBACK_MEMORY_BUDGET_MB,
+    }
+}
+
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut value: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        // SAFETY: the name is a NUL-terminated literal, `value` is a writable
+        // u64 and `size` holds its length, as `hw.memsize` requires.
+        let ok = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut value as *mut u64).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+        };
+        (ok && value > 0).then_some(value)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kib = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 fn read_settings_file(path: &Path) -> Result<Option<String>> {
@@ -146,13 +219,38 @@ pub(crate) fn resolve(
     env: &dyn Fn(&str) -> Option<String>,
     settings_file: Option<PathBuf>,
     file_text: Option<&str>,
-    default_max_loaded_shards: usize,
+    physical_memory_bytes: Option<u64>,
 ) -> Result<DaemonSettings> {
     // The file is validated even when the environment wins. A broken file
     // that only surfaces after the variable disappears is a trap.
-    let from_file = match (&settings_file, file_text) {
+    let file = match (&settings_file, file_text) {
         (Some(path), Some(text)) => parse_settings_file(path, text)?,
-        _ => None,
+        _ => FileSettings::default(),
+    };
+    let from_file = file.max_loaded_shards;
+    let budget_from_env = env(MEMORY_BUDGET_ENV)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let parsed = value.trim().parse::<i64>().map_err(|_| {
+                anyhow!("environment variable {MEMORY_BUDGET_ENV}=`{value}` is not a whole number")
+            })?;
+            validate_memory_budget_mb(
+                parsed,
+                &format!("environment variable {MEMORY_BUDGET_ENV}"),
+            )
+        })
+        .transpose()?;
+    let (memory_budget_mb, memory_budget_source) = match (budget_from_env, file.memory_budget_mb)
+    {
+        (Some(mb), _) => (mb, SettingSource::Environment(MEMORY_BUDGET_ENV)),
+        (None, Some(mb)) => (
+            mb,
+            SettingSource::SettingsFile(settings_file.clone().expect("file value implies a path")),
+        ),
+        (None, None) => (
+            default_memory_budget_mb(physical_memory_bytes),
+            SettingSource::Default,
+        ),
     };
     let from_env = [MAX_LOADED_SHARDS_ENV, MAX_LOADED_WORKSPACES_ENV]
         .into_iter()
@@ -171,25 +269,47 @@ pub(crate) fn resolve(
         .transpose()?;
 
     let (max_loaded_shards, max_loaded_shards_source) = match (from_env, from_file) {
-        (Some(from_env), _) => from_env,
+        (Some((shards, source)), _) => (Some(shards), source),
         (None, Some(shards)) => (
-            shards,
+            Some(shards),
             SettingSource::SettingsFile(settings_file.clone().expect("file value implies a path")),
         ),
-        (None, None) => (
-            default_max_loaded_shards.clamp(1, MAX_LOADED_SHARDS_LIMIT),
-            SettingSource::Default,
-        ),
+        (None, None) => (None, SettingSource::Default),
     };
     Ok(DaemonSettings {
         max_loaded_shards,
         max_loaded_shards_source,
+        memory_budget_bytes: memory_budget_mb * 1024 * 1024,
+        memory_budget_source,
         settings_file_present: settings_file.is_some() && file_text.is_some(),
         settings_file,
     })
 }
 
-fn parse_settings_file(path: &Path, text: &str) -> Result<Option<usize>> {
+#[derive(Debug, Default)]
+struct FileSettings {
+    max_loaded_shards: Option<usize>,
+    memory_budget_mb: Option<u64>,
+}
+
+fn whole_number(document: &DocumentMut, key: &str, path: &Path) -> Result<Option<(i64, String)>> {
+    let Some(item) = document.get(key) else {
+        return Ok(None);
+    };
+    let source = format!("`{key}` in `{}`", path.display());
+    let value = match item {
+        Item::Value(value) => value.as_integer().ok_or_else(|| {
+            anyhow!(
+                "{source} must be a whole number, got `{}`",
+                value.to_string().trim()
+            )
+        })?,
+        _ => bail!("{source} must be a whole number, not a table"),
+    };
+    Ok(Some((value, source)))
+}
+
+fn parse_settings_file(path: &Path, text: &str) -> Result<FileSettings> {
     let document = text.parse::<DocumentMut>().map_err(|error| {
         anyhow!(
             "daemon settings file `{}` is not valid TOML: {error}",
@@ -205,20 +325,23 @@ fn parse_settings_file(path: &Path, text: &str) -> Result<Option<usize>> {
             KNOWN_KEYS.join(", ")
         );
     }
-    let Some(item) = document.get(MAX_LOADED_SHARDS_KEY) else {
-        return Ok(None);
-    };
-    let source = format!("`{MAX_LOADED_SHARDS_KEY}` in `{}`", path.display());
-    let value = match item {
-        Item::Value(value) => value.as_integer().ok_or_else(|| {
-            anyhow!(
-                "{source} must be a whole number, got `{}`",
-                value.to_string().trim()
-            )
-        })?,
-        _ => bail!("{source} must be a whole number, not a table"),
-    };
-    validate_max_loaded_shards(value, &source).map(Some)
+    Ok(FileSettings {
+        max_loaded_shards: whole_number(&document, MAX_LOADED_SHARDS_KEY, path)?
+            .map(|(value, source)| validate_max_loaded_shards(value, &source))
+            .transpose()?,
+        memory_budget_mb: whole_number(&document, MEMORY_BUDGET_KEY, path)?
+            .map(|(value, source)| validate_memory_budget_mb(value, &source))
+            .transpose()?,
+    })
+}
+
+fn validate_memory_budget_mb(value: i64, source: &str) -> Result<u64> {
+    if !(MIN_MEMORY_BUDGET_MB as i64..=MAX_MEMORY_BUDGET_MB as i64).contains(&value) {
+        bail!(
+            "{source} must be between {MIN_MEMORY_BUDGET_MB} and {MAX_MEMORY_BUDGET_MB} (MiB), got {value}"
+        );
+    }
+    Ok(value as u64)
 }
 
 fn validate_max_loaded_shards(value: i64, source: &str) -> Result<usize> {
@@ -285,89 +408,102 @@ mod tests {
         Some(PathBuf::from("/home/op/.config/lattice/daemon.toml"))
     }
 
-    #[test]
-    fn precedence_is_environment_then_file_then_default_and_the_source_is_reported() {
-        let none = env_of(&[]);
-        let default = resolve(&none, file(), None, 4).unwrap();
-        assert_eq!(default.max_loaded_shards, 4);
-        assert_eq!(default.max_loaded_shards_source, SettingSource::Default);
-        assert!(!default.settings_file_present);
-        assert_eq!(
-            default.report()["max_loaded_shards_source"],
-            "built-in default"
-        );
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const RAM_16G: Option<u64> = Some(16 * GIB);
 
-        let from_file = resolve(&none, file(), Some("max_loaded_shards = 6\n"), 4).unwrap();
-        assert_eq!(from_file.max_loaded_shards, 6);
+    #[test]
+    fn by_default_there_is_no_shard_ceiling_and_memory_is_a_third_of_ram() {
+        let settings = resolve(&env_of(&[]), file(), None, RAM_16G).unwrap();
+        assert_eq!(settings.max_loaded_shards, None);
+        assert_eq!(settings.max_loaded_shards_source, SettingSource::Default);
+        assert_eq!(settings.memory_budget_bytes, 5461 * 1024 * 1024);
+        assert_eq!(settings.memory_budget_source, SettingSource::Default);
+        assert!(!settings.settings_file_present);
+        let report = settings.report();
+        assert!(report["max_loaded_shards"].is_null());
+        assert_eq!(report["max_loaded_shards_source"], "built-in default");
+
+        // Small machines keep a usable floor; unknown memory gets a fixed value.
+        assert_eq!(default_memory_budget_mb(Some(4 * GIB)), 2048);
+        assert_eq!(default_memory_budget_mb(Some(64 * GIB)), 21_845);
+        assert_eq!(default_memory_budget_mb(None), 4096);
+    }
+
+    #[test]
+    fn a_ceiling_written_before_demand_driven_capacity_still_works() {
+        // The file rolled out on 2026-09-19 holds exactly this.
+        let settings =
+            resolve(&env_of(&[]), file(), Some("max_loaded_shards = 6\n"), RAM_16G).unwrap();
+        assert_eq!(settings.max_loaded_shards, Some(6));
         assert_eq!(
-            from_file.max_loaded_shards_source,
+            settings.max_loaded_shards_source,
             SettingSource::SettingsFile(file().unwrap())
         );
-        assert!(from_file.settings_file_present);
+        assert!(settings.settings_file_present);
+        assert_eq!(settings.memory_budget_source, SettingSource::Default);
+        let report = settings.report();
+        assert_eq!(report["max_loaded_shards"], 6);
         assert_eq!(
-            from_file.report(),
-            json!({
-                "max_loaded_shards": 6,
-                "max_loaded_shards_source":
-                    "settings file /home/op/.config/lattice/daemon.toml",
-                "settings_file": "/home/op/.config/lattice/daemon.toml",
-                "settings_file_present": true,
-            })
+            report["max_loaded_shards_source"],
+            "settings file /home/op/.config/lattice/daemon.toml"
+        );
+        assert_eq!(report["settings_file_present"], true);
+    }
+
+    #[test]
+    fn precedence_is_environment_then_file_then_default_for_both_keys() {
+        let text = "max_loaded_shards = 6\nmemory_budget_mb = 3000\n";
+        let from_file = resolve(&env_of(&[]), file(), Some(text), RAM_16G).unwrap();
+        assert_eq!(from_file.max_loaded_shards, Some(6));
+        assert_eq!(from_file.memory_budget_bytes, 3000 * 1024 * 1024);
+        assert_eq!(
+            from_file.memory_budget_source,
+            SettingSource::SettingsFile(file().unwrap())
         );
 
-        let env = env_of(&[(MAX_LOADED_SHARDS_ENV, " 9 ")]);
-        let from_env = resolve(&env, file(), Some("max_loaded_shards = 6\n"), 4).unwrap();
-        assert_eq!(from_env.max_loaded_shards, 9);
+        let env = env_of(&[(MAX_LOADED_SHARDS_ENV, " 9 "), (MEMORY_BUDGET_ENV, "8192")]);
+        let from_env = resolve(&env, file(), Some(text), RAM_16G).unwrap();
+        assert_eq!(from_env.max_loaded_shards, Some(9));
         assert_eq!(
             from_env.max_loaded_shards_source.describe(),
             "environment variable LATTICE_MAX_LOADED_SHARDS"
+        );
+        assert_eq!(from_env.memory_budget_bytes, 8192 * 1024 * 1024);
+        assert_eq!(
+            from_env.memory_budget_source.describe(),
+            "environment variable LATTICE_MEMORY_BUDGET_MB"
         );
 
         // The older variable still works, and the current one beats it.
         let legacy = env_of(&[(MAX_LOADED_WORKSPACES_ENV, "5")]);
         assert_eq!(
-            resolve(&legacy, file(), None, 4).unwrap().max_loaded_shards,
-            5
+            resolve(&legacy, file(), None, RAM_16G).unwrap().max_loaded_shards,
+            Some(5)
         );
-        let both = env_of(&[
-            (MAX_LOADED_WORKSPACES_ENV, "5"),
-            (MAX_LOADED_SHARDS_ENV, "7"),
-        ]);
+        let both = env_of(&[(MAX_LOADED_WORKSPACES_ENV, "5"), (MAX_LOADED_SHARDS_ENV, "7")]);
         assert_eq!(
-            resolve(&both, file(), None, 4).unwrap().max_loaded_shards,
-            7
+            resolve(&both, file(), None, RAM_16G).unwrap().max_loaded_shards,
+            Some(7)
         );
         // An empty variable is unset, not zero.
-        let empty = env_of(&[(MAX_LOADED_SHARDS_ENV, "  ")]);
-        assert_eq!(
-            resolve(&empty, file(), Some("max_loaded_shards = 6"), 4)
-                .unwrap()
-                .max_loaded_shards,
-            6
-        );
+        let empty = env_of(&[(MAX_LOADED_SHARDS_ENV, "  "), (MEMORY_BUDGET_ENV, "")]);
+        let settings = resolve(&empty, file(), Some(text), RAM_16G).unwrap();
+        assert_eq!(settings.max_loaded_shards, Some(6));
+        assert_eq!(settings.memory_budget_bytes, 3000 * 1024 * 1024);
     }
 
     #[test]
-    fn a_file_without_the_key_or_with_only_comments_falls_through_to_the_default() {
-        let none = env_of(&[]);
+    fn a_file_without_keys_or_with_only_comments_falls_through_to_the_defaults() {
         for text in ["", "# nothing set yet\n", "\n\n"] {
-            let settings = resolve(&none, file(), Some(text), 3).unwrap();
-            assert_eq!(settings.max_loaded_shards, 3);
-            assert_eq!(settings.max_loaded_shards_source, SettingSource::Default);
+            let settings = resolve(&env_of(&[]), file(), Some(text), RAM_16G).unwrap();
+            assert_eq!(settings.max_loaded_shards, None);
+            assert_eq!(settings.memory_budget_source, SettingSource::Default);
             assert!(settings.settings_file_present);
         }
-        assert_eq!(resolve(&none, None, None, 0).unwrap().max_loaded_shards, 1);
-        assert_eq!(
-            resolve(&none, None, None, 10_000)
-                .unwrap()
-                .max_loaded_shards,
-            MAX_LOADED_SHARDS_LIMIT
-        );
     }
 
     #[test]
     fn invalid_file_values_are_rejected_with_the_file_and_key_named() {
-        let none = env_of(&[]);
         for (text, expected) in [
             ("max_loaded_shards = 0", "must be between 1 and 64, got 0"),
             ("max_loaded_shards = -2", "must be between 1 and 64, got -2"),
@@ -377,17 +513,18 @@ mod tests {
             ("max_loaded_shards = true", "must be a whole number"),
             ("[max_loaded_shards]\nvalue = 6", "not a table"),
             ("max_loaded_shard = 6", "unknown key `max_loaded_shard`"),
-            (
-                "max_loaded_shards = 6\nidle_ttl = 5",
-                "unknown key `idle_ttl`",
-            ),
+            ("max_loaded_shards = 6\nidle_ttl = 5", "unknown key `idle_ttl`"),
             ("max_loaded_shards = ", "not valid TOML"),
-            (
-                "max_loaded_shards = 6\nmax_loaded_shards = 7",
-                "not valid TOML",
-            ),
+            ("max_loaded_shards = 6\nmax_loaded_shards = 7", "not valid TOML"),
+            ("memory_budget_mb = 100", "must be between 512 and"),
+            ("memory_budget_mb = -1", "must be between 512 and"),
+            ("memory_budget_mb = \"6GB\"", "must be a whole number"),
+            ("memory_budget = 4096", "unknown key `memory_budget`"),
         ] {
-            let error = format!("{:#}", resolve(&none, file(), Some(text), 4).unwrap_err());
+            let error = format!(
+                "{:#}",
+                resolve(&env_of(&[]), file(), Some(text), RAM_16G).unwrap_err()
+            );
             assert!(error.contains(expected), "{text:?} gave {error}");
             assert!(error.contains("daemon.toml"), "{error}");
         }
@@ -395,25 +532,35 @@ mod tests {
 
     #[test]
     fn invalid_environment_values_are_rejected_rather_than_ignored() {
-        for (value, expected) in [
-            ("six", "is not a whole number"),
-            ("6.0", "is not a whole number"),
-            ("0", "must be between 1 and 64, got 0"),
-            ("-1", "must be between 1 and 64, got -1"),
-            ("1000", "must be between 1 and 64, got 1000"),
+        for (name, value, expected) in [
+            (MAX_LOADED_SHARDS_ENV, "six", "is not a whole number"),
+            (MAX_LOADED_SHARDS_ENV, "6.0", "is not a whole number"),
+            (MAX_LOADED_SHARDS_ENV, "0", "must be between 1 and 64, got 0"),
+            (MAX_LOADED_SHARDS_ENV, "-1", "must be between 1 and 64, got -1"),
+            (MAX_LOADED_SHARDS_ENV, "1000", "must be between 1 and 64, got 1000"),
+            (MEMORY_BUDGET_ENV, "lots", "is not a whole number"),
+            (MEMORY_BUDGET_ENV, "64", "must be between 512 and"),
         ] {
-            let env = env_of(&[(MAX_LOADED_SHARDS_ENV, value)]);
-            let error = format!("{:#}", resolve(&env, file(), None, 4).unwrap_err());
+            let env = env_of(&[(name, value)]);
+            let error = format!("{:#}", resolve(&env, file(), None, RAM_16G).unwrap_err());
             assert!(error.contains(expected), "{value:?} gave {error}");
-            assert!(error.contains(MAX_LOADED_SHARDS_ENV), "{error}");
+            assert!(error.contains(name), "{error}");
         }
     }
 
     #[test]
     fn a_broken_file_is_an_error_even_when_the_environment_would_win() {
         let env = env_of(&[(MAX_LOADED_SHARDS_ENV, "9")]);
-        let error = resolve(&env, file(), Some("max_loaded_shards = 0"), 4).unwrap_err();
+        let error = resolve(&env, file(), Some("max_loaded_shards = 0"), RAM_16G).unwrap_err();
         assert!(format!("{error:#}").contains("daemon.toml"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn physical_memory_is_readable_and_plausible_here() {
+        let bytes = physical_memory_bytes().expect("physical memory is readable here");
+        assert!(bytes >= GIB, "{bytes}");
+        assert!(bytes < 64 * 1024 * GIB, "{bytes}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
