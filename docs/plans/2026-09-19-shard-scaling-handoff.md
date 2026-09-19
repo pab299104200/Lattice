@@ -124,7 +124,14 @@ another port, `LATTICE_LIFECYCLE_LOG_DIR`).
 
 ## Rollout and rollback
 
-Owner: the coordinator or Pete. Nothing below has been run against the live install.
+**Rolled out 2026-09-19 about 11:55 EDT** (steps 1 to 6; step 7 not run): `master`
+fast-forwarded, `max_loaded_shards = 6` removed (the settings file is now empty, so the defaults
+apply), release build, daemon restarted. `lattice doctor` in relay and lattice: every check PASS,
+"memory budget 5461 MiB from built-in default; no shard ceiling". The rollout exposed a
+pre-existing `doctor` defect: in the five enforcing workspaces every hook fixture failed, because
+the fixture cuts the hook off from the daemon and expected silence, while enforcement correctly
+prints its fail-open notice. Fixed: under enforcement the fixture now requires that notice and
+rejects any block.
 
 1. Merge: `git -C /Users/pete/Cadres/lattice merge --ff-only feature/demand-driven-shards`
    (branch is based on `master` at `71552ca`).

@@ -60,6 +60,11 @@ struct HookFixtureResult {
 enum HookFixtureStdout {
     Silent,
     SessionStartRecovery(HookFixtureHost),
+    /// The workspace enforces the Lattice workflow. The fixture cuts the
+    /// hook off from the daemon, so the hook must say so, once, and must not
+    /// block anything (`docs/hook-enforcement.md`, "Fail-open rule").
+    /// Silence here would be the defect enforcement exists to prevent.
+    EnforcedFailOpen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -989,7 +994,8 @@ fn run_hook_fixture(
     if !command.is_file() {
         anyhow::bail!("configured hook path is missing: {}", command.display());
     }
-    let expected_stdout = hook_fixture_stdout_contract(registration)?;
+    let enforcing = crate::hook_enforcement::load_policy(workspace).enforcing();
+    let expected_stdout = hook_fixture_stdout_contract(registration, enforcing)?;
     let state_root = doctor_hook_fixture_state_root()?;
     let result = run_hook_fixture_at(
         &command,
@@ -1034,7 +1040,14 @@ fn hook_fixture_is_eligible(registration: &HookRegistration, workspace: &Path) -
         && hook_command_path(registration, workspace).is_file()
 }
 
-fn hook_fixture_stdout_contract(registration: &HookRegistration) -> Result<HookFixtureStdout> {
+fn hook_fixture_stdout_contract(
+    registration: &HookRegistration,
+    enforcing: bool,
+) -> Result<HookFixtureStdout> {
+    // SessionEnd has no channel to the agent, so it is silent either way.
+    if enforcing && registration.event != "SessionEnd" {
+        return Ok(HookFixtureStdout::EnforcedFailOpen);
+    }
     if registration.event != "SessionStart" {
         return Ok(HookFixtureStdout::Silent);
     }
@@ -1166,6 +1179,33 @@ fn validate_hook_fixture_stdout(
         anyhow::bail!("wrote stdout: {}", fixture_output_summary(stdout));
     }
     match expected {
+        HookFixtureStdout::EnforcedFailOpen => {
+            let text = String::from_utf8_lossy(&stdout.bytes);
+            let notices = [
+                crate::hook_enforcement::NoticeCondition::DaemonUnreachable,
+                crate::hook_enforcement::NoticeCondition::CaptureUnavailable,
+            ]
+            .map(crate::hook_enforcement::notice_text);
+            // Notices may arrive JSON-escaped inside a host envelope.
+            let says_why = notices.iter().any(|notice| {
+                text.contains(notice.as_str())
+                    || text.contains(serde_json::to_string(notice).unwrap().trim_matches('"'))
+            });
+            let blocks = text.contains("\"deny\"") || text.contains("\"block\"");
+            if says_why && !blocks {
+                Ok(())
+            } else if blocks {
+                anyhow::bail!(
+                    "blocked while the daemon was unreachable; enforcement must fail open: {}",
+                    fixture_output_summary(stdout)
+                )
+            } else {
+                anyhow::bail!(
+                    "did not state that Lattice was unreachable, which an enforcing workspace must: {}",
+                    fixture_output_summary(stdout)
+                )
+            }
+        }
         HookFixtureStdout::Silent if stdout.bytes.is_empty() => Ok(()),
         HookFixtureStdout::Silent => {
             anyhow::bail!("wrote stdout: {}", fixture_output_summary(stdout))
@@ -1382,6 +1422,57 @@ fn file_digest(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_enforcing_workspace_fixture_must_fail_open_loudly() {
+        use crate::hook_enforcement::{notice_text, NoticeCondition};
+        let output = |text: String| LimitedFixtureOutput {
+            bytes: text.into_bytes(),
+            truncated: false,
+        };
+        let unreachable = notice_text(NoticeCondition::DaemonUnreachable);
+        // Plain text, as Codex prints it.
+        validate_hook_fixture_stdout(
+            HookFixtureStdout::EnforcedFailOpen,
+            &output(format!("lattice: {unreachable}\n")),
+        )
+        .unwrap();
+        // Inside a Claude Code envelope.
+        let envelope = serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": format!("lattice: {unreachable}")}});
+        validate_hook_fixture_stdout(
+            HookFixtureStdout::EnforcedFailOpen,
+            &output(envelope.to_string()),
+        )
+        .unwrap();
+        // Stop reports missing capture instead.
+        let stop = serde_json::json!({"systemMessage":
+            format!("lattice: {}", notice_text(NoticeCondition::CaptureUnavailable))});
+        validate_hook_fixture_stdout(
+            HookFixtureStdout::EnforcedFailOpen,
+            &output(stop.to_string()),
+        )
+        .unwrap();
+
+        // Silence is the defect enforcement exists to prevent.
+        let error = validate_hook_fixture_stdout(
+            HookFixtureStdout::EnforcedFailOpen,
+            &output(String::new()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not state"), "{error}");
+        // Blocking while the daemon is unreachable breaks the fail-open rule.
+        let deny = serde_json::json!({"hookSpecificOutput": {
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!("lattice: {unreachable}")}});
+        let error = validate_hook_fixture_stdout(
+            HookFixtureStdout::EnforcedFailOpen,
+            &output(deny.to_string()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must fail open"), "{error}");
+    }
 
     #[test]
     fn doctor_reports_capacity_memory_the_ceiling_and_a_pending_restart() {
@@ -1746,7 +1837,7 @@ mod tests {
             timeout_secs: Some(5),
         };
         assert_eq!(
-            hook_fixture_stdout_contract(&codex).unwrap(),
+            hook_fixture_stdout_contract(&codex, false).unwrap(),
             HookFixtureStdout::SessionStartRecovery(HookFixtureHost::Codex)
         );
 
@@ -1756,14 +1847,33 @@ mod tests {
             ..codex.clone()
         };
         assert_eq!(
-            hook_fixture_stdout_contract(&claude).unwrap(),
+            hook_fixture_stdout_contract(&claude, false).unwrap(),
             HookFixtureStdout::SessionStartRecovery(HookFixtureHost::ClaudeCode)
         );
 
-        let error = hook_fixture_stdout_contract(&HookRegistration {
-            command: "/workspace/integrations/claude-code/hooks/session-start.sh".to_string(),
-            ..codex
-        })
+        // Under enforcement every event but SessionEnd must speak up.
+        assert_eq!(
+            hook_fixture_stdout_contract(&codex, true).unwrap(),
+            HookFixtureStdout::EnforcedFailOpen
+        );
+        assert_eq!(
+            hook_fixture_stdout_contract(
+                &HookRegistration {
+                    event: "SessionEnd".to_string(),
+                    ..claude.clone()
+                },
+                true
+            )
+            .unwrap(),
+            HookFixtureStdout::Silent
+        );
+        let error = hook_fixture_stdout_contract(
+            &HookRegistration {
+                command: "/workspace/integrations/claude-code/hooks/session-start.sh".to_string(),
+                ..codex
+            },
+            false,
+        )
         .unwrap_err();
         assert!(error
             .to_string()
