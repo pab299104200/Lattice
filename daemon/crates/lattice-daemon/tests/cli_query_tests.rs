@@ -224,6 +224,7 @@ fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
         .local_addr()
         .expect("fake daemon address")
         .to_string();
+    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept proxy");
         let mut reader = BufReader::new(stream);
@@ -235,34 +236,33 @@ fn stdio_proxy_exits_within_two_seconds_when_client_stdin_closes() {
         );
         let mut stream = reader.into_inner();
         acknowledge_hello(&mut stream, &hello);
+        connected_tx
+            .send(Instant::now())
+            .expect("signal proxy handshake");
         let mut reader = BufReader::new(stream);
-        let mut remainder = String::new();
-        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
-            remainder.clear();
-        }
+        drain_until_disconnect(&mut reader);
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
-        .args(["--stdio", "--workspace"])
-        .arg(&workspace)
-        .env("LATTICE_DAEMON_ADDR", &addr)
-        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn stdio proxy");
+    let mut child = spawn_stdio_proxy(&addr, &workspace, &[]);
 
-    let closed_at = Instant::now();
+    // The client closes stdin before the proxy has even started: the hardest
+    // case, because EOF is already pending when the proxy connects. The
+    // lifecycle bound is on the proxy's own behaviour, from the moment it is
+    // connected with EOF pending to the moment it exits. Measuring from spawn
+    // instead timed process startup, and failed whenever the machine was busy.
     drop(child.stdin.take());
-    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    let connected_at = connected_rx
+        .recv_timeout(PROCESS_STARTUP_ALLOWANCE)
+        .expect("stdio proxy did not start and complete its handshake");
+    let status = wait_for_exit(&mut child, PROCESS_STARTUP_ALLOWANCE);
+    let exited_after = connected_at.elapsed();
     assert!(
         status.success(),
         "stdio proxy failed after EOF: status={status:?}"
     );
     assert!(
-        closed_at.elapsed() <= Duration::from_secs(2),
-        "stdio proxy exceeded the two-second EOF lifecycle bound"
+        exited_after <= Duration::from_secs(2),
+        "stdio proxy took {exited_after:?} to exit after connecting with EOF pending; the lifecycle bound is two seconds"
     );
     server.join().expect("fake daemon joins");
 }
@@ -294,25 +294,16 @@ fn stdio_proxy_stays_connected_while_client_stdin_is_open_and_idle() {
         )
         .expect("write later response");
 
-        let mut remainder = String::new();
-        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
-            remainder.clear();
-        }
+        drain_until_disconnect(&mut reader);
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
-        .args(["--stdio", "--workspace"])
-        .arg(&workspace)
-        .env("LATTICE_DAEMON_ADDR", &addr)
-        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
-        // The removed idle reaper honored this small value. Keeping it in the
-        // regression fixture proves stale operator configuration is harmless.
-        .env("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn stdio proxy");
+    // The removed idle reaper honored this small value. Keeping it in the
+    // regression fixture proves stale operator configuration is harmless.
+    let mut child = spawn_stdio_proxy(
+        &addr,
+        &workspace,
+        &[("LATTICE_PROXY_IDLE_TIMEOUT_SECS", "1")],
+    );
 
     thread::sleep(Duration::from_millis(1200));
     assert!(
@@ -373,22 +364,10 @@ fn stdio_proxy_keeps_an_in_flight_request_connected_until_response() {
         writeln!(stream, "{}", r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
             .expect("write delayed response");
         response_sent_tx.send(()).expect("signal delayed response");
-        let mut remainder = String::new();
-        while reader.read_line(&mut remainder).expect("read proxy EOF") != 0 {
-            remainder.clear();
-        }
+        drain_until_disconnect(&mut reader);
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lattice"))
-        .args(["--stdio", "--workspace"])
-        .arg(&workspace)
-        .env("LATTICE_DAEMON_ADDR", &addr)
-        .env("XDG_RUNTIME_DIR", install_fake_credential(&addr))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn stdio proxy");
+    let mut child = spawn_stdio_proxy(&addr, &workspace, &[]);
     writeln!(
         child.stdin.as_mut().expect("proxy stdin"),
         "{}",
@@ -401,9 +380,10 @@ fn stdio_proxy_keeps_an_in_flight_request_connected_until_response() {
         .expect("proxy stdin")
         .flush()
         .expect("flush proxy request");
+    // Includes process startup, which is not what this test is about.
     request_received_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("proxy did not forward request to daemon");
+        .recv_timeout(PROCESS_STARTUP_ALLOWANCE)
+        .expect("proxy did not start and forward the request to the daemon");
 
     thread::sleep(Duration::from_millis(2100));
     assert!(
@@ -482,18 +462,99 @@ fn handle_connection(stream: TcpStream, observed: &Arc<Mutex<Vec<String>>>, mode
     let _ = writeln!(writer, "{}", response);
 }
 
+/// How long a test waits for a spawned `lattice` to start, connect and
+/// complete its handshake. Startup is not a behaviour under test here.
+///
+/// It is also not cheap under `cargo test`. Cargo re-places the binary on
+/// every invocation, which gives it a new inode with identical content, and
+/// macOS validates the code signature of an executable it has not launched
+/// before. For this unoptimised binary of about 107 MB that first launch was
+/// measured at 2.4 to 3.8 seconds on an idle ten-core machine, against 20 ms
+/// for the second launch of the same file, and it grows with load. Bounds of
+/// two seconds measured from `spawn` were therefore timing the operating
+/// system, and failed on every run once the machine was busy. Thirty seconds
+/// is roughly ten times the idle measurement. A proxy that has not connected
+/// by then is broken, not slow.
+const PROCESS_STARTUP_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// Every `lattice` process these tests start, built one way.
+///
+/// The fake daemon's address and credential are not enough isolation. A
+/// proxy that loses its daemon reconnects, and if nothing is listening it
+/// starts a real `lattice --daemon`. Before this helper a failing test left
+/// exactly that behind: a surviving proxy auto-started a real daemon on the
+/// test's random port, under the developer's real HOME, where it opened the
+/// same hook-session state as their live daemon. So each process gets a
+/// private HOME and state, config and log roots, and `LATTICE_DAEMON_EXE`
+/// names a program that exits at once, so auto-start cannot produce a daemon.
+fn lattice_command(addr: &str) -> Command {
+    let sandbox = fake_runtime_base(addr).join("sandbox-home");
+    std::fs::create_dir_all(&sandbox).expect("create sandbox home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lattice"));
+    command
+        .env("LATTICE_DAEMON_ADDR", addr)
+        .env("XDG_RUNTIME_DIR", install_fake_credential(addr))
+        .env("HOME", &sandbox)
+        .env("XDG_STATE_HOME", sandbox.join("state"))
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("LATTICE_LIFECYCLE_LOG_DIR", sandbox.join("logs"))
+        .env("LATTICE_DAEMON_EXE", NOT_A_DAEMON)
+        .env_remove("LATTICE_MAX_LOADED_SHARDS")
+        .env_remove("LATTICE_MAX_LOADED_WORKSPACES");
+    command
+}
+
+#[cfg(unix)]
+const NOT_A_DAEMON: &str = "/usr/bin/false";
+#[cfg(not(unix))]
+const NOT_A_DAEMON: &str = "C:\\Windows\\System32\\where.exe";
+
+/// Kills and reaps its process when dropped. A panicking assertion must not
+/// leave a proxy running after its test's fake daemon has gone.
+struct OwnedChild(std::process::Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for OwnedChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+fn spawn_stdio_proxy(addr: &str, workspace: &PathBuf, extra_env: &[(&str, &str)]) -> OwnedChild {
+    let mut command = lattice_command(addr);
+    command
+        .args(["--stdio", "--workspace"])
+        .arg(workspace)
+        .envs(extra_env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    OwnedChild(command.spawn().expect("spawn stdio proxy"))
+}
+
 fn run_lattice(
     addr: &str,
     cwd: &PathBuf,
     args: &[&str],
     stdin_text: Option<&str>,
 ) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lattice"));
+    let mut command = lattice_command(addr);
     command
         .args(args)
         .current_dir(cwd)
-        .env("LATTICE_DAEMON_ADDR", addr)
-        .env("XDG_RUNTIME_DIR", install_fake_credential(addr))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if stdin_text.is_some() {
@@ -509,6 +570,30 @@ fn run_lattice(
             .expect("write stdin");
     }
     child.wait_with_output().expect("wait")
+}
+
+/// Read until the proxy has gone away. These fake daemons drain only to
+/// outlive the proxy; how the connection ends is not under test. A proxy that
+/// exits closes its socket, and the peer may see that as a clean end of
+/// stream or as a reset depending on timing, so both count as gone. Any other
+/// error is still a failure.
+fn drain_until_disconnect(reader: &mut impl BufRead) {
+    let mut remainder = String::new();
+    loop {
+        match reader.read_line(&mut remainder) {
+            Ok(0) => return,
+            Ok(_) => remainder.clear(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return
+            }
+            Err(error) => panic!("read from proxy failed: {error}"),
+        }
+    }
 }
 
 fn acknowledge_hello(stream: &mut TcpStream, hello: &str) {

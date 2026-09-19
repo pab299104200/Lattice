@@ -659,8 +659,17 @@ fn run_mcp_verification_process(
             program.display()
         )
     })?;
-    stdin.write_all(input.as_bytes())?;
-    stdin.flush()?;
+    // A command that dies at once closes its stdin before this write. That is
+    // not the failure to report: carry on, so the read loop below can report
+    // its exit status and stderr, which say why it died.
+    match stdin
+        .write_all(input.as_bytes())
+        .and_then(|()| stdin.flush())
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => return Err(error.into()),
+    }
 
     let stdout = child.stdout.take().ok_or_else(|| {
         anyhow!(
@@ -722,7 +731,10 @@ fn run_mcp_verification_process(
                 }),
             },
             Ok(Ok(None)) => {
-                if let Some(status) = child.try_wait()? {
+                // End of stdout is seen a moment before the exit status can
+                // be collected. Asking once loses that race under load and
+                // reports "closed stdout" with no status and no stderr.
+                if let Some(status) = wait_briefly_for_exit(&mut child, deadline)? {
                     let mut stderr = String::new();
                     if let Some(mut stream) = child.stderr.take() {
                         let _ = stream.read_to_string(&mut stderr);
@@ -1156,6 +1168,28 @@ struct HookProcessContext<'a> {
     workspace: &'a Path,
     executable: &'a Path,
     state_root: &'a Path,
+}
+
+/// How long to wait for the exit status of a process whose stdout has already
+/// reached end of file. What remains is process teardown, which takes
+/// milliseconds; two seconds allows for a heavily loaded machine. A process
+/// still running after that really did close stdout while staying alive.
+const EXIT_AFTER_EOF_GRACE: Duration = Duration::from_secs(2);
+
+fn wait_briefly_for_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let give_up = deadline.min(Instant::now() + EXIT_AFTER_EOF_GRACE);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= give_up {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// The verifier deliberately has a deadline: a broken hook must make install
@@ -3398,6 +3432,50 @@ mod tests {
             .to_string();
 
         assert!(error.contains("configured MCP command exited"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn mcp_config_for(executable: &Path) -> Value {
+        json!({"mcpServers": {"lattice": {
+            "type": "stdio", "command": executable, "args": ["--stdio"]
+        }}})
+    }
+
+    #[test]
+    fn install_verify_reports_the_exit_status_even_when_stdout_closes_first() {
+        let (root, _workspace, runtime) = install_fixture();
+        // Close stdout, then take a moment to exit: the window the verifier
+        // used to lose, when it asked for the status exactly once.
+        write_executable(
+            &runtime.executable,
+            "#!/bin/sh\necho 'lattice: cannot open index' >&2\nexec 1>&-\nsleep 0.4\nexit 23\n",
+        );
+        let error = verify_configured_mcp_server(
+            &mcp_config_for(&runtime.executable),
+            Path::new("/fixture/.mcp.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("configured MCP command exited"), "{error}");
+        assert!(error.contains("23"), "{error}");
+        assert!(error.contains("cannot open index"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_verify_says_stdout_closed_only_when_the_command_is_still_running() {
+        let (root, _workspace, runtime) = install_fixture();
+        write_executable(&runtime.executable, "#!/bin/sh\nexec 1>&-\nsleep 6\n");
+        let started = Instant::now();
+        let error = verify_configured_mcp_server(
+            &mcp_config_for(&runtime.executable),
+            Path::new("/fixture/.mcp.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("closed stdout before returning"), "{error}");
+        assert!(started.elapsed() >= EXIT_AFTER_EOF_GRACE);
+        assert!(started.elapsed() < INSTALL_VERIFY_TIMEOUT);
         fs::remove_dir_all(root).unwrap();
     }
 

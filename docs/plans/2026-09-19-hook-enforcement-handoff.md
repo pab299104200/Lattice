@@ -239,6 +239,77 @@ and `indexed_plan_reaches_cache_after_four_thousand_absent_rows` (one-second gra
 in code this branch changes. **hypothesis**: load-sensitive timing, with two suites and a
 measurement daemon running at once.
 
+## Third follow-up, 2026-09-19: two proxy tests failing for the coordinator
+
+Branch `fix/proxy-test-isolation`, off `master` at 57280aa. Not merged: `master` is the live
+checkout, so merging is the coordinator's call.
+
+**Not caused by the enforcement change, and not a behavioural regression.** **verified**:
+`git diff 6955329..57280aa` is empty for `proxy.rs`, `transport.rs`, `transport_credentials.rs`,
+`lifecycle_log.rs` and `tests/`, and adds only four `mod` lines to `main.rs`.
+
+**Cause, verified by measurement.** `cargo test` re-places `target/debug/lattice` on every
+invocation: same SHA, size and mtime, **new inode** each time (363341335, 363352804, 363353352 in
+three consecutive runs). macOS validates the ad-hoc code signature of an executable it has not
+launched before. A fresh copy of the debug binary takes **1.7 to 2.0 s on first launch and 7 ms
+on the second**, measured for the old 101 MB binary and the new 102 MB one alike. Through cargo
+the proxy logged `process_start` 2.5 s after `spawn()` returned, then connected in 10 ms. Run
+directly, without cargo re-placing the binary, the same test forwards its request in 20 ms.
+
+Both failing tests put a two-second bound on something measured from `spawn()`:
+`child did not exit within 2s` and `proxy did not forward request to daemon: Timeout`. They were
+timing the operating system. Old `master` passed 3 of 3 on an idle machine with about 5 to 10
+percent of margin; one more megabyte of binary, or any load, removes it. I reproduced 3 of 3
+failures under synthetic load, and 4 of 6 on unchanged `master` on a quiet machine.
+
+**A real defect found on the way.** When either test failed, its proxy child was dropped without
+being killed. The fake daemon then went away, the surviving proxy reconnected, found nothing
+listening, and **auto-started a real `lattice --daemon`** on the test's random port under the
+developer's real `HOME`, where it opened the same hook-session state as the live daemon. That is
+what the two orphan `target/enforcement/debug/lattice --daemon` processes at 00:09 were. My own
+runs on unchanged `master` produced seven more, which I killed after checking each command line.
+The tests also wrote to the real `~/.lattice/logs/lifecycle.jsonl`. They never touched the live
+daemon's socket: each uses its own port and a fake credential.
+
+**Fixes.**
+- `tests/cli_query_tests.rs`: every spawned process is built by one helper with a private
+  `HOME`, state, config and log roots, and `LATTICE_DAEMON_EXE=/usr/bin/false` so auto-start
+  cannot produce a daemon. Children are killed and reaped on drop. **verified** by injecting
+  two failures: 0 orphans, 0 lines added to the real lifecycle log.
+- The two-second lifecycle bound is kept, not relaxed, and is now measured from the completed
+  handshake to exit, with EOF already pending. **verified** actual value: 15 ms. Startup gets
+  its own 30-second allowance, about ten times the idle first-launch measurement, with the
+  reason recorded in the code.
+- Fake daemons that drain only to outlive the proxy accept a connection reset as well as a
+  clean end of stream. I saw one such reset, once.
+- `cli.rs`, a product fix: `install --verify` asked for the MCP command's exit status exactly
+  once, at the instant stdout closed. Under load it lost that race and reported "closed stdout"
+  with no status and no stderr, which is the coordinator's one-off
+  `install_verify_fails_loudly...` failure and the unhelpful message I met in my own sandbox.
+  It now waits up to two seconds for the status (teardown takes milliseconds), and a broken
+  pipe when writing to an already-dead command no longer pre-empts the report. Two new tests;
+  the first fails with the old message when the wait is removed.
+
+**Three full runs**, `cargo test --workspace --no-fail-fast`, in this worktree:
+
+| Run | Load average at start | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| 1 | 6.5 | 2,343 | 0 | 39 |
+| 2 | 13.3 | 2,343 | 0 | 39 |
+| 3 | 17.9 | 2,343 | 0 | 39 |
+
+No orphan processes afterwards. `cargo fmt --check` passes.
+
+**Still load-sensitive, not changed:** `authenticated_ordinary_rpc_loads_its_shard_only_after_
+first_request` (250 ms admission bound) and `indexed_plan_reaches_cache_after_four_thousand_
+absent_rows` (one-second grace) each failed once earlier under heavy load and passed in all three
+runs above.
+
+**The rollout has already happened**, at 00:43 EDT and not by me: `master` was fast-forwarded to
+57280aa, `~/.config/lattice/daemon.toml` written with `max_loaded_shards = 6`, the release binary
+rebuilt, the old daemon (pid 57458) replaced by pid 97609. **verified** from the new daemon:
+`max_loaded_shards=6 from settings file ...; 6 loaded, 5 pinned; daemon memory 1443 MiB`.
+
 ## Design decisions
 
 ### How the daemon knows a `prepare_change` happened
