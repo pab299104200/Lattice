@@ -52,9 +52,9 @@ This file is the resume point. Update it and commit after every task.
 - [x] (e) Transparent unload of idle-but-connected shards
 - [x] Test hygiene: unit tests ran against the real HOME (see Findings) — `0116284`
 - [x] Memory sweep unloads at most one shard per tick
-- [ ] (c) Doctor output reviewed end to end on a private daemon
-- [ ] (f) Memory growth: attribute the live allocations that survive unloading; fix; allocator retention
-- [ ] (g) Docs: `docs/shard-capacity.md`, README daemon settings, shard architecture doc, hook-enforcement.md
+- [x] (c) Status and doctor visibility (unit-tested; exercised by the acceptance run)
+- [x] (f) Memory growth found and fixed: the embedding model ran whole workspaces in one pass — `c6e49ab`
+- [x] (g) Docs: `docs/shard-capacity.md`, README daemon settings, resource budgets, shard architecture, hook-enforcement — `c588d20`, `ab22819`
 - [ ] Full suite three times with `--no-fail-fast`, fmt, clippy, no orphan processes, real HOME untouched
 - [ ] Private-daemon acceptance: N workspaces load, idle eviction, reconnect reload, memory pressure
 
@@ -77,6 +77,25 @@ This file is the resume point. Update it and commit after every task.
    `malloc_zone_pressure_relief(NULL, 0)` returns 0 and changes nothing; after freeing all of
    400 MiB of 100 KB blocks the footprint stays at 350 MiB (probe `relief.c` in the session scratchpad).
 5. Hooks do not grow memory: 900 hook calls with no shard loaded added about 2.5 MB.
+6. **Shard load and unload do not leak.** Under malloc stack logging, three load, query and
+   unload cycles of one workspace left 545 KB of live allocations (1,944 blocks).
+7. **The growth is the embedding model's ONNX Runtime arena.** The live heap held single blocks
+   of 256, 128, 64, 32 and 16 MiB, each 16 KiB over a power of two: an arena that doubles and
+   never shrinks, held by the process-wide embedding engine. `vector_sync` embedded every file
+   summary of a workspace in one run. Measured: one run of 2,000 texts leaves 7,049 MiB for the
+   life of the process; runs of 16 leave 296 MiB and are 2.3 times faster (17.4 s against 40.0 s).
+   Fixed in `EmbeddingEngine::embed_batch` (`EMBEDDING_RUN_BATCH = 16`), with a model-free unit
+   test and a real-model equivalence test (`--ignored`, needs `ORT_DYLIB_PATH`).
+8. **mimalloc was tried and rejected**: over four load and unload cycles it held 186 to 285 MiB
+   after each unload against 32 to 136 MiB for the system allocator.
+9. **Private-daemon experiments before 11:00 ran without embeddings**: ONNX Runtime is loaded
+   from beside the executable, and worktree builds do not have it. Copy
+   `libonnxruntime.dylib` next to the binary, and set `LATTICE_EMBEDDING_MODEL_DIR` to the
+   versioned directory (`~/.lattice/models/all-minilm-l6-v2-1110a243`), not its parent.
+10. Outside this change, seen on the way (hypotheses, not investigated): index jobs on four
+    fresh clones of real repositories ran one at a time and mostly waited rather than computed
+    (11 jobs in 20 minutes, the daemon near 0 % CPU); memory maintenance logged
+    `snapshot content hash mismatch` for a freshly created keystone memory store.
 
 ## Build and test
 
