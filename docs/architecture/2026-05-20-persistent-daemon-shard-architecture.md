@@ -224,6 +224,25 @@ Eviction priority should prefer:
 
 The structural shard graph should be compact enough that a warm shard is affordable; if not, the graph model itself is wrong.
 
+### As built: capacity follows connected agents (2026-09-19)
+
+A fixed "max concurrently warm shards" count starved whichever workspace connected after it was
+reached: Relay went unindexed for most of a day behind three slots held by other open sessions.
+Pete's ruling replaced the count: "the shard index should just be scaling with the number of
+agents connected." The daemon now:
+
+- gives every workspace with a connected agent a shard, one per checkout however many agents
+  share it;
+- limits itself by its measured memory footprint against `memory_budget_mb` (default a third of
+  physical memory), not by a count; `max_loaded_shards` survives only as an optional operator
+  ceiling, unset by default and reported whenever it defers anyone;
+- under pressure unloads, least recently used first, shards with no connection, then shards whose
+  agents have been silent for 10 minutes, and never a shard that is loading, indexing or serving;
+- resolves each session's shard per request, so an unloaded shard reloads transparently on its
+  next request and a deferred workspace heals without reconnecting.
+
+The rules, settings and signals are in [shard capacity](../shard-capacity.md).
+
 ## Migration Plan
 
 ### Phase 1: Introduce shard registry without changing tool contracts

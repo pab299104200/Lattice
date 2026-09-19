@@ -121,21 +121,26 @@ run, and that it must say so in its report.
 | Adapter exceeded its two-second deadline | `lattice status --timeout 2` |
 | Adapter failed locally, such as unreadable private state | `lattice doctor` |
 | Index still indexing | `lattice status` |
-| Index deferred because every shard slot is busy | close another workspace's session or raise `LATTICE_MAX_LOADED_SHARDS` |
+| Index deferred: the memory budget or a configured shard ceiling is reached and every loaded workspace is in use | `lattice status`, which names the limit and what to raise |
 | Index failed to load | `lattice doctor` |
 | Policy file unreadable | rerun the installer with `--enforce` |
 | Repository changes could not be listed in time | run `lattice impact <file>` by hand |
 | Turn summary not captured (shown to the operator at `Stop`) | `lattice doctor` |
 
-A deferred workspace is the case this rule exists for. When every shard slot is held by another
-workspace with an open session, Lattice never loads the workspace, and it used to report that
-as `indexing: true` while hooks stayed silent. `lattice status` now says "Deferred behind shard
-capacity" in its `summary`, and an enforcing workspace is told once. Session capture is
-unaffected: hook routes do not need a loaded shard, so edits and turn summaries are recorded
-while deferred and nothing has to be queued.
+A deferred workspace is the case this rule exists for. Under the old fixed shard count, a
+workspace that connected after the count was reached was never loaded, and it was reported as
+`indexing: true` while hooks stayed silent. Capacity now follows connected agents
+([shard capacity](shard-capacity.md)), so a workspace is deferred only when the memory budget or
+an operator's `max_loaded_shards` ceiling is reached and nothing loaded is idle enough to unload.
+`lattice status` then says "Deferred, not loading" in its `summary`, with the limit, the numbers
+and what to raise, and an enforcing workspace is told once. The daemon retries on each request,
+so the deferral ends by itself when memory frees. Session capture is unaffected: hook routes do
+not need a loaded shard, so edits and turn summaries are recorded while deferred and nothing has
+to be queued.
 
-A workspace that simply has no shard loaded yet is not a failure. The gate asks for a plan,
-and asking for one is what loads the workspace.
+A workspace that simply has no shard loaded yet is not a failure, including one whose idle
+shard was unloaded to make room. The gate asks for a plan, and asking for one is what loads the
+workspace.
 
 Notices are claimed with a marker file under `$XDG_STATE_HOME/lattice/hook-notices` (default
 `~/.local/state/lattice/hook-notices`). The file name is a digest; it holds no session,

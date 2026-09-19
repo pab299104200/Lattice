@@ -380,25 +380,30 @@ Environment variables configure one start of the daemon at best. The daemon is s
 
 ```toml
 # $XDG_CONFIG_HOME/lattice/daemon.toml, default ~/.config/lattice/daemon.toml
-max_loaded_shards = 6
+memory_budget_mb = 6144
 ```
 
 | Key | Meaning |
 | --- | --- |
-| `max_loaded_shards` | How many workspaces the daemon keeps loaded at once, from 1 to 64. A workspace with an open agent session is never evicted, so set this at or above the number of workspaces you keep open together. One beyond the cap is deferred: never loaded, and `lattice status` says so |
+| `memory_budget_mb` | The daemon's real memory footprint limit, in MiB (512 to 4,194,304). Default: a third of physical memory, at least 2048. Idle workspaces are unloaded to stay within it |
+| `max_loaded_shards` | Optional hard ceiling on loaded workspaces (1 to 64). Default: none. Leave it unset. Capacity follows connected agents, and a ceiling can defer a workspace that has one; when it does, status, doctor and the hook notice say so |
 
-- **Precedence:** environment variable (`LATTICE_MAX_LOADED_SHARDS`, then the older `LATTICE_MAX_LOADED_WORKSPACES`), then this file, then the built-in default.
+Every workspace with a connected agent gets a shard, so there is no count to tune. Memory is the limit: under pressure, workspaces with no connection are unloaded first, then workspaces whose agents have been silent for 10 minutes; those reload on their next request. See [shard capacity](docs/shard-capacity.md) for the rules, the defaults and what to watch.
+
+- **Precedence:** environment variable (`LATTICE_MEMORY_BUDGET_MB`; `LATTICE_MAX_LOADED_SHARDS`, then the older `LATTICE_MAX_LOADED_WORKSPACES`), then this file, then the built-in default.
 - **Invalid values stop the daemon.** A value out of range, a wrong type, an unknown key or broken TOML makes `lattice --daemon` exit before it listens, with an error naming the file and key. The same applies to an invalid environment value. The file is checked even when the environment wins. Lattice never falls back silently to a setting you did not choose.
-- **See what is in force:** `lattice status` shows `shard_capacity`, for example `max_loaded_shards=6 from settings file /Users/you/.config/lattice/daemon.toml; 5 loaded, 5 pinned by an open session or index work`. `lattice doctor` validates the file, shows the running daemon's value and source, and warns when a restart would change it or when every slot is pinned.
-- **Choosing a value:** measured on macOS in 2026-09, a freshly loaded workspace costs about 0.12 MB of real memory per indexed file (360 MB for 3,066 files), so six mid-sized repositories need roughly 3 to 4 GiB. The built-in default is `6`. `shard_capacity` also shows the daemon's real memory footprint and uptime. On macOS that figure includes compressed memory, which resident size (`ps` RSS) leaves out.
+- **See what is in force:** `lattice status` shows `shard_capacity`, for example `5 connected workspace(s) with 7 agent(s); 5 shard(s) loaded, 0 idle, 2 connected but idle and unloadable; memory 1443 MiB of 5461 MiB budget (built-in default) after 8 h up; no shard ceiling`. The footprint includes compressed memory on macOS, which resident size (`ps` RSS) leaves out. `lattice doctor` validates the file, shows the running daemon's capacity, and warns when the next workspace would be deferred or a restart would change a setting.
+- **Choosing a budget:** measured on macOS in 2026-09, a freshly loaded workspace costs about 0.12 MB of real memory per indexed file (360 MB for 3,066 files), so six mid-sized repositories need roughly 3 to 4 GiB.
 - **Applying a change** needs a daemon restart: `pkill -f 'lattice --daemon'`. Open agent sessions survive it; each reconnects and starts the daemon on its next request.
 
 | Setting | Default / purpose |
 | --- | --- |
 | `LATTICE_DAEMON_ADDR` | `127.0.0.1:47659`; alternate loopback endpoint |
 | `LATTICE_DAEMON_EXE` | Explicit absolute binary path for proxy startup |
-| `LATTICE_MAX_LOADED_SHARDS` | `6`, or fewer if the view budget holds fewer. Overrides `max_loaded_shards` in the [daemon settings file](#daemon-settings-file) for one daemon start only; use the file for a lasting value. Invalid values stop the daemon |
-| `LATTICE_WORKSPACE_IDLE_TTL_SECS` | `1800` |
+| `LATTICE_MEMORY_BUDGET_MB` | A third of physical memory, at least `2048`. Overrides `memory_budget_mb` in the [daemon settings file](#daemon-settings-file) for one daemon start only. Invalid values stop the daemon |
+| `LATTICE_MAX_LOADED_SHARDS` | Unset: no ceiling. Overrides `max_loaded_shards` in the daemon settings file for one daemon start only. Invalid values stop the daemon |
+| `LATTICE_CONNECTED_IDLE_SECS` | `600`; how long a connected workspace must be silent before it may be unloaded to make room |
+| `LATTICE_WORKSPACE_IDLE_TTL_SECS` | `1800`; grace period before a workspace with no connection is unloaded |
 | `LATTICE_MAX_CONCURRENT_INDEX_JOBS` | `1`; shared indexing capacity |
 | `LATTICE_MATERIALIZATION_BUDGET_BYTES` | `2147483648`; logical materialization admission |
 | `LATTICE_USER_CACHE_BUDGET_BYTES` | `8589934592`; accounting across proven repository homes |

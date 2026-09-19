@@ -8,8 +8,12 @@ cancelling its task, or returning an error releases its reservation through
 the reservation guard.
 
 `LATTICE_MATERIALIZATION_BUDGET_BYTES` sets the process daemon allowance
-and defaults to 2 GiB. `LATTICE_VIEW_RESERVATION_BYTES` sets the configured
-logical admission unit for each resident checkout view and defaults to 256 MiB.
+and defaults to 2 GiB. `LATTICE_VIEW_RESERVATION_BYTES` sets an optional
+logical admission unit for each resident checkout view. Unset, it reserves
+nothing: at its former 256 MiB default against the 2 GiB allowance it refused
+the ninth workspace whatever real memory said, a fixed count in disguise.
+Workspace admission follows the daemon's measured memory footprint instead;
+see [shard capacity](shard-capacity.md).
 `LATTICE_INDEX_JOB_RESERVATION_BYTES` sets the additional allowance for a
 concurrent staging generation and also defaults to 256 MiB. These are logical
 admission units, not measured allocations or guarantees about physical RSS.
