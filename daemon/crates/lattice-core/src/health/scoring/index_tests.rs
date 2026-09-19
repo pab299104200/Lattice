@@ -323,8 +323,17 @@ fn documentation_without_control_flow_does_not_disable_code_health() {
 #[test]
 fn unavailable_code_complexity_degrades_without_fabricating_measurements() {
     let mut complexity = complexity_facts();
-    complexity.insert("unsupported.xyz".into(), compute_file_complexity_facts("unsupported.xyz", "opaque"));
-    let index = HealthFactIndex::builder().with_complexity_facts(complexity).build();
+    complexity.insert(
+        "unsupported.xyz".into(),
+        compute_file_complexity_facts("unsupported.xyz", "opaque"),
+    );
+    let index = HealthFactIndex::builder()
+        .with_complexity_facts(complexity)
+        .build();
     assert_eq!(index.availability(), FactAvailability::Degraded);
-    assert!(index.facts("src/core.rs").unwrap().get(FactKind::MaxCyclomaticComplexity).is_some());
+    assert!(index
+        .facts("src/core.rs")
+        .unwrap()
+        .get(FactKind::MaxCyclomaticComplexity)
+        .is_some());
 }

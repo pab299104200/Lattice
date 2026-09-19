@@ -18592,8 +18592,10 @@ diff --git a/daemon/src/orchestrator.rs b/daemon/src/orchestrator.rs
         assert!(!summary.contains("signals suppressed"));
         let impact = json!({"git_intelligence": {"impact_advisory": {
             "metadata": metadata, "missing_cochange_partners": []}}});
-        assert_eq!(super::git_intelligence_summary(impact.as_object().unwrap()).unwrap(),
-            "degraded; signals suppressed.");
+        assert_eq!(
+            super::git_intelligence_summary(impact.as_object().unwrap()).unwrap(),
+            "degraded; signals suppressed."
+        );
     }
 
     #[test]
@@ -19653,7 +19655,10 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
     } else {
         "co_change_availability"
     };
-    let availability = metadata.get(family).or_else(|| metadata.get("availability"))?.as_str()?;
+    let availability = metadata
+        .get(family)
+        .or_else(|| metadata.get("availability"))?
+        .as_str()?;
     if availability != "available" {
         return Some(format!("{availability}; signals suppressed."));
     }
@@ -19676,12 +19681,15 @@ fn git_intelligence_summary(object: &serde_json::Map<String, Value>) -> Option<S
         (_, Some(count)) => format!("{count} missing co-change partner(s)"),
         _ => "no applicable presentation evidence".to_string(),
     };
-    let qualification = if metadata.get("availability").and_then(Value::as_str) == Some("degraded") {
+    let qualification = if metadata.get("availability").and_then(Value::as_str) == Some("degraded")
+    {
         " Other history families are degraded."
     } else {
         ""
     };
-    Some(format!("available across {window} commit(s); {detail}.{qualification}"))
+    Some(format!(
+        "available across {window} commit(s); {detail}.{qualification}"
+    ))
 }
 
 /// Markdown lines for the `health` section, bounded to what a reader can act
