@@ -23,6 +23,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
+use crate::hook_enforcement::{
+    self, checkout_relative_path, classify_edit_path, classify_relative_path, deny_reason,
+    followup_reminder, load_policy, notice_text, FollowupGaps, IndexState, NoticeCondition,
+    PathClass, PlanState, PolicyState, BEST_EFFORT_DAEMON_NOTICE, MAX_SHELL_CHANGED_PATHS,
+};
 use crate::hook_session_client::{
     HookClientBinding, HookClientBindingKey, HookClientCapturePayload, HookClientOpaqueId,
     HookSessionClient, HookSessionClientError, PendingHookDelivery,
@@ -37,8 +42,13 @@ use crate::workspace_identity::WorkspaceIdentity;
 
 const MAX_HOST_ENVELOPE_BYTES: usize = 64 * 1024;
 const ADAPTER_DEADLINE: Duration = Duration::from_millis(2_000);
-const SESSION_START_NOTICE: &str = "lattice: daemon unreachable — run 'lattice doctor'";
-const SESSION_START_NOTICE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const NOTICE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Share of the two-second invocation deadline that `git status` may spend.
+/// The rest is kept for the daemon round trip that follows it.
+const SHELL_DETECTION_BUDGET: Duration = Duration::from_millis(700);
+/// Claude Code spills hook context above 10,000 characters to a file.
+const MAX_CONTEXT_CHARS: usize = 9_000;
+const MAX_LISTED_SHELL_PATHS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Integration {
@@ -67,6 +77,7 @@ impl Integration {
 enum HookKind {
     SessionStart,
     UserPromptSubmit,
+    PreToolUse,
     PostToolUse,
     Stop,
     StructuredFact,
@@ -78,6 +89,7 @@ impl HookKind {
         match value {
             "session-start" => Some(Self::SessionStart),
             "user-prompt-submit" => Some(Self::UserPromptSubmit),
+            "pre-tool-use" => Some(Self::PreToolUse),
             "post-tool-use" => Some(Self::PostToolUse),
             "stop" => Some(Self::Stop),
             "structured-fact" => Some(Self::StructuredFact),
@@ -114,6 +126,23 @@ struct HostFact {
     host_session_id: String,
     payload: Option<HookClientCapturePayload>,
     presentation: Option<HostPresentationRequest>,
+    tool: ToolFact,
+    session_source: Option<&'static str>,
+    stop_hook_active: bool,
+}
+
+/// What a tool event is, reduced to the category and, for an edit tool, its
+/// dedicated path field. A shell tool's input is never read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ToolFact {
+    NotATool,
+    /// An edit tool that names its target.
+    Edit { path: String, scratch: Option<PathBuf> },
+    /// An edit tool whose host exposes no target (Codex `apply_patch` carries
+    /// only patch text, which is not read).
+    EditWithoutPath,
+    Shell,
+    Other,
 }
 
 #[derive(Debug)]
@@ -135,31 +164,158 @@ struct HostPresentationResult {
 #[error("hook daemon transport unavailable")]
 struct HookDaemonUnavailable(#[source] anyhow::Error);
 
+/// The daemon answered and refused. Distinct from a transport failure so an
+/// enforcing workspace can say which one happened.
+#[derive(Debug, thiserror::Error)]
+#[error("hook request rejected")]
+struct HookDaemonRejected;
+
 pub(crate) fn is_hook_adapter_command() -> bool {
     std::env::args().nth(1).as_deref() == Some("__hook-adapter")
 }
 
-/// Hook invocations are deliberately best-effort. Only authenticated, bounded
-/// daemon presentations reach stdout; failures remain silent and never render
-/// rejected host input.
+/// Everything decided before the daemon is contacted. It is resolved outside
+/// the invocation deadline so that a timeout can still be reported.
+struct Prepared {
+    fact: HostFact,
+    identity: WorkspaceIdentity,
+    policy: PolicyState,
+}
+
+/// What one invocation tells the host. Rendering is host-specific; building
+/// it is not.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct HookOutput {
+    contexts: Vec<String>,
+    deny: Option<String>,
+    system_message: Option<String>,
+}
+
+impl HookOutput {
+    fn context(text: String) -> Self {
+        Self {
+            contexts: vec![text],
+            ..Self::default()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.contexts.is_empty() && self.deny.is_none() && self.system_message.is_none()
+    }
+}
+
+/// In a workspace that has not opted in to enforcement, hooks stay
+/// best-effort: only authenticated, bounded daemon presentations reach
+/// stdout and failures are silent, apart from the one SessionStart recovery
+/// notice. In an enforcing workspace every failure still allows the tool
+/// call, but is reported once per session and condition. Rejected host input
+/// is never rendered in either mode.
 pub(crate) async fn run_from_env() {
     let Some(invocation) = Invocation::from_env() else {
         return;
     };
-    if let Ok(Ok(Some(output))) = tokio::time::timeout(ADAPTER_DEADLINE, run(invocation)).await {
-        println!("{output}");
+    let Ok(prepared) = prepare(&invocation) else {
+        return;
+    };
+    let outcome = tokio::time::timeout(ADAPTER_DEADLINE, run(&invocation, &prepared)).await;
+    let output = match outcome {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => failure_output(&invocation, &prepared, failure_condition(&error)),
+        Err(_) => failure_output(&invocation, &prepared, NoticeCondition::AdapterTimeout),
+    };
+    if let Some(rendered) = render_output(invocation.integration, invocation.kind, output) {
+        println!("{rendered}");
     }
 }
 
-async fn run(invocation: Invocation) -> Result<Option<String>> {
+fn prepare(invocation: &Invocation) -> Result<Prepared> {
     let input = read_bounded_stdin(std::io::stdin().lock())?;
-    let fact = extract_host_fact(invocation.kind, &input)?;
-    if matches!(invocation.kind, HookKind::Stop | HookKind::StructuredFact)
-        && fact.payload.is_none()
-    {
-        return Ok(None);
-    }
     let identity = checkout_identity_from_cwd()?;
+    let fact = extract_host_fact(invocation.kind, &input, &identity.checkout_root)?;
+    let policy = load_policy(&identity.checkout_root);
+    Ok(Prepared {
+        fact,
+        identity,
+        policy,
+    })
+}
+
+fn failure_condition(error: &anyhow::Error) -> NoticeCondition {
+    if error.downcast_ref::<HookDaemonUnavailable>().is_some() {
+        NoticeCondition::DaemonUnreachable
+    } else if error.downcast_ref::<HookDaemonRejected>().is_some() {
+        NoticeCondition::DaemonRejected
+    } else {
+        NoticeCondition::AdapterFailed
+    }
+}
+
+/// Turn a failure into at most one notice. Nothing here can block a tool.
+fn failure_output(
+    invocation: &Invocation,
+    prepared: &Prepared,
+    condition: NoticeCondition,
+) -> HookOutput {
+    if !prepared.policy.enforcing() {
+        // Pre-enforcement contract, unchanged.
+        if invocation.kind == HookKind::SessionStart
+            && condition == NoticeCondition::DaemonUnreachable
+            && claim_notice(invocation.integration, prepared, condition)
+        {
+            return HookOutput::context(BEST_EFFORT_DAEMON_NOTICE.to_string());
+        }
+        return HookOutput::default();
+    }
+    let condition = if invocation.kind == HookKind::Stop {
+        // Stop has no passive channel to the model; tell the operator that
+        // the turn summary was not captured.
+        NoticeCondition::CaptureUnavailable
+    } else {
+        condition
+    };
+    notice_output(invocation, prepared, condition)
+}
+
+/// A claimed notice, routed to the only channel the event offers that does
+/// not alter control flow.
+fn notice_output(
+    invocation: &Invocation,
+    prepared: &Prepared,
+    condition: NoticeCondition,
+) -> HookOutput {
+    if invocation.kind == HookKind::SessionEnd
+        || !claim_notice(invocation.integration, prepared, condition)
+    {
+        return HookOutput::default();
+    }
+    let text = notice_text(condition);
+    if invocation.kind == HookKind::Stop {
+        HookOutput {
+            system_message: Some(text),
+            ..HookOutput::default()
+        }
+    } else {
+        HookOutput::context(text)
+    }
+}
+
+async fn run(invocation: &Invocation, prepared: &Prepared) -> Result<HookOutput> {
+    let fact = &prepared.fact;
+    let identity = &prepared.identity;
+    let enforcing = prepared.policy.enforcing();
+    let mut output = HookOutput::default();
+    if matches!(prepared.policy, PolicyState::Unreadable(_))
+        && invocation.kind != HookKind::Stop
+    {
+        output = notice_output(invocation, prepared, NoticeCondition::PolicyUnreadable);
+    }
+
+    if invocation.kind == HookKind::StructuredFact && fact.payload.is_none() {
+        return Ok(output);
+    }
+    if invocation.kind == HookKind::Stop && fact.payload.is_none() && !enforcing {
+        return Ok(output);
+    }
     let key = HookClientBindingKey::new(
         invocation.integration.binding_id(),
         fact.host_session_id.clone(),
@@ -168,152 +324,334 @@ async fn run(invocation: Invocation) -> Result<Option<String>> {
     )?;
     let client = HookSessionClient::open_default()?;
     let now_ms = unix_time_ms()?;
-
-    if invocation.kind == HookKind::SessionStart {
-        client.retire_acknowledged_close(&key)?;
-    }
+    let session = SessionContext {
+        client: &client,
+        key: &key,
+        integration: invocation.integration,
+        host_session_id: &fact.host_session_id,
+        identity,
+        now_ms,
+    };
 
     match invocation.kind {
-        HookKind::SessionStart | HookKind::UserPromptSubmit => {
-            let presentation = match open_or_resume(
-                &client,
-                &key,
-                invocation.integration,
-                &fact.host_session_id,
-                &identity,
-                now_ms,
-                fact.presentation.as_ref(),
-            )
-            .await
-            {
-                Ok(presentation) => presentation,
-                Err(error)
-                    if invocation.kind == HookKind::SessionStart
-                        && session_start_notice_eligible(&error) =>
-                {
-                    // A raw host session identifier is not authority.  Only
-                    // the validated host envelope and checkout identity scope
-                    // this non-authoritative recovery hint. The marker is
-                    // privacy-preserving and claimed atomically, including
-                    // before the daemon has minted the session's first binding.
-                    if claim_session_start_notice(
-                        invocation.integration,
-                        &fact.host_session_id,
-                        &identity,
-                    )? {
-                        return Ok(Some(render_session_start_notice(invocation.integration)));
-                    }
-                    return Err(error);
+        HookKind::SessionStart => {
+            client.retire_acknowledged_close(&key)?;
+            let enforcement = enforcing.then(|| {
+                let mut request = json!({"event": "session-start"});
+                if let Some(source) = fact.session_source {
+                    request["session_source"] = json!(source);
                 }
-                Err(error) => return Err(error),
+                request
+            });
+            let answer = session
+                .open_or_resume(fact.presentation.as_ref(), enforcement)
+                .await?;
+            push_presentation(&mut output, answer.presentation);
+            push_index_notice(&mut output, invocation, prepared, answer.enforcement.as_ref());
+        }
+        HookKind::UserPromptSubmit => {
+            let answer = session
+                .open_or_resume(fact.presentation.as_ref(), None)
+                .await?;
+            push_presentation(&mut output, answer.presentation);
+        }
+        HookKind::PreToolUse => {
+            if !enforcing {
+                return Ok(output);
+            }
+            let path_known = match &fact.tool {
+                ToolFact::Edit { path, scratch } => {
+                    if !classify_edit_path(&identity.checkout_root, path, scratch.as_deref())
+                        .gated()
+                    {
+                        return Ok(output);
+                    }
+                    true
+                }
+                ToolFact::EditWithoutPath => false,
+                ToolFact::NotATool | ToolFact::Shell | ToolFact::Other => return Ok(output),
             };
-            Ok(presentation.map(|result| {
-                render_host_presentation(invocation.integration, invocation.kind, result)
-            }))
+            let answer = session
+                .open_or_resume(None, Some(json!({"event": "pre-tool-use"})))
+                .await?;
+            let enforcement = answer
+                .enforcement
+                .ok_or_else(|| anyhow::Error::new(HookDaemonRejected))?;
+            if enforcement.deny {
+                output.deny = Some(deny_reason(enforcement.plan_state, path_known));
+            } else {
+                push_index_notice(&mut output, invocation, prepared, Some(&enforcement));
+            }
         }
         HookKind::PostToolUse => {
-            let Some(payload) = fact.payload else {
-                return Ok(None);
-            };
-            let presentation = open_or_resume(
-                &client,
-                &key,
-                invocation.integration,
-                &fact.host_session_id,
-                &identity,
-                now_ms,
-                fact.presentation.as_ref(),
-            )
-            .await?;
-            let binding = client.load_binding(&key, now_ms)?;
-            match client.enqueue(&key, payload, now_ms) {
-                Ok(_) => {}
-                Err(error) => return Err(error.into()),
-            }
-            let mut wire = HookWire::connect(&identity).await?;
-            flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
-            Ok(presentation.map(|result| {
-                render_host_presentation(invocation.integration, invocation.kind, result)
-            }))
+            run_post_tool_use(invocation, prepared, &session, &mut output).await?;
         }
         HookKind::Stop => {
-            let Some(payload) = fact.payload else {
-                return Ok(None);
-            };
-            let binding = client.load_binding(&key, now_ms)?;
-            match client.enqueue(&key, payload, now_ms) {
-                Ok(_) | Err(HookSessionClientError::BindingClosed) => {}
-                Err(error) => return Err(error.into()),
+            let enforcement =
+                (enforcing && !fact.stop_hook_active).then(|| json!({"event": "stop"}));
+            let answer = session.open_or_resume(None, enforcement).await?;
+            if let Some(payload) = fact.payload.clone() {
+                session.deliver(payload).await?;
             }
-            let mut wire = HookWire::connect(&identity).await?;
-            flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
-            Ok(None)
+            if let Some(reminder) = answer
+                .enforcement
+                .and_then(|enforcement| enforcement.followup)
+                .and_then(followup_reminder)
+            {
+                match invocation.integration {
+                    // One continuation, claimed once per session by the daemon
+                    // and never requested while a stop hook is already active.
+                    Integration::ClaudeCode => output.contexts.push(reminder),
+                    // Codex can only block-and-continue; tell the operator.
+                    Integration::Codex => output.system_message = Some(reminder),
+                }
+            }
         }
-        HookKind::StructuredFact => {
-            let Some(payload) = fact.payload else {
-                return Ok(None);
+        HookKind::StructuredFact | HookKind::SessionEnd => {
+            let Some(payload) = fact.payload.clone() else {
+                return Ok(output);
             };
+            // These never create a binding: a fact or a close for a session
+            // Lattice never opened has nothing to attach to.
             let binding = client.load_binding(&key, now_ms)?;
             match client.enqueue(&key, payload, now_ms) {
                 Ok(_) => {}
-                Err(HookSessionClientError::BindingClosed) => return Ok(None),
+                Err(HookSessionClientError::BindingClosed) => {
+                    if invocation.kind == HookKind::StructuredFact {
+                        return Ok(output);
+                    }
+                }
                 Err(error) => return Err(error.into()),
             }
-            let mut wire = HookWire::connect(&identity).await?;
+            let mut wire = HookWire::connect(identity).await?;
             flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
-            Ok(None)
-        }
-        HookKind::SessionEnd => {
-            let Some(payload) = fact.payload else {
-                return Ok(None);
-            };
-            let binding = client.load_binding(&key, now_ms)?;
-            match client.enqueue(&key, payload, now_ms) {
-                Ok(_) | Err(HookSessionClientError::BindingClosed) => {}
-                Err(error) => return Err(error.into()),
-            }
-            let mut wire = HookWire::connect(&identity).await?;
-            flush_pending(&client, &key, &binding, &mut wire, now_ms).await?;
-            Ok(None)
         }
     }
+    Ok(output)
 }
 
-/// Claim the single recovery notice for a locally authenticated host session.
-/// The marker is non-authoritative and stores no host data: it only prevents
-/// a repeated bounded presentation after transport/configuration failure.
-fn claim_session_start_notice(
-    integration: Integration,
-    host_session_id: &str,
-    identity: &WorkspaceIdentity,
-) -> Result<bool> {
-    let marker = session_start_notice_marker(
-        integration,
-        host_session_id,
+async fn run_post_tool_use(
+    invocation: &Invocation,
+    prepared: &Prepared,
+    session: &SessionContext<'_>,
+    output: &mut HookOutput,
+) -> Result<()> {
+    let fact = &prepared.fact;
+    let identity = &prepared.identity;
+    let enforcing = prepared.policy.enforcing();
+    let marker = session_marker(
+        invocation.integration,
+        &fact.host_session_id,
         &identity.repository_id,
         &identity.checkout_root,
     );
-    claim_session_start_notice_at(&default_notice_root()?, &marker)
-}
 
-fn session_start_notice_eligible(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<HookDaemonUnavailable>().is_some()
-}
-
-fn render_session_start_notice(integration: Integration) -> String {
-    match integration {
-        Integration::Codex => SESSION_START_NOTICE.to_string(),
-        Integration::ClaudeCode => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": SESSION_START_NOTICE,
+    let inspect_repository = enforcing
+        && matches!(fact.tool, ToolFact::Shell | ToolFact::EditWithoutPath);
+    if !inspect_repository {
+        let Some(payload) = fact.payload.clone() else {
+            return Ok(());
+        };
+        if enforcing {
+            if let Some(path) = fact.presentation.as_ref().and_then(|request| request.path.as_deref())
+            {
+                // Best effort: a stale snapshot only costs one extra mention.
+                let _ = crate::hook_shell_changes::absorb_tool_edit(
+                    &identity.checkout_root,
+                    &default_state_directory("hook-shell-snapshots")?,
+                    &marker,
+                    path,
+                );
             }
-        })
-        .to_string(),
+        }
+        let answer = session
+            .open_or_resume(fact.presentation.as_ref(), None)
+            .await?;
+        session.deliver(payload).await?;
+        push_presentation(output, answer.presentation);
+        return Ok(());
+    }
+
+    let detection = crate::hook_shell_changes::detect_shell_changes(
+        &identity.checkout_root,
+        &default_state_directory("hook-shell-snapshots")?,
+        &marker,
+        SHELL_DETECTION_BUDGET,
+    )
+    .await;
+    let changed = match detection {
+        Ok(crate::hook_shell_changes::ShellDetection::Changed(paths)) => paths,
+        Ok(crate::hook_shell_changes::ShellDetection::Baseline) => Vec::new(),
+        Ok(crate::hook_shell_changes::ShellDetection::Degraded) | Err(_) => {
+            merge_output(
+                output,
+                notice_output(invocation, prepared, NoticeCondition::ShellDetectionDegraded),
+            );
+            Vec::new()
+        }
+    };
+    let product = changed
+        .into_iter()
+        .filter(|path| classify_relative_path(Path::new(path)) == PathClass::Product)
+        .collect::<Vec<_>>();
+    if product.is_empty() {
+        return Ok(());
+    }
+    let total = product.len();
+    let forwarded = &product[..total.min(MAX_SHELL_CHANGED_PATHS)];
+
+    let presentation = HostPresentationRequest {
+        kind: HookKind::PostToolUse,
+        request_id: fact
+            .presentation
+            .as_ref()
+            .map_or_else(|| format!("evt_{marker}_{}", session.now_ms), |request| {
+                request.request_id.clone()
+            }),
+        prompt: None,
+        path: Some(forwarded[0].clone()),
+        acted_on_injection_id: None,
+    };
+    let answer = session
+        .open_or_resume(
+            Some(&presentation),
+            Some(json!({"event": "shell-edit", "product_paths": forwarded.len()})),
+        )
+        .await?;
+    for path in forwarded {
+        // A path the capture schema refuses is skipped, never sent raw.
+        if let Ok(event) = edited_path_event(path) {
+            session
+                .deliver(HookClientCapturePayload::Event(event))
+                .await?;
+        }
+    }
+    output.contexts.push(shell_change_summary(forwarded, total));
+    push_presentation(output, answer.presentation);
+    let plan_current = answer
+        .enforcement
+        .as_ref()
+        .is_some_and(|enforcement| enforcement.plan_state == PlanState::Current);
+    if !plan_current {
+        merge_output(
+            output,
+            notice_output(invocation, prepared, NoticeCondition::ShellEditWithoutPlan),
+        );
+    }
+    push_index_notice(output, invocation, prepared, answer.enforcement.as_ref());
+    Ok(())
+}
+
+/// Name the files a shell command changed. Paths come from `git status`, not
+/// from the command, and the list is bounded.
+fn shell_change_summary(forwarded: &[String], total: usize) -> String {
+    let listed = forwarded
+        .iter()
+        .take(MAX_LISTED_SHELL_PATHS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = total.saturating_sub(MAX_LISTED_SHELL_PATHS.min(forwarded.len()));
+    let suffix = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "lattice: the shell changed {total} product file(s): {listed}{suffix}. Impact notes \
+         below cover the first; run `lattice impact <file>` for the others you have not checked."
+    )
+}
+
+fn push_presentation(output: &mut HookOutput, presentation: Option<HostPresentationResult>) {
+    if let Some(presentation) = presentation {
+        output.contexts.push(presentation.context);
     }
 }
 
-fn session_start_notice_marker(
+fn push_index_notice(
+    output: &mut HookOutput,
+    invocation: &Invocation,
+    prepared: &Prepared,
+    enforcement: Option<&EnforcementAnswer>,
+) {
+    if let Some(condition) =
+        enforcement.and_then(|enforcement| NoticeCondition::for_index(&enforcement.index_state))
+    {
+        merge_output(output, notice_output(invocation, prepared, condition));
+    }
+}
+
+fn merge_output(output: &mut HookOutput, other: HookOutput) {
+    output.contexts.extend(other.contexts);
+    output.deny = output.deny.take().or(other.deny);
+    output.system_message = output.system_message.take().or(other.system_message);
+}
+
+/// Render for the host. Both hosts accept the same JSON for tool events;
+/// Codex ignores plain text there, and takes plain text for session events.
+fn render_output(integration: Integration, kind: HookKind, output: HookOutput) -> Option<String> {
+    if output.is_empty() {
+        return None;
+    }
+    let context = (!output.contexts.is_empty()).then(|| {
+        let joined = output.contexts.join("\n\n");
+        match joined.char_indices().nth(MAX_CONTEXT_CHARS) {
+            Some((end, _)) => joined[..end].to_string(),
+            None => joined,
+        }
+    });
+    let event = match kind {
+        HookKind::SessionStart => "SessionStart",
+        HookKind::UserPromptSubmit => "UserPromptSubmit",
+        HookKind::PreToolUse => "PreToolUse",
+        HookKind::PostToolUse => "PostToolUse",
+        HookKind::Stop => "Stop",
+        HookKind::StructuredFact | HookKind::SessionEnd => return None,
+    };
+    let plain_text_event = integration == Integration::Codex
+        && matches!(kind, HookKind::SessionStart | HookKind::UserPromptSubmit);
+    if plain_text_event && output.deny.is_none() && output.system_message.is_none() {
+        return context;
+    }
+    let mut rendered = serde_json::Map::new();
+    let mut specific = serde_json::Map::new();
+    if let Some(reason) = output.deny {
+        specific.insert("permissionDecision".into(), json!("deny"));
+        specific.insert("permissionDecisionReason".into(), json!(reason));
+    }
+    if let Some(context) = context {
+        specific.insert("additionalContext".into(), json!(context));
+    }
+    if !specific.is_empty() {
+        specific.insert("hookEventName".into(), json!(event));
+        rendered.insert("hookSpecificOutput".into(), Value::Object(specific));
+    }
+    if let Some(message) = output.system_message {
+        rendered.insert("systemMessage".into(), json!(message));
+    }
+    Some(Value::Object(rendered).to_string())
+}
+
+/// Claim the single notice for a condition in a locally authenticated host
+/// session. The marker is non-authoritative and stores no host data: it only
+/// prevents a repeated bounded presentation. A claim that cannot be recorded
+/// is treated as already made, so a broken state directory cannot turn one
+/// notice into one per tool call.
+fn claim_notice(integration: Integration, prepared: &Prepared, condition: NoticeCondition) -> bool {
+    let marker = session_marker(
+        integration,
+        &prepared.fact.host_session_id,
+        &prepared.identity.repository_id,
+        &prepared.identity.checkout_root,
+    );
+    default_state_directory("hook-notices")
+        .and_then(|root| claim_notice_at(&root, condition, &marker))
+        .unwrap_or(false)
+}
+
+/// A content-free name for a host session in one checkout.
+fn session_marker(
     integration: Integration,
     host_session_id: &str,
     repository_id: &str,
@@ -331,15 +669,15 @@ fn session_start_notice_marker(
     )
 }
 
-fn default_notice_root() -> Result<PathBuf> {
+fn default_state_directory(name: &str) -> Result<PathBuf> {
     let state_home = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .ok_or_else(|| anyhow!("hook notice state location is unavailable"))?;
-    Ok(state_home.join("lattice").join("hook-notices"))
+        .ok_or_else(|| anyhow!("hook state location is unavailable"))?;
+    Ok(state_home.join("lattice").join(name))
 }
 
-fn claim_session_start_notice_at(root: &Path, marker: &str) -> Result<bool> {
+fn claim_notice_at(root: &Path, condition: NoticeCondition, marker: &str) -> Result<bool> {
     fs::create_dir_all(root)?;
     #[cfg(unix)]
     {
@@ -347,8 +685,8 @@ fn claim_session_start_notice_at(root: &Path, marker: &str) -> Result<bool> {
         permissions.set_mode(0o700);
         fs::set_permissions(root, permissions)?;
     }
-    prune_session_start_notices(root)?;
-    let path = root.join(format!("session-start-{marker}"));
+    prune_notices(root)?;
+    let path = root.join(format!("{}-{marker}", condition.slug()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -360,17 +698,12 @@ fn claim_session_start_notice_at(root: &Path, marker: &str) -> Result<bool> {
     }
 }
 
-fn prune_session_start_notices(root: &Path) -> Result<()> {
+fn prune_notices(root: &Path) -> Result<()> {
     let now = SystemTime::now();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file()
-            || !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("session-start-"))
-        {
+        if !path.is_file() {
             continue;
         }
         let expired = entry
@@ -378,7 +711,7 @@ fn prune_session_start_notices(root: &Path) -> Result<()> {
             .modified()
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > SESSION_START_NOTICE_RETENTION);
+            .is_some_and(|age| age > NOTICE_RETENTION);
         if expired {
             let _ = fs::remove_file(path);
         }
@@ -386,40 +719,115 @@ fn prune_session_start_notices(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn open_or_resume(
-    client: &HookSessionClient,
-    key: &HookClientBindingKey,
+struct SessionContext<'a> {
+    client: &'a HookSessionClient,
+    key: &'a HookClientBindingKey,
     integration: Integration,
-    host_session_id: &str,
-    identity: &WorkspaceIdentity,
+    host_session_id: &'a str,
+    identity: &'a WorkspaceIdentity,
     now_ms: i64,
+}
+
+struct OpenAnswer {
+    presentation: Option<HostPresentationResult>,
+    enforcement: Option<EnforcementAnswer>,
+}
+
+#[derive(Debug)]
+struct EnforcementAnswer {
+    deny: bool,
+    plan_state: PlanState,
+    index_state: IndexState,
+    followup: Option<FollowupGaps>,
+}
+
+impl SessionContext<'_> {
+    async fn open_or_resume(
+        &self,
+        presentation: Option<&HostPresentationRequest>,
+        enforcement: Option<Value>,
+    ) -> Result<OpenAnswer> {
+        open_or_resume(self, presentation, enforcement).await
+    }
+
+    /// Queue one capture payload under the current binding and flush the
+    /// queue. Must follow `open_or_resume` in the same invocation.
+    async fn deliver(&self, payload: HookClientCapturePayload) -> Result<()> {
+        let binding = self.client.load_binding(self.key, self.now_ms)?;
+        match self.client.enqueue(self.key, payload, self.now_ms) {
+            Ok(_) | Err(HookSessionClientError::BindingClosed) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut wire = HookWire::connect(self.identity).await?;
+        flush_pending(self.client, self.key, &binding, &mut wire, self.now_ms).await
+    }
+}
+
+async fn open_or_resume(
+    session: &SessionContext<'_>,
     presentation: Option<&HostPresentationRequest>,
-) -> Result<Option<HostPresentationResult>> {
-    let existing = match client.load_binding(key, now_ms) {
-        Ok(binding) => Some(binding),
-        Err(HookSessionClientError::BindingMissing) => None,
+    enforcement: Option<Value>,
+) -> Result<OpenAnswer> {
+    let SessionContext {
+        client,
+        key,
+        integration,
+        host_session_id,
+        identity,
+        now_ms,
+    } = *session;
+    // `idle_expired` marks a binding only the daemon can adjudicate; see
+    // `HookSessionClient::load_idle_expired_binding`.
+    let (existing, idle_expired) = match client.load_binding(key, now_ms) {
+        Ok(binding) => (Some(binding), false),
+        Err(HookSessionClientError::BindingMissing) => (None, false),
         Err(HookSessionClientError::BindingExpired) => {
-            client.prune(key, now_ms)?;
-            None
+            match client.load_idle_expired_binding(key, now_ms) {
+                Ok(binding) => (Some(binding), true),
+                Err(_) => {
+                    client.prune(key, now_ms)?;
+                    (None, false)
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     };
-    let mut params = json!({
-        "integration": integration.binding_id(),
-        "host_session_id": host_session_id,
-    });
-    if let Some(binding) = &existing {
-        params["resume"] = json!({
-            "binding_id": binding.binding_id().as_str(),
-            "capability": binding.capability().as_str(),
+    let build_params = |resume: Option<&HookClientBinding>| {
+        let mut params = json!({
+            "integration": integration.binding_id(),
+            "host_session_id": host_session_id,
         });
-    }
-    if let Some(presentation) = presentation {
-        params["presentation"] = presentation_params(presentation);
-    }
+        if let Some(binding) = resume {
+            params["resume"] = json!({
+                "binding_id": binding.binding_id().as_str(),
+                "capability": binding.capability().as_str(),
+            });
+        }
+        if let Some(presentation) = presentation {
+            params["presentation"] = presentation_params(presentation);
+        }
+        if let Some(enforcement) = &enforcement {
+            params["enforcement"] = enforcement.clone();
+        }
+        params
+    };
     let mut wire = HookWire::connect(identity).await?;
-    let result = wire.call(HOOK_SESSION_OPEN_METHOD, params).await?;
-    let (opened, presentation) = decode_open_result(integration, identity, result)?;
+    let (existing, result) = match wire
+        .call(HOOK_SESSION_OPEN_METHOD, build_params(existing.as_ref()))
+        .await
+    {
+        Ok(result) => (existing, result),
+        Err(error) if idle_expired && error.downcast_ref::<HookDaemonRejected>().is_some() => {
+            // The daemon agrees the binding is gone. Start a new generation.
+            client.discard_refused_binding(key)?;
+            let result = wire
+                .call(HOOK_SESSION_OPEN_METHOD, build_params(None))
+                .await?;
+            (None, result)
+        }
+        Err(error) => return Err(error),
+    };
+    let (opened, answer) = decode_open_result(integration, identity, result)?;
     if let Some(existing) = existing {
         if existing.binding_id() != opened.binding_id()
             || existing.capability() != opened.capability()
@@ -429,12 +837,11 @@ async fn open_or_resume(
             return Err(anyhow!("hook binding resume was rejected"));
         }
         client.refresh_binding(key, &opened)?;
-        flush_pending(client, key, &opened, &mut wire, now_ms).await?;
     } else {
         client.store_binding(key, &opened)?;
-        flush_pending(client, key, &opened, &mut wire, now_ms).await?;
     }
-    Ok(presentation)
+    flush_pending(client, key, &opened, &mut wire, now_ms).await?;
+    Ok(answer)
 }
 
 #[derive(Deserialize)]
@@ -450,13 +857,53 @@ struct OpenResult {
     checkout_id: String,
     #[serde(default)]
     presentation: Option<HostPresentationResult>,
+    #[serde(default)]
+    enforcement: Option<EnforcementWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnforcementWire {
+    decision: String,
+    plan_state: String,
+    index_state: String,
+    #[serde(default)]
+    followup: Option<FollowupWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FollowupWire {
+    stale_docs: bool,
+    remember: bool,
+}
+
+/// An answer the adapter cannot interpret is an error, which fails open. It
+/// is never read as "allow" or as "deny".
+fn decode_enforcement(wire: EnforcementWire) -> Result<EnforcementAnswer> {
+    let deny = match wire.decision.as_str() {
+        "allow" => false,
+        "deny" => true,
+        _ => return Err(anyhow!("hook enforcement decision is invalid")),
+    };
+    Ok(EnforcementAnswer {
+        deny,
+        plan_state: PlanState::parse(&wire.plan_state)
+            .ok_or_else(|| anyhow!("hook enforcement plan state is invalid"))?,
+        index_state: IndexState::parse(&wire.index_state)
+            .ok_or_else(|| anyhow!("hook enforcement index state is invalid"))?,
+        followup: wire.followup.map(|followup| FollowupGaps {
+            stale_docs: followup.stale_docs,
+            remember: followup.remember,
+        }),
+    })
 }
 
 fn decode_open_result(
     integration: Integration,
     identity: &WorkspaceIdentity,
     value: Value,
-) -> Result<(HookClientBinding, Option<HostPresentationResult>)> {
+) -> Result<(HookClientBinding, OpenAnswer)> {
     let result: OpenResult = serde_json::from_value(value)?;
     let _ = (result.generation, result.resumed);
     if result.repository_id != identity.repository_id
@@ -484,7 +931,10 @@ fn decode_open_result(
             result.idle_deadline_ms,
             result.absolute_deadline_ms,
         )?,
-        presentation,
+        OpenAnswer {
+            presentation,
+            enforcement: result.enforcement.map(decode_enforcement).transpose()?,
+        },
     ))
 }
 
@@ -630,7 +1080,7 @@ impl HookWire {
                 continue;
             }
             if response.get("error").is_some() {
-                return Err(anyhow!("hook request rejected"));
+                return Err(HookDaemonRejected.into());
             }
             return response
                 .get("result")
@@ -653,7 +1103,7 @@ fn read_bounded_stdin(mut reader: impl Read) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
+fn extract_host_fact(kind: HookKind, bytes: &[u8], checkout_root: &Path) -> Result<HostFact> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| anyhow!("invalid hook envelope"))?;
     let object = value
@@ -666,10 +1116,22 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
         .ok_or_else(|| anyhow!("hook session identity is missing"))?
         .to_string();
 
-    let edit_path = extract_edit_path(object);
+    let tool = match kind {
+        HookKind::PreToolUse | HookKind::PostToolUse => extract_tool_fact(object),
+        _ => ToolFact::NotATool,
+    };
+    // Capture facts and presentations are repository-relative. Claude Code
+    // always sends an absolute path; one outside the checkout yields no fact.
+    let relative_edit_path = match &tool {
+        ToolFact::Edit { path, .. } => checkout_relative_path(checkout_root, path),
+        _ => None,
+    };
     let payload = match kind {
-        HookKind::SessionStart | HookKind::UserPromptSubmit => None,
-        HookKind::PostToolUse => extract_edit_event(object)?,
+        HookKind::SessionStart | HookKind::UserPromptSubmit | HookKind::PreToolUse => None,
+        HookKind::PostToolUse => relative_edit_path
+            .as_deref()
+            .and_then(|path| edited_path_event(path).ok())
+            .map(HookClientCapturePayload::Event),
         HookKind::Stop => session_capture_turn_summary_from_host(
             object.get("last_assistant_message").and_then(Value::as_str),
         )
@@ -707,21 +1169,42 @@ fn extract_host_fact(kind: HookKind, bytes: &[u8]) -> Result<HostFact> {
                 path: None,
                 acted_on_injection_id,
             }),
-        HookKind::PostToolUse => edit_path.map(|path| HostPresentationRequest {
-            kind,
-            request_id,
-            prompt: None,
-            path: Some(path.to_string()),
-            acted_on_injection_id,
-        }),
-        HookKind::Stop => None,
-        HookKind::StructuredFact => None,
-        HookKind::SessionEnd => None,
+        // A shell call has no path yet, but keeps the host's request id so
+        // the repository-derived presentation stays idempotent per tool call.
+        HookKind::PostToolUse if payload.is_some() || tool == ToolFact::Shell
+            || tool == ToolFact::EditWithoutPath =>
+        {
+            Some(HostPresentationRequest {
+                kind,
+                request_id,
+                prompt: None,
+                path: relative_edit_path,
+                acted_on_injection_id,
+            })
+        }
+        HookKind::PreToolUse
+        | HookKind::PostToolUse
+        | HookKind::Stop
+        | HookKind::StructuredFact
+        | HookKind::SessionEnd => None,
     };
+    // A categorical value only; any other source is ignored, never forwarded.
+    let session_source = match (kind, object.get("source").and_then(Value::as_str)) {
+        (HookKind::SessionStart, Some("startup")) => Some("startup"),
+        (HookKind::SessionStart, Some("resume")) => Some("resume"),
+        (HookKind::SessionStart, Some("clear")) => Some("clear"),
+        (HookKind::SessionStart, Some("compact")) => Some("compact"),
+        _ => None,
+    };
+    let stop_hook_active = kind == HookKind::Stop
+        && object.get("stop_hook_active").and_then(Value::as_bool) == Some(true);
     Ok(HostFact {
         host_session_id,
         payload,
         presentation,
+        tool,
+        session_source,
+        stop_hook_active,
     })
 }
 
@@ -756,47 +1239,59 @@ fn extract_structured_fact(
     Ok(Some(HookClientCapturePayload::Event(normalized)))
 }
 
-fn extract_edit_event(
-    object: &serde_json::Map<String, Value>,
-) -> Result<Option<HookClientCapturePayload>> {
-    let tool_name = object.get("tool_name").and_then(Value::as_str);
-    if !matches!(
-        tool_name,
-        Some("apply_patch" | "Edit" | "Write" | "NotebookEdit")
-    ) {
-        return Ok(None);
-    }
-    let path = extract_edit_path(object);
-    let Some(path) = path else {
-        return Ok(None);
+const EDIT_TOOLS: [&str; 5] = ["apply_patch", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+const SHELL_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
+
+/// Reduce a tool envelope to its category. For an edit tool the dedicated
+/// path field is kept; `notebook_path` is NotebookEdit's. Nothing else in
+/// `tool_input` or `tool_response` is read, and a shell tool's input is not
+/// read at all.
+fn extract_tool_fact(object: &serde_json::Map<String, Value>) -> ToolFact {
+    let Some(tool_name) = object.get("tool_name").and_then(Value::as_str) else {
+        return ToolFact::Other;
     };
-    let normalized = parse_session_capture_event(
+    if SHELL_TOOLS.contains(&tool_name) {
+        return ToolFact::Shell;
+    }
+    if !EDIT_TOOLS.contains(&tool_name) {
+        return ToolFact::Other;
+    }
+    let input = object.get("tool_input").and_then(Value::as_object);
+    let path = object
+        .get("file_path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            input.and_then(|input| {
+                input
+                    .get("file_path")
+                    .or_else(|| input.get("notebook_path"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .filter(|path| !path.trim().is_empty());
+    match path {
+        Some(path) => ToolFact::Edit {
+            path: path.to_string(),
+            scratch: object
+                .get("scratchpad_dir")
+                .and_then(Value::as_str)
+                .filter(|scratch| Path::new(scratch).is_absolute())
+                .map(PathBuf::from),
+        },
+        None => ToolFact::EditWithoutPath,
+    }
+}
+
+fn edited_path_event(relative_path: &str) -> Result<SessionCaptureEvent> {
+    parse_session_capture_event(
         &json!({
             "schema_version": SESSION_CAPTURE_SCHEMA_VERSION,
             "kind": "edited_path",
-            "path": path,
+            "path": relative_path,
         })
         .to_string(),
     )
-    .map_err(|_| anyhow!("invalid edited path"))?;
-    Ok(Some(HookClientCapturePayload::Event(normalized)))
-}
-
-fn extract_edit_path(object: &serde_json::Map<String, Value>) -> Option<&str> {
-    let tool_name = object.get("tool_name").and_then(Value::as_str);
-    if !matches!(
-        tool_name,
-        Some("apply_patch" | "Edit" | "Write" | "NotebookEdit")
-    ) {
-        return None;
-    }
-    object.get("file_path").and_then(Value::as_str).or_else(|| {
-        object
-            .get("tool_input")
-            .and_then(Value::as_object)
-            .and_then(|input| input.get("file_path"))
-            .and_then(Value::as_str)
-    })
+    .map_err(|_| anyhow!("invalid edited path"))
 }
 
 fn host_request_id(object: &serde_json::Map<String, Value>, bytes: &[u8]) -> String {
@@ -819,6 +1314,7 @@ fn presentation_params(request: &HostPresentationRequest) -> Value {
         HookKind::SessionStart => "session-start",
         HookKind::UserPromptSubmit => "user-prompt-submit",
         HookKind::PostToolUse => "post-tool-use",
+        HookKind::PreToolUse => unreachable!("pre-tool-use has no presentation request"),
         HookKind::Stop => unreachable!("stop has no presentation request"),
         HookKind::StructuredFact => {
             unreachable!("structured facts have no presentation request")
@@ -839,33 +1335,6 @@ fn presentation_params(request: &HostPresentationRequest) -> Value {
         value["acted_on_injection_id"] = Value::String(injection_id.clone());
     }
     value
-}
-
-fn render_host_presentation(
-    integration: Integration,
-    kind: HookKind,
-    result: HostPresentationResult,
-) -> String {
-    let _ = result.injection_id;
-    match integration {
-        Integration::Codex => result.context,
-        Integration::ClaudeCode => json!({
-            "hookSpecificOutput": {
-                "hookEventName": match kind {
-                    HookKind::SessionStart => "SessionStart",
-                    HookKind::UserPromptSubmit => "UserPromptSubmit",
-                    HookKind::PostToolUse => "PostToolUse",
-                    HookKind::Stop => "Stop",
-                    HookKind::StructuredFact => {
-                        unreachable!("structured facts have no presentation")
-                    }
-                    HookKind::SessionEnd => "SessionEnd",
-                },
-                "additionalContext": result.context,
-            }
-        })
-        .to_string(),
-    }
 }
 
 fn stable_digest_hex(bytes: &[u8]) -> String {
@@ -918,6 +1387,12 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Extraction is lexical for paths that do not exist, so a fixed
+    /// non-existent checkout keeps these tests off the filesystem.
+    fn checkout() -> &'static Path {
+        Path::new("/lattice-test-checkout")
+    }
+
     #[test]
     fn bounded_reader_rejects_oversized_envelopes() {
         let input = vec![b'x'; MAX_HOST_ENVELOPE_BYTES + 1];
@@ -936,7 +1411,7 @@ mod tests {
             "tool_input":{"file_path":"src/lib.rs","command":"secret"},
             "tool_response":{"output":"secret"}
         }"#;
-        let extracted = extract_host_fact(HookKind::PostToolUse, input).unwrap();
+        let extracted = extract_host_fact(HookKind::PostToolUse, input, checkout()).unwrap();
         let HookClientCapturePayload::Event(event) = extracted.payload.unwrap() else {
             panic!("expected an edit event");
         };
@@ -960,7 +1435,7 @@ mod tests {
             "tool_input":{"file_path":"src/lib.rs","content":"sentinel-secret"},
             "tool_response":{"output":"sentinel-secret"}
         }"#;
-        let extracted = extract_host_fact(HookKind::PostToolUse, input).unwrap();
+        let extracted = extract_host_fact(HookKind::PostToolUse, input, checkout()).unwrap();
         let binding = HookClientBinding::new(
             HookClientOpaqueId::new("11".repeat(16)).unwrap(),
             HookClientOpaqueId::new("22".repeat(32)).unwrap(),
@@ -1013,7 +1488,11 @@ mod tests {
             "tool_name": "Write",
             "tool_input": {"file_path": "src/main.rs"},
         });
-        let extracted = extract_host_fact(HookKind::PostToolUse, input.to_string().as_bytes());
+        let extracted = extract_host_fact(
+            HookKind::PostToolUse,
+            input.to_string().as_bytes(),
+            checkout(),
+        );
         assert!(extracted.is_ok());
         fs::remove_file(fifo).unwrap();
         fs::remove_dir(root).unwrap();
@@ -1029,7 +1508,7 @@ mod tests {
             "final_summary":"host text is not an admitted dedicated field yet",
             "files":["src/private.rs"]
         }"#;
-        let extracted = extract_host_fact(HookKind::SessionEnd, input).unwrap();
+        let extracted = extract_host_fact(HookKind::SessionEnd, input, checkout()).unwrap();
         let HookClientCapturePayload::Close(close) = extracted.payload.unwrap() else {
             panic!("expected a close marker");
         };
@@ -1046,7 +1525,7 @@ mod tests {
             "cwd":"/forged/root",
             "nested":{"last_assistant_message":"nested must be ignored"}
         }"#;
-        let extracted = extract_host_fact(HookKind::Stop, input).unwrap();
+        let extracted = extract_host_fact(HookKind::Stop, input, checkout()).unwrap();
         assert!(extracted.presentation.is_none());
         let HookClientCapturePayload::TurnSummary(event) = extracted.payload.unwrap() else {
             panic!("expected a turn-summary delivery");
@@ -1075,7 +1554,8 @@ mod tests {
             json!({"session_id":"opaque-session","last_assistant_message":"a".repeat(2_001)}),
         ] {
             let extracted =
-                extract_host_fact(HookKind::Stop, value.to_string().as_bytes()).unwrap();
+                extract_host_fact(HookKind::Stop, value.to_string().as_bytes(), checkout())
+                    .unwrap();
             assert!(extracted.payload.is_none());
             assert!(extracted.presentation.is_none());
         }
@@ -1092,7 +1572,7 @@ mod tests {
             "lattice_injection_id":"hinj_11111111111111111111111111111111",
             "extra_secret":"must-not-cross"
         }"#;
-        let extracted = extract_host_fact(HookKind::UserPromptSubmit, input).unwrap();
+        let extracted = extract_host_fact(HookKind::UserPromptSubmit, input, checkout()).unwrap();
         assert!(extracted.payload.is_none());
         let presentation = extracted.presentation.unwrap();
         let wire = presentation_params(&presentation).to_string();
@@ -1111,104 +1591,158 @@ mod tests {
 
     #[test]
     fn presentation_rendering_is_host_specific_and_keeps_injection_id() {
-        let codex = render_host_presentation(
-            Integration::Codex,
-            HookKind::SessionStart,
-            HostPresentationResult {
-                injection_id: "hinj_11111111111111111111111111111111".to_string(),
-                context: "Lattice memory [injection_id=hinj_11111111111111111111111111111111]"
-                    .to_string(),
-            },
+        let context =
+            "Lattice memory [injection_id=hinj_11111111111111111111111111111111]".to_string();
+        // Codex takes plain text for session events.
+        assert_eq!(
+            render_output(
+                Integration::Codex,
+                HookKind::SessionStart,
+                HookOutput::context(context.clone())
+            ),
+            Some(context.clone())
         );
-        assert!(codex.starts_with("Lattice memory"));
-        let claude = render_host_presentation(
-            Integration::ClaudeCode,
-            HookKind::PostToolUse,
-            HostPresentationResult {
-                injection_id: "hinj_22222222222222222222222222222222".to_string(),
-                context: "one-line warning [injection_id=hinj_22222222222222222222222222222222]"
-                    .to_string(),
-            },
+        // Codex ignores plain text on tool events, so both hosts get JSON.
+        for integration in [Integration::ClaudeCode, Integration::Codex] {
+            let rendered = render_output(
+                integration,
+                HookKind::PostToolUse,
+                HookOutput::context(context.clone()),
+            )
+            .unwrap();
+            let rendered: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(rendered["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+            assert_eq!(rendered["hookSpecificOutput"]["additionalContext"], context);
+            assert!(rendered["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none());
+        }
+        assert_eq!(
+            render_output(
+                Integration::ClaudeCode,
+                HookKind::PostToolUse,
+                HookOutput::default()
+            ),
+            None
         );
-        let claude: Value = serde_json::from_str(&claude).unwrap();
-        assert_eq!(claude["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-        assert!(claude["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("hinj_22222222222222222222222222222222"));
     }
 
-    #[test]
-    fn session_start_transport_notice_is_claimed_once_and_host_formatted() {
-        let root = std::env::temp_dir().join(format!(
-            "lattice-hook-notice-{}",
+    fn notice_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lattice-hook-notice-{label}-{}-{}",
+            std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn a_notice_is_claimed_once_per_session_and_condition_under_a_content_free_name() {
+        let root = notice_root("claim");
         let host_session_id = "authenticated-host-session";
         let repository_id = "repository-id";
         let checkout_root = Path::new("/private/checkout");
-        let marker = session_start_notice_marker(
+        let marker = session_marker(
             Integration::Codex,
             host_session_id,
             repository_id,
             checkout_root,
         );
 
-        assert!(claim_session_start_notice_at(&root, &marker).unwrap());
-        assert!(!claim_session_start_notice_at(&root, &marker).unwrap());
-        let entries = fs::read_dir(&root)
+        let unreachable = NoticeCondition::DaemonUnreachable;
+        assert!(claim_notice_at(&root, unreachable, &marker).unwrap());
+        assert!(!claim_notice_at(&root, unreachable, &marker).unwrap());
+        // De-duplication is per condition: a second condition still speaks.
+        let timeout = NoticeCondition::AdapterTimeout;
+        assert!(claim_notice_at(&root, timeout, &marker).unwrap());
+        assert!(!claim_notice_at(&root, timeout, &marker).unwrap());
+        // And per session: another session claims its own.
+        let other = session_marker(
+            Integration::Codex,
+            "another-host-session",
+            repository_id,
+            checkout_root,
+        );
+        assert!(claim_notice_at(&root, unreachable, &other).unwrap());
+
+        let mut entries = fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![format!("session-start-{marker}")]);
-        let filename = &entries[0];
-        for private_value in [host_session_id, repository_id, "/private", "checkout"] {
-            assert!(
-                !filename.contains(private_value),
-                "notice filename leaked {private_value}"
-            );
+        entries.sort();
+        let mut expected = vec![
+            format!("adapter-timeout-{marker}"),
+            format!("session-start-{marker}"),
+            format!("session-start-{other}"),
+        ];
+        expected.sort();
+        assert_eq!(entries, expected);
+        for filename in &entries {
+            for private_value in [host_session_id, repository_id, "/private", "checkout"] {
+                assert!(
+                    !filename.contains(private_value),
+                    "notice filename leaked {private_value}"
+                );
+            }
         }
-        assert_eq!(
-            render_session_start_notice(Integration::Codex),
-            "lattice: daemon unreachable — run 'lattice doctor'"
-        );
-        let claude: Value =
-            serde_json::from_str(&render_session_start_notice(Integration::ClaudeCode)).unwrap();
-        assert_eq!(
-            claude["hookSpecificOutput"]["hookEventName"],
-            "SessionStart"
-        );
-        assert_eq!(
-            claude["hookSpecificOutput"]["additionalContext"],
-            "lattice: daemon unreachable — run 'lattice doctor'"
-        );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn ordinary_empty_memory_result_has_no_transport_notice() {
-        let presentation: Option<HostPresentationResult> = None;
-        let output = presentation.map(|result| {
-            render_host_presentation(Integration::Codex, HookKind::SessionStart, result)
-        });
-
-        assert_eq!(output, None);
+    fn best_effort_session_start_notice_keeps_its_wording_and_host_format() {
+        let output = HookOutput::context(BEST_EFFORT_DAEMON_NOTICE.to_string());
+        assert_eq!(
+            render_output(Integration::Codex, HookKind::SessionStart, output),
+            Some("lattice: daemon unreachable — run 'lattice doctor'".to_string())
+        );
+        let claude: Value = serde_json::from_str(
+            &render_output(
+                Integration::ClaudeCode,
+                HookKind::SessionStart,
+                HookOutput::context(BEST_EFFORT_DAEMON_NOTICE.to_string()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claude,
+            json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "lattice: daemon unreachable — run 'lattice doctor'",
+            }})
+        );
     }
 
     #[test]
-    fn session_start_notice_rejects_non_transport_failures() {
+    fn ordinary_empty_memory_result_renders_nothing() {
+        let mut output = HookOutput::default();
+        push_presentation(&mut output, None);
+        assert_eq!(
+            render_output(Integration::Codex, HookKind::SessionStart, output),
+            None
+        );
+    }
+
+    #[test]
+    fn failures_map_to_the_condition_that_actually_happened() {
         let transport =
             anyhow::Error::new(HookDaemonUnavailable(anyhow!("private transport detail")));
-        assert!(session_start_notice_eligible(&transport));
-        assert!(!session_start_notice_eligible(&anyhow!(
-            "invalid daemon presentation"
-        )));
-        assert!(!session_start_notice_eligible(&anyhow::Error::new(
-            HookSessionClientError::BindingMissing
-        )));
+        assert_eq!(
+            failure_condition(&transport),
+            NoticeCondition::DaemonUnreachable
+        );
+        assert_eq!(
+            failure_condition(&anyhow::Error::new(HookDaemonRejected)),
+            NoticeCondition::DaemonRejected
+        );
+        for local in [
+            anyhow!("invalid daemon presentation"),
+            anyhow::Error::new(HookSessionClientError::BindingMissing),
+        ] {
+            assert_eq!(failure_condition(&local), NoticeCondition::AdapterFailed);
+        }
     }
 
     #[test]
@@ -1226,7 +1760,7 @@ mod tests {
             "label":"lattice core tests",
             "outcome":"passed"
         }"#;
-        let extracted = extract_host_fact(HookKind::StructuredFact, check).unwrap();
+        let extracted = extract_host_fact(HookKind::StructuredFact, check, checkout()).unwrap();
         let HookClientCapturePayload::Event(event) = extracted.payload.unwrap() else {
             panic!("expected typed event");
         };
@@ -1247,7 +1781,11 @@ mod tests {
             json!({"session_id":"s","schema_version":1,"kind":"error","category":"test","fingerprint":format!("sha256:{}", "3".repeat(64)),"status":"resolved","summary":"not producer-declared"}),
         ] {
             let result =
-                extract_host_fact(HookKind::StructuredFact, rejected.to_string().as_bytes());
+                extract_host_fact(
+                HookKind::StructuredFact,
+                rejected.to_string().as_bytes(),
+                checkout(),
+            );
             assert!(result.is_err() || result.unwrap().payload.is_none());
         }
     }

@@ -382,6 +382,53 @@ impl HookSessionClient {
         })
     }
 
+    /// Load a binding whose local idle deadline has passed but whose absolute
+    /// deadline has not, so the caller can ask the daemon to resume it.
+    ///
+    /// The daemon renews its idle deadline whenever it admits a delivery; the
+    /// client learns a renewed deadline only from an open or resume. After a
+    /// run of deliveries the client can therefore believe a binding expired
+    /// while the daemon still holds it open, and a fresh open is then refused
+    /// because one is already open. Only the daemon can say which is true, so
+    /// expiry by idleness alone is a reason to ask, not to discard.
+    pub fn load_idle_expired_binding(
+        &self,
+        key: &HookClientBindingKey,
+        now_ms: i64,
+    ) -> Result<HookClientBinding, HookSessionClientError> {
+        self.with_lock(|| {
+            let record = self.load_record(key)?;
+            if now_ms > record.absolute_deadline_ms {
+                return Err(HookSessionClientError::BindingExpired);
+            }
+            if record.close_sequence.is_some() {
+                return Err(HookSessionClientError::BindingClosed);
+            }
+            record.into_binding()
+        })
+    }
+
+    /// Remove a binding the daemon has refused to resume, with its queue.
+    /// Unlike `prune` this does not consult the local deadlines: the daemon's
+    /// refusal is the authority.
+    pub fn discard_refused_binding(
+        &self,
+        key: &HookClientBindingKey,
+    ) -> Result<(), HookSessionClientError> {
+        self.with_lock(|| {
+            let fingerprint = key.fingerprint(&self.cryptography)?;
+            let record = match self.load_record_by_fingerprint(&fingerprint) {
+                Ok(record) => record,
+                Err(HookSessionClientError::BindingMissing) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            for pending in self.pending_records(&fingerprint, &record)? {
+                remove_private_file(&self.pending_path(&fingerprint, pending.sequence))?;
+            }
+            remove_private_file(&self.binding_path(&fingerprint))
+        })
+    }
+
     /// Persists daemon-renewed deadlines only when the returned binding is
     /// exactly the locally held capability and authority. This cannot replace
     /// a binding or reset local delivery bookkeeping.

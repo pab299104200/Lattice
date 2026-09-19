@@ -191,6 +191,29 @@ pub(crate) fn classify_edit_path(
     classify_relative_path(relative)
 }
 
+/// The checkout-relative, `/`-separated form of an edit target, or `None`
+/// when it resolves outside the checkout. Claude Code always sends absolute
+/// paths, while capture facts and presentations are repository-relative.
+pub(crate) fn checkout_relative_path(checkout_root: &Path, raw: &str) -> Option<String> {
+    let normalized = raw.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        checkout_root.join(candidate)
+    };
+    let resolved = resolve_through_existing_ancestor(&absolute);
+    let relative = resolved.strip_prefix(checkout_root).ok()?;
+    let parts = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Classify a path already known to be checkout-relative, such as a `git
 /// status` entry.
 pub(crate) fn classify_relative_path(relative: &Path) -> PathClass {
@@ -376,6 +399,7 @@ pub(crate) enum NoticeCondition {
     ShellDetectionDegraded,
     ShellEditWithoutPlan,
     CaptureUnavailable,
+    AdapterFailed,
 }
 
 impl NoticeCondition {
@@ -393,6 +417,7 @@ impl NoticeCondition {
             Self::ShellDetectionDegraded => "shell-detection-degraded",
             Self::ShellEditWithoutPlan => "shell-edit-without-plan",
             Self::CaptureUnavailable => "capture-unavailable",
+            Self::AdapterFailed => "adapter-failed",
         }
     }
 
@@ -463,6 +488,11 @@ pub(crate) fn notice_text(condition: NoticeCondition) -> String {
         NoticeCondition::CaptureUnavailable => {
             "Lattice session capture is not recording this session's turn summaries. Run \
              `lattice doctor`."
+        }
+        NoticeCondition::AdapterFailed => {
+            "Lattice's hook adapter failed before it could reach the daemon, most likely because \
+             its private state under ~/.local/state/lattice is unreadable. Edits are not \
+             blocked. Run `lattice doctor`."
         }
     };
     match condition {
@@ -657,6 +687,32 @@ mod tests {
     }
 
     #[test]
+    fn absolute_edit_targets_become_checkout_relative_and_outside_paths_do_not() {
+        let root = temp_root("relative");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let absolute = root.join("src/lib.rs").to_string_lossy().into_owned();
+        assert_eq!(
+            checkout_relative_path(&root, &absolute).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            checkout_relative_path(&root, "src/new/file.rs").as_deref(),
+            Some("src/new/file.rs")
+        );
+        assert_eq!(
+            checkout_relative_path(&root, "src/../src/./lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(checkout_relative_path(&root, "/etc/hosts"), None);
+        assert_eq!(checkout_relative_path(&root, "../escape.rs"), None);
+        assert_eq!(
+            checkout_relative_path(&root, &root.to_string_lossy()),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn host_scratchpad_inside_the_workspace_is_exempt() {
         let root = temp_root("scratchpad");
         let scratch = root.join("work/session-scratch");
@@ -812,6 +868,7 @@ mod tests {
             NoticeCondition::ShellDetectionDegraded,
             NoticeCondition::ShellEditWithoutPlan,
             NoticeCondition::CaptureUnavailable,
+            NoticeCondition::AdapterFailed,
         ];
         let mut slugs = std::collections::BTreeSet::new();
         let mut texts = std::collections::BTreeSet::new();
