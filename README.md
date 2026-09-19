@@ -378,7 +378,7 @@ This affects every workspace served by that daemon. Coordinate shared-service re
 | --- | --- |
 | `LATTICE_DAEMON_ADDR` | `127.0.0.1:47659`; alternate loopback endpoint |
 | `LATTICE_DAEMON_EXE` | Explicit absolute binary path for proxy startup |
-| `LATTICE_MAX_LOADED_SHARDS` | `3`; inactive non-indexing shards can be evicted |
+| `LATTICE_MAX_LOADED_SHARDS` | the view budget divided by the view reservation, `8` with the defaults (2 GiB / 256 MiB), at most `16`. A shard with an open session is never evicted, so set this at or above the number of workspaces you keep open at once. A workspace beyond the cap is deferred, and `lattice status` says so in its `summary` |
 | `LATTICE_WORKSPACE_IDLE_TTL_SECS` | `1800` |
 | `LATTICE_MAX_CONCURRENT_INDEX_JOBS` | `1`; shared indexing capacity |
 | `LATTICE_MATERIALIZATION_BUDGET_BYTES` | `2147483648`; logical materialization admission |

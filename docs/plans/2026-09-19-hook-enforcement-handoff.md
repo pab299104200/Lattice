@@ -103,6 +103,71 @@ Investigated read-only by a subagent, then each code claim re-read by me.
   on disk (Sep 14 17:57); `sessions.db-wal` is 4.1 MB and unchecked since Sep 16; about 100
   registry bindings stay `open` past their deadline because expiry is lazy.
 
+## Follow-up from the coordinator, 2026-09-19: shard starvation
+
+The coordinator observed from Relay `partial_reason: runtime_bootstrap_deferred`, with seven
+stdio proxies for five workspaces (relay, beacon x2, portal x2, keystone, synapse) on one daemon.
+
+**Correction to one inference in that message.** The deferral did not stop the capture journal
+at 07:31. Hook routes are shard-independent. **verified**: on a private daemon capped at one
+shard, with that shard pinned by an open proxy, a starved workspace still recorded an
+`edited_path` and a `turn_summary`. Relay's own journal also kept rows until 09-18 although its
+leases were deferred from 09-15. The 07:31 stop is the sanitizer defect above. Both were silent,
+which is the real point.
+
+Reproduced and **verified** on that private daemon, with the final binary:
+
+```
+status= deferred | indexing= False
+summary= Deferred behind shard capacity: every shard slot is held by another workspace with an
+  open session, so this workspace has not been loaded and nothing is indexing it. ...
+SessionStart (enforcing): "lattice: Lattice has deferred loading this workspace because every
+  shard slot is busy ... Edits are not blocked. ... state in your report ..."
+repeat SessionStart: silent.  Gate with no plan while deferred: allowed.
+```
+
+Assessment of the four questions:
+
+1. **Are idle shards evicted when sessions stay open for days? No, by design.** `is_evictable`
+   requires zero connections, and the architecture doc says a runtime becomes evictable "once
+   the last proxy disconnects". A session open for three days pins its shard for three days,
+   used or not. With more open workspaces than slots the late arrival starves forever. This is
+   a fairness defect in the design. **Not fixed**: a fair fix evicts a connection-pinned shard
+   that has no request in flight (that is already tracked by `RuntimeWorkTracker`) and has been
+   unused for some minutes, and makes every lease re-admit its shard on the next request, as
+   `DeferredShardHandler` already does. Today an evicted `ShardEntry` would answer its open
+   connections "indexing" forever. That is a change to the daemon's shard lifecycle and its
+   shutdown tests, outside this brief, and it should be its own reviewed change.
+2. **Is five workspaces a supported load here? Yes, easily.** **verified**: the live daemon uses
+   191 MB resident with three shards loaded, on a 16 GiB machine. Admission already reserves
+   256 MiB per shard against a 2 GiB budget, which allows 8. The count cap of 3 was a second,
+   smaller, arbitrary gate, and the operator guide already documented the default as 8.
+   **Fixed**: the default cap is now the view budget divided by the view reservation (8 with
+   defaults, at most 16). `LATTICE_MAX_LOADED_SHARDS` still overrides it.
+3. **Durable configuration.** There is none, and an environment variable cannot be made durable:
+   **verified in code and by observation**, the daemon is spawned by whichever stdio proxy first
+   finds it missing and inherits that client's environment. A hand-started daemon with the
+   variable set loses a race with seven proxies that reconnect the moment the old one dies.
+   Changing the default is therefore the durable fix. A daemon config file would be the general
+   answer and does not exist.
+4. **Should capture queue while deferred? No need.** Nothing is dropped; see the correction.
+
+Restart, for Pete to decide. **Do not run it before the new binary is built**, or the proxies
+respawn the old binary with the cap of 3:
+
+```bash
+cd /Users/pete/Cadres/lattice && git checkout feature/hook-enforcement
+cargo build --manifest-path daemon/Cargo.toml --release
+pkill -f 'lattice --daemon'
+```
+
+Effect on the other sessions, **verified** on a private daemon: an open stdio proxy survives
+the kill, spawns a new daemon on its next request and answers it. No session ends and no client
+needs reconnecting. What is lost: requests in flight at that instant fail once; every workspace
+reloads its shard from its on-disk index on first use (seconds, and cold answers are marked
+partial meanwhile); in-memory context handles from before the restart expire. Hook capture
+bindings survive, because they are on disk. With five workspaces and a cap of 8, Relay loads.
+
 ## Design decisions
 
 ### How the daemon knows a `prepare_change` happened
@@ -196,8 +261,8 @@ Defects fixed along the way, each with a test:
 ## Test results (observed, final code)
 
 ```
-cargo test --workspace            2,328 passed, 0 failed, 39 ignored
-  lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 638 | integration 8
+cargo test --workspace            2,330 passed, 0 failed, 39 ignored
+  lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 640 | integration 8
 cargo fmt --all -- --check        pass
 integrations/claude-code/tests/enforcement_e2e.sh <binary>    42 passed, 0 failed
 integrations/codex/tests/hooks_test.sh                        pass
@@ -251,8 +316,7 @@ output" sentence with the wording under "Wording for a product repository's inst
 they are git-ignored and untracked here, so I left them unchanged rather than make an edit
 nobody can review. Apply the same wording there by hand.
 
-To get Relay indexed at all, which enforcement does not fix: close a portal, beacon or keystone
-Lattice session, or start the daemon with `LATTICE_MAX_LOADED_SHARDS=6`.
+Relay gets indexed by step 2: the new default shard cap is 8. See the follow-up section.
 
 ## Rollback
 

@@ -106,6 +106,22 @@ impl ResourceBudget {
         }
     }
 
+    /// How many workspace views the configured budget can hold at once. This
+    /// is the default shard cap: admission already reserves one view per
+    /// shard against this budget, so a separate, smaller count only starves
+    /// workspaces the machine has room for. The ceiling keeps a very large
+    /// budget from implying an unbounded resident set.
+    pub(crate) fn default_view_capacity() -> usize {
+        const MAX_DEFAULT_SHARDS: u64 = 16;
+        let total = env_u64(
+            MATERIALIZATION_BUDGET_ENV,
+            DEFAULT_MATERIALIZATION_BUDGET_BYTES,
+        )
+        .max(1);
+        let view_class = env_u64(VIEW_CLASS_BUDGET_ENV, total).max(1).min(total);
+        (view_class / Self::default_view_reservation()).clamp(1, MAX_DEFAULT_SHARDS) as usize
+    }
+
     pub(crate) fn default_view_reservation() -> u64 {
         env_u64(VIEW_RESERVATION_ENV, DEFAULT_VIEW_RESERVATION_BYTES).max(1)
     }

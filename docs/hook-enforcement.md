@@ -127,6 +127,13 @@ run, and that it must say so in its report.
 | Repository changes could not be listed in time | run `lattice impact <file>` by hand |
 | Turn summary not captured (shown to the operator at `Stop`) | `lattice doctor` |
 
+A deferred workspace is the case this rule exists for. When every shard slot is held by another
+workspace with an open session, Lattice never loads the workspace, and it used to report that
+as `indexing: true` while hooks stayed silent. `lattice status` now says "Deferred behind shard
+capacity" in its `summary`, and an enforcing workspace is told once. Session capture is
+unaffected: hook routes do not need a loaded shard, so edits and turn summaries are recorded
+while deferred and nothing has to be queued.
+
 A workspace that simply has no shard loaded yet is not a failure. The gate asks for a plan,
 and asking for one is what loads the workspace.
 

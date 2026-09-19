@@ -303,7 +303,23 @@ fn cold_index_status_payload(
     } else {
         "starting"
     };
+    let summary = if bootstrap_error.is_some() {
+        "Failed to load this workspace. Lattice answers for it are unavailable. Run `lattice doctor`."
+            .to_string()
+    } else if deferred_reason.is_some() {
+        // Say the thing an operator needs in words. `indexing` and
+        // `not_loaded` both read as "wait", and waiting never ends here.
+        "Deferred behind shard capacity: every shard slot is held by another workspace with an \
+         open session, so this workspace has not been loaded and nothing is indexing it. It will \
+         stay deferred until one of those sessions closes or the daemon is restarted with a \
+         higher LATTICE_MAX_LOADED_SHARDS. Lattice answers for this workspace are partial."
+            .to_string()
+    } else {
+        "Loading this workspace for the first time. Answers are partial until indexing finishes."
+            .to_string()
+    };
     serde_json::json!({
+        "summary": summary,
         "status": if bootstrap_error.is_some() {
             "degraded"
         } else if deferred_reason.is_some() {
@@ -945,7 +961,10 @@ impl GlobalDaemon {
         let mut daemon = Self::new_with_config(
             env_usize(
                 "LATTICE_MAX_LOADED_SHARDS",
-                env_usize("LATTICE_MAX_LOADED_WORKSPACES", 3),
+                env_usize(
+                    "LATTICE_MAX_LOADED_WORKSPACES",
+                    crate::resource_budget::ResourceBudget::default_view_capacity(),
+                ),
             ),
             env_bool("LATTICE_PREWARM_VIEW_SHARDS", false),
         );
@@ -1783,6 +1802,10 @@ mod tests {
         );
         assert_eq!(deferred["status"], "deferred");
         assert_eq!(deferred["indexing"], false);
+        let summary = deferred["summary"].as_str().unwrap();
+        assert!(summary.starts_with("Deferred behind shard capacity"));
+        assert!(summary.contains("nothing is indexing it"));
+        assert!(summary.contains("LATTICE_MAX_LOADED_SHARDS"));
         assert_eq!(deferred["bootstrap"]["state"], "deferred");
         assert_eq!(deferred["graph_snapshot_state"], "not_loaded");
         // A merged view must still treat the deferred shard as incomplete.
@@ -1796,6 +1819,76 @@ mod tests {
             cold_index_status_payload(&root, &index_work, Some("bootstrap failed".into()), None);
         assert_eq!(failed["status"], "degraded");
         assert_eq!(failed["indexing"], false);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_starved_of_a_shard_slot_reports_deferred_to_the_hook_gate() {
+        use crate::hook_enforcement::IndexState;
+        let daemon = Arc::new(GlobalDaemon::new_with_config(1, false));
+        let resident = unique_test_root("index-state-resident");
+        let starved = unique_test_root("index-state-starved");
+        for root in [&resident, &starved] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let request = |root: &Path| ProxyRequest {
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        };
+        // Nothing loaded and a free slot: the first Lattice call will load it.
+        assert_eq!(
+            daemon.index_state_for(&request(&starved)).await,
+            IndexState::NotLoaded
+        );
+
+        // One slot, held by a workspace that is still bootstrapping and so is
+        // not evictable. The probe must not admit, retain or evict anything.
+        let resident_root = resident.canonicalize().unwrap();
+        let reservation = daemon
+            .resource_budget
+            .try_reserve("test_view", 1)
+            .expect("reserve test view");
+        daemon.shards.lock().await.insert(
+            shard_key(&resident_root),
+            Arc::new(ShardEntry::pending(
+                resident_root,
+                Arc::clone(&daemon.index_work),
+                reservation,
+            )),
+        );
+        assert_eq!(
+            daemon.index_state_for(&request(&resident)).await,
+            IndexState::Indexing
+        );
+        assert_eq!(
+            daemon.index_state_for(&request(&starved)).await,
+            IndexState::Deferred
+        );
+        assert_eq!(daemon.shards.lock().await.len(), 1);
+        // More than one root is a merged view, which has no single index.
+        let mut view = request(&resident);
+        view.workspace_roots
+            .push(starved.to_string_lossy().to_string());
+        assert_eq!(daemon.index_state_for(&view).await, IndexState::NotLoaded);
+
+        daemon.shards.lock().await.clear();
+        for root in [resident, starved] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_shard_cap_follows_the_view_budget() {
+        // 2 GiB budget / 256 MiB per view, unless the operator set either.
+        if std::env::var_os(crate::resource_budget::MATERIALIZATION_BUDGET_ENV).is_none()
+            && std::env::var_os(crate::resource_budget::VIEW_CLASS_BUDGET_ENV).is_none()
+            && std::env::var_os(crate::resource_budget::VIEW_RESERVATION_ENV).is_none()
+        {
+            assert_eq!(
+                crate::resource_budget::ResourceBudget::default_view_capacity(),
+                8
+            );
+        }
     }
 
     #[test]
