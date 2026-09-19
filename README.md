@@ -206,7 +206,7 @@ Prompt hooks provide an initial briefing. The installed instructions also direct
 5. Record verified reusable corrections with `remember`; keep task progress and test results in the plan's execution tracker.
 6. Include relevant calls, evidence, and incomplete results in sub-agent handoffs. Each agent needs context for its own task.
 
-When Lattice is unavailable, continue with direct inspection and record the limitation; retry at the next task boundary. Hook installation does not enforce model behavior or automatically detect arbitrary task transitions. Actual tool-call traces establish adoption. See [agent workflow](docs/agent-workflow.md).
+When Lattice is unavailable, continue with direct inspection and record the limitation; retry at the next task boundary. A default hook installation does not enforce model behavior or automatically detect arbitrary task transitions. A workspace can opt in with `lattice install --workspace <path> --enforce`: product edits are then denied until `prepare_change` has been served for the checkout, shell-made edits get the same feedback as tool-made edits, and an unavailable Lattice says so once instead of failing silent. Every Lattice failure still allows the tool call. See [hook enforcement](docs/hook-enforcement.md). Actual tool-call traces establish adoption. See [agent workflow](docs/agent-workflow.md).
 
 ### Response budgets and follow-up context
 
@@ -271,7 +271,7 @@ A memory's confidence, evidence strength, behavioral verification, checkout appl
 
 ### Capture and verification
 
-Hooks supply bounded session, prompt-briefing, edit, turn-summary, and session-close integration. Capture accepts allowlisted metadata and a bounded final-assistant-message summary; it does not read transcript files or retain raw prompts, commands, process streams, or environment values in capture state. `Stop` is nonterminal; `SessionEnd` closes a session. Failed close delivery is not successful capture.
+Hooks supply bounded session, prompt-briefing, edit, turn-summary, and session-close integration, plus an opt-in [plan gate](docs/hook-enforcement.md). Capture accepts allowlisted metadata and a bounded final-assistant-message summary; it does not read transcript files or retain raw prompts, commands, process streams, or environment values in capture state. `Stop` is nonterminal; `SessionEnd` closes a session. Failed close delivery is not successful capture.
 
 Navigation summaries are derived caches. Session prose and edit counts alone cannot certify a reusable correction. Lesson capture requires observed failure, matching resolution, and validated correction. Deterministic capture needs no LLM; optional consolidation is repository-scoped and proposal-only.
 

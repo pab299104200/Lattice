@@ -20,11 +20,15 @@ content actually received, according to the returned receipt contract.
 
 Installed integrations provide session, prompt, edit, and turn hooks; working
 memory has bounded checkpoint support. These complement direct tool calls.
-They do not enforce task-by-task adoption. The default `lattice install --workspace <path>` maintains this workflow in
+By default they do not enforce task-by-task adoption; a workspace can opt in to
+[hook enforcement](hook-enforcement.md), which denies a product edit until a
+change plan has been served. The default `lattice install --workspace <path>` maintains this workflow in
 managed sections of both `AGENTS.md` and `CLAUDE.md`, alongside MCP and hook
 configuration. Explicit client hook targets remain hook-only. Lattice unavailability
 must be recorded, followed by direct inspection and a retry at the next task
-boundary; unavailable hooks must remain best-effort.
+boundary. Hooks never break a session: every Lattice failure allows the tool
+call. In a best-effort workspace an unavailable hook is silent; in an enforcing
+one it reports the failure once and the agent must repeat it in its report.
 
 ## Beacon acceptance exercise
 

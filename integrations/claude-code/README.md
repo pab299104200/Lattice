@@ -14,7 +14,11 @@ The Rust installer reconciles Lattice entries in the project-local
 `.claude/settings.json`. It updates stale command paths, matchers, timeouts,
 and duplicate Lattice entries in place while preserving unrelated hooks. It
 does not edit global Claude configuration. `--verify` re-reads the resulting
-file, validates the hook assets, and exercises the context-producing hooks.
+file, validates the hook assets, and exercises every installed hook against a
+deliberately unreachable daemon.
+
+Add `--enforce` to opt this workspace in to enforcement, and `--no-enforce` to
+opt it out again. See [Enforcement mode](#enforcement-mode).
 
 The installer records the absolute executable and hook-asset paths resolved
 from the running installation. No checkout-specific path is required; use the
@@ -24,15 +28,58 @@ same command after moving or reinstalling Lattice.
 
 - `SessionStart`: calls `lattice recall "session start" --mode task --json`, adds current task memory and repo rules as `additionalContext`, and clips output to about 1500 tokens.
 - `UserPromptSubmit`: calls `lattice context "<prompt>" --mode auto --min-relevance 0.25`, clips output to about 1200 tokens, and emits nothing when the result is too small or not relevant.
-- `PostToolUse`: for `Edit|Write`, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
-- `Stop`: sends only the bounded top-level `last_assistant_message` as a nonterminal turn-summary fact under the existing authenticated binding. It never opens a transcript or creates a binding.
+- `PreToolUse`: installed only in an enforcing workspace. See [Enforcement mode](#enforcement-mode).
+- `PostToolUse`: for `apply_patch|Edit|Write`, records the edited path as a capture fact and returns a bounded note of at most about 240 tokens for that file. Claude Code sends an absolute `file_path`; the adapter converts it to a checkout-relative path and ignores a path outside the checkout. Until 2026-09 absolute paths were rejected, so this hook produced nothing in Claude Code.
+- `Stop`: sends only the bounded top-level `last_assistant_message` as a nonterminal turn-summary fact. It never opens a transcript. It resumes the session binding, or opens one when none exists, so a long run of turns keeps capturing. Layout is collapsed, Markdown code spans and fences are replaced with `[code]`, and a long message keeps its first 2,000 bytes. A message that still contains a secret, an external path or a shell construct is dropped whole.
 - `SessionEnd`: sends an authenticated, content-free close marker for the host session. This is the sole terminal event. The daemon reduces a verified close into repository-local session memory; unavailable capture is not reported as successful.
 
 Every script locates the configured or installed Lattice binary and invokes the
-bounded adapter. If the binary is missing, the daemon is unavailable, or the
-adapter cannot finish within its two-second invocation deadline, the script
-exits `0` without output so hooks never break a Claude session. Session recall
-and rule lookup run concurrently.
+bounded adapter, and always exits `0`, so hooks never break a Claude session.
+In a best-effort workspace a missing binary, an unavailable daemon or an
+adapter that cannot finish within its two-second invocation deadline produces
+no output, apart from one `SessionStart` recovery notice. In an enforcing
+workspace the same failures still allow the tool call but are reported once.
+
+## Enforcement mode
+
+```bash
+./daemon/target/release/lattice install claude-code --workspace "$PWD" --enforce --verify
+./daemon/target/release/lattice install claude-code --workspace "$PWD" --no-enforce --verify
+```
+
+The mode is recorded in the workspace's `.lattice/workspace-policy.json`, never
+in global configuration. A rerun without either flag keeps it. Restart Claude
+Code afterwards.
+
+In an enforcing workspace:
+
+- `PreToolUse` on `apply_patch|Edit|Write|MultiEdit|NotebookEdit` denies an edit
+  to product code until `prepare_change` has been served for this checkout,
+  through MCP or the CLI. It returns the documented
+  `hookSpecificOutput.permissionDecision: "deny"` with a two-line reason.
+  Anthropic documents that a hook `deny` applies in `bypassPermissions` mode
+  too. Documentation, `.lattice/`, `.claude/`, scratch and out-of-workspace
+  paths are exempt. One plan covers a whole multi-file change.
+- `PostToolUse` also matches `Bash|PowerShell`. The command, its output, its
+  environment and its working directory are not read. Changed files are found
+  from a bounded `git status` comparison, get the same note as tool-made edits,
+  and are recorded as capture facts. Product files changed through the shell
+  with no current plan are reported once.
+- `Stop` adds one reminder per session when product files were edited and the
+  stale-docs check or `remember` never ran. Claude Code continues the
+  conversation once for a `Stop` hook's `additionalContext`; Lattice never
+  sends it while `stop_hook_active` is true and never uses `decision: "block"`.
+- A daemon that is down, refusing, slow, still indexing, deferred or not
+  capturing produces one notice per session per condition. Nothing is blocked.
+
+`--verify` in an enforcing workspace additionally proves, with the daemon
+unreachable, that the gate allows a product edit and emits exactly the
+unreachable-daemon notice once, stays silent for a documentation path, and that
+a shell call records its baseline without retaining the command.
+
+The full contract, the freshness rule and the replacement wording for a product
+repository's instructions are in
+[docs/hook-enforcement.md](../../docs/hook-enforcement.md).
 
 The installer records a five-second outer timeout for every hook. The shipped
 adapter uses one bounded two-second invocation deadline for each hook. These
@@ -87,7 +134,9 @@ Do not register a bare `lattice` command or point a workspace at `$HOME`.
 Hook injection does not replace direct Lattice calls during a plan. Include the
 [agent workflow](../../docs/agent-workflow.md) in the consuming repository's
 agent instructions and verify actual task-boundary tool calls in acceptance
-tests. Installation alone does not enforce this behavior.
+tests. A best-effort installation does not enforce this behavior. An enforcing
+one enforces exactly one step, a change plan before a product edit, and
+reminds about two more.
 
 For complete project setup, run `lattice install --workspace /path/to/project`.
 It installs both clients' MCP configurations and hooks and maintains workflow

@@ -26,13 +26,49 @@ Codex requires project `.codex/` layers to be trusted before project-local hooks
 
 - `SessionStart`: calls `lattice recall "session start" --mode task --json` and `lattice context "repo rules and operator workflow" --mode rules`, then prints compact markdown for Codex to consume when hook stdout is supported.
 - `UserPromptSubmit`: extracts the prompt from the hook payload, calls `lattice context "<prompt>" --mode auto --min-relevance 0.25`, and emits nothing when the result is too small or not relevant.
-- `PostToolUse`: for `apply_patch|Edit|Write`, extracts the edited file, calls `lattice impact <edited-file> --no-tests`, emits at most 10 lines, and skips leaf edits by default unless at least three impact/dependent lines are present.
-- `Stop`: sends only the bounded top-level `last_assistant_message` as a nonterminal turn-summary fact under the existing authenticated binding. It never opens a transcript or creates a binding.
+- `PreToolUse`: installed only in an enforcing workspace. See [Enforcement mode](#enforcement-mode).
+- `PostToolUse`: for `apply_patch|Edit|Write`, records the edited path when the host names one and returns a bounded note as `hookSpecificOutput.additionalContext`. Codex ignores plain-text stdout on tool events, so plain text written here before 2026-09 never reached the model. Codex's `apply_patch` hook input is the raw patch text with no path field, and Lattice does not read it; a best-effort workspace therefore gets no per-edit note from Codex. An enforcing workspace finds Codex edits from repository state.
+- `Stop`: sends only the bounded top-level `last_assistant_message` as a nonterminal turn-summary fact. It never opens a transcript. It resumes the session binding, or opens one when none exists. Layout is collapsed, Markdown code spans and fences are replaced with `[code]`, and a long message keeps its first 2,000 bytes. A message that still contains a secret, an external path or a shell construct is dropped whole.
 - `SessionEnd`: sends an authenticated, content-free close marker for the host session. This is the sole terminal event. The daemon reduces a verified close into repository-local session memory; unavailable capture is not reported as successful.
 
-Every script locates the configured or installed Lattice binary and invokes the bounded adapter. If the binary is missing, the daemon is unavailable, or the adapter cannot finish within its two-second invocation deadline, the script exits `0` without output so hooks never break a Codex session. This is deliberately a no-injection result, not evidence that the hook configuration is absent: diagnose it with `lattice status --timeout 2` after the session is responsive. Session recall and rule lookup run concurrently. The installer records a five-second outer timeout for every hook, leaving process and serialization overhead around the adapter call.
+Every script locates the configured or installed Lattice binary and invokes the bounded adapter, and always exits `0`, so hooks never break a Codex session. In a best-effort workspace a missing binary, an unavailable daemon or an adapter that cannot finish within its two-second invocation deadline produces no output. This is deliberately a no-injection result, not evidence that the hook configuration is absent: diagnose it with `lattice status --timeout 2` after the session is responsive. In an enforcing workspace the same failures still allow the tool call but are reported once. Session recall and rule lookup run concurrently. The installer records a five-second outer timeout for every hook, leaving process and serialization overhead around the adapter call.
 
 Hook delivery is attributed by the daemon as `codex` / `hook`; installer fixture runs use a protected state root and skip metrics so verification does not pollute adoption reports.
+
+## Enforcement mode
+
+```bash
+./target/release/lattice install codex --workspace "$PWD/.." --enforce --verify
+./target/release/lattice install codex --workspace "$PWD/.." --no-enforce --verify
+```
+
+The mode is recorded in the workspace's `.lattice/workspace-policy.json` and is
+shared with Claude Code. Review and trust the changed hooks with `/hooks`, then
+restart Codex. The contract is in
+[docs/hook-enforcement.md](../../docs/hook-enforcement.md).
+
+Codex supports `PreToolUse`, `PostToolUse` and `Stop`, and blocks a tool call on
+the same `hookSpecificOutput.permissionDecision: "deny"` JSON as Claude Code.
+Every enforcement event is therefore wired. These guarantees do **not** exist
+in Codex:
+
+- **No path exemptions.** `apply_patch` exposes only patch text. Lattice does
+  not read it, so it cannot tell a documentation patch from a code patch. In
+  Codex every patch needs a current plan, including documentation and scratch
+  files. The denial says so.
+- **No per-path note from the edit tool.** For the same reason Codex edits are
+  found from `git status`, exactly like shell edits. A change to a git-ignored
+  file is not seen.
+- **No model-facing Stop reminder.** Codex's `Stop` hook can only block and
+  continue, which Lattice never does. The reminder is sent as `systemMessage`,
+  which the operator sees and the model does not.
+- **No bypass-mode statement.** Anthropic documents that a hook `deny` applies
+  in bypass-permissions mode. Lattice has no equivalent documented statement
+  for Codex approval policies.
+
+What is the same: the plan gate itself, the freshness rule, shell-edit
+detection for `Bash`, the one-notice-per-condition fail-open rule, and the
+privacy posture.
 
 ## Declared verification checks
 
@@ -89,7 +125,9 @@ budgets, and the daemon-unavailable no-op contract.
 Hook injection does not replace direct Lattice calls during a plan. Include the
 [agent workflow](../../docs/agent-workflow.md) in the consuming repository's
 agent instructions and verify actual task-boundary tool calls in acceptance
-tests. Installation alone does not enforce this behavior.
+tests. A best-effort installation does not enforce this behavior. An enforcing
+one enforces exactly one step, a change plan before an edit, and reminds the
+operator about two more.
 
 For complete project setup, run `lattice install --workspace /path/to/project`.
 It installs both clients' MCP configurations and hooks and maintains workflow

@@ -555,11 +555,13 @@ pub(crate) fn followup_reminder(gaps: FollowupGaps) -> Option<String> {
     let steps = match (gaps.stale_docs, gaps.remember) {
         (false, false) => return None,
         (true, true) => {
-            "the stale-docs check (`lattice status --scope docs`, MCP `status` with scope \
-             `docs`) and `lattice remember` for any verified, reusable outcome"
+            "the stale-docs check (`lattice status --scope docs --files <changed files>`, MCP \
+             `status` with scope `docs`) and `lattice remember` for any verified, reusable \
+             outcome"
         }
         (true, false) => {
-            "the stale-docs check (`lattice status --scope docs`, MCP `status` with scope `docs`)"
+            "the stale-docs check (`lattice status --scope docs --files <changed files>`, MCP \
+             `status` with scope `docs`)"
         }
         (false, true) => "`lattice remember` for any verified, reusable outcome",
     };
