@@ -98,6 +98,8 @@ extern "C" fn remove_sandbox() {
     if let Some(sandbox) = SANDBOX.get() {
         let _ = std::fs::remove_dir_all(sandbox);
     }
+    // Children this process killed are gone by now; take theirs too.
+    remove_orphaned_sandboxes();
 }
 
 /// Remove sandboxes whose process has gone without reaching `atexit`.
