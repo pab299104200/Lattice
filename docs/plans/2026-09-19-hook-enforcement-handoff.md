@@ -6,8 +6,9 @@ Every claim is tagged **verified** (evidence named) or **hypothesis**.
 
 ## Status
 
-IN PROGRESS. Investigation complete; implementation started. Nothing below the
-"Design decisions" heading is built until a "Built" entry says so.
+COMPLETE on the branch, not rolled out. Nothing live was changed: the running daemon
+(pid 57458) was not restarted, no product repository was touched, and `daemon/target/release`
+was not rebuilt. See "One thing the brief got wrong" before rolling out.
 
 ## Host contract, checked against primary sources (2026-09-18)
 
@@ -149,18 +150,143 @@ reminder is claimed once per session by the daemon and never requested while
 `stop_hook_active` is true, so it cannot loop. Codex has no such channel, so it gets
 `systemMessage` (operator-visible) instead.
 
-## Built so far (all committed on the branch)
+## One thing the brief got wrong
 
-- `hook_enforcement.rs` policy file `.lattice/workspace-policy.json`, path classes, freshness
-  rule, notice and deny wording. `hook_workflow_state.rs` workflow facts and session state.
-  `hook_shell_changes.rs` bounded `git status --porcelain=v2` snapshot comparison.
-- `hook_session_route.rs` `enforcement` request/answer on `hook/session_open`;
-  `socket_server.rs` step recording, non-loading `index_state_for`, deferred status fix.
-- `hook_adapter.rs` `pre-tool-use` kind, gate, shell feedback, notices, JSON rendering for both
-  hosts on tool events, checkout-relative edit paths, Stop re-opens its binding.
-- `hook_session_client.rs` idle-expired bindings are resumed rather than discarded.
+The brief says to build to `daemon/target/release` and not to reinstall the binary.
+**verified** `~/.local/bin/lattice` is a symlink to `daemon/target/release/lattice`, and the
+live daemon runs from that path. A release build there IS a reinstall: it swaps the hook adapter
+under every live session in every repository. I built to `daemon/target/enforcement` (ignored
+by git) and tested against private daemons on ports 47991 to 47993 under a sandbox `HOME`.
+**verified** afterwards: `daemon/target/release/lattice` is still dated Sep 14 17:57, one daemon
+process, same pid, and its lifecycle log has no entry for any scratch workspace.
 
-## Still to do when this was written
+## What is built
 
-Sanitizer fix, installer `--enforce`/`--no-enforce` and `--verify`, hook scripts, Codex parity,
-docs, adapter unit tests, end-to-end run against a private daemon, clippy and fmt.
+| Requirement | Where | State |
+|---|---|---|
+| 1. Opt-in per workspace | `hook_enforcement.rs` (policy file), `cli.rs` (`--enforce`, `--no-enforce`, mode kept on plain rerun), `install.rs` (`HookMode`) | done |
+| 2. PreToolUse gate | `hook_adapter.rs` (`pre-tool-use` kind, path class), `hook_session_route.rs` (`decide_enforcement`), `hook_workflow_state.rs`, `socket_server.rs` (records the served step) | done |
+| 3. Fail open, loudly | `hook_adapter.rs` (`failure_output`, `claim_notice`), 11 conditions in `hook_enforcement.rs` | done |
+| 4. Shell edits | `hook_shell_changes.rs`, `run_post_tool_use` in the adapter | done |
+| 5. Stop reminder | daemon claims it once; adapter never asks while `stop_hook_active` | done |
+| 6. Codex parity | `integrations/codex/hooks/pre-tool-use.sh`, JSON output on tool events, README states the four missing guarantees | done |
+| 7. Diagnosis | above; three Lattice defects fixed, one design weakness reported | done |
+| 8. Tests | below | done |
+| 9. Docs | `docs/hook-enforcement.md` (new, citable), both integration READMEs, `README.md`, `docs/agent-workflow.md` | done |
+
+Defects fixed along the way, each with a test:
+
+1. Multi-line turn summaries dropped whole (`sanitize_text` ordering). Long summaries dropped
+   instead of bounded. Host-side only, Markdown code spans and fences become `[code]` before
+   the unchanged strict check. The deliberate rule that a summary with a backticked command is
+   refused on the wire is kept, and its existing test still passes.
+2. Claude Code absolute edit paths rejected, so edit capture and the PostToolUse note never
+   worked. Paths are now made checkout-relative; outside paths yield no fact.
+3. Client and daemon idle deadlines drifting apart. An idle-expired binding is now offered to
+   the daemon for resume; only a refusal discards it. Stop resumes or opens its binding.
+4. One refused delivery blocked the whole ordered queue forever. A refused non-close delivery
+   is dropped and the rest drain; a close is never dropped.
+5. Codex ignored plain-text tool-event output. Both hosts now get JSON there.
+6. `lattice status` claimed `indexing: true` for a deferred workspace. It now reports
+   `status: "deferred"`, `indexing: false`. Merged views still treat it as incomplete.
+7. `integrations/codex/tests/hooks_test.sh` used `rg`; without ripgrep installed the guard
+   against public CLI calls in hook scripts passed vacuously. It uses `grep` now, and I watched
+   it fail when a script called `lattice impact`.
+
+## Test results (observed, final code)
+
+```
+cargo test --workspace            2,328 passed, 0 failed, 39 ignored
+  lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 638 | integration 8
+cargo fmt --all -- --check        pass
+integrations/claude-code/tests/enforcement_e2e.sh <binary>    42 passed, 0 failed
+integrations/codex/tests/hooks_test.sh                        pass
+integrations/codex/tests/install_test.sh                      pass
+```
+
+About 75 new unit tests. Tests proven to bite by injecting the bug: the workflow-session key
+(restoring the per-generation key makes `a_plan_survives_binding_regeneration...` fail with
+`deny`), the script guard above, and the end-to-end harness (17 failures against the old
+binary). The end-to-end harness measured the gate at 66 to 71 ms.
+
+**`cargo clippy -- -D warnings` does not pass, and did not pass on `master`.** Observed: 133
+distinct diagnostics on the branch with my work stashed, almost all in `lattice-core`
+(`consolidation/`, `health/`, `storage/`). The three new files are clean and I introduced no
+new diagnostic; the one I did introduce (an unused import) is fixed. Clearing the rest is a
+separate change across code this brief does not touch. `cargo fmt --check` also failed on
+`master` for two files; those are formatted in their own commit.
+
+Version skew, **verified** with the new adapter against the OLD daemon binary on a private
+port: a best-effort workspace captures edits and multi-line summaries at once with nothing
+left in the client queue; an enforcing workspace allows the edit and emits the
+"daemon refused" notice once.
+
+## Rollout (coordinator)
+
+```bash
+# 1. Build. This swaps the hook adapter for every live session immediately, because
+#    ~/.local/bin/lattice is a symlink into this directory. Verified safe against the old daemon.
+cd /Users/pete/Cadres/lattice && git checkout feature/hook-enforcement
+cargo build --manifest-path daemon/Cargo.toml --release
+
+# 2. Restart the daemon so it records plans. Until then enforcing workspaces fail open with a
+#    "daemon refused" notice. This ends every live MCP session; clients reconnect on next use.
+pkill -f 'lattice --daemon' ; sleep 2        # proxies restart the daemon on demand
+lattice status --workspace /Users/pete/Cadres/lattice --timeout 5
+
+# 3. Acceptance, touches nothing live:
+bash integrations/claude-code/tests/enforcement_e2e.sh
+
+# 4. Opt each product repository in (both clients), then restart its agent sessions.
+for repo in relay synapse beacon keystone portal; do
+  lattice install --workspace "/Users/pete/Cadres/$repo" --enforce --verify
+done
+```
+
+Then in each product repository replace the "hook packages must stay best-effort ... produce no
+output" sentence with the wording under "Wording for a product repository's instructions" in
+`docs/hook-enforcement.md`. Lattice's own `CLAUDE.md` and `AGENTS.md` carry the same sentence;
+they are git-ignored and untracked here, so I left them unchanged rather than make an edit
+nobody can review. Apply the same wording there by hand.
+
+To get Relay indexed at all, which enforcement does not fix: close a portal, beacon or keystone
+Lattice session, or start the daemon with `LATTICE_MAX_LOADED_SHARDS=6`.
+
+## Rollback
+
+```bash
+# Per repository, immediate and complete:
+lattice install --workspace /Users/pete/Cadres/<repo> --no-enforce --verify
+# Emergency, no installer needed (the adapter reads the policy on every call):
+rm /Users/pete/Cadres/<repo>/.lattice/workspace-policy.json
+# Whole change:
+cd /Users/pete/Cadres/lattice && git checkout master
+cargo build --manifest-path daemon/Cargo.toml --release && pkill -f 'lattice --daemon'
+```
+
+Rolling the binary back while a repository is still enforcing is safe: the old adapter ignores
+an unknown hook kind and prints nothing, so the leftover `PreToolUse` entry is inert. Run
+`--no-enforce` afterwards to remove it. `workflow.db` and the notice and snapshot directories
+under `~/.local/state/lattice` can be deleted at any time.
+
+## Open risks
+
+- **Checkout-scoped plans.** With many agents in one checkout, one agent's plan satisfies every
+  session already running there. Nothing a host supplies can fix this. Worktrees can.
+- **hypothesis** Claude Code subagent hooks carry the parent's `session_id`. The docs do not
+  say. If they carry their own, each subagent needs its own plan, which is stricter, not unsafe.
+- **Shell attribution under concurrency.** A change made by another agent during a shell call is
+  listed for that call. The wording says "changed", not "you changed".
+- **NotebookEdit path field** is undocumented. `notebook_path` is accepted; if the real name
+  differs the gate allows that tool. `MultiEdit` is no longer documented at all.
+- **Stop reminder costs one continuation** in Claude Code, by the host's design.
+- **Many summaries are still dropped.** Any remaining `;`, `|`, `<`, `>` outside code, or an
+  absolute path such as `/Users/...`, drops the summary. That is the existing privacy rule and
+  I did not weaken it. Whether to redact instead of drop is a product decision for Pete.
+- **Deferred workspaces.** The three-shard cap still leaves a workspace with its own live proxy
+  waiting indefinitely. Now reported honestly, not solved.
+- **Codex** is verified from `openai/codex` source, not from a Codex run. No Codex session was
+  exercised.
+- Not acted on: 4.1 MB unchecked `sessions.db-wal`; about 100 bindings left `open` past their
+  deadline because expiry is lazy.
+
