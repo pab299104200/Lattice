@@ -342,7 +342,7 @@ pub fn parse_session_capture_event(
 pub fn session_capture_turn_summary_from_host(
     last_assistant_message: Option<&str>,
 ) -> Option<SessionCaptureEvent> {
-    let summary = normalize_turn_summary(last_assistant_message?)?;
+    let summary = prepare_host_turn_summary(last_assistant_message?)?;
     Some(SessionCaptureEvent {
         schema_version: SESSION_CAPTURE_SCHEMA_VERSION,
         fact: SessionCaptureFact::TurnSummary { summary },
@@ -576,6 +576,22 @@ fn map_digest_authority_error(_: SessionDigestError) -> SessionCaptureError {
     SessionCaptureError::InvalidAuthority
 }
 
+/// Hard ceiling on host text examined at all, so preparation stays bounded.
+const MAX_HOST_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Prepare a host's final assistant message for capture. Unlike the wire
+/// parser, which rejects anything that is not already normal, this accepts
+/// real prose: it removes quoted code, collapses layout, applies the same
+/// strict safety check, and keeps a bounded prefix rather than discarding a
+/// long message. The result always passes `normalize_turn_summary`.
+fn prepare_host_turn_summary(value: &str) -> Option<String> {
+    if value.len() > MAX_HOST_MESSAGE_BYTES {
+        return None;
+    }
+    let redacted = super::session_digest::redact_code_spans(value);
+    sanitize_text(&redacted, MAX_TURN_SUMMARY_BYTES)
+}
+
 fn normalize_turn_summary(value: &str) -> Option<String> {
     if value.len() > MAX_TURN_SUMMARY_BYTES {
         return None;
@@ -673,10 +689,53 @@ mod tests {
             }
         );
         assert!(session_capture_turn_summary_from_host(None).is_none());
+        // A long message keeps a bounded prefix instead of being lost whole.
+        let long = session_capture_turn_summary_from_host(Some(
+            &"word ".repeat(MAX_TURN_SUMMARY_BYTES),
+        ))
+        .expect("bounded prefix of a long host summary");
+        let SessionCaptureFact::TurnSummary { summary } = &long.fact else {
+            panic!("expected a turn summary");
+        };
+        assert!(summary.len() <= MAX_TURN_SUMMARY_BYTES);
+        assert!(summary.starts_with("word word"));
         assert!(session_capture_turn_summary_from_host(Some(
-            &"x".repeat(MAX_TURN_SUMMARY_BYTES + 1)
+            &"x".repeat(MAX_HOST_MESSAGE_BYTES + 1)
         ))
         .is_none());
+
+        // Real assistant messages are multi-line and quote code. Layout is
+        // collapsed and quoted code is removed, never retained.
+        let prose = session_capture_turn_summary_from_host(Some(
+            "Fixed the parser.\n\n- ran `cargo test --secret-flag`\n- updated\tdocs\n\n```sh\nrm -rf build\n```\nDone.",
+        ))
+        .expect("multi-line host summary");
+        assert_eq!(
+            prose.fact,
+            SessionCaptureFact::TurnSummary {
+                summary: "Fixed the parser. - ran [code] - updated docs [code] Done.".to_owned(),
+            }
+        );
+        let wire = serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "kind": "turn_summary",
+            "summary": "Fixed the parser. - ran [code] - updated docs [code] Done.",
+        }))
+        .unwrap();
+        assert!(parse_session_capture_event(&wire).is_ok());
+        // The strict rules still drop what redaction does not remove.
+        for dropped in [
+            "unbalanced ` backtick stays unsafe",
+            "piped a | b outside code",
+            "escape \u{1b}[31m sequence",
+            "nul \0 byte",
+            "see /Users/someone/private/notes",
+        ] {
+            assert!(
+                session_capture_turn_summary_from_host(Some(dropped)).is_none(),
+                "{dropped:?} was retained"
+            );
+        }
         assert!(session_capture_turn_summary_from_host(Some(
             "Finished with token=secret-value-that-must-not-be-retained"
         ))

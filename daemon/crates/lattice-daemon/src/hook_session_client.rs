@@ -580,6 +580,32 @@ impl HookSessionClient {
         })
     }
 
+    /// Drop a non-terminal delivery the daemon answered and refused. Validation
+    /// is deterministic, so replaying it can only be refused again, and the
+    /// queue is flushed in order: keeping it would block every later delivery
+    /// until it aged out. A close is never dropped this way, because it is the
+    /// session's only terminal event. Returns whether the delivery was dropped.
+    pub fn discard_rejected_delivery(
+        &self,
+        key: &HookClientBindingKey,
+        delivery_id: &HookClientOpaqueId,
+    ) -> Result<bool, HookSessionClientError> {
+        self.with_lock(|| {
+            let fingerprint = key.fingerprint(&self.cryptography)?;
+            let record = self.load_record_by_fingerprint(&fingerprint)?;
+            let pending = self
+                .pending_records(&fingerprint, &record)?
+                .into_iter()
+                .find(|pending| pending.delivery_id == delivery_id.0)
+                .ok_or(HookSessionClientError::DeliveryMissing)?;
+            if pending.payload.is_close() {
+                return Ok(false);
+            }
+            remove_private_file(&self.pending_path(&fingerprint, pending.sequence))?;
+            Ok(true)
+        })
+    }
+
     /// Removes a conclusively expired binding, or an acknowledged close after
     /// its retry grace.  It never infers success from a missing transport reply.
     pub fn prune(
@@ -1410,6 +1436,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             sequences
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_event_is_dropped_so_it_cannot_block_the_queue_but_a_close_is_kept() {
+        let (client, root) = client("rejected");
+        let key = key();
+        client.store_binding(&key, &binding()).unwrap();
+        let refused = client.enqueue(&key, event("src/a.rs"), 1).unwrap().delivery;
+        let behind = client.enqueue(&key, event("src/b.rs"), 2).unwrap().delivery;
+        let closing = client.enqueue(&key, close(), 3).unwrap().delivery;
+
+        assert!(client
+            .discard_rejected_delivery(&key, &refused.delivery_id)
+            .unwrap());
+        assert_eq!(
+            client
+                .pending(&key)
+                .unwrap()
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![behind.sequence, closing.sequence]
+        );
+        // The terminal event is never dropped on a refusal.
+        assert!(!client
+            .discard_rejected_delivery(&key, &closing.delivery_id)
+            .unwrap());
+        assert_eq!(client.pending(&key).unwrap().len(), 2);
+        assert!(matches!(
+            client.discard_rejected_delivery(&key, &refused.delivery_id),
+            Err(HookSessionClientError::DeliveryMissing)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_idle_expired_binding_is_offered_for_resume_until_its_absolute_deadline() {
+        let (client, root) = client("idle-expired");
+        let key = key();
+        let stored = binding();
+        let idle = stored.idle_deadline_ms();
+        let absolute = stored.absolute_deadline_ms();
+        assert!(idle < absolute, "fixture must separate the two deadlines");
+        client.store_binding(&key, &stored).unwrap();
+
+        assert!(matches!(
+            client.load_binding(&key, idle + 1),
+            Err(HookSessionClientError::BindingExpired)
+        ));
+        let resumable = client.load_idle_expired_binding(&key, idle + 1).unwrap();
+        assert_eq!(resumable.binding_id(), stored.binding_id());
+        assert_eq!(resumable.capability(), stored.capability());
+        assert!(matches!(
+            client.load_idle_expired_binding(&key, absolute + 1),
+            Err(HookSessionClientError::BindingExpired)
+        ));
+
+        // The daemon refusing the resume is the authority to start over.
+        client.enqueue(&key, event("src/a.rs"), idle).unwrap();
+        client.discard_refused_binding(&key).unwrap();
+        assert!(matches!(
+            client.load_idle_expired_binding(&key, idle + 1),
+            Err(HookSessionClientError::BindingMissing)
+        ));
+        client.discard_refused_binding(&key).unwrap();
+        client.store_binding(&key, &binding()).unwrap();
+        assert!(client.pending(&key).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_closed_binding_is_never_offered_for_resume() {
+        let (client, root) = client("closed-resume");
+        let key = key();
+        client.store_binding(&key, &binding()).unwrap();
+        client.enqueue(&key, close(), 1).unwrap();
+        assert!(matches!(
+            client.load_idle_expired_binding(&key, 2),
+            Err(HookSessionClientError::BindingClosed)
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 

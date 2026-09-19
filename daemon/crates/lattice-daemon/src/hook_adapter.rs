@@ -953,6 +953,7 @@ async fn flush_pending(
     wire: &mut HookWire,
     now_ms: i64,
 ) -> Result<()> {
+    let mut rejected = None;
     for delivery in client.pending(key)? {
         let method = match delivery.payload {
             HookClientCapturePayload::Event(_) => HOOK_EVENT_METHOD,
@@ -960,11 +961,21 @@ async fn flush_pending(
             HookClientCapturePayload::Close(_) => HOOK_SESSION_CLOSE_METHOD,
         };
         let params = delivery_params(binding, &delivery)?;
-        wire.call(method, params).await?;
-        client.acknowledge(key, &delivery.delivery_id, now_ms)?;
+        match wire.call(method, params).await {
+            Ok(_) => client.acknowledge(key, &delivery.delivery_id, now_ms)?,
+            Err(error) if error.downcast_ref::<HookDaemonRejected>().is_some() => {
+                // Report the refusal after draining the rest, so one refused
+                // fact can neither hide nor hold back the ones behind it.
+                if !client.discard_rejected_delivery(key, &delivery.delivery_id)? {
+                    return Err(error);
+                }
+                rejected = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
     let _ = client.prune(key, now_ms);
-    Ok(())
+    rejected.map_or(Ok(()), Err)
 }
 
 fn delivery_params(binding: &HookClientBinding, delivery: &PendingHookDelivery) -> Result<Value> {

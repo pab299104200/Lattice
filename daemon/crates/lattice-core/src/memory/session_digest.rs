@@ -735,7 +735,16 @@ pub(crate) fn is_sha256_fingerprint(value: &str) -> bool {
 /// an ambiguous field is intentional: the caller can still retain unrelated,
 /// safe observations from the same digest.
 pub(crate) fn sanitize_text(value: &str, max_bytes: usize) -> Option<String> {
-    if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+    // Newlines and tabs are control characters, but they are layout, not
+    // content. They must be collapsed before the control-character check or
+    // every multi-line message is dropped whole, which is what this function
+    // did until 2026-09. A control character that is not whitespace (NUL,
+    // escape, bell) still drops the field.
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() && !character.is_whitespace())
+    {
         return None;
     }
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -747,6 +756,34 @@ pub(crate) fn sanitize_text(value: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
     Some(truncate_utf8(&normalized, max_bytes))
+}
+
+/// Replace Markdown code with a fixed placeholder. Code spans and fences are
+/// where an assistant message quotes commands and file content, which capture
+/// must not retain. This only ever removes text. An unbalanced backtick is
+/// left in place, so the strict check that follows still drops the field.
+pub(crate) fn redact_code_spans(value: &str) -> String {
+    const PLACEHOLDER: &str = "[code]";
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('`') {
+        let fence_len = rest[start..].bytes().take_while(|byte| *byte == b'`').count();
+        let fence = &rest[start..start + fence_len];
+        let after = &rest[start + fence_len..];
+        let Some(close) = after.find(fence) else {
+            break;
+        };
+        output.push_str(&rest[..start]);
+        output.push_str(PLACEHOLDER);
+        let mut resume = close + fence_len;
+        // A longer run of backticks is not this span's closer.
+        while after[resume..].starts_with('`') {
+            resume += 1;
+        }
+        rest = &after[resume..];
+    }
+    output.push_str(rest);
+    output
 }
 
 fn contains_secret_material(value: &str) -> bool {
@@ -892,6 +929,30 @@ fn hash_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_spans_are_removed_and_unbalanced_backticks_are_left_for_the_strict_check() {
+        for (input, expected) in [
+            ("no code here", "no code here"),
+            ("run `ls -la` now", "run [code] now"),
+            ("a `x` b `y` c", "a [code] b [code] c"),
+            ("``code with ` inside`` end", "[code] end"),
+            ("```sh\nrm -rf /\n``` after", "[code] after"),
+            ("``` fence `inline` still fenced ``` tail", "[code] tail"),
+            ("dangling ` backtick", "dangling ` backtick"),
+            ("closed `a` then dangling `b", "closed [code] then dangling `b"),
+            ("``", "``"),
+            ("multibyte `\u{e9}t\u{e9}` \u{2014} ok", "multibyte [code] \u{2014} ok"),
+        ] {
+            assert_eq!(redact_code_spans(input), expected, "{input:?}");
+        }
+        assert_eq!(
+            sanitize_text("line one\n\tline two\r\n", 100).as_deref(),
+            Some("line one line two")
+        );
+        assert_eq!(sanitize_text("bell \u{7} here", 100), None);
+        assert_eq!(sanitize_text("\n \t", 100), None);
+    }
 
     const FINGERPRINT: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
