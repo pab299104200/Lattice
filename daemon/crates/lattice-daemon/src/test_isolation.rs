@@ -32,7 +32,21 @@ static SANDBOX: OnceLock<PathBuf> = OnceLock::new();
 #[cfg_attr(windows, link_section = ".CRT$XCU")]
 static ISOLATE_TEST_PROCESS: extern "C" fn() = isolate_test_process;
 
+/// Set on every isolated process, and so inherited by its children.
+const SANDBOX_ENV: &str = "LATTICE_TEST_SANDBOX";
+
 extern "C" fn isolate_test_process() {
+    // Some tests run this test binary again as a child, and time-out tests
+    // kill it, so it never reaches `atexit`. A child therefore keeps the
+    // sandbox it inherited, already isolated, and leaves removal to the
+    // process that created it.
+    if let Some(inherited) = std::env::var_os(SANDBOX_ENV).map(PathBuf::from) {
+        if inherited.is_dir() {
+            let _ = REAL_HOME.set(None);
+            let _ = SANDBOX.set(inherited);
+            return;
+        }
+    }
     let real_home = std::env::var_os("HOME").map(PathBuf::from);
     let sandbox = std::env::temp_dir().join(format!("lattice-test-home-{}", std::process::id()));
     for name in ["home", "state", "config", "cache", "data", "run"] {
@@ -68,6 +82,7 @@ extern "C" fn isolate_test_process() {
     ] {
         std::env::set_var(variable, sandbox.join(name));
     }
+    std::env::set_var(SANDBOX_ENV, &sandbox);
     let _ = REAL_HOME.set(real_home);
     let _ = SANDBOX.set(sandbox);
     // SAFETY: `remove_sandbox` is a plain `extern "C" fn()` with no
@@ -123,6 +138,35 @@ mod tests {
             let value = PathBuf::from(std::env::var_os(variable).unwrap());
             assert!(value.starts_with(sandbox), "{variable}={}", value.display());
         }
+    }
+
+    #[test]
+    fn a_child_test_process_reuses_its_parents_sandbox() {
+        let sandbox = SANDBOX.get().expect("isolation ran before main");
+        if let Some(parent) = std::env::var_os("LATTICE_TEST_ISOLATION_PARENT") {
+            // In the child: a sandbox of its own would be left behind if the
+            // parent killed it, as time-out tests do.
+            assert_eq!(sandbox, &PathBuf::from(parent));
+            assert_eq!(
+                PathBuf::from(std::env::var_os("HOME").unwrap()),
+                sandbox.join("home")
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "test_isolation::tests::a_child_test_process_reuses_its_parents_sandbox",
+                "--exact",
+                "--quiet",
+            ])
+            .env("LATTICE_TEST_ISOLATION_PARENT", sandbox)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "the child did not reuse its parent's sandbox"
+        );
+        assert!(sandbox.is_dir(), "and must not remove it");
     }
 
     #[test]
