@@ -8,6 +8,7 @@ mod git_intelligence_runtime;
 mod health_facts_runtime;
 mod hook_adapter;
 mod hook_enforcement;
+mod hook_shell_changes;
 mod hook_session_binding;
 mod hook_session_client;
 mod hook_session_registry;
