@@ -106,13 +106,17 @@ impl ResourceBudget {
         }
     }
 
-    /// How many workspace views the configured budget can hold at once. This
-    /// is the default shard cap: admission already reserves one view per
-    /// shard against this budget, so a separate, smaller count only starves
-    /// workspaces the machine has room for. The ceiling keeps a very large
-    /// budget from implying an unbounded resident set.
+    /// The built-in shard cap: what the view budget can hold, and never more
+    /// than six.
+    ///
+    /// The budget is a logical reservation, not a measurement. Measured on
+    /// macOS in 2026-09, a freshly loaded workspace costs about 0.12 MB of
+    /// real footprint per indexed file (360 MB for 3,066 files), so six
+    /// mid-sized repositories come to roughly 3 to 4 GiB. Six is what that
+    /// supports as a default; an operator with more memory raises it in the
+    /// daemon settings file.
     pub(crate) fn default_view_capacity() -> usize {
-        const MAX_DEFAULT_SHARDS: u64 = 16;
+        const MAX_DEFAULT_SHARDS: u64 = 6;
         let total = env_u64(
             MATERIALIZATION_BUDGET_ENV,
             DEFAULT_MATERIALIZATION_BUDGET_BYTES,

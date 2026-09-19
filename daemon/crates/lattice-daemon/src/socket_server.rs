@@ -232,8 +232,18 @@ fn attach_daemon_report(result: &mut Value, report: Value) {
 
 /// One line for the plain-text status view, which collapses nested objects.
 fn shard_capacity_line(report: &Value) -> Value {
+    // Footprint and uptime together are what make slow growth visible.
+    let memory = report["memory_footprint_bytes"]
+        .as_u64()
+        .map_or_else(String::new, |bytes| {
+            format!(
+                "; daemon memory {} MiB after {} h up",
+                bytes / (1024 * 1024),
+                report["uptime_secs"].as_u64().unwrap_or_default() / 3600
+            )
+        });
     Value::String(format!(
-        "max_loaded_shards={} from {}; {} loaded, {} pinned by an open session or index work",
+        "max_loaded_shards={} from {}; {} loaded, {} pinned by an open session or index work{memory}",
         report["max_loaded_shards"],
         report["max_loaded_shards_source"]
             .as_str()
@@ -1011,6 +1021,7 @@ pub(crate) struct GlobalDaemon {
     hook_session_route: Option<Arc<HookSessionRoute>>,
     shutting_down: AtomicBool,
     settings: crate::daemon_settings::DaemonSettings,
+    started_at: std::time::Instant,
 }
 
 impl GlobalDaemon {
@@ -1050,6 +1061,7 @@ impl GlobalDaemon {
                 crate::resource_budget::ResourceBudget::default_view_reservation(),
             hook_session_route: None,
             settings: crate::daemon_settings::DaemonSettings::unconfigured(max_loaded_shards),
+            started_at: std::time::Instant::now(),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -1206,6 +1218,9 @@ impl GlobalDaemon {
             .values()
             .filter(|entry| !entry.is_evictable())
             .count());
+        report["memory_footprint_bytes"] =
+            serde_json::json!(crate::daemon_settings::process_memory_footprint_bytes());
+        report["uptime_secs"] = serde_json::json!(self.started_at.elapsed().as_secs());
         report
     }
 
@@ -1985,6 +2000,12 @@ mod tests {
         );
         assert_eq!(report["loaded_shards"], 0);
         assert_eq!(report["pinned_shards"], 0);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(report["memory_footprint_bytes"].as_u64().unwrap() > 1024 * 1024);
+        assert!(report["uptime_secs"].is_u64());
+        let mut report = report;
+        report["memory_footprint_bytes"] = serde_json::json!(3_u64 * 1024 * 1024 * 1024);
+        report["uptime_secs"] = serde_json::json!(7_200);
 
         // The MCP tool envelope: JSON inside a text block.
         let mut tool = serde_json::json!({"content": [{"type": "text",
@@ -1996,7 +2017,7 @@ mod tests {
         assert_eq!(inner["daemon"]["max_loaded_shards"], 6);
         assert_eq!(
             inner["shard_capacity"],
-            "max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; 0 loaded, 0 pinned by an open session or index work"
+            "max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; 0 loaded, 0 pinned by an open session or index work; daemon memory 3072 MiB after 2 h up"
         );
         // The bare `lattice/status` payload.
         let mut bare = serde_json::json!({"status": "deferred"});
@@ -2041,14 +2062,14 @@ mod tests {
 
     #[test]
     fn default_shard_cap_follows_the_view_budget() {
-        // 2 GiB budget / 256 MiB per view, unless the operator set either.
+        // The 2 GiB / 256 MiB budget would allow 8; the measured default is 6.
         if std::env::var_os(crate::resource_budget::MATERIALIZATION_BUDGET_ENV).is_none()
             && std::env::var_os(crate::resource_budget::VIEW_CLASS_BUDGET_ENV).is_none()
             && std::env::var_os(crate::resource_budget::VIEW_RESERVATION_ENV).is_none()
         {
             assert_eq!(
                 crate::resource_budget::ResourceBudget::default_view_capacity(),
-                8
+                6
             );
         }
     }

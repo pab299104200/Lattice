@@ -168,6 +168,77 @@ reloads its shard from its on-disk index on first use (seconds, and cold answers
 partial meanwhile); in-memory context handles from before the restart expire. Hook capture
 bindings survive, because they are on disk. With five workspaces and a cap of 8, Relay loads.
 
+## Second follow-up, 2026-09-19: durable shard cap, and memory measured honestly
+
+### Correction: my "191 MB, comfortably supported" was wrong
+
+I used resident size. On macOS that excludes compressed memory. **verified** with
+`top -l 1 -pid 57458 -stats mem,cmprs`: the live daemon's footprint is **8,831 MB, of which
+8,770 MB is compressed**; RSS was 66 MB at that moment. The machine has 16 GiB and was at
+41 percent free, so it is coping.
+
+Measured per-shard cost, **verified** on a private daemon under a sandbox `HOME`, loading
+shallow scratch clones (no product repository or its `.lattice` state was touched):
+
+| Step | Footprint |
+|---|---|
+| daemon, no shard | 3 MB |
+| keystone loaded, 3,066 indexed files, 42,452 nodes | 359 MB |
+| after two queries | 365 MB |
+| synapse also loaded, 1,483 files, 16,142 nodes | 409 MB |
+| idle 1, 2, 3 minutes (background work settles) | 528, 532, 532 MB |
+
+So a fresh shard costs about 0.12 MB per indexed file. All six repositories (about 35,000
+tracked files) come to roughly **3 to 4 GiB fresh**. Cold indexing keystone took 10 minutes,
+I/O-bound in `ContentObjectStore::put`, with the machine also running two test suites.
+
+**The real risk is growth, not the cap.** The three live shards (portal, keystone, beacon)
+should cost about 2.3 GiB fresh and hold 8.8 GiB after 4.7 days: roughly 6.5 GiB accumulated,
+about 1.4 GiB a day. **hypothesis**: an unbounded cache or a leak; I did not find the cause.
+I did not run `vmmap` or `footprint` on the live daemon because both suspend the target while
+they read it. For Pete, if he accepts a pause of a few seconds for every session:
+`vmmap --summary 57458 | tail -40`. The restart in the rollout resets the footprint, which is
+also why this will look fixed when it is not.
+
+**Recommendation: 6 is sound** on fresh numbers and leaves about 12 GiB of headroom on this
+machine. Re-check after a few days with `lattice doctor`, which now prints the real footprint
+and uptime. If it is back above about 6 GiB, the growth needs its own investigation.
+
+### Built
+
+- `daemon_settings.rs`: `$XDG_CONFIG_HOME/lattice/daemon.toml`, default
+  `~/.config/lattice/daemon.toml`. Lattice had no config convention; this mirrors its use of
+  `XDG_STATE_HOME`. First key `max_loaded_shards`, 1 to 64.
+- Precedence: `LATTICE_MAX_LOADED_SHARDS`, then the older `LATTICE_MAX_LOADED_WORKSPACES`, then
+  the file, then the default. The file is validated even when the environment wins.
+- Invalid value, wrong type, unknown key, broken TOML, a directory in the file's place, or an
+  invalid environment value: the daemon exits 1 **before binding its port**, names the source,
+  and logs `daemon_settings_invalid`. The old `env_usize` silently ignored a bad value; removed.
+- `lattice status` gains `daemon` (value, source, file path, slots loaded and pinned, memory
+  footprint, uptime) and a one-line `shard_capacity` for the plain view, which collapses nested
+  objects. It is attached at the transport layer, because a shard cannot know daemon-wide facts.
+- `lattice doctor` validates the file (FAIL if the next start would be refused), prints the
+  running daemon's value, source, slot use, memory and uptime, and WARNs when a restart would
+  change the cap, when every slot is pinned, when the daemon predates settings reporting, and
+  for a deferred workspace, which it used to print as `PASS ... watcher=healthy`.
+- Built-in default is now 6, no longer the budget-derived 8, which was not grounded in memory.
+- `README.md`: "Daemon settings file" section directly above the environment table.
+
+**verified** on private daemons with the final binary: invalid file exits 1 and the port stays
+unbound; typo key and invalid environment are named in the error; valid file gives
+`max_loaded_shards=6 from settings file ...`; environment 4 beats file 6; with the file changed
+to 9 under a running daemon, doctor says "A restart would use 9 from settings file ...".
+
+Not mine, still running when I finished: two `target/enforcement/debug/lattice --daemon`
+processes on random ports (pids 71659, 71877, started 00:09). I never built debug there, so I
+left them. **hypothesis**: orphans from the coordinator's test run against my target directory.
+
+Two pre-existing tests failed once each under load and passed alone and on rerun:
+`authenticated_ordinary_rpc_loads_its_shard_only_after_first_request` (250 ms wall-clock bound)
+and `indexed_plan_reaches_cache_after_four_thousand_absent_rows` (one-second grace). Neither is
+in code this branch changes. **hypothesis**: load-sensitive timing, with two suites and a
+measurement daemon running at once.
+
 ## Design decisions
 
 ### How the daemon knows a `prepare_change` happened
@@ -261,8 +332,8 @@ Defects fixed along the way, each with a test:
 ## Test results (observed, final code)
 
 ```
-cargo test --workspace            2,330 passed, 0 failed, 39 ignored
-  lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 640 | integration 8
+cargo test --workspace            2,341 passed, 0 failed, 39 ignored
+  lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 651 | integration 8
 cargo fmt --all -- --check        pass
 integrations/claude-code/tests/enforcement_e2e.sh <binary>    43 passed, 0 failed (5 runs in a row)
 integrations/codex/tests/hooks_test.sh                        pass
@@ -294,12 +365,21 @@ left in the client queue; an enforcing workspace allows the edit and emits the
 cd /Users/pete/Cadres/lattice && git checkout feature/hook-enforcement
 cargo build --manifest-path daemon/Cargo.toml --release
 
+# 1b. Make the shard cap durable BEFORE the restart, so the new daemon reads it at start.
+#     An invalid file stops the daemon from starting, so check it first.
+mkdir -p ~/.config/lattice
+printf 'max_loaded_shards = 6\n' > ~/.config/lattice/daemon.toml
+lattice doctor --workspace /Users/pete/Cadres/lattice | grep 'daemon settings'
+#     expect: PASS daemon settings: max_loaded_shards=6 from settings file ...
+#     (the old daemon is still running, so the "running daemon" line will WARN; that is right)
+
 # 2. Restart the daemon so it records plans. Until then enforcing workspaces fail open with a
 #    "daemon refused" notice. This ends every live MCP session; clients reconnect on next use.
 pkill -f 'lattice --daemon' ; sleep 2        # AGENTS.md says a proxy starts the daemon on
                                              # demand. Documented, NOT observed by me. If
                                              # status fails: lattice --daemon &
-lattice status --workspace /Users/pete/Cadres/lattice --timeout 5
+lattice status --workspace /Users/pete/Cadres/lattice --timeout 5 | grep shard_capacity
+#     expect: max_loaded_shards=6 from settings file /Users/pete/.config/lattice/daemon.toml; ...
 
 # 3. Acceptance, touches nothing live:
 bash integrations/claude-code/tests/enforcement_e2e.sh
@@ -316,7 +396,7 @@ output" sentence with the wording under "Wording for a product repository's inst
 they are git-ignored and untracked here, so I left them unchanged rather than make an edit
 nobody can review. Apply the same wording there by hand.
 
-Relay gets indexed by step 2: the new default shard cap is 8. See the follow-up section.
+Relay gets indexed by step 2: the cap becomes 6, from the settings file and also as the new built-in default, for five product repositories plus Lattice.
 
 ## Rollback
 

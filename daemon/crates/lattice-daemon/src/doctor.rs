@@ -470,8 +470,19 @@ fn format_running_settings(
     let source = running["max_loaded_shards_source"]
         .as_str()
         .unwrap_or("unknown");
+    // The real footprint, not resident size, next to uptime: slow growth in a
+    // long-lived daemon is otherwise invisible until the machine swaps.
+    let memory = running["memory_footprint_bytes"]
+        .as_u64()
+        .map_or_else(String::new, |bytes| {
+            format!(
+                "; memory {} MiB after {} h up",
+                bytes / (1024 * 1024),
+                running["uptime_secs"].as_u64().unwrap_or_default() / 3600
+            )
+        });
     let usage = format!(
-        "running daemon: max_loaded_shards={cap} from {source}; {loaded} of {cap} shard slots loaded, {pinned} pinned by an open session or index work"
+        "running daemon: max_loaded_shards={cap} from {source}; {loaded} of {cap} shard slots loaded, {pinned} pinned by an open session or index work{memory}"
     );
     if let Some(configured) = configured.filter(|settings| settings.max_loaded_shards as u64 != cap)
     {
@@ -1366,6 +1377,15 @@ mod tests {
         let (line, warned) = format_running_settings(Some(&running(6, 5, 5)), Some(&from_file));
         assert!(!warned);
         assert!(line.starts_with("PASS running daemon: max_loaded_shards=6 from built-in default; 5 of 6 shard slots loaded, 5 pinned"));
+        assert!(
+            !line.contains("memory"),
+            "unknown footprint must not be printed as zero"
+        );
+        let mut measured = running(6, 5, 5);
+        measured["memory_footprint_bytes"] = json!(9_u64 * 1024 * 1024 * 1024);
+        measured["uptime_secs"] = json!(113 * 3600);
+        let (line, _) = format_running_settings(Some(&measured), Some(&from_file));
+        assert!(line.ends_with("; memory 9216 MiB after 113 h up"), "{line}");
 
         // The daemon started before the file was written: say a restart is pending.
         let (line, warned) = format_running_settings(Some(&running(3, 3, 3)), Some(&from_file));

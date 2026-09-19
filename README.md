@@ -374,11 +374,30 @@ pkill -f 'lattice --daemon'
 
 This affects every workspace served by that daemon. Coordinate shared-service restarts. A shell-started daemon can also be run explicitly with `lattice --daemon`; configure its environment before launch.
 
+### Daemon settings file
+
+Environment variables configure one start of the daemon at best. The daemon is started on demand by whichever client first finds it missing, and it inherits that client's environment, so a variable set in your shell does not survive the next restart. Settings that must last go in a file the daemon reads itself:
+
+```toml
+# $XDG_CONFIG_HOME/lattice/daemon.toml, default ~/.config/lattice/daemon.toml
+max_loaded_shards = 6
+```
+
+| Key | Meaning |
+| --- | --- |
+| `max_loaded_shards` | How many workspaces the daemon keeps loaded at once, from 1 to 64. A workspace with an open agent session is never evicted, so set this at or above the number of workspaces you keep open together. One beyond the cap is deferred: never loaded, and `lattice status` says so |
+
+- **Precedence:** environment variable (`LATTICE_MAX_LOADED_SHARDS`, then the older `LATTICE_MAX_LOADED_WORKSPACES`), then this file, then the built-in default.
+- **Invalid values stop the daemon.** A value out of range, a wrong type, an unknown key or broken TOML makes `lattice --daemon` exit before it listens, with an error naming the file and key. The same applies to an invalid environment value. The file is checked even when the environment wins. Lattice never falls back silently to a setting you did not choose.
+- **See what is in force:** `lattice status` shows `shard_capacity`, for example `max_loaded_shards=6 from settings file /Users/you/.config/lattice/daemon.toml; 5 loaded, 5 pinned by an open session or index work`. `lattice doctor` validates the file, shows the running daemon's value and source, and warns when a restart would change it or when every slot is pinned.
+- **Choosing a value:** measured on macOS in 2026-09, a freshly loaded workspace costs about 0.12 MB of real memory per indexed file (360 MB for 3,066 files), so six mid-sized repositories need roughly 3 to 4 GiB. The built-in default is `6`. `shard_capacity` also shows the daemon's real memory footprint and uptime. On macOS that figure includes compressed memory, which resident size (`ps` RSS) leaves out.
+- **Applying a change** needs a daemon restart: `pkill -f 'lattice --daemon'`. Open agent sessions survive it; each reconnects and starts the daemon on its next request.
+
 | Setting | Default / purpose |
 | --- | --- |
 | `LATTICE_DAEMON_ADDR` | `127.0.0.1:47659`; alternate loopback endpoint |
 | `LATTICE_DAEMON_EXE` | Explicit absolute binary path for proxy startup |
-| `LATTICE_MAX_LOADED_SHARDS` | the view budget divided by the view reservation, `8` with the defaults (2 GiB / 256 MiB), at most `16`. A shard with an open session is never evicted, so set this at or above the number of workspaces you keep open at once. A workspace beyond the cap is deferred, and `lattice status` says so in its `summary` |
+| `LATTICE_MAX_LOADED_SHARDS` | `6`, or fewer if the view budget holds fewer. Overrides `max_loaded_shards` in the [daemon settings file](#daemon-settings-file) for one daemon start only; use the file for a lasting value. Invalid values stop the daemon |
 | `LATTICE_WORKSPACE_IDLE_TTL_SECS` | `1800` |
 | `LATTICE_MAX_CONCURRENT_INDEX_JOBS` | `1`; shared indexing capacity |
 | `LATTICE_MATERIALIZATION_BUDGET_BYTES` | `2147483648`; logical materialization admission |

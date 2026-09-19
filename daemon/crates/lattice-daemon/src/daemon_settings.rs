@@ -228,6 +228,46 @@ fn validate_max_loaded_shards(value: i64, source: &str) -> Result<usize> {
     Ok(value as usize)
 }
 
+/// The memory this process really occupies, in bytes.
+///
+/// On macOS this is the physical footprint, which includes compressed pages.
+/// Resident size does not: a daemon that has been idle for days can show tens
+/// of megabytes resident while holding gigabytes compressed, which is how a
+/// 8.8 GiB daemon was first measured as 191 MB. On Linux it is resident size.
+/// Elsewhere, or if the platform call fails, it is unknown rather than zero.
+pub(crate) fn process_memory_footprint_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+        // SAFETY: `info` is a correctly sized, writable `rusage_info_v2`, the
+        // flavor passed is the one that fills exactly that struct, and the
+        // pid is this process. The value is read only after success.
+        let filled = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+            ) == 0
+        };
+        // SAFETY: initialised by the successful call above.
+        filled.then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        // SAFETY: `sysconf` has no preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(page_size)
+            .ok()
+            .map(|size| resident_pages * size)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +414,27 @@ mod tests {
         let env = env_of(&[(MAX_LOADED_SHARDS_ENV, "9")]);
         let error = resolve(&env, file(), Some("max_loaded_shards = 0"), 4).unwrap_err();
         assert!(format!("{error:#}").contains("daemon.toml"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_process_footprint_is_known_plausible_and_grows_with_allocation() {
+        let before = process_memory_footprint_bytes().expect("footprint is readable here");
+        assert!(
+            before > 1024 * 1024,
+            "{before} bytes is too small to be real"
+        );
+        // Touch every page so the allocation is actually backed.
+        let mut ballast = vec![0_u8; 64 * 1024 * 1024];
+        for index in (0..ballast.len()).step_by(4096) {
+            ballast[index] = (index % 251) as u8;
+        }
+        let after = process_memory_footprint_bytes().unwrap();
+        assert!(ballast.iter().step_by(4096).any(|byte| *byte != 0));
+        assert!(
+            after >= before + 32 * 1024 * 1024,
+            "footprint went from {before} to {after} after touching 64 MiB"
+        );
     }
 
     #[test]
