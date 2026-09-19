@@ -242,8 +242,30 @@ impl ShardEntry {
         let runtime = lock_owned(&self.runtime).take();
         if let Some(runtime) = runtime {
             runtime.shutdown().await;
+            release_freed_memory_after_unload(&self.root).await;
         }
     }
+}
+
+/// Return an unloaded shard's freed memory to the system and record what the
+/// footprint did, so growth that survives unloading is visible in the
+/// lifecycle log rather than inferred from `top`.
+async fn release_freed_memory_after_unload(root: &PathBuf) {
+    let before = crate::daemon_settings::process_memory_footprint_bytes();
+    let released = tokio::task::spawn_blocking(crate::daemon_settings::release_freed_memory)
+        .await
+        .unwrap_or_default();
+    let after = crate::daemon_settings::process_memory_footprint_bytes();
+    lifecycle_log::log_event(
+        "daemon",
+        "shard_memory_released",
+        &[
+            ("shard_key", serde_json::json!(shard_key(root))),
+            ("allocator_released_bytes", serde_json::json!(released)),
+            ("footprint_before_bytes", serde_json::json!(before)),
+            ("footprint_after_bytes", serde_json::json!(after)),
+        ],
+    );
 }
 
 #[async_trait::async_trait]
@@ -1354,6 +1376,9 @@ pub(crate) struct GlobalDaemon {
     footprint: FootprintProbe,
     memory_budget_bytes: u64,
     connected_idle_secs: u64,
+    /// Set while the daemon is over budget with nothing left to unload, so
+    /// that condition is logged once per episode.
+    over_budget_reported: AtomicBool,
     max_loaded_shards: Option<usize>,
     prewarm_view_shards: bool,
     idle_ttl: Duration,
@@ -1402,6 +1427,7 @@ impl GlobalDaemon {
             loading: Arc::new(AtomicUsize::new(0)),
             footprint: Arc::new(crate::daemon_settings::process_memory_footprint_bytes),
             memory_budget_bytes: settings.memory_budget_bytes,
+            over_budget_reported: AtomicBool::new(false),
             connected_idle_secs: env_duration_secs(
                 "LATTICE_CONNECTED_IDLE_SECS",
                 Duration::from_secs(DEFAULT_CONNECTED_IDLE_SECS),
@@ -1873,40 +1899,56 @@ impl GlobalDaemon {
         Ok(entry)
     }
 
-    /// Unload shards until the daemon is back inside its memory budget, or
-    /// nothing idle is left. Admission keeps headroom for a load it cannot
-    /// size in advance; this corrects for loads that turned out larger, and
-    /// for growth over a long uptime.
+    /// Unload at most one idle shard while the daemon is over its memory
+    /// budget. Admission keeps headroom for a load it cannot size in advance;
+    /// this corrects for loads that turned out larger, and for growth over a
+    /// long uptime.
+    ///
+    /// One per sweep, not a loop until the footprint drops: when the overage
+    /// is memory no shard owns, a loop would unload every idle workspace in
+    /// one pass and gain nothing. The sweep runs at least once a minute, so
+    /// genuine shard pressure still clears within minutes, and admission
+    /// evicts on demand in the meantime.
     async fn relieve_memory_pressure(&self) {
         let _lifecycle = self.lifecycle_gate.lock().await;
-        loop {
-            let over_budget =
-                (self.footprint)().is_some_and(|footprint| footprint > self.memory_budget_bytes);
-            if !over_budget {
-                return;
-            }
-            let victim = {
-                let mut shards = self.shards.lock().await;
-                take_victim(&mut shards, now_epoch_secs(), self.connected_idle_secs)
-            };
-            let Some((key, entry, class)) = victim else {
-                return;
-            };
-            lifecycle_log::log_event(
-                "daemon",
-                "shard_memory_eviction",
-                &[
-                    ("shard_key", serde_json::json!(key)),
-                    ("victim", serde_json::json!(class.label())),
-                    (
-                        "footprint_bytes",
-                        serde_json::json!((self.footprint)().unwrap_or_default()),
-                    ),
-                    ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
-                ],
-            );
-            entry.shutdown().await;
+        let Some(footprint) = (self.footprint)() else {
+            return;
+        };
+        if footprint <= self.memory_budget_bytes {
+            self.over_budget_reported.store(false, Ordering::Release);
+            return;
         }
+        let victim = {
+            let mut shards = self.shards.lock().await;
+            take_victim(&mut shards, now_epoch_secs(), self.connected_idle_secs)
+        };
+        let Some((key, entry, class)) = victim else {
+            // Reported once per episode: the cause is not a shard, and the
+            // log should say so rather than repeat every minute.
+            if !self.over_budget_reported.swap(true, Ordering::AcqRel) {
+                lifecycle_log::log_event(
+                    "daemon",
+                    "memory_over_budget_nothing_to_unload",
+                    &[
+                        ("footprint_bytes", serde_json::json!(footprint)),
+                        ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
+                        ("loaded_shards", serde_json::json!(self.shards.lock().await.len())),
+                    ],
+                );
+            }
+            return;
+        };
+        lifecycle_log::log_event(
+            "daemon",
+            "shard_memory_eviction",
+            &[
+                ("shard_key", serde_json::json!(key)),
+                ("victim", serde_json::json!(class.label())),
+                ("footprint_bytes", serde_json::json!(footprint)),
+                ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
+            ],
+        );
+        entry.shutdown().await;
     }
 
     async fn evict_idle(&self) {
@@ -2753,6 +2795,48 @@ mod tests {
         );
 
         drop((busy, silent, newcomer));
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn one_sweep_unloads_at_most_one_shard_and_reports_an_unfixable_overage_once() {
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        let roots = capacity_roots("one-per-sweep", 2);
+        let mut leases = Vec::new();
+        for root in &roots {
+            leases.push(
+                daemon
+                    .handler_for_client(&request_for(root), ClientKind::StdioProxy)
+                    .await
+                    .unwrap(),
+            );
+            wait_for_shard_published(&daemon, root).await;
+        }
+        {
+            let shards = daemon.shards.lock().await;
+            age(&shards[&shard_key(&roots[0])], 7_200);
+            age(&shards[&shard_key(&roots[1])], 3_600);
+        }
+        // Memory no shard owns: unloading cannot fix it, so a sweep must not
+        // empty the daemon in one pass.
+        used.store(3 * 1024 * TEST_MIB, Ordering::Release);
+        daemon.relieve_memory_pressure().await;
+        assert_eq!(
+            loaded_keys(&daemon).await,
+            vec![shard_key(&roots[1])],
+            "one sweep, one victim, least recently used first"
+        );
+        assert!(!daemon.over_budget_reported.load(Ordering::Acquire));
+        daemon.relieve_memory_pressure().await;
+        assert!(loaded_keys(&daemon).await.is_empty());
+
+        // Nothing left: the overage is reported once, and cleared when it ends.
+        daemon.relieve_memory_pressure().await;
+        assert!(daemon.over_budget_reported.load(Ordering::Acquire));
+        used.store(64 * TEST_MIB, Ordering::Release);
+        daemon.relieve_memory_pressure().await;
+        assert!(!daemon.over_budget_reported.load(Ordering::Acquire));
+        drop(leases);
         cleanup(&daemon, roots).await;
     }
 

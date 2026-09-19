@@ -387,6 +387,40 @@ pub(crate) fn process_memory_footprint_bytes() -> Option<u64> {
     }
 }
 
+/// Hand memory that has been freed back to the operating system, and return
+/// how many bytes the allocator reports releasing (zero where it does not
+/// report). Called after a shard is unloaded.
+///
+/// Freeing is not returning. Measured on the live daemon on 2026-09-19 with
+/// no workspace loaded, the macOS default zone held 688 MiB of freed space
+/// (52% fragmentation) inside regions that had been swapped out, and all of
+/// it counted in the footprint that the memory budget reads. Without this,
+/// unloading a shard to make room frees almost nothing the budget can see.
+pub(crate) fn release_freed_memory() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            /// libSystem, `<malloc/malloc.h>`: a null zone means every zone,
+            /// and a goal of zero means release as much as possible.
+            fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t)
+                -> libc::size_t;
+        }
+        // SAFETY: a null zone and a zero goal are the documented "all zones,
+        // as much as possible" arguments; the call only returns free pages.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) as u64 }
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `malloc_trim` has no preconditions; zero keeps no padding.
+        unsafe { libc::malloc_trim(0) };
+        0
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
