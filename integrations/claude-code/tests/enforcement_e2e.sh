@@ -55,12 +55,32 @@ out="$("$BIN" install --workspace "$R" --verify 2>&1)"; rc=$?
 check "default target keeps the recorded mode and verifies MCP plus both clients" "[ $rc -eq 0 ]" "$out"
 check "both clients carry the gate" "grep -q pre-tool-use.sh '$R/.claude/settings.json' && grep -q pre-tool-use.sh '$R/.codex/hooks.json'"
 
+# The verify step above loaded the workspace. While it is still indexing the
+# gate fails open by design, so a denial can only be asserted once it settles.
+index_status() {
+  "$BIN" status --workspace "$R" --json --timeout 5 2>/dev/null | python3 -c '
+import json, sys
+try:
+    outer = json.load(sys.stdin)
+    inner = json.loads(outer["content"][0]["text"]) if "content" in outer else outer
+    print("indexing" if inner.get("indexing") else inner.get("status", "unknown"))
+except Exception:
+    print("unknown")'
+}
+settled=""
+for _ in $(seq 1 120); do
+  settled="$(index_status)"
+  [ "$settled" != "indexing" ] && [ "$settled" != "unknown" ] && break
+  sleep 0.5
+done
+check "workspace index settled before asserting denials (state: $settled)" "[ '$settled' != indexing ] && [ '$settled' != unknown ]"
+
 hook() { ( cd "$R" && printf '%s' "$2" | "$HOOKS/$1" ); }
 edit() { printf '{"session_id":"%s","hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"t%s","tool_input":{"file_path":"%s","old_string":"SENTINEL-OLD","new_string":"SENTINEL-NEW"}}' "$1" "$RANDOM" "$2"; }
 SID=e2e-session-1
 
 out="$(hook session-start.sh "{\"session_id\":\"$SID\",\"source\":\"startup\"}")"; save "$out"
-check "SessionStart runs" "true"
+check "SessionStart runs" "true"; printf "INFO  SessionStart said: %s\n" "$(printf "%s" "$out" | cut -c1-200)"
 
 t0=$(python3 -c 'import time;print(time.time())')
 out="$(hook pre-tool-use.sh "$(edit $SID "$R/src/lib.rs")")"; save "$out"

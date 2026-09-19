@@ -264,7 +264,7 @@ Defects fixed along the way, each with a test:
 cargo test --workspace            2,330 passed, 0 failed, 39 ignored
   lattice-core 1,298 | lattice-daemon lib 384 | lattice-daemon bin 640 | integration 8
 cargo fmt --all -- --check        pass
-integrations/claude-code/tests/enforcement_e2e.sh <binary>    42 passed, 0 failed
+integrations/claude-code/tests/enforcement_e2e.sh <binary>    43 passed, 0 failed (5 runs in a row)
 integrations/codex/tests/hooks_test.sh                        pass
 integrations/codex/tests/install_test.sh                      pass
 ```
@@ -338,6 +338,10 @@ under `~/.local/state/lattice` can be deleted at any time.
 
 ## Open risks
 
+- **The gate is open while a workspace loads.** For the seconds a shard spends indexing after
+  a daemon restart or first contact, product edits are allowed with one notice. That is the
+  fail-open rule working, and it is how I found a race in my own harness: it asserted a denial
+  while the index was still loading and failed 4 runs in 5 until it waited for `ready`.
 - **Checkout-scoped plans.** With many agents in one checkout, one agent's plan satisfies every
   session already running there. Nothing a host supplies can fix this. Worktrees can.
 - **hypothesis** Claude Code subagent hooks carry the parent's `session_id`. The docs do not
