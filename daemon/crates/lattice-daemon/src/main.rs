@@ -20,8 +20,6 @@ mod index_work;
 mod install;
 mod install_project;
 mod lifecycle_log;
-#[cfg(test)]
-mod test_isolation;
 mod memory_attribution;
 mod memory_retention_runtime;
 mod proxy;
@@ -32,6 +30,8 @@ mod runtime_support;
 mod session_digest_consolidation_runtime;
 mod socket_server;
 mod storage_operator;
+#[cfg(test)]
+mod test_isolation;
 mod transport;
 mod transport_credentials;
 mod trusted_check_runner;

@@ -25,7 +25,10 @@ static SANDBOX: OnceLock<PathBuf> = OnceLock::new();
 
 #[used]
 #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
-#[cfg_attr(any(target_os = "linux", target_os = "android"), link_section = ".init_array")]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    link_section = ".init_array"
+)]
 #[cfg_attr(windows, link_section = ".CRT$XCU")]
 static ISOLATE_TEST_PROCESS: extern "C" fn() = isolate_test_process;
 
