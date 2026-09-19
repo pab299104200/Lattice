@@ -128,9 +128,37 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
         }
     }
 
+    // What the next daemon start would use. Checked here because an invalid
+    // settings file stops the daemon, and this is where an operator looks.
+    let configured = crate::daemon_settings::load(
+        crate::resource_budget::ResourceBudget::default_view_capacity(),
+    );
+    match &configured {
+        Ok(settings) => println!("{}", format_configured_settings(settings)),
+        Err(error) => {
+            failures += 1;
+            println!(
+                "FAIL daemon settings: {error:#}. The daemon will not start until this is fixed."
+            );
+        }
+    }
+
+    let mut running_reported = false;
     for root in &workspace_roots {
         match index_status_for(root) {
-            Ok(status) => print_index_status(root, &status),
+            Ok(status) => {
+                let payload = status_payload(&status);
+                if !running_reported {
+                    running_reported = true;
+                    let (line, warned) =
+                        format_running_settings(payload.get("daemon"), configured.as_ref().ok());
+                    warnings += usize::from(warned);
+                    println!("{line}");
+                }
+                let line = format_index_status(root, &status);
+                warnings += usize::from(line.starts_with("WARN"));
+                println!("{line}");
+            }
             Err(error) => {
                 failures += 1;
                 println!("FAIL workspace {} status: {}", root.display(), error);
@@ -400,18 +428,80 @@ fn index_status_for(root: &Path) -> Result<Value> {
     Ok(response.result.unwrap_or(Value::Null))
 }
 
-fn print_index_status(root: &Path, response: &Value) {
-    println!("{}", format_index_status(root, response));
-}
-
-fn format_index_status(root: &Path, response: &Value) -> String {
-    let payload = response["content"]
+fn status_payload(response: &Value) -> Value {
+    response["content"]
         .as_array()
         .and_then(|items| items.first())
         .and_then(|item| item["text"].as_str())
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .unwrap_or_else(|| response.clone());
+        .unwrap_or_else(|| response.clone())
+}
+
+fn format_configured_settings(settings: &crate::daemon_settings::DaemonSettings) -> String {
+    let file = match (&settings.settings_file, settings.settings_file_present) {
+        (Some(path), true) => format!("settings file {} is valid", path.display()),
+        (Some(path), false) => format!("no settings file at {}", path.display()),
+        (None, _) => "no settings file location (HOME is unset)".to_string(),
+    };
+    format!(
+        "PASS daemon settings: max_loaded_shards={} from {}; {}",
+        settings.max_loaded_shards,
+        settings.max_loaded_shards_source.describe(),
+        file
+    )
+}
+
+/// Compare what the running daemon uses with what a restart would use. They
+/// differ whenever the settings changed after the daemon started, or when
+/// the daemon was started by a client with a different environment.
+fn format_running_settings(
+    running: Option<&Value>,
+    configured: Option<&crate::daemon_settings::DaemonSettings>,
+) -> (String, bool) {
+    let Some(running) = running.filter(|running| running.is_object()) else {
+        return (
+            "WARN running daemon does not report its settings; it predates settings reporting, so restart it to load this build".to_string(),
+            true,
+        );
+    };
+    let cap = running["max_loaded_shards"].as_u64().unwrap_or_default();
+    let loaded = running["loaded_shards"].as_u64().unwrap_or_default();
+    let pinned = running["pinned_shards"].as_u64().unwrap_or_default();
+    let source = running["max_loaded_shards_source"]
+        .as_str()
+        .unwrap_or("unknown");
+    let usage = format!(
+        "running daemon: max_loaded_shards={cap} from {source}; {loaded} of {cap} shard slots loaded, {pinned} pinned by an open session or index work"
+    );
+    if let Some(configured) = configured.filter(|settings| settings.max_loaded_shards as u64 != cap)
+    {
+        return (
+            format!(
+                "WARN {usage}. A restart would use {} from {}",
+                configured.max_loaded_shards,
+                configured.max_loaded_shards_source.describe()
+            ),
+            true,
+        );
+    }
+    if cap > 0 && pinned >= cap {
+        return (
+            format!("WARN {usage}. Every slot is pinned, so any further workspace is deferred"),
+            true,
+        );
+    }
+    (format!("PASS {usage}"), false)
+}
+
+fn format_index_status(root: &Path, response: &Value) -> String {
+    let payload = status_payload(response);
     let status = payload["status"].as_str().unwrap_or("unknown");
+    if status == "deferred" {
+        return format!(
+            "WARN workspace {} status=deferred index=not_loaded: every shard slot is held by another workspace, so nothing is indexing this one. Close another workspace's session or raise max_loaded_shards in the daemon settings file",
+            root.display()
+        );
+    }
     let files = payload["files"].as_i64().unwrap_or_default();
     let parse_failures = payload["parse_failures"].as_u64().unwrap_or_default();
     if parse_failures > 0 {
@@ -1248,6 +1338,63 @@ fn file_digest(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_reports_the_shard_cap_its_source_and_a_pending_restart() {
+        use crate::daemon_settings::{DaemonSettings, SettingSource};
+        let path = PathBuf::from("/home/op/.config/lattice/daemon.toml");
+        let from_file = DaemonSettings {
+            max_loaded_shards: 6,
+            max_loaded_shards_source: SettingSource::SettingsFile(path.clone()),
+            settings_file: Some(path.clone()),
+            settings_file_present: true,
+        };
+        assert_eq!(
+            format_configured_settings(&from_file),
+            "PASS daemon settings: max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; settings file /home/op/.config/lattice/daemon.toml is valid"
+        );
+        let mut absent = DaemonSettings::unconfigured(8);
+        absent.settings_file = Some(path);
+        assert!(format_configured_settings(&absent).ends_with(
+            "from built-in default; no settings file at /home/op/.config/lattice/daemon.toml"
+        ));
+
+        let running = |cap: u64, loaded: u64, pinned: u64| {
+            json!({"max_loaded_shards": cap, "max_loaded_shards_source": "built-in default",
+                   "loaded_shards": loaded, "pinned_shards": pinned})
+        };
+        let (line, warned) = format_running_settings(Some(&running(6, 5, 5)), Some(&from_file));
+        assert!(!warned);
+        assert!(line.starts_with("PASS running daemon: max_loaded_shards=6 from built-in default; 5 of 6 shard slots loaded, 5 pinned"));
+
+        // The daemon started before the file was written: say a restart is pending.
+        let (line, warned) = format_running_settings(Some(&running(3, 3, 3)), Some(&from_file));
+        assert!(warned);
+        assert!(line.starts_with("WARN running daemon: max_loaded_shards=3"));
+        assert!(line.ends_with(
+            "A restart would use 6 from settings file /home/op/.config/lattice/daemon.toml"
+        ));
+
+        let (line, warned) = format_running_settings(Some(&running(6, 6, 6)), Some(&from_file));
+        assert!(warned);
+        assert!(line.contains("Every slot is pinned"));
+
+        for missing in [None, Some(&Value::Null)] {
+            let (line, warned) = format_running_settings(missing, Some(&from_file));
+            assert!(warned);
+            assert!(line.contains("predates settings reporting"));
+        }
+    }
+
+    #[test]
+    fn a_deferred_workspace_is_a_warning_not_a_healthy_pass() {
+        let response = json!({"content": [{"type": "text", "text":
+            json!({"status": "deferred", "indexing": false, "files": null}).to_string()}]});
+        let line = format_index_status(Path::new("/work/relay"), &response);
+        assert!(line.starts_with("WARN workspace /work/relay status=deferred"));
+        assert!(line.contains("nothing is indexing this one"));
+        assert!(!line.contains("watcher=healthy"));
+    }
 
     #[test]
     fn config_scan_reports_conflicting_lattice_registrations() {

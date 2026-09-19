@@ -187,6 +187,62 @@ impl RequestHandler for ShardEntry {
     }
 }
 
+/// An index status request, by either route the CLI, doctor and MCP use.
+fn is_index_status_request(method: &str, params: &Value) -> bool {
+    match method {
+        "lattice/status" => true,
+        "tools/call" => {
+            params.get("name").and_then(Value::as_str) == Some("status")
+                && matches!(
+                    params.pointer("/arguments/scope").and_then(Value::as_str),
+                    None | Some("index")
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Add the daemon-wide facts to a status answer. A workspace shard cannot
+/// know them: the cap and its source belong to the process, and whether this
+/// workspace is starved depends on what else is loaded.
+fn attach_daemon_report(result: &mut Value, report: Value) {
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    match text {
+        Some(Value::Object(mut payload)) => {
+            payload.insert("shard_capacity".into(), shard_capacity_line(&report));
+            payload.insert("daemon".into(), report);
+            if let Some(slot) = result.pointer_mut("/content/0/text") {
+                *slot = Value::String(Value::Object(payload).to_string());
+            }
+        }
+        Some(_) => {}
+        None => {
+            if let Some(payload) = result.as_object_mut().filter(|payload| {
+                payload.contains_key("status") && !payload.contains_key("content")
+            }) {
+                payload.insert("shard_capacity".into(), shard_capacity_line(&report));
+                payload.insert("daemon".into(), report);
+            }
+        }
+    }
+}
+
+/// One line for the plain-text status view, which collapses nested objects.
+fn shard_capacity_line(report: &Value) -> Value {
+    Value::String(format!(
+        "max_loaded_shards={} from {}; {} loaded, {} pinned by an open session or index work",
+        report["max_loaded_shards"],
+        report["max_loaded_shards_source"]
+            .as_str()
+            .unwrap_or("unknown"),
+        report["loaded_shards"],
+        report["pinned_shards"],
+    ))
+}
+
 /// The workflow step a request satisfies if it succeeds. Only the tool name
 /// and the `status` scope are inspected; no argument is retained.
 fn served_workflow_step(
@@ -954,20 +1010,16 @@ pub(crate) struct GlobalDaemon {
     view_reservation_bytes: u64,
     hook_session_route: Option<Arc<HookSessionRoute>>,
     shutting_down: AtomicBool,
+    settings: crate::daemon_settings::DaemonSettings,
 }
 
 impl GlobalDaemon {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(settings: crate::daemon_settings::DaemonSettings) -> Self {
         let mut daemon = Self::new_with_config(
-            env_usize(
-                "LATTICE_MAX_LOADED_SHARDS",
-                env_usize(
-                    "LATTICE_MAX_LOADED_WORKSPACES",
-                    crate::resource_budget::ResourceBudget::default_view_capacity(),
-                ),
-            ),
+            settings.max_loaded_shards,
             env_bool("LATTICE_PREWARM_VIEW_SHARDS", false),
         );
+        daemon.settings = settings;
         match HookSessionRoute::open_default() {
             Ok(route) => daemon.hook_session_route = Some(Arc::new(route)),
             Err(_) => {
@@ -997,6 +1049,7 @@ impl GlobalDaemon {
             view_reservation_bytes:
                 crate::resource_budget::ResourceBudget::default_view_reservation(),
             hook_session_route: None,
+            settings: crate::daemon_settings::DaemonSettings::unconfigured(max_loaded_shards),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -1141,6 +1194,19 @@ impl GlobalDaemon {
                 &[("workspace_key", serde_json::json!(view_key))],
             );
         });
+    }
+
+    /// Daemon-wide facts for `status` and `doctor`: the effective shard cap,
+    /// where it came from, and how much of it is in use.
+    pub(crate) async fn report(&self) -> Value {
+        let mut report = self.settings.report();
+        let shards = self.shards.lock().await;
+        report["loaded_shards"] = serde_json::json!(shards.len());
+        report["pinned_shards"] = serde_json::json!(shards
+            .values()
+            .filter(|entry| !entry.is_evictable())
+            .count());
+        report
     }
 
     /// Report a workspace's index state without loading, retaining or
@@ -1320,6 +1386,24 @@ impl GlobalDaemon {
 }
 
 pub(crate) async fn run_global_daemon() -> Result<()> {
+    // Before binding: a daemon that is going to refuse its settings must not
+    // first accept connections from proxies that then lose it.
+    let settings = crate::daemon_settings::load(
+        crate::resource_budget::ResourceBudget::default_view_capacity(),
+    )
+    .inspect_err(|error| {
+        lifecycle_log::log_event(
+            "daemon",
+            "daemon_settings_invalid",
+            &[("error", serde_json::json!(format!("{error:#}")))],
+        );
+    })
+    .context("lattice daemon did not start: its settings are invalid")?;
+    lifecycle_log::log_event(
+        "daemon",
+        "daemon_settings_loaded",
+        &[("settings", settings.report())],
+    );
     let addr = daemon_addr();
     let listener = TcpListener::bind(&addr)
         .await
@@ -1339,7 +1423,7 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
         &[("daemon_addr", serde_json::json!(addr.clone()))],
     );
 
-    let daemon = Arc::new(GlobalDaemon::new());
+    let daemon = Arc::new(GlobalDaemon::new(settings));
     let mut connections = tokio::task::JoinSet::new();
     let mut cleanup_interval = tokio::time::interval(daemon.cleanup_interval());
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1667,9 +1751,14 @@ async fn run_json_rpc_connection(
                     let workflow_step = served_workflow_step(&method, &params)
                         .zip(daemon.hook_session_route.clone());
                     let workflow_hello = proxy_request.clone();
+                    let status_daemon =
+                        is_index_status_request(&method, &params).then(|| Arc::clone(&daemon));
                     let task = tokio::spawn(async move {
                         let _request_work = request_work;
-                        let outcome = handler.handle(&method, params).await;
+                        let mut outcome = handler.handle(&method, params).await;
+                        if let (Ok(result), Some(daemon)) = (&mut outcome, status_daemon) {
+                            attach_daemon_report(result, daemon.report().await);
+                        }
                         if let (Ok(result), Some((step, route))) = (&outcome, workflow_step) {
                             if !tool_result_is_error(result) {
                                 // Recorded before the response is written, so an
@@ -1874,6 +1963,79 @@ mod tests {
         daemon.shards.lock().await.clear();
         for root in [resident, starved] {
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn status_answers_carry_the_effective_cap_its_source_and_slot_usage() {
+        let mut daemon = GlobalDaemon::new_with_config(6, false);
+        daemon.settings = crate::daemon_settings::DaemonSettings {
+            max_loaded_shards: 6,
+            max_loaded_shards_source: crate::daemon_settings::SettingSource::SettingsFile(
+                PathBuf::from("/home/op/.config/lattice/daemon.toml"),
+            ),
+            settings_file: Some(PathBuf::from("/home/op/.config/lattice/daemon.toml")),
+            settings_file_present: true,
+        };
+        let report = daemon.report().await;
+        assert_eq!(report["max_loaded_shards"], 6);
+        assert_eq!(
+            report["max_loaded_shards_source"],
+            "settings file /home/op/.config/lattice/daemon.toml"
+        );
+        assert_eq!(report["loaded_shards"], 0);
+        assert_eq!(report["pinned_shards"], 0);
+
+        // The MCP tool envelope: JSON inside a text block.
+        let mut tool = serde_json::json!({"content": [{"type": "text",
+            "text": "{\"status\":\"ready\",\"files\":12}"}]});
+        attach_daemon_report(&mut tool, report.clone());
+        let inner: Value =
+            serde_json::from_str(tool["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["files"], 12);
+        assert_eq!(inner["daemon"]["max_loaded_shards"], 6);
+        assert_eq!(
+            inner["shard_capacity"],
+            "max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; 0 loaded, 0 pinned by an open session or index work"
+        );
+        // The bare `lattice/status` payload.
+        let mut bare = serde_json::json!({"status": "deferred"});
+        attach_daemon_report(&mut bare, report.clone());
+        assert_eq!(bare["daemon"]["loaded_shards"], 0);
+        // Anything else is left exactly as it was.
+        for untouched in [
+            serde_json::json!({"content": [{"type": "text", "text": "## markdown status"}]}),
+            serde_json::json!({"content": [{"type": "text", "text": "[1,2]"}]}),
+            serde_json::json!({"tools": []}),
+        ] {
+            let mut value = untouched.clone();
+            attach_daemon_report(&mut value, report.clone());
+            assert_eq!(value, untouched);
+        }
+
+        let call = |name: &str, arguments: Value| serde_json::json!({"name": name, "arguments": arguments});
+        assert!(is_index_status_request("lattice/status", &Value::Null));
+        assert!(is_index_status_request(
+            "tools/call",
+            &call("status", serde_json::json!({}))
+        ));
+        assert!(is_index_status_request(
+            "tools/call",
+            &call("status", serde_json::json!({"scope": "index"}))
+        ));
+        for (method, params) in [
+            (
+                "tools/call",
+                call("status", serde_json::json!({"scope": "docs"})),
+            ),
+            (
+                "tools/call",
+                call("status", serde_json::json!({"scope": "storage"})),
+            ),
+            ("tools/call", call("context", serde_json::json!({}))),
+            ("tools/list", Value::Null),
+        ] {
+            assert!(!is_index_status_request(method, &params));
         }
     }
 
@@ -3281,14 +3443,6 @@ fn env_duration_secs(name: &str, fallback: Duration) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(fallback)
-}
-
-fn env_usize(name: &str, fallback: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
         .unwrap_or(fallback)
 }
 

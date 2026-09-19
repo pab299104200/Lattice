@@ -2,6 +2,7 @@
 
 mod adoption_metrics;
 mod cli;
+mod daemon_settings;
 mod disk_budget;
 mod doctor;
 mod git_intelligence_runtime;
