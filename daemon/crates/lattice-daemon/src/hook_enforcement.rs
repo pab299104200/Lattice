@@ -465,10 +465,10 @@ pub(crate) fn notice_text(condition: NoticeCondition) -> String {
              Edits are not blocked. Check progress with `lattice status`."
         }
         NoticeCondition::IndexDeferred => {
-            "Lattice has deferred loading this workspace because every shard slot is busy, so \
-             plan and impact answers are partial. Edits are not blocked. Close another \
-             workspace's Lattice session or raise LATTICE_MAX_LOADED_SHARDS, then check \
-             `lattice status`."
+            "Lattice could not load this workspace: the daemon is at its memory budget or its \
+             configured shard ceiling, and every loaded workspace is in use. Plan and impact \
+             answers are partial. Edits are not blocked. Run `lattice status` for the reason \
+             and what to raise."
         }
         NoticeCondition::IndexFailed => {
             "Lattice failed to load this workspace index, so plan and impact answers are \

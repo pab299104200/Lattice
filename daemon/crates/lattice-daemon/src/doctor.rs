@@ -1384,68 +1384,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn doctor_reports_the_shard_cap_its_source_and_a_pending_restart() {
+    fn doctor_reports_capacity_memory_the_ceiling_and_a_pending_restart() {
         use crate::daemon_settings::{DaemonSettings, SettingSource};
+        const MIB: u64 = 1024 * 1024;
         let path = PathBuf::from("/home/op/.config/lattice/daemon.toml");
-        let from_file = DaemonSettings {
-            max_loaded_shards: 6,
+        let with_ceiling = DaemonSettings {
+            max_loaded_shards: Some(6),
             max_loaded_shards_source: SettingSource::SettingsFile(path.clone()),
+            memory_budget_bytes: 5461 * MIB,
+            memory_budget_source: SettingSource::Default,
             settings_file: Some(path.clone()),
             settings_file_present: true,
         };
         assert_eq!(
-            format_configured_settings(&from_file),
-            "PASS daemon settings: max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; settings file /home/op/.config/lattice/daemon.toml is valid"
+            format_configured_settings(&with_ceiling),
+            "PASS daemon settings: memory budget 5461 MiB from built-in default; shard ceiling 6 from settings file /home/op/.config/lattice/daemon.toml; settings file /home/op/.config/lattice/daemon.toml is valid"
         );
-        let mut absent = DaemonSettings::unconfigured(8);
-        absent.settings_file = Some(path);
-        assert!(format_configured_settings(&absent).ends_with(
-            "from built-in default; no settings file at /home/op/.config/lattice/daemon.toml"
-        ));
+        let mut unlimited = DaemonSettings::unconfigured(None);
+        unlimited.memory_budget_bytes = 5461 * MIB;
+        unlimited.settings_file = Some(path);
+        let line = format_configured_settings(&unlimited);
+        assert!(line.contains("no shard ceiling"), "{line}");
+        assert!(line.ends_with("no settings file at /home/op/.config/lattice/daemon.toml"));
 
-        let running = |cap: u64, loaded: u64, pinned: u64| {
-            json!({"max_loaded_shards": cap, "max_loaded_shards_source": "built-in default",
-                   "loaded_shards": loaded, "pinned_shards": pinned})
+        let running = |ceiling: Value, deferred: Value| {
+            json!({
+                "max_loaded_shards": ceiling,
+                "max_loaded_shards_source": "settings file /home/op/.config/lattice/daemon.toml",
+                "memory_budget_bytes": 5461 * MIB, "memory_footprint_bytes": 1443 * MIB,
+                "uptime_secs": 8 * 3600, "connected_workspaces": 5, "agents": 7,
+                "loaded_shards": 5, "idle_shards": 0, "connected_idle_shards": 2,
+                "deferred": deferred,
+            })
         };
-        let (line, warned) = format_running_settings(Some(&running(6, 5, 5)), Some(&from_file));
-        assert!(!warned);
-        assert!(line.starts_with("PASS running daemon: max_loaded_shards=6 from built-in default; 5 of 6 shard slots loaded, 5 pinned"));
-        assert!(
-            !line.contains("memory"),
-            "unknown footprint must not be printed as zero"
+        let (line, warned) =
+            format_running_settings(Some(&running(json!(6), Value::Null)), Some(&with_ceiling));
+        assert!(!warned, "{line}");
+        assert_eq!(
+            line,
+            "PASS running daemon: 5 connected workspace(s), 7 agent(s); 5 shard(s) loaded, 0 idle, 2 connected but idle; memory 1443 MiB of 5461 MiB after 8 h up; shard ceiling 6 from settings file /home/op/.config/lattice/daemon.toml"
         );
-        let mut measured = running(6, 5, 5);
-        measured["memory_footprint_bytes"] = json!(9_u64 * 1024 * 1024 * 1024);
-        measured["uptime_secs"] = json!(113 * 3600);
-        let (line, _) = format_running_settings(Some(&measured), Some(&from_file));
-        assert!(line.ends_with("; memory 9216 MiB after 113 h up"), "{line}");
 
-        // The daemon started before the file was written: say a restart is pending.
-        let (line, warned) = format_running_settings(Some(&running(3, 3, 3)), Some(&from_file));
+        // A ceiling or the memory budget about to defer someone is said loudly.
+        let (line, warned) = format_running_settings(
+            Some(&running(json!(6), json!("ceiling"))),
+            Some(&with_ceiling),
+        );
         assert!(warned);
-        assert!(line.starts_with("WARN running daemon: max_loaded_shards=3"));
-        assert!(line.ends_with(
-            "A restart would use 6 from settings file /home/op/.config/lattice/daemon.toml"
-        ));
-
-        let (line, warned) = format_running_settings(Some(&running(6, 6, 6)), Some(&from_file));
+        assert!(
+            line.contains("would be DEFERRED: the ceiling is reached"),
+            "{line}"
+        );
+        let (line, warned) = format_running_settings(
+            Some(&running(json!(6), json!("memory"))),
+            Some(&with_ceiling),
+        );
         assert!(warned);
-        assert!(line.contains("Every slot is pinned"));
+        assert!(
+            line.contains("would be DEFERRED: memory is at its budget"),
+            "{line}"
+        );
 
+        // The settings changed after the daemon started.
+        let (line, warned) =
+            format_running_settings(Some(&running(json!(6), Value::Null)), Some(&unlimited));
+        assert!(warned);
+        assert!(
+            line.ends_with("A restart would use a memory budget of 5461 MiB and no shard ceiling"),
+            "{line}"
+        );
+
+        // Older daemons.
+        let fixed_count = json!({"max_loaded_shards": 6, "loaded_shards": 6, "pinned_shards": 5});
+        let (line, warned) = format_running_settings(Some(&fixed_count), Some(&with_ceiling));
+        assert!(warned);
+        assert!(line.contains("still uses a fixed shard count"), "{line}");
         for missing in [None, Some(&Value::Null)] {
-            let (line, warned) = format_running_settings(missing, Some(&from_file));
+            let (line, warned) = format_running_settings(missing, Some(&with_ceiling));
             assert!(warned);
-            assert!(line.contains("predates settings reporting"));
+            assert!(line.contains("predates capacity reporting"), "{line}");
         }
     }
 
     #[test]
     fn a_deferred_workspace_is_a_warning_not_a_healthy_pass() {
-        let response = json!({"content": [{"type": "text", "text":
-            json!({"status": "deferred", "indexing": false, "files": null}).to_string()}]});
+        let response = json!({"content": [{"type": "text", "text": json!({
+            "status": "deferred", "indexing": false, "files": null,
+            "bootstrap": {"deferred_reason": "the shard ceiling max_loaded_shards=6 is reached"}
+        }).to_string()}]});
         let line = format_index_status(Path::new("/work/relay"), &response);
         assert!(line.starts_with("WARN workspace /work/relay status=deferred"));
-        assert!(line.contains("nothing is indexing this one"));
+        assert!(line.contains("the shard ceiling max_loaded_shards=6 is reached"));
         assert!(!line.contains("watcher=healthy"));
     }
 

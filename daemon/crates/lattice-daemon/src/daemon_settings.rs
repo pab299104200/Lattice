@@ -234,14 +234,10 @@ pub(crate) fn resolve(
             let parsed = value.trim().parse::<i64>().map_err(|_| {
                 anyhow!("environment variable {MEMORY_BUDGET_ENV}=`{value}` is not a whole number")
             })?;
-            validate_memory_budget_mb(
-                parsed,
-                &format!("environment variable {MEMORY_BUDGET_ENV}"),
-            )
+            validate_memory_budget_mb(parsed, &format!("environment variable {MEMORY_BUDGET_ENV}"))
         })
         .transpose()?;
-    let (memory_budget_mb, memory_budget_source) = match (budget_from_env, file.memory_budget_mb)
-    {
+    let (memory_budget_mb, memory_budget_source) = match (budget_from_env, file.memory_budget_mb) {
         (Some(mb), _) => (mb, SettingSource::Environment(MEMORY_BUDGET_ENV)),
         (None, Some(mb)) => (
             mb,
@@ -432,8 +428,13 @@ mod tests {
     #[test]
     fn a_ceiling_written_before_demand_driven_capacity_still_works() {
         // The file rolled out on 2026-09-19 holds exactly this.
-        let settings =
-            resolve(&env_of(&[]), file(), Some("max_loaded_shards = 6\n"), RAM_16G).unwrap();
+        let settings = resolve(
+            &env_of(&[]),
+            file(),
+            Some("max_loaded_shards = 6\n"),
+            RAM_16G,
+        )
+        .unwrap();
         assert_eq!(settings.max_loaded_shards, Some(6));
         assert_eq!(
             settings.max_loaded_shards_source,
@@ -477,12 +478,19 @@ mod tests {
         // The older variable still works, and the current one beats it.
         let legacy = env_of(&[(MAX_LOADED_WORKSPACES_ENV, "5")]);
         assert_eq!(
-            resolve(&legacy, file(), None, RAM_16G).unwrap().max_loaded_shards,
+            resolve(&legacy, file(), None, RAM_16G)
+                .unwrap()
+                .max_loaded_shards,
             Some(5)
         );
-        let both = env_of(&[(MAX_LOADED_WORKSPACES_ENV, "5"), (MAX_LOADED_SHARDS_ENV, "7")]);
+        let both = env_of(&[
+            (MAX_LOADED_WORKSPACES_ENV, "5"),
+            (MAX_LOADED_SHARDS_ENV, "7"),
+        ]);
         assert_eq!(
-            resolve(&both, file(), None, RAM_16G).unwrap().max_loaded_shards,
+            resolve(&both, file(), None, RAM_16G)
+                .unwrap()
+                .max_loaded_shards,
             Some(7)
         );
         // An empty variable is unset, not zero.
@@ -513,9 +521,15 @@ mod tests {
             ("max_loaded_shards = true", "must be a whole number"),
             ("[max_loaded_shards]\nvalue = 6", "not a table"),
             ("max_loaded_shard = 6", "unknown key `max_loaded_shard`"),
-            ("max_loaded_shards = 6\nidle_ttl = 5", "unknown key `idle_ttl`"),
+            (
+                "max_loaded_shards = 6\nidle_ttl = 5",
+                "unknown key `idle_ttl`",
+            ),
             ("max_loaded_shards = ", "not valid TOML"),
-            ("max_loaded_shards = 6\nmax_loaded_shards = 7", "not valid TOML"),
+            (
+                "max_loaded_shards = 6\nmax_loaded_shards = 7",
+                "not valid TOML",
+            ),
             ("memory_budget_mb = 100", "must be between 512 and"),
             ("memory_budget_mb = -1", "must be between 512 and"),
             ("memory_budget_mb = \"6GB\"", "must be a whole number"),
@@ -535,9 +549,21 @@ mod tests {
         for (name, value, expected) in [
             (MAX_LOADED_SHARDS_ENV, "six", "is not a whole number"),
             (MAX_LOADED_SHARDS_ENV, "6.0", "is not a whole number"),
-            (MAX_LOADED_SHARDS_ENV, "0", "must be between 1 and 64, got 0"),
-            (MAX_LOADED_SHARDS_ENV, "-1", "must be between 1 and 64, got -1"),
-            (MAX_LOADED_SHARDS_ENV, "1000", "must be between 1 and 64, got 1000"),
+            (
+                MAX_LOADED_SHARDS_ENV,
+                "0",
+                "must be between 1 and 64, got 0",
+            ),
+            (
+                MAX_LOADED_SHARDS_ENV,
+                "-1",
+                "must be between 1 and 64, got -1",
+            ),
+            (
+                MAX_LOADED_SHARDS_ENV,
+                "1000",
+                "must be between 1 and 64, got 1000",
+            ),
             (MEMORY_BUDGET_ENV, "lots", "is not a whole number"),
             (MEMORY_BUDGET_ENV, "64", "must be between 512 and"),
         ] {

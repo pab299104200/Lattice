@@ -94,15 +94,33 @@ impl ShardEntry {
             .map(|runtime| Arc::clone(&runtime.handler) as Arc<dyn RequestHandler>))
     }
 
-    fn start_bootstrap(self: &Arc<Self>, focus_files: Vec<String>, focus_dirs: Vec<String>) {
+    fn start_bootstrap(
+        self: &Arc<Self>,
+        focus_files: Vec<String>,
+        focus_dirs: Vec<String>,
+        cost: LoadCostProbe,
+    ) {
         let entry = Arc::clone(self);
         let root = entry.root.clone();
         let index_work = Arc::clone(&entry.index_work);
         let task = tokio::spawn(async move {
-            match crate::build_workspace_runtime(vec![root], focus_files, focus_dirs, index_work)
-                .await
-            {
+            let alone = cost.loading.fetch_add(1, Ordering::SeqCst) == 0;
+            let before = (cost.footprint)();
+            let built =
+                crate::build_workspace_runtime(vec![root], focus_files, focus_dirs, index_work)
+                    .await;
+            let still_alone = cost.loading.fetch_sub(1, Ordering::SeqCst) == 1;
+            match built {
                 Ok(runtime) => {
+                    // The footprint is process-wide, so growth can be
+                    // attributed to this shard only if it loaded alone.
+                    if let (true, true, Some(before), Some(after)) =
+                        (alone, still_alone, before, (cost.footprint)())
+                    {
+                        entry
+                            .load_cost_bytes
+                            .store(after.saturating_sub(before), Ordering::Release);
+                    }
                     let mut slot = lock_owned(&entry.runtime);
                     *slot = Some(runtime);
                 }
@@ -305,7 +323,9 @@ fn shard_capacity_line(report: &Value) -> Value {
     let ceiling = match report["max_loaded_shards"].as_u64() {
         Some(ceiling) => format!(
             "shard ceiling {ceiling} from {}",
-            report["max_loaded_shards_source"].as_str().unwrap_or("unknown")
+            report["max_loaded_shards_source"]
+                .as_str()
+                .unwrap_or("unknown")
         ),
         None => "no shard ceiling".to_string(),
     };
@@ -443,14 +463,12 @@ fn cold_index_status_payload(
     let summary = if bootstrap_error.is_some() {
         "Failed to load this workspace. Lattice answers for it are unavailable. Run `lattice doctor`."
             .to_string()
-    } else if deferred_reason.is_some() {
+    } else if let Some(reason) = deferred_reason {
         // Say the thing an operator needs in words. `indexing` and
         // `not_loaded` both read as "wait", and waiting never ends here.
-        "Deferred behind shard capacity: every shard slot is held by another workspace with an \
-         open session, so this workspace has not been loaded and nothing is indexing it. It will \
-         stay deferred until one of those sessions closes or the daemon is restarted with a \
-         higher LATTICE_MAX_LOADED_SHARDS. Lattice answers for this workspace are partial."
-            .to_string()
+        format!(
+            "Deferred, not loading: {reason} Nothing is indexing this workspace, and Lattice answers for it are partial until it can be loaded."
+        )
     } else {
         "Loading this workspace for the first time. Answers are partial until indexing finishes."
             .to_string()
@@ -592,7 +610,12 @@ fn take_victim(
                     entry.is_idle_connected(now_epoch_secs, connected_idle_secs)
                 }
             })
-            .map(|(key, entry)| (entry.last_used_epoch_secs.load(Ordering::Acquire), key.clone()))
+            .map(|(key, entry)| {
+                (
+                    entry.last_used_epoch_secs.load(Ordering::Acquire),
+                    key.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         candidates.sort();
         for (_, key) in candidates {
@@ -1299,6 +1322,13 @@ enum PathRoute {
     None,
 }
 
+/// What a loading shard needs to measure its own cost.
+#[derive(Clone)]
+struct LoadCostProbe {
+    footprint: FootprintProbe,
+    loading: Arc<AtomicUsize>,
+}
+
 /// Reads the daemon's real memory footprint. Injected so tests can drive
 /// memory pressure without allocating gigabytes.
 type FootprintProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
@@ -1320,6 +1350,7 @@ pub(crate) struct GlobalDaemon {
     /// holds the checkout lease.
     lifecycle_gate: Mutex<()>,
     connected: Arc<StdMutex<HashMap<String, ConnectedWorkspace>>>,
+    loading: Arc<AtomicUsize>,
     footprint: FootprintProbe,
     memory_budget_bytes: u64,
     connected_idle_secs: u64,
@@ -1368,6 +1399,7 @@ impl GlobalDaemon {
             shards: Mutex::new(HashMap::new()),
             lifecycle_gate: Mutex::new(()),
             connected: Arc::new(StdMutex::new(HashMap::new())),
+            loading: Arc::new(AtomicUsize::new(0)),
             footprint: Arc::new(crate::daemon_settings::process_memory_footprint_bytes),
             memory_budget_bytes: settings.memory_budget_bytes,
             connected_idle_secs: env_duration_secs(
@@ -1561,7 +1593,10 @@ impl GlobalDaemon {
         let shards = self.shards.lock().await;
 
         // Every workspace that is connected, loaded, or both.
-        let mut keys = connected.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        let mut keys = connected
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         keys.extend(shards.keys().cloned());
         let mut workspaces = Vec::new();
         for key in &keys {
@@ -1600,18 +1635,17 @@ impl GlobalDaemon {
             .values()
             .filter(|clients| clients.agents > 0)
             .count());
-        report["agents"] =
-            serde_json::json!(connected.values().map(|clients| clients.agents).sum::<usize>());
+        report["agents"] = serde_json::json!(connected
+            .values()
+            .map(|clients| clients.agents)
+            .sum::<usize>());
         report["loaded_shards"] = serde_json::json!(shards.len());
         report["idle_shards"] = serde_json::json!(count("idle"));
         report["connected_idle_shards"] = serde_json::json!(count("connected_idle"));
-        report["evictable_shards"] =
-            serde_json::json!(count("idle") + count("connected_idle"));
+        report["evictable_shards"] = serde_json::json!(count("idle") + count("connected_idle"));
         report["connected_idle_threshold_secs"] = serde_json::json!(self.connected_idle_secs);
         report["idle_grace_secs"] = serde_json::json!(self.idle_ttl.as_secs());
-        report["deferred"] = serde_json::json!(self
-            .would_defer(&shards)
-            .map(|kind| kind.label()));
+        report["deferred"] = serde_json::json!(self.would_defer(&shards).map(|kind| kind.label()));
         report["memory_budget_bytes"] = serde_json::json!(self.memory_budget_bytes);
         report["memory_footprint_bytes"] = serde_json::json!((self.footprint)());
         report["uptime_secs"] = serde_json::json!(self.started_at.elapsed().as_secs());
@@ -1750,22 +1784,24 @@ impl GlobalDaemon {
             // idle has been offered up.
             let victim = match self.pressure(&shards) {
                 None => None,
-                Some(kind) => match take_victim(
-                    &mut shards,
-                    now_epoch_secs(),
-                    self.connected_idle_secs,
-                ) {
-                    Some((victim_key, entry, class)) => Some((victim_key, entry, class, kind)),
-                    // Memory that stays high with nothing loaded is not
-                    // something refusing this workspace could fix.
-                    None if kind == DeferralKind::Memory && !shards.values().any(|entry| entry.is_loaded()) => None,
-                    None => {
-                        return Err(anyhow::Error::new(ShardDeferred {
-                            message: self.deferral_message(&kind, &key, shards.len()),
-                            kind,
-                        }))
+                Some(kind) => {
+                    match take_victim(&mut shards, now_epoch_secs(), self.connected_idle_secs) {
+                        Some((victim_key, entry, class)) => Some((victim_key, entry, class, kind)),
+                        // Memory that stays high with nothing loaded is not
+                        // something refusing this workspace could fix.
+                        None if kind == DeferralKind::Memory
+                            && !shards.values().any(|entry| entry.is_loaded()) =>
+                        {
+                            None
+                        }
+                        None => {
+                            return Err(anyhow::Error::new(ShardDeferred {
+                                message: self.deferral_message(&kind, &key, shards.len()),
+                                kind,
+                            }))
+                        }
                     }
-                },
+                }
             };
 
             // Reserve the full configured logical materialization allowance
@@ -1796,7 +1832,10 @@ impl GlobalDaemon {
                     ("requested_shard", serde_json::json!(key.clone())),
                     ("victim", serde_json::json!(class.label())),
                     ("pressure", serde_json::json!(kind.label())),
-                    ("victim_connections", serde_json::json!(victim.connections())),
+                    (
+                        "victim_connections",
+                        serde_json::json!(victim.connections()),
+                    ),
                 ],
             );
             victim.shutdown().await;
@@ -1816,7 +1855,14 @@ impl GlobalDaemon {
             // Bootstrap ownership is installed while admission remains fenced
             // by the shard-map lock. Shutdown cannot drain this entry between
             // the final admission check and constructor-handle publication.
-            entry.start_bootstrap(focus_files, focus_dirs);
+            entry.start_bootstrap(
+                focus_files,
+                focus_dirs,
+                LoadCostProbe {
+                    footprint: Arc::clone(&self.footprint),
+                    loading: Arc::clone(&self.loading),
+                },
+            );
         }
 
         lifecycle_log::log_event(
@@ -1913,14 +1959,15 @@ impl GlobalDaemon {
 pub(crate) async fn run_global_daemon() -> Result<()> {
     // Before binding: a daemon that is going to refuse its settings must not
     // first accept connections from proxies that then lose it.
-    let settings = crate::daemon_settings::load().inspect_err(|error| {
-        lifecycle_log::log_event(
-            "daemon",
-            "daemon_settings_invalid",
-            &[("error", serde_json::json!(format!("{error:#}")))],
-        );
-    })
-    .context("lattice daemon did not start: its settings are invalid")?;
+    let settings = crate::daemon_settings::load()
+        .inspect_err(|error| {
+            lifecycle_log::log_event(
+                "daemon",
+                "daemon_settings_invalid",
+                &[("error", serde_json::json!(format!("{error:#}")))],
+            );
+        })
+        .context("lattice daemon did not start: its settings are invalid")?;
     lifecycle_log::log_event(
         "daemon",
         "daemon_settings_loaded",
@@ -2418,9 +2465,8 @@ mod tests {
         assert_eq!(deferred["status"], "deferred");
         assert_eq!(deferred["indexing"], false);
         let summary = deferred["summary"].as_str().unwrap();
-        assert!(summary.starts_with("Deferred behind shard capacity"));
-        assert!(summary.contains("nothing is indexing it"));
-        assert!(summary.contains("LATTICE_MAX_LOADED_SHARDS"));
+        assert!(summary.starts_with("Deferred, not loading: 3 loaded workspace shards"));
+        assert!(summary.contains("Nothing is indexing this workspace"));
         assert_eq!(deferred["bootstrap"]["state"], "deferred");
         assert_eq!(deferred["graph_snapshot_state"], "not_loaded");
         // A merged view must still treat the deferred shard as incomplete.
@@ -2434,6 +2480,484 @@ mod tests {
             cold_index_status_payload(&root, &index_work, Some("bootstrap failed".into()), None);
         assert_eq!(failed["status"], "degraded");
         assert_eq!(failed["indexing"], false);
+    }
+
+    const TEST_MIB: u64 = 1024 * 1024;
+
+    /// A daemon whose memory reading the test controls.
+    fn daemon_with_memory(
+        ceiling: Option<usize>,
+        budget_mib: u64,
+    ) -> (Arc<GlobalDaemon>, Arc<AtomicU64>) {
+        let used = Arc::new(AtomicU64::new(64 * TEST_MIB));
+        let mut daemon = GlobalDaemon::new_with_ceiling(ceiling, false);
+        let probe = Arc::clone(&used);
+        daemon.footprint = Arc::new(move || Some(probe.load(Ordering::Acquire)));
+        daemon.memory_budget_bytes = budget_mib * TEST_MIB;
+        daemon.connected_idle_secs = 600;
+        (Arc::new(daemon), used)
+    }
+
+    fn capacity_roots(label: &str, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                let root = unique_test_root(&format!("lattice-demand-{label}-{index}"));
+                std::fs::create_dir_all(&root).expect("create capacity root");
+                root.canonicalize().unwrap_or(root)
+            })
+            .collect()
+    }
+
+    fn request_for(root: &Path) -> ProxyRequest {
+        ProxyRequest {
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+            focus_files: Vec::new(),
+            focus_dirs: Vec::new(),
+        }
+    }
+
+    /// Make a shard look as if nothing has asked it for anything for a while.
+    fn age(entry: &ShardEntry, secs: u64) {
+        entry
+            .last_used_epoch_secs
+            .store(now_epoch_secs().saturating_sub(secs), Ordering::Release);
+    }
+
+    async fn loaded_keys(daemon: &GlobalDaemon) -> Vec<String> {
+        let mut keys = daemon
+            .shards
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    async fn cleanup(daemon: &Arc<GlobalDaemon>, roots: Vec<PathBuf>) {
+        shutdown_all_shards(daemon).await;
+        for root in roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_connected_workspace_loads_with_no_count_based_deferral() {
+        // Far more than the old fixed count of three, and more than the eight
+        // the fixed 256 MiB view reservation used to allow.
+        let (daemon, _) = daemon_with_memory(None, 8 * 1024);
+        let roots = capacity_roots("all-load", 12);
+        let mut leases = Vec::new();
+        for root in &roots {
+            let lease = daemon
+                .handler_for_client(&request_for(root), ClientKind::StdioProxy)
+                .await
+                .expect("a connected workspace always gets a lease");
+            assert_eq!(
+                retained_shard_count(&lease.retained_shards),
+                1,
+                "workspace {} was deferred",
+                root.display()
+            );
+            leases.push(lease);
+        }
+        assert_eq!(loaded_keys(&daemon).await.len(), 12);
+        let report = daemon.report().await;
+        assert_eq!(report["connected_workspaces"], 12);
+        assert_eq!(report["agents"], 12);
+        assert_eq!(report["loaded_shards"], 12);
+        assert!(report["deferred"].is_null());
+        assert!(report["max_loaded_shards"].is_null());
+        drop(leases);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn two_agents_on_one_checkout_share_a_shard_and_are_counted_separately() {
+        let (daemon, _) = daemon_with_memory(None, 8 * 1024);
+        let roots = capacity_roots("shared", 1);
+        let first = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let second = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let cli = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::Cli)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded_keys(&daemon).await.len(),
+            1,
+            "one checkout, one shard"
+        );
+        let shard = Arc::clone(daemon.shards.lock().await.values().next().unwrap());
+        assert_eq!(shard.connections(), 3);
+
+        let report = daemon.report().await;
+        assert_eq!(report["connected_workspaces"], 1);
+        assert_eq!(report["agents"], 2);
+        assert_eq!(report["workspaces"][0]["agents"], 2);
+        assert_eq!(report["workspaces"][0]["other_clients"], 1);
+
+        drop(first);
+        drop(cli);
+        let report = daemon.report().await;
+        assert_eq!(report["agents"], 1);
+        assert_eq!(shard.connections(), 1);
+        drop(second);
+        let report = daemon.report().await;
+        assert_eq!(report["connected_workspaces"], 0);
+        assert_eq!(report["agents"], 0);
+        assert_eq!(shard.connections(), 0);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn an_unconnected_shard_is_evicted_after_its_grace_and_not_before() {
+        let (mut_daemon, _) = daemon_with_memory(None, 8 * 1024);
+        let daemon = mut_daemon;
+        let roots = capacity_roots("grace", 2);
+        let connected = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let gone = daemon
+            .handler_for_client(&request_for(&roots[1]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        drop(gone);
+        wait_for_shard_evictable(&daemon, &roots[1]).await;
+        let grace = daemon.idle_ttl.as_secs();
+
+        // Inside the grace period nothing goes, so a reconnect is instant.
+        daemon.evict_idle().await;
+        assert_eq!(loaded_keys(&daemon).await.len(), 2);
+
+        // Past it, only the unconnected shard goes, however old the other is.
+        for entry in daemon.shards.lock().await.values() {
+            age(entry, grace + 10);
+        }
+        daemon.evict_idle().await;
+        assert_eq!(loaded_keys(&daemon).await, vec![shard_key(&roots[0])]);
+        drop(connected);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_eviction_loads_the_workspace_again() {
+        let (daemon, _) = daemon_with_memory(None, 8 * 1024);
+        let roots = capacity_roots("reconnect", 1);
+        let lease = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let first = Arc::clone(daemon.shards.lock().await.values().next().unwrap());
+        drop(lease);
+        wait_for_shard_evictable(&daemon, &roots[0]).await;
+        age(&first, daemon.idle_ttl.as_secs() + 10);
+        daemon.evict_idle().await;
+        assert!(loaded_keys(&daemon).await.is_empty());
+        assert!(first.is_retired());
+
+        let lease = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        assert_eq!(retained_shard_count(&lease.retained_shards), 1);
+        let second = Arc::clone(daemon.shards.lock().await.values().next().unwrap());
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!second.is_retired());
+        drop(lease);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn memory_pressure_evicts_unconnected_then_idle_connected_and_never_a_busy_shard() {
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        let roots = capacity_roots("memory", 4);
+        let busy = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let silent = daemon
+            .handler_for_client(&request_for(&roots[1]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        let gone = daemon
+            .handler_for_client(&request_for(&roots[2]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        drop(gone);
+        for root in &roots[..3] {
+            wait_for_shard_published(&daemon, root).await;
+        }
+        wait_for_shard_evictable(&daemon, &roots[2]).await;
+        {
+            let shards = daemon.shards.lock().await;
+            age(&shards[&shard_key(&roots[1])], 3_600);
+            age(&shards[&shard_key(&roots[2])], 30);
+        }
+
+        // At the budget. The newcomer still loads: the unconnected shard goes
+        // first, although the connected one has been idle for far longer.
+        used.store(2 * 1024 * TEST_MIB, Ordering::Release);
+        let newcomer = daemon
+            .handler_for_client(&request_for(&roots[3]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        assert_eq!(retained_shard_count(&newcomer.retained_shards), 1);
+        let keys = loaded_keys(&daemon).await;
+        assert!(
+            !keys.contains(&shard_key(&roots[2])),
+            "unconnected shard must go first"
+        );
+        assert!(keys.contains(&shard_key(&roots[1])));
+
+        // Still over budget at the next sweep: now the connected-but-silent
+        // shard is unloaded. The busy one and the newcomer are untouched.
+        let silent_shard = Arc::clone(&daemon.shards.lock().await[&shard_key(&roots[1])]);
+        wait_for_shard_published(&daemon, &roots[3]).await;
+        // Exactly at the budget the sweep leaves everything alone.
+        daemon.relieve_memory_pressure().await;
+        assert!(loaded_keys(&daemon).await.contains(&shard_key(&roots[1])));
+        used.store(2 * 1024 * TEST_MIB + 1, Ordering::Release);
+        daemon.relieve_memory_pressure().await;
+        let keys = loaded_keys(&daemon).await;
+        assert!(!keys.contains(&shard_key(&roots[1])));
+        assert!(keys.contains(&shard_key(&roots[0])));
+        assert!(keys.contains(&shard_key(&roots[3])));
+        assert!(silent_shard.is_retired());
+
+        // Its agent asks again: it reloads, invisibly to the client.
+        used.store(256 * TEST_MIB, Ordering::Release);
+        let status = silent
+            .handler
+            .handle(
+                "tools/call",
+                serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+            )
+            .await
+            .expect("an unloaded shard answers its next request");
+        assert!(extract_tool_json(status).is_ok());
+        let reloaded = Arc::clone(&daemon.shards.lock().await[&shard_key(&roots[1])]);
+        assert!(!Arc::ptr_eq(&reloaded, &silent_shard));
+        assert_eq!(reloaded.connections(), 1, "the lease retains its new shard");
+        assert_eq!(
+            silent_shard.connections(),
+            0,
+            "and released the retired one"
+        );
+
+        drop((busy, silent, newcomer));
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn deferral_is_honest_and_happens_only_when_nothing_can_be_unloaded() {
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        let roots = capacity_roots("honest", 3);
+        let mut leases = Vec::new();
+        for root in &roots[..2] {
+            leases.push(
+                daemon
+                    .handler_for_client(&request_for(root), ClientKind::StdioProxy)
+                    .await
+                    .unwrap(),
+            );
+            wait_for_shard_published(&daemon, root).await;
+        }
+        // Both in use moments ago, and memory is at its budget.
+        used.store(2 * 1024 * TEST_MIB, Ordering::Release);
+        assert_eq!(
+            daemon.index_state_for(&request_for(&roots[2])).await,
+            crate::hook_enforcement::IndexState::Deferred
+        );
+        let starved = daemon
+            .handler_for_client(&request_for(&roots[2]), ClientKind::StdioProxy)
+            .await
+            .expect("a deferred workspace still gets a lease that can heal");
+        assert_eq!(retained_shard_count(&starved.retained_shards), 0);
+        let status = extract_tool_json(
+            starved
+                .handler
+                .handle(
+                    "tools/call",
+                    serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "deferred");
+        assert_eq!(status["indexing"], false);
+        let summary = status["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("memory is at its budget: 2048 MiB used of 2048 MiB"),
+            "{summary}"
+        );
+        assert!(summary.contains("memory_budget_mb"), "{summary}");
+        assert_eq!(
+            loaded_keys(&daemon).await.len(),
+            2,
+            "nothing busy was evicted"
+        );
+
+        // It is counted as connected even though it has no shard.
+        let report = daemon.report().await;
+        assert_eq!(report["connected_workspaces"], 3);
+        assert_eq!(report["loaded_shards"], 2);
+        assert_eq!(report["deferred"], "memory");
+        assert!(shard_capacity_line(&report)
+            .as_str()
+            .unwrap()
+            .contains("would be DEFERRED by the memory budget"));
+
+        // One of the others falls silent. The starved lease heals by itself.
+        age(&daemon.shards.lock().await[&shard_key(&roots[0])], 3_600);
+        let status = extract_tool_json(
+            starved
+                .handler
+                .handle(
+                    "tools/call",
+                    serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(status["status"], "deferred");
+        assert_eq!(retained_shard_count(&starved.retained_shards), 1);
+        drop(leases);
+        drop(starved);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_ceiling_is_honoured_reported_and_never_starves_silently() {
+        // The settings file rolled out on 2026-09-19 says six. Two keeps the
+        // test small; the rule is the same.
+        let (daemon, _) = daemon_with_memory(Some(2), 8 * 1024);
+        let roots = capacity_roots("ceiling", 3);
+        let mut leases = Vec::new();
+        for root in &roots[..2] {
+            leases.push(
+                daemon
+                    .handler_for_client(&request_for(root), ClientKind::StdioProxy)
+                    .await
+                    .unwrap(),
+            );
+            wait_for_shard_published(&daemon, root).await;
+        }
+        let third = daemon
+            .handler_for_client(&request_for(&roots[2]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        assert_eq!(retained_shard_count(&third.retained_shards), 0);
+        let status = extract_tool_json(
+            third
+                .handler
+                .handle(
+                    "tools/call",
+                    serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "deferred");
+        let summary = status["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("shard ceiling max_loaded_shards=2"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Raise or remove max_loaded_shards"),
+            "{summary}"
+        );
+        assert_eq!(
+            daemon.index_state_for(&request_for(&roots[2])).await,
+            crate::hook_enforcement::IndexState::Deferred
+        );
+        assert_eq!(daemon.report().await["deferred"], "ceiling");
+
+        // Unlike the old fixed count, a ceiling does not let a silent session
+        // hold a slot against a workspace that needs it.
+        age(&daemon.shards.lock().await[&shard_key(&roots[1])], 3_600);
+        assert_eq!(
+            daemon.index_state_for(&request_for(&roots[2])).await,
+            crate::hook_enforcement::IndexState::NotLoaded
+        );
+        third
+            .handler
+            .handle(
+                "tools/call",
+                serde_json::json!({"name": "status", "arguments": {"scope": "index"}}),
+            )
+            .await
+            .unwrap();
+        let keys = loaded_keys(&daemon).await;
+        assert_eq!(keys.len(), 2, "the ceiling still holds");
+        assert!(keys.contains(&shard_key(&roots[2])));
+        assert!(!keys.contains(&shard_key(&roots[1])));
+        drop(leases);
+        drop(third);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn a_shard_with_a_request_in_flight_is_never_chosen() {
+        let (daemon, _) = daemon_with_memory(Some(1), 8 * 1024);
+        let roots = capacity_roots("in-flight", 2);
+        let lease = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        wait_for_shard_published(&daemon, &roots[0]).await;
+        let shard = Arc::clone(&daemon.shards.lock().await[&shard_key(&roots[0])]);
+        age(&shard, 3_600);
+        assert!(shard.is_idle_connected(now_epoch_secs(), 600));
+
+        let in_flight = lease.begin_work();
+        assert_eq!(in_flight.len(), 1);
+        assert!(!shard.is_idle_connected(now_epoch_secs(), 600));
+        assert!(!shard.try_retire(), "a request in flight wins the race");
+        assert!(!shard.is_retired());
+        let error = match daemon
+            .shard_for(roots[1].clone(), Vec::new(), Vec::new(), false)
+            .await
+        {
+            Ok(_) => panic!("a shard answering a request must not be unloaded"),
+            Err(error) => error,
+        };
+        assert!(is_shard_capacity_error(&error));
+
+        drop(in_flight);
+        assert!(shard.try_retire());
+        // A request that arrives after retirement takes no guard on the old
+        // runtime, so its shutdown cannot wait on it.
+        assert!(lease.begin_work().is_empty());
+        shard.retired.store(false, Ordering::SeqCst);
+        drop(lease);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn high_memory_with_nothing_loaded_does_not_refuse_the_first_workspace() {
+        // Whatever is using the memory, refusing this workspace cannot free it.
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        used.store(3 * 1024 * TEST_MIB, Ordering::Release);
+        let roots = capacity_roots("nothing-loaded", 1);
+        let lease = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        assert_eq!(retained_shard_count(&lease.retained_shards), 1);
+        drop(lease);
+        cleanup(&daemon, roots).await;
     }
 
     #[tokio::test]
@@ -2493,13 +3017,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_answers_carry_the_effective_cap_its_source_and_slot_usage() {
+    async fn status_answers_carry_capacity_memory_the_ceiling_and_its_source() {
+        const MIB: u64 = 1024 * 1024;
         let mut daemon = GlobalDaemon::new_with_config(6, false);
+        daemon.footprint = Arc::new(|| Some(3072 * MIB));
+        daemon.memory_budget_bytes = 5461 * MIB;
         daemon.settings = crate::daemon_settings::DaemonSettings {
-            max_loaded_shards: 6,
+            max_loaded_shards: Some(6),
             max_loaded_shards_source: crate::daemon_settings::SettingSource::SettingsFile(
                 PathBuf::from("/home/op/.config/lattice/daemon.toml"),
             ),
+            memory_budget_bytes: 5461 * MIB,
+            memory_budget_source: crate::daemon_settings::SettingSource::Default,
             settings_file: Some(PathBuf::from("/home/op/.config/lattice/daemon.toml")),
             settings_file_present: true,
         };
@@ -2510,13 +3039,13 @@ mod tests {
             "settings file /home/op/.config/lattice/daemon.toml"
         );
         assert_eq!(report["loaded_shards"], 0);
-        assert_eq!(report["pinned_shards"], 0);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        assert!(report["memory_footprint_bytes"].as_u64().unwrap() > 1024 * 1024);
+        assert_eq!(report["connected_workspaces"], 0);
+        assert_eq!(report["agents"], 0);
+        assert_eq!(report["memory_footprint_bytes"], 3072 * MIB);
+        assert_eq!(report["memory_budget_bytes"], 5461 * MIB);
+        assert!(report["deferred"].is_null());
         assert!(report["uptime_secs"].is_u64());
-        let mut report = report;
-        report["memory_footprint_bytes"] = serde_json::json!(3_u64 * 1024 * 1024 * 1024);
-        report["uptime_secs"] = serde_json::json!(7_200);
+        assert_eq!(report["connected_idle_threshold_secs"], 600);
 
         // The MCP tool envelope: JSON inside a text block.
         let mut tool = serde_json::json!({"content": [{"type": "text",
@@ -2528,7 +3057,7 @@ mod tests {
         assert_eq!(inner["daemon"]["max_loaded_shards"], 6);
         assert_eq!(
             inner["shard_capacity"],
-            "max_loaded_shards=6 from settings file /home/op/.config/lattice/daemon.toml; 0 loaded, 0 pinned by an open session or index work; daemon memory 3072 MiB after 2 h up"
+            "0 connected workspace(s) with 0 agent(s); 0 shard(s) loaded, 0 idle, 0 connected but idle and unloadable; memory 3072 MiB of 5461 MiB budget (built-in default) after 0 h up; shard ceiling 6 from settings file /home/op/.config/lattice/daemon.toml"
         );
         // The bare `lattice/status` payload.
         let mut bare = serde_json::json!({"status": "deferred"});
@@ -3254,7 +3783,19 @@ mod tests {
             Ok(_) => panic!("capacity must not evict a shard retained by a pending request"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("all are active or indexing"));
+        assert!(is_shard_capacity_error(&error));
+        assert_eq!(
+            error
+                .downcast_ref::<ShardDeferred>()
+                .map(|deferred| &deferred.kind),
+            Some(&DeferralKind::Ceiling)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("shard ceiling max_loaded_shards=1"),
+            "{error}"
+        );
 
         drop(retained);
         wait_for_shard_evictable(&daemon, &root_a).await;
@@ -3888,6 +4429,46 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("shard never became evictable for {}", root.display());
+    }
+
+    /// Loaded and quiet: bootstrap finished and no index job queued or
+    /// running. It waits on real indexing of a scratch directory, which is
+    /// not a behaviour under test. With this file's tests running in
+    /// parallel, a twelve-workspace test was observed to take over a minute,
+    /// and thirty seconds failed two tests; three minutes is a ceiling for a
+    /// stuck bootstrap, not an expectation.
+    async fn wait_for_shard_published(daemon: &GlobalDaemon, root: &PathBuf) {
+        let key = shard_key(root);
+        for _ in 0..6_000 {
+            {
+                let shards = daemon.shards.lock().await;
+                if let Some(entry) = shards.get(&key) {
+                    if !entry.is_bootstrapping()
+                        && lock_owned(&entry.runtime).is_some()
+                        && !entry.index_work.workspace_is_busy(&key)
+                        && !entry.has_work_in_flight()
+                    {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let shards = daemon.shards.lock().await;
+        let stuck = shards.get(&key).map(|entry| {
+            format!(
+                "bootstrapping={} runtime={} index_busy={} work_in_flight={} error={:?}",
+                entry.is_bootstrapping(),
+                lock_owned(&entry.runtime).is_some(),
+                entry.index_work.workspace_is_busy(&key),
+                entry.has_work_in_flight(),
+                entry.bootstrap_error(),
+            )
+        });
+        panic!(
+            "shard never finished loading for {}: {stuck:?}",
+            root.display()
+        );
     }
 
     struct NoopRequestHandler;
