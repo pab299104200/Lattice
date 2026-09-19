@@ -205,7 +205,7 @@ fn collect_known_with_limits(
     Ok(())
 }
 
-fn registry_root() -> Result<PathBuf> {
+pub(crate) fn registry_root() -> Result<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))

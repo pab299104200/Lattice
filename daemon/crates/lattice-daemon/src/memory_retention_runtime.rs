@@ -487,7 +487,7 @@ fn persist_snapshot_cursor(
     Ok(())
 }
 
-fn registry_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn registry_path() -> anyhow::Result<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))

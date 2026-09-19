@@ -17,6 +17,8 @@ pub(crate) mod resource_budget;
 pub mod rpc;
 pub(crate) mod runtime_support;
 pub(crate) mod storage_operator;
+#[cfg(test)]
+mod test_isolation;
 pub(crate) mod trusted_check_runner;
 #[allow(dead_code)]
 pub(crate) mod watcher_health;

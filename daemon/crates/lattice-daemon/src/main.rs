@@ -20,6 +20,8 @@ mod index_work;
 mod install;
 mod install_project;
 mod lifecycle_log;
+#[cfg(test)]
+mod test_isolation;
 mod memory_attribution;
 mod memory_retention_runtime;
 mod proxy;

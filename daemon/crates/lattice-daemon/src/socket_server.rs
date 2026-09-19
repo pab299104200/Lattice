@@ -4432,19 +4432,21 @@ mod tests {
     }
 
     /// Loaded and quiet: bootstrap finished and no index job queued or
-    /// running. It waits on real indexing of a scratch directory, which is
-    /// not a behaviour under test. With this file's tests running in
-    /// parallel, a twelve-workspace test was observed to take over a minute,
-    /// and thirty seconds failed two tests; three minutes is a ceiling for a
-    /// stuck bootstrap, not an expectation.
+    /// running. It waits on real indexing of an empty scratch directory,
+    /// which takes well under a second alone; sixty seconds is a ceiling for
+    /// a stuck bootstrap under a fully parallel test run, not an expectation.
     async fn wait_for_shard_published(daemon: &GlobalDaemon, root: &PathBuf) {
         let key = shard_key(root);
         for _ in 0..6_000 {
             {
                 let shards = daemon.shards.lock().await;
                 if let Some(entry) = shards.get(&key) {
-                    if !entry.is_bootstrapping()
-                        && lock_owned(&entry.runtime).is_some()
+                    // One lock at a time: `has_work_in_flight` takes the
+                    // runtime lock, which a guard held across this whole
+                    // condition would still own.
+                    let published = lock_owned(&entry.runtime).is_some();
+                    if published
+                        && !entry.is_bootstrapping()
                         && !entry.index_work.workspace_is_busy(&key)
                         && !entry.has_work_in_flight()
                     {
@@ -4456,10 +4458,11 @@ mod tests {
         }
         let shards = daemon.shards.lock().await;
         let stuck = shards.get(&key).map(|entry| {
+            let published = lock_owned(&entry.runtime).is_some();
             format!(
                 "bootstrapping={} runtime={} index_busy={} work_in_flight={} error={:?}",
                 entry.is_bootstrapping(),
-                lock_owned(&entry.runtime).is_some(),
+                published,
                 entry.index_work.workspace_is_busy(&key),
                 entry.has_work_in_flight(),
                 entry.bootstrap_error(),
