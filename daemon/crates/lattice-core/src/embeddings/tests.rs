@@ -376,6 +376,93 @@ mod tests {
     }
 
     #[test]
+    fn large_batches_run_in_bounded_order_preserving_pieces() {
+        use crate::embeddings::engine::{in_bounded_runs, EMBEDDING_RUN_BATCH};
+        let texts: Vec<String> = (0..(EMBEDDING_RUN_BATCH * 3 + 5))
+            .map(|index| index.to_string())
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut run_sizes = Vec::new();
+        let out = in_bounded_runs(&refs, EMBEDDING_RUN_BATCH, |run| {
+            run_sizes.push(run.len());
+            Ok(run
+                .iter()
+                .map(|text| text.parse::<usize>().unwrap())
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            (0..refs.len()).collect::<Vec<_>>(),
+            "order is preserved"
+        );
+        assert_eq!(
+            run_sizes,
+            vec![
+                EMBEDDING_RUN_BATCH,
+                EMBEDDING_RUN_BATCH,
+                EMBEDDING_RUN_BATCH,
+                5
+            ]
+        );
+        assert!(
+            in_bounded_runs(&[], EMBEDDING_RUN_BATCH, |_| -> Result<Vec<u8>> {
+                unreachable!("no run for no texts")
+            })
+            .unwrap()
+            .is_empty()
+        );
+
+        // A failing or short run fails the call rather than misaligning vectors.
+        let mut runs = 0;
+        let error = in_bounded_runs(&refs, EMBEDDING_RUN_BATCH, |run| {
+            runs += 1;
+            if runs == 2 {
+                anyhow::bail!("model failed");
+            }
+            Ok(vec![0_u8; run.len()])
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("model failed"));
+        let error = in_bounded_runs(&refs, EMBEDDING_RUN_BATCH, |run| {
+            Ok(vec![0_u8; run.len() - 1])
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("returned 15 vectors for 16 texts"),
+            "{error}"
+        );
+    }
+
+    /// Needs the shared model and ONNX Runtime: run with `ORT_DYLIB_PATH` set
+    /// and `--ignored`.
+    #[test]
+    #[ignore]
+    fn bounded_runs_give_the_same_vectors_as_embedding_one_at_a_time() {
+        let model = crate::embeddings::shared_embedding_model_dir()
+            .unwrap()
+            .join("model.onnx");
+        let engine = EmbeddingEngine::new(model.to_str().unwrap()).unwrap();
+        let texts: Vec<String> = (0..40)
+            .map(|index| format!("function handler_{index} retries requests {index} times"))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let batched = engine.embed_batch(&refs).unwrap();
+        assert_eq!(batched.len(), refs.len());
+        for (text, vector) in refs.iter().zip(&batched) {
+            let single = engine.embed(text).unwrap();
+            let distance = single
+                .iter()
+                .zip(vector)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(distance < 1e-4, "{text}: {distance}");
+        }
+    }
+
+    #[test]
     #[ignore] // Requires ONNX model file
     fn test_embed_single_text() {
         let engine = EmbeddingEngine::new("models/all-MiniLM-L6-v2.onnx").unwrap();

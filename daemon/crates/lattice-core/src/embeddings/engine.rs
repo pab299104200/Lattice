@@ -14,6 +14,26 @@ use super::object_cache::{EmbeddingCacheStats, EmbeddingIdentity, EmbeddingObjec
 pub const EMBEDDING_NORMALIZATION_VERSION: &str = "mean-pool-l2-v1";
 pub const EMBEDDING_PREPROCESSING_VERSION: &str = "tokenizer-json-special-tokens-v1";
 
+/// The most texts the model runs over at once.
+///
+/// ONNX Runtime's CPU arena grows to the largest run it has seen and never
+/// gives the memory back, and the engine is process-wide, so one large run
+/// set the daemon's footprint for the rest of its life. Measured on macOS
+/// (Apple silicon) on 2026-09-19, embedding 2,000 texts of 128 tokens:
+///
+/// | texts per run | time   | footprint afterwards |
+/// |---------------|--------|----------------------|
+/// | 2,000 (one)   | 40.0 s | 7,049 MiB            |
+/// | 128           | 18.4 s | 968 MiB              |
+/// | 64            | 17.4 s | 573 MiB              |
+/// | 32            | 17.3 s | 378 MiB              |
+/// | 16            | 17.4 s | 296 MiB              |
+/// | 8             | 17.1 s | 294 MiB              |
+///
+/// The model alone is about 265 MiB. Sixteen is where smaller runs stop
+/// saving memory, and throughput is flat from 8 to 64.
+pub const EMBEDDING_RUN_BATCH: usize = 16;
+
 static PROCESS_EMBEDDING_RUNTIME: OnceLock<ProcessEmbeddingRuntime<EmbeddingEngine>> =
     OnceLock::new();
 
@@ -163,8 +183,14 @@ impl EmbeddingEngine {
 
     /// Embed a batch of text strings, returning a vector of 384-dimensional L2-normalized vectors.
     ///
-    /// Uses mean pooling with attention mask and L2 normalization.
+    /// Uses mean pooling with attention mask and L2 normalization. The model
+    /// runs over at most `EMBEDDING_RUN_BATCH` texts at a time, whatever the
+    /// caller passes; see that constant for why.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        in_bounded_runs(texts, EMBEDDING_RUN_BATCH, |run| self.embed_run(run))
+    }
+
+    fn embed_run(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let batch_size = texts.len();
         if batch_size == 0 {
             return Ok(Vec::new());
@@ -423,6 +449,28 @@ pub fn embedding_runtime_status() -> EmbeddingRuntimeStatus {
 /// Loads ONNX Runtime before any `ort` API can invoke its implicit, panicking
 /// loader. The explicit path turns an absent or incompatible shared library
 /// into the normal semantic-to-lexical fallback rather than a daemon crash.
+/// Run `run` over `texts` in order, at most `limit` at a time, and join the
+/// results. A run that fails fails the whole call: a partial set of vectors
+/// would be misaligned with the texts it was asked for.
+pub(crate) fn in_bounded_runs<T>(
+    texts: &[&str],
+    limit: usize,
+    mut run: impl FnMut(&[&str]) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let mut results = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(limit.max(1)) {
+        let produced = run(chunk)?;
+        anyhow::ensure!(
+            produced.len() == chunk.len(),
+            "embedding run returned {} vectors for {} texts",
+            produced.len(),
+            chunk.len()
+        );
+        results.extend(produced);
+    }
+    Ok(results)
+}
+
 fn initialize_onnx_runtime() -> Result<()> {
     let runtime_path = onnx_runtime_library_path()?;
     initialize_onnx_runtime_with(&runtime_path, |path| {

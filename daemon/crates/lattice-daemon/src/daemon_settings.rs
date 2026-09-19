@@ -402,8 +402,10 @@ pub(crate) fn release_freed_memory() -> u64 {
         extern "C" {
             /// libSystem, `<malloc/malloc.h>`: a null zone means every zone,
             /// and a goal of zero means release as much as possible.
-            fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t)
-                -> libc::size_t;
+            fn malloc_zone_pressure_relief(
+                zone: *mut libc::c_void,
+                goal: libc::size_t,
+            ) -> libc::size_t;
         }
         // SAFETY: a null zone and a zero goal are the documented "all zones,
         // as much as possible" arguments; the call only returns free pages.

@@ -1932,7 +1932,10 @@ impl GlobalDaemon {
                     &[
                         ("footprint_bytes", serde_json::json!(footprint)),
                         ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
-                        ("loaded_shards", serde_json::json!(self.shards.lock().await.len())),
+                        (
+                            "loaded_shards",
+                            serde_json::json!(self.shards.lock().await.len()),
+                        ),
                     ],
                 );
             }
