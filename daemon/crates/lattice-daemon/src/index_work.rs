@@ -20,6 +20,10 @@ impl RuntimeWorkTracker {
         RuntimeWorkGuard(Arc::clone(self))
     }
 
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn wait_idle(&self) {
         loop {
             let idle = self.idle.notified();

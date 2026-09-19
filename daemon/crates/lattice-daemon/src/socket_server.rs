@@ -53,6 +53,13 @@ struct ShardEntry {
     index_work: Arc<crate::index_work::IndexWorkCoordinator>,
     active_connections: AtomicUsize,
     last_used_epoch_secs: AtomicU64,
+    /// Set when the shard has been taken out of the map to be shut down. A
+    /// lease that still holds it re-acquires a fresh shard on its next
+    /// request, which is what makes unloading a connected shard transparent.
+    retired: AtomicBool,
+    /// Growth of the daemon's footprint while this shard loaded. Zero when it
+    /// could not be attributed, because another shard was loading too.
+    load_cost_bytes: AtomicU64,
     _materialization_reservation: crate::resource_budget::ResourceReservation,
 }
 
@@ -71,6 +78,8 @@ impl ShardEntry {
             index_work,
             active_connections: AtomicUsize::new(0),
             last_used_epoch_secs: AtomicU64::new(now_epoch_secs()),
+            retired: AtomicBool::new(false),
+            load_cost_bytes: AtomicU64::new(0),
             _materialization_reservation: materialization_reservation,
         }
     }
@@ -141,6 +150,58 @@ impl ShardEntry {
         self.active_connections.load(Ordering::Acquire) == 0
             && !self.is_bootstrapping()
             && !self.index_work.workspace_is_busy(&shard_key(&self.root))
+    }
+
+    fn touch(&self) {
+        self.last_used_epoch_secs
+            .store(now_epoch_secs(), Ordering::Release);
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    fn connections(&self) -> usize {
+        self.active_connections.load(Ordering::Acquire)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.is_bootstrapping() || lock_owned(&self.runtime).is_some()
+    }
+
+    fn has_work_in_flight(&self) -> bool {
+        lock_owned(&self.runtime)
+            .as_ref()
+            .is_some_and(|runtime| runtime.active_work() > 0)
+    }
+
+    fn idle_secs(&self, now_epoch_secs: u64) -> u64 {
+        now_epoch_secs.saturating_sub(self.last_used_epoch_secs.load(Ordering::Acquire))
+    }
+
+    /// Agents are connected but nothing has asked this shard for anything for
+    /// `threshold_secs`, and nothing is running against it. Such a shard may
+    /// be unloaded when another connected workspace needs the memory; it
+    /// reloads on its next request. It is never unloaded merely for being
+    /// idle, only to make room.
+    fn is_idle_connected(&self, now_epoch_secs: u64, threshold_secs: u64) -> bool {
+        self.connections() > 0
+            && !self.is_bootstrapping()
+            && !self.index_work.workspace_is_busy(&shard_key(&self.root))
+            && !self.has_work_in_flight()
+            && self.idle_secs(now_epoch_secs) >= threshold_secs
+    }
+
+    /// Mark the shard retired unless a request got in first. A request takes
+    /// its work guard and then re-checks `retired` (see
+    /// `RuntimeLease::begin_work`), so exactly one side backs off.
+    fn try_retire(&self) -> bool {
+        self.retired.store(true, Ordering::SeqCst);
+        if self.has_work_in_flight() {
+            self.retired.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 
     fn is_idle(&self, now_epoch_secs: u64, idle_ttl_secs: u64) -> bool {
@@ -232,24 +293,34 @@ fn attach_daemon_report(result: &mut Value, report: Value) {
 
 /// One line for the plain-text status view, which collapses nested objects.
 fn shard_capacity_line(report: &Value) -> Value {
-    // Footprint and uptime together are what make slow growth visible.
-    let memory = report["memory_footprint_bytes"]
-        .as_u64()
-        .map_or_else(String::new, |bytes| {
-            format!(
-                "; daemon memory {} MiB after {} h up",
-                bytes / (1024 * 1024),
-                report["uptime_secs"].as_u64().unwrap_or_default() / 3600
-            )
-        });
+    let mib = |key: &str| report[key].as_u64().map(|bytes| bytes / (1024 * 1024));
+    let memory = match (mib("memory_footprint_bytes"), mib("memory_budget_bytes")) {
+        (Some(used), Some(budget)) => format!(
+            "memory {used} MiB of {budget} MiB budget ({}) after {} h up",
+            report["memory_budget_source"].as_str().unwrap_or("unknown"),
+            report["uptime_secs"].as_u64().unwrap_or_default() / 3600
+        ),
+        _ => "memory unknown".to_string(),
+    };
+    let ceiling = match report["max_loaded_shards"].as_u64() {
+        Some(ceiling) => format!(
+            "shard ceiling {ceiling} from {}",
+            report["max_loaded_shards_source"].as_str().unwrap_or("unknown")
+        ),
+        None => "no shard ceiling".to_string(),
+    };
+    let deferred = match report["deferred"].as_str() {
+        Some("ceiling") => "; the next workspace would be DEFERRED by the shard ceiling",
+        Some("memory") => "; the next workspace would be DEFERRED by the memory budget",
+        _ => "",
+    };
     Value::String(format!(
-        "max_loaded_shards={} from {}; {} loaded, {} pinned by an open session or index work{memory}",
-        report["max_loaded_shards"],
-        report["max_loaded_shards_source"]
-            .as_str()
-            .unwrap_or("unknown"),
+        "{} connected workspace(s) with {} agent(s); {} shard(s) loaded, {} idle, {} connected but idle and unloadable; {memory}; {ceiling}{deferred}",
+        report["connected_workspaces"],
+        report["agents"],
         report["loaded_shards"],
-        report["pinned_shards"],
+        report["idle_shards"],
+        report["connected_idle_shards"],
     ))
 }
 
@@ -466,6 +537,7 @@ fn cold_indexing_tool_payload(
 struct RuntimeLease {
     retained_shards: Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
     handler: Arc<dyn RequestHandler>,
+    _connection: ConnectionRegistration,
 }
 
 impl RuntimeLease {
@@ -473,11 +545,153 @@ impl RuntimeLease {
         lock_owned(&self.retained_shards)
             .values()
             .filter_map(|shard| {
-                lock_owned(&shard.runtime)
+                let guard = lock_owned(&shard.runtime)
                     .as_ref()
-                    .map(|runtime| runtime.begin_work())
+                    .map(|runtime| runtime.begin_work())?;
+                // A guard on a retired runtime would make its shutdown wait
+                // for a request that is about to go and wait for that very
+                // shutdown. Re-check after taking it; see `try_retire`.
+                (!shard.is_retired()).then_some(guard)
             })
             .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VictimClass {
+    /// No agent connected and no work: costs nobody anything.
+    Unconnected,
+    /// Agents connected but silent past the threshold. It reloads on its
+    /// next request.
+    ConnectedIdle,
+}
+
+impl VictimClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unconnected => "unconnected",
+            Self::ConnectedIdle => "connected_idle",
+        }
+    }
+}
+
+/// Choose and remove the shard to unload under pressure, least recently used
+/// first: unconnected shards before connected-but-idle ones, and never a
+/// shard that is loading, indexing, or answering a request.
+fn take_victim(
+    shards: &mut HashMap<String, Arc<ShardEntry>>,
+    now_epoch_secs: u64,
+    connected_idle_secs: u64,
+) -> Option<(String, Arc<ShardEntry>, VictimClass)> {
+    for class in [VictimClass::Unconnected, VictimClass::ConnectedIdle] {
+        let mut candidates = shards
+            .iter()
+            .filter(|(_, entry)| match class {
+                VictimClass::Unconnected => entry.is_evictable(),
+                VictimClass::ConnectedIdle => {
+                    entry.is_idle_connected(now_epoch_secs, connected_idle_secs)
+                }
+            })
+            .map(|(key, entry)| (entry.last_used_epoch_secs.load(Ordering::Acquire), key.clone()))
+            .collect::<Vec<_>>();
+        candidates.sort();
+        for (_, key) in candidates {
+            let retired = shards.get(&key).is_some_and(|entry| entry.try_retire());
+            if retired {
+                return shards.remove(&key).map(|entry| (key, entry, class));
+            }
+        }
+    }
+    None
+}
+
+impl DeferralKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ceiling => "ceiling",
+            Self::Memory => "memory",
+        }
+    }
+}
+
+/// Why a connected workspace could not be given a shard right now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeferralKind {
+    /// The operator's `max_loaded_shards` ceiling is reached and every
+    /// loaded workspace is busy.
+    Ceiling,
+    /// The daemon's real memory is at its budget and no loaded workspace is
+    /// idle enough to unload.
+    Memory,
+}
+
+#[derive(Debug)]
+struct ShardDeferred {
+    kind: DeferralKind,
+    message: String,
+}
+
+impl std::fmt::Display for ShardDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ShardDeferred {}
+
+/// Registers one connection against its workspace for as long as the lease
+/// lives, whether or not the workspace could be loaded. This, not the shard
+/// map, is what "connected" means: a deferred workspace has no shard, and
+/// its agents must still be counted and reported.
+struct ConnectionRegistration {
+    registry: Arc<StdMutex<HashMap<String, ConnectedWorkspace>>>,
+    key: String,
+    agent: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ConnectedWorkspace {
+    /// Live agent sessions: stdio proxies held open by Claude Code or Codex.
+    agents: usize,
+    /// Short-lived clients such as the CLI and doctor.
+    other: usize,
+}
+
+impl ConnectionRegistration {
+    fn new(
+        registry: &Arc<StdMutex<HashMap<String, ConnectedWorkspace>>>,
+        key: String,
+        agent: bool,
+    ) -> Self {
+        let mut connected = lock_owned(registry);
+        let entry = connected.entry(key.clone()).or_default();
+        if agent {
+            entry.agents += 1;
+        } else {
+            entry.other += 1;
+        }
+        drop(connected);
+        Self {
+            registry: Arc::clone(registry),
+            key,
+            agent,
+        }
+    }
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        let mut connected = lock_owned(&self.registry);
+        if let Some(entry) = connected.get_mut(&self.key) {
+            if self.agent {
+                entry.agents = entry.agents.saturating_sub(1);
+            } else {
+                entry.other = entry.other.saturating_sub(1);
+            }
+            if *entry == ConnectedWorkspace::default() {
+                connected.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -525,8 +739,85 @@ impl RequestHandler for DeferredShardHandler {
 }
 
 fn is_shard_capacity_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("loaded workspace shards") || message.contains("resource-limited:")
+    if error.downcast_ref::<ShardDeferred>().is_some() {
+        return true;
+    }
+    error.to_string().contains("resource-limited:")
+}
+
+/// The handler every lease uses for its primary workspace.
+///
+/// A lease used to hold its shard directly. A shard that was then evicted
+/// answered "indexing" to that connection for the rest of its life, so a
+/// connected shard could never be unloaded, and a fixed count of shards
+/// starved whichever workspace connected last. This handler resolves the
+/// shard on each request instead: a retired shard is replaced by a fresh one,
+/// and a workspace that could not be admitted is retried, so both unloading
+/// and deferral heal on the next request without the client noticing more
+/// than a cold answer while the index reloads from disk.
+struct LeaseShardHandler {
+    daemon: Arc<GlobalDaemon>,
+    root: PathBuf,
+    focus_files: Vec<String>,
+    focus_dirs: Vec<String>,
+    retained_shards: Arc<StdMutex<HashMap<String, Arc<ShardEntry>>>>,
+}
+
+impl LeaseShardHandler {
+    fn current(&self) -> Option<Arc<ShardEntry>> {
+        lock_owned(&self.retained_shards)
+            .get(&shard_key(&self.root))
+            .filter(|entry| !entry.is_retired())
+            .cloned()
+    }
+
+    /// Swap a freshly retained shard into the lease, releasing the retired
+    /// one it replaces.
+    fn adopt(&self, entry: &Arc<ShardEntry>) {
+        let replaced =
+            lock_owned(&self.retained_shards).insert(shard_key(&self.root), Arc::clone(entry));
+        if let Some(replaced) = replaced {
+            replaced.release();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for LeaseShardHandler {
+    async fn handle(&self, method: &str, params: Value) -> Result<Value, (i32, String)> {
+        let entry = match self.current() {
+            Some(entry) => entry,
+            None => match self
+                .daemon
+                .shard_for(
+                    self.root.clone(),
+                    self.focus_files.clone(),
+                    self.focus_dirs.clone(),
+                    true,
+                )
+                .await
+            {
+                Ok(entry) => {
+                    self.adopt(&entry);
+                    entry
+                }
+                Err(error) if is_shard_capacity_error(&error) => {
+                    let reason = error.to_string();
+                    return cold_start_response(
+                        method,
+                        &params,
+                        &self.root,
+                        &self.daemon.index_work,
+                        None,
+                        Some(reason.as_str()),
+                    );
+                }
+                Err(error) => return Err((-32603, format!("workspace bootstrap failed: {error}"))),
+            },
+        };
+        entry.touch();
+        entry.handle(method, params).await
+    }
 }
 
 impl Drop for RuntimeLease {
@@ -1008,9 +1299,31 @@ enum PathRoute {
     None,
 }
 
+/// Reads the daemon's real memory footprint. Injected so tests can drive
+/// memory pressure without allocating gigabytes.
+type FootprintProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Room kept free for the workspace about to load. Its cost is unknown until
+/// it has loaded; measured in 2026-09 it is about 0.12 MB per indexed file,
+/// so 512 MiB covers a repository of roughly 4,000 files, and the periodic
+/// sweep corrects for anything larger.
+const LOAD_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+/// How long a connected shard must go unused before it may be unloaded to
+/// make room. Ten minutes is well past a pause between tool calls, and a
+/// reload costs seconds because the index is read back from disk.
+const DEFAULT_CONNECTED_IDLE_SECS: u64 = 600;
+
 pub(crate) struct GlobalDaemon {
     shards: Mutex<HashMap<String, Arc<ShardEntry>>>,
-    max_loaded_shards: usize,
+    /// Serialises loading a new shard with shutting an old one down, so a
+    /// workspace is never bootstrapped while its previous runtime still
+    /// holds the checkout lease.
+    lifecycle_gate: Mutex<()>,
+    connected: Arc<StdMutex<HashMap<String, ConnectedWorkspace>>>,
+    footprint: FootprintProbe,
+    memory_budget_bytes: u64,
+    connected_idle_secs: u64,
+    max_loaded_shards: Option<usize>,
     prewarm_view_shards: bool,
     idle_ttl: Duration,
     has_loaded_runtime: AtomicBool,
@@ -1026,10 +1339,11 @@ pub(crate) struct GlobalDaemon {
 
 impl GlobalDaemon {
     pub(crate) fn new(settings: crate::daemon_settings::DaemonSettings) -> Self {
-        let mut daemon = Self::new_with_config(
+        let mut daemon = Self::new_with_ceiling(
             settings.max_loaded_shards,
             env_bool("LATTICE_PREWARM_VIEW_SHARDS", false),
         );
+        daemon.memory_budget_bytes = settings.memory_budget_bytes;
         daemon.settings = settings;
         match HookSessionRoute::open_default() {
             Ok(route) => daemon.hook_session_route = Some(Arc::new(route)),
@@ -1041,10 +1355,26 @@ impl GlobalDaemon {
         daemon
     }
 
+    /// A daemon with an explicit shard ceiling, as tests and an operator's
+    /// `max_loaded_shards` both express it.
     fn new_with_config(max_loaded_shards: usize, prewarm_view_shards: bool) -> Self {
+        Self::new_with_ceiling(Some(max_loaded_shards), prewarm_view_shards)
+    }
+
+    fn new_with_ceiling(max_loaded_shards: Option<usize>, prewarm_view_shards: bool) -> Self {
         let resource_budget = crate::resource_budget::ResourceBudget::from_env();
+        let settings = crate::daemon_settings::DaemonSettings::unconfigured(max_loaded_shards);
         Self {
             shards: Mutex::new(HashMap::new()),
+            lifecycle_gate: Mutex::new(()),
+            connected: Arc::new(StdMutex::new(HashMap::new())),
+            footprint: Arc::new(crate::daemon_settings::process_memory_footprint_bytes),
+            memory_budget_bytes: settings.memory_budget_bytes,
+            connected_idle_secs: env_duration_secs(
+                "LATTICE_CONNECTED_IDLE_SECS",
+                Duration::from_secs(DEFAULT_CONNECTED_IDLE_SECS),
+            )
+            .as_secs(),
             max_loaded_shards,
             prewarm_view_shards,
             idle_ttl: env_duration_secs(
@@ -1060,7 +1390,7 @@ impl GlobalDaemon {
             view_reservation_bytes:
                 crate::resource_budget::ResourceBudget::default_view_reservation(),
             hook_session_route: None,
-            settings: crate::daemon_settings::DaemonSettings::unconfigured(max_loaded_shards),
+            settings,
             started_at: std::time::Instant::now(),
             shutting_down: AtomicBool::new(false),
         }
@@ -1072,7 +1402,16 @@ impl GlobalDaemon {
         self
     }
 
+    #[cfg(test)]
     async fn handler_for(self: &Arc<Self>, request: &ProxyRequest) -> Result<RuntimeLease> {
+        self.handler_for_client(request, ClientKind::Cli).await
+    }
+
+    async fn handler_for_client(
+        self: &Arc<Self>,
+        request: &ProxyRequest,
+        client_kind: ClientKind,
+    ) -> Result<RuntimeLease> {
         let roots = canonical_roots(&request.workspace_roots)?;
         let view_key = workspace_key(&roots);
         self.evict_idle().await;
@@ -1095,20 +1434,23 @@ impl GlobalDaemon {
             Err(error) => return Err(error),
         };
         let deferred_primary = primary.is_none();
-        let primary_handler: Arc<dyn RequestHandler> = if let Some(primary) = primary.as_ref() {
-            primary.handler()
-        } else {
-            Arc::new(DeferredShardHandler {
-                daemon: Arc::clone(self),
-                root: primary_root.clone(),
-                focus_files: request.focus_files.clone(),
-                focus_dirs: request.focus_dirs.clone(),
-            })
-        };
+        // Counted as connected whether or not it could be loaded.
+        let connection = ConnectionRegistration::new(
+            &self.connected,
+            shard_key(&primary_root),
+            client_kind == ClientKind::StdioProxy,
+        );
         let retained_shards = Arc::new(StdMutex::new(HashMap::new()));
         if let Some(primary) = primary {
             adopt_retained_lease_shard(&retained_shards, primary.into_shard())?;
         }
+        let primary_handler: Arc<dyn RequestHandler> = Arc::new(LeaseShardHandler {
+            daemon: Arc::clone(self),
+            root: primary_root.clone(),
+            focus_files: request.focus_files.clone(),
+            focus_dirs: request.focus_dirs.clone(),
+            retained_shards: Arc::clone(&retained_shards),
+        });
         let handler: Arc<dyn RequestHandler> = if roots.len() > 1 {
             Arc::new(ViewRequestHandler {
                 daemon: Arc::clone(self),
@@ -1153,6 +1495,7 @@ impl GlobalDaemon {
         Ok(RuntimeLease {
             retained_shards,
             handler,
+            _connection: connection,
         })
     }
 
@@ -1211,17 +1554,89 @@ impl GlobalDaemon {
     /// Daemon-wide facts for `status` and `doctor`: the effective shard cap,
     /// where it came from, and how much of it is in use.
     pub(crate) async fn report(&self) -> Value {
+        const MAX_REPORTED_WORKSPACES: usize = 32;
         let mut report = self.settings.report();
+        let now = now_epoch_secs();
+        let connected = lock_owned(&self.connected).clone();
         let shards = self.shards.lock().await;
-        report["loaded_shards"] = serde_json::json!(shards.len());
-        report["pinned_shards"] = serde_json::json!(shards
+
+        // Every workspace that is connected, loaded, or both.
+        let mut keys = connected.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        keys.extend(shards.keys().cloned());
+        let mut workspaces = Vec::new();
+        for key in &keys {
+            let clients = connected.get(key).copied().unwrap_or_default();
+            let entry = shards.get(key);
+            let state = match entry {
+                None => "not_loaded",
+                Some(entry) if entry.bootstrap_error().is_some() => "failed",
+                Some(entry) if entry.is_bootstrapping() => "loading",
+                Some(entry) if entry.index_work.workspace_is_busy(key) => "indexing",
+                Some(entry) if entry.is_evictable() => "idle",
+                Some(entry) if entry.is_idle_connected(now, self.connected_idle_secs) => {
+                    "connected_idle"
+                }
+                Some(_) => "in_use",
+            };
+            workspaces.push(serde_json::json!({
+                "workspace": key,
+                "agents": clients.agents,
+                "other_clients": clients.other,
+                "state": state,
+                "idle_secs": entry.map(|entry| entry.idle_secs(now)),
+                // Attributable only when nothing else was loading at the time.
+                "load_cost_bytes": entry
+                    .map(|entry| entry.load_cost_bytes.load(Ordering::Acquire))
+                    .filter(|bytes| *bytes > 0),
+            }));
+        }
+        let count = |state: &str| {
+            workspaces
+                .iter()
+                .filter(|workspace| workspace["state"] == state)
+                .count()
+        };
+        report["connected_workspaces"] = serde_json::json!(connected
             .values()
-            .filter(|entry| !entry.is_evictable())
+            .filter(|clients| clients.agents > 0)
             .count());
-        report["memory_footprint_bytes"] =
-            serde_json::json!(crate::daemon_settings::process_memory_footprint_bytes());
+        report["agents"] =
+            serde_json::json!(connected.values().map(|clients| clients.agents).sum::<usize>());
+        report["loaded_shards"] = serde_json::json!(shards.len());
+        report["idle_shards"] = serde_json::json!(count("idle"));
+        report["connected_idle_shards"] = serde_json::json!(count("connected_idle"));
+        report["evictable_shards"] =
+            serde_json::json!(count("idle") + count("connected_idle"));
+        report["connected_idle_threshold_secs"] = serde_json::json!(self.connected_idle_secs);
+        report["idle_grace_secs"] = serde_json::json!(self.idle_ttl.as_secs());
+        report["deferred"] = serde_json::json!(self
+            .would_defer(&shards)
+            .map(|kind| kind.label()));
+        report["memory_budget_bytes"] = serde_json::json!(self.memory_budget_bytes);
+        report["memory_footprint_bytes"] = serde_json::json!((self.footprint)());
         report["uptime_secs"] = serde_json::json!(self.started_at.elapsed().as_secs());
+        report["workspaces_truncated"] =
+            serde_json::json!(workspaces.len() > MAX_REPORTED_WORKSPACES);
+        workspaces.truncate(MAX_REPORTED_WORKSPACES);
+        report["workspaces"] = Value::Array(workspaces);
         report
+    }
+
+    /// Whether one more workspace would be deferred right now, without
+    /// changing anything. Mirrors the decision in `shard_for`.
+    fn would_defer(&self, shards: &HashMap<String, Arc<ShardEntry>>) -> Option<DeferralKind> {
+        let kind = self.pressure(shards)?;
+        let now = now_epoch_secs();
+        let has_victim = shards.values().any(|entry| {
+            entry.is_evictable() || entry.is_idle_connected(now, self.connected_idle_secs)
+        });
+        if has_victim {
+            return None;
+        }
+        if kind == DeferralKind::Memory && !shards.values().any(|entry| entry.is_loaded()) {
+            return None;
+        }
+        Some(kind)
     }
 
     /// Report a workspace's index state without loading, retaining or
@@ -1248,12 +1663,52 @@ impl GlobalDaemon {
                 Ok(_) => IndexState::Indexing,
                 Err(_) => IndexState::Failed,
             },
-            None if shards.len() >= self.max_loaded_shards
-                && !shards.values().any(|entry| entry.is_evictable()) =>
-            {
-                IndexState::Deferred
-            }
+            None if self.would_defer(&shards).is_some() => IndexState::Deferred,
             None => IndexState::NotLoaded,
+        }
+    }
+
+    async fn reuse_shard(&self, key: &str, retain: bool) -> Result<Option<Arc<ShardEntry>>> {
+        let shards = self.shards.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("daemon is shutting down; new workspace shards are unavailable");
+        }
+        Ok(shards.get(key).map(|entry| {
+            if retain {
+                entry.retain();
+            }
+            Arc::clone(entry)
+        }))
+    }
+
+    /// What, if anything, stands in the way of loading one more shard.
+    fn pressure(&self, shards: &HashMap<String, Arc<ShardEntry>>) -> Option<DeferralKind> {
+        if self
+            .max_loaded_shards
+            .is_some_and(|ceiling| shards.len() >= ceiling)
+        {
+            return Some(DeferralKind::Ceiling);
+        }
+        let footprint = (self.footprint)()?;
+        (footprint.saturating_add(LOAD_HEADROOM_BYTES) > self.memory_budget_bytes)
+            .then_some(DeferralKind::Memory)
+    }
+
+    fn deferral_message(&self, kind: &DeferralKind, key: &str, loaded: usize) -> String {
+        match kind {
+            DeferralKind::Ceiling => format!(
+                "the shard ceiling max_loaded_shards={} (from {}) is reached: {loaded} workspaces are loaded and every one of them is in use, so {key} cannot be loaded. Raise or remove max_loaded_shards in the daemon settings file, or wait for another workspace to go idle for {} minutes.",
+                self.max_loaded_shards.unwrap_or_default(),
+                self.settings.max_loaded_shards_source.describe(),
+                self.connected_idle_secs / 60,
+            ),
+            DeferralKind::Memory => format!(
+                "the daemon's memory is at its budget: {} MiB used of {} MiB (from {}), with {loaded} workspaces loaded and every one of them in use, so {key} cannot be loaded. Raise memory_budget_mb in the daemon settings file, close a workspace's agent session, or wait for one to go idle for {} minutes.",
+                (self.footprint)().unwrap_or_default() / (1024 * 1024),
+                self.memory_budget_bytes / (1024 * 1024),
+                self.settings.memory_budget_source.describe(),
+                self.connected_idle_secs / 60,
+            ),
         }
     }
 
@@ -1265,6 +1720,13 @@ impl GlobalDaemon {
         retain: bool,
     ) -> Result<Arc<ShardEntry>> {
         let key = shard_key(&root);
+        if let Some(entry) = self.reuse_shard(&key, retain).await? {
+            return Ok(entry);
+        }
+        // Loading is serialised with shutting shards down, so this workspace
+        // is never bootstrapped while a previous runtime of it still holds
+        // the checkout lease. Reuse above never waits here.
+        let _lifecycle = self.lifecycle_gate.lock().await;
         let (entry, victim) = {
             let mut shards = self.shards.lock().await;
             if self.shutting_down.load(Ordering::Acquire) {
@@ -1282,22 +1744,28 @@ impl GlobalDaemon {
                 return Ok(Arc::clone(entry));
             }
 
-            let victim = if shards.len() < self.max_loaded_shards {
-                None
-            } else {
-                let victim_key = shards
-                    .iter()
-                    .filter(|(_, entry)| entry.is_evictable())
-                    .min_by_key(|(_, entry)| entry.last_used_epoch_secs.load(Ordering::Acquire))
-                    .map(|(candidate, _)| candidate.clone());
-                let Some(victim_key) = victim_key else {
-                    anyhow::bail!(
-                        "lattice daemon has {} loaded workspace shards and all are active or indexing; defer {} until a shard becomes evictable or LATTICE_MAX_LOADED_SHARDS is raised.",
-                        self.max_loaded_shards,
-                        key
-                    );
-                };
-                shards.remove(&victim_key).map(|entry| (victim_key, entry))
+            // Demand-driven admission: see docs/shard-capacity.md. A count
+            // never defers a connected workspace by itself; only an explicit
+            // ceiling or real memory can, and then only after everything
+            // idle has been offered up.
+            let victim = match self.pressure(&shards) {
+                None => None,
+                Some(kind) => match take_victim(
+                    &mut shards,
+                    now_epoch_secs(),
+                    self.connected_idle_secs,
+                ) {
+                    Some((victim_key, entry, class)) => Some((victim_key, entry, class, kind)),
+                    // Memory that stays high with nothing loaded is not
+                    // something refusing this workspace could fix.
+                    None if kind == DeferralKind::Memory && !shards.values().any(|entry| entry.is_loaded()) => None,
+                    None => {
+                        return Err(anyhow::Error::new(ShardDeferred {
+                            message: self.deferral_message(&kind, &key, shards.len()),
+                            kind,
+                        }))
+                    }
+                },
             };
 
             // Reserve the full configured logical materialization allowance
@@ -1319,13 +1787,16 @@ impl GlobalDaemon {
             (entry, victim)
         };
 
-        if let Some((victim_key, victim)) = victim {
+        if let Some((victim_key, victim, class, kind)) = victim {
             lifecycle_log::log_event(
                 "daemon",
                 "shard_capacity_eviction",
                 &[
                     ("evicted_shard", serde_json::json!(victim_key)),
                     ("requested_shard", serde_json::json!(key.clone())),
+                    ("victim", serde_json::json!(class.label())),
+                    ("pressure", serde_json::json!(kind.label())),
+                    ("victim_connections", serde_json::json!(victim.connections())),
                 ],
             );
             victim.shutdown().await;
@@ -1356,10 +1827,47 @@ impl GlobalDaemon {
         Ok(entry)
     }
 
+    /// Unload shards until the daemon is back inside its memory budget, or
+    /// nothing idle is left. Admission keeps headroom for a load it cannot
+    /// size in advance; this corrects for loads that turned out larger, and
+    /// for growth over a long uptime.
+    async fn relieve_memory_pressure(&self) {
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        loop {
+            let over_budget =
+                (self.footprint)().is_some_and(|footprint| footprint > self.memory_budget_bytes);
+            if !over_budget {
+                return;
+            }
+            let victim = {
+                let mut shards = self.shards.lock().await;
+                take_victim(&mut shards, now_epoch_secs(), self.connected_idle_secs)
+            };
+            let Some((key, entry, class)) = victim else {
+                return;
+            };
+            lifecycle_log::log_event(
+                "daemon",
+                "shard_memory_eviction",
+                &[
+                    ("shard_key", serde_json::json!(key)),
+                    ("victim", serde_json::json!(class.label())),
+                    (
+                        "footprint_bytes",
+                        serde_json::json!((self.footprint)().unwrap_or_default()),
+                    ),
+                    ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
+                ],
+            );
+            entry.shutdown().await;
+        }
+    }
+
     async fn evict_idle(&self) {
         let now = now_epoch_secs();
         let ttl = self.idle_ttl.as_secs();
         let mut victims = Vec::new();
+        let _lifecycle = self.lifecycle_gate.lock().await;
         {
             let mut shards = self.shards.lock().await;
             let idle_keys: Vec<String> = shards
@@ -1368,8 +1876,10 @@ impl GlobalDaemon {
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in idle_keys {
-                if let Some(entry) = shards.remove(&key) {
-                    victims.push((key, entry));
+                if shards.get(&key).is_some_and(|entry| entry.try_retire()) {
+                    if let Some(entry) = shards.remove(&key) {
+                        victims.push((key, entry));
+                    }
                 }
             }
         }
@@ -1403,10 +1913,7 @@ impl GlobalDaemon {
 pub(crate) async fn run_global_daemon() -> Result<()> {
     // Before binding: a daemon that is going to refuse its settings must not
     // first accept connections from proxies that then lose it.
-    let settings = crate::daemon_settings::load(
-        crate::resource_budget::ResourceBudget::default_view_capacity(),
-    )
-    .inspect_err(|error| {
+    let settings = crate::daemon_settings::load().inspect_err(|error| {
         lifecycle_log::log_event(
             "daemon",
             "daemon_settings_invalid",
@@ -1461,6 +1968,7 @@ pub(crate) async fn run_global_daemon() -> Result<()> {
             }
             _ = cleanup_interval.tick() => {
                 daemon.evict_idle().await;
+                daemon.relieve_memory_pressure().await;
                 if daemon.should_shutdown_when_idle().await {
                     tracing::info!("lattice daemon exiting after all workspace runtimes went idle");
                     lifecycle_log::log_event("daemon", "idle_exit", &[]);
@@ -1728,7 +2236,10 @@ async fn run_json_rpc_connection(
                 }
 
                 if lease.is_none() {
-                    match daemon.handler_for(&proxy_request).await {
+                    match daemon
+                        .handler_for_client(&proxy_request, connection.client_kind)
+                        .await
+                    {
                         Ok(loaded) => lease = Some(loaded),
                         Err(_) => {
                             if !is_notification {
@@ -2057,20 +2568,6 @@ mod tests {
             ("tools/list", Value::Null),
         ] {
             assert!(!is_index_status_request(method, &params));
-        }
-    }
-
-    #[test]
-    fn default_shard_cap_follows_the_view_budget() {
-        // The 2 GiB / 256 MiB budget would allow 8; the measured default is 6.
-        if std::env::var_os(crate::resource_budget::MATERIALIZATION_BUDGET_ENV).is_none()
-            && std::env::var_os(crate::resource_budget::VIEW_CLASS_BUDGET_ENV).is_none()
-            && std::env::var_os(crate::resource_budget::VIEW_RESERVATION_ENV).is_none()
-        {
-            assert_eq!(
-                crate::resource_budget::ResourceBudget::default_view_capacity(),
-                6
-            );
         }
     }
 

@@ -10,7 +10,6 @@ pub(crate) const VIEW_RESERVATION_ENV: &str = "LATTICE_VIEW_RESERVATION_BYTES";
 pub(crate) const VIEW_CLASS_BUDGET_ENV: &str = "LATTICE_VIEW_CLASS_BUDGET_BYTES";
 pub(crate) const INDEX_CLASS_BUDGET_ENV: &str = "LATTICE_INDEX_CLASS_BUDGET_BYTES";
 const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const DEFAULT_VIEW_RESERVATION_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct ResourceBudget {
@@ -106,28 +105,16 @@ impl ResourceBudget {
         }
     }
 
-    /// The built-in shard cap: what the view budget can hold, and never more
-    /// than six.
+    /// The logical allowance reserved for each loaded workspace view.
     ///
-    /// The budget is a logical reservation, not a measurement. Measured on
-    /// macOS in 2026-09, a freshly loaded workspace costs about 0.12 MB of
-    /// real footprint per indexed file (360 MB for 3,066 files), so six
-    /// mid-sized repositories come to roughly 3 to 4 GiB. Six is what that
-    /// supports as a default; an operator with more memory raises it in the
-    /// daemon settings file.
-    pub(crate) fn default_view_capacity() -> usize {
-        const MAX_DEFAULT_SHARDS: u64 = 6;
-        let total = env_u64(
-            MATERIALIZATION_BUDGET_ENV,
-            DEFAULT_MATERIALIZATION_BUDGET_BYTES,
-        )
-        .max(1);
-        let view_class = env_u64(VIEW_CLASS_BUDGET_ENV, total).max(1).min(total);
-        (view_class / Self::default_view_reservation()).clamp(1, MAX_DEFAULT_SHARDS) as usize
-    }
-
+    /// Unset, it is one byte, which reserves nothing. It used to default to
+    /// 256 MiB against a 2 GiB budget, which refused the ninth workspace
+    /// whatever real memory said: a count of eight in disguise. Shard
+    /// admission now follows the daemon's real footprint
+    /// (`docs/shard-capacity.md`). An operator who sets
+    /// `LATTICE_VIEW_RESERVATION_BYTES` keeps byte admission as before.
     pub(crate) fn default_view_reservation() -> u64 {
-        env_u64(VIEW_RESERVATION_ENV, DEFAULT_VIEW_RESERVATION_BYTES).max(1)
+        env_u64(VIEW_RESERVATION_ENV, 1).max(1)
     }
 
     pub(crate) fn try_reserve(

@@ -130,9 +130,7 @@ pub(crate) async fn run(workspace_roots: Vec<PathBuf>) -> Result<bool> {
 
     // What the next daemon start would use. Checked here because an invalid
     // settings file stops the daemon, and this is where an operator looks.
-    let configured = crate::daemon_settings::load(
-        crate::resource_budget::ResourceBudget::default_view_capacity(),
-    );
+    let configured = crate::daemon_settings::load();
     match &configured {
         Ok(settings) => println!("{}", format_configured_settings(settings)),
         Err(error) => {
@@ -437,6 +435,13 @@ fn status_payload(response: &Value) -> Value {
         .unwrap_or_else(|| response.clone())
 }
 
+fn describe_ceiling(ceiling: Option<u64>, source: &str) -> String {
+    match ceiling {
+        Some(ceiling) => format!("shard ceiling {ceiling} from {source}"),
+        None => "no shard ceiling".to_string(),
+    }
+}
+
 fn format_configured_settings(settings: &crate::daemon_settings::DaemonSettings) -> String {
     let file = match (&settings.settings_file, settings.settings_file_present) {
         (Some(path), true) => format!("settings file {} is valid", path.display()),
@@ -444,62 +449,87 @@ fn format_configured_settings(settings: &crate::daemon_settings::DaemonSettings)
         (None, _) => "no settings file location (HOME is unset)".to_string(),
     };
     format!(
-        "PASS daemon settings: max_loaded_shards={} from {}; {}",
-        settings.max_loaded_shards,
-        settings.max_loaded_shards_source.describe(),
+        "PASS daemon settings: memory budget {} MiB from {}; {}; {}",
+        settings.memory_budget_bytes / (1024 * 1024),
+        settings.memory_budget_source.describe(),
+        describe_ceiling(
+            settings.max_loaded_shards.map(|ceiling| ceiling as u64),
+            &settings.max_loaded_shards_source.describe()
+        ),
         file
     )
 }
 
-/// Compare what the running daemon uses with what a restart would use. They
-/// differ whenever the settings changed after the daemon started, or when
-/// the daemon was started by a client with a different environment.
+/// What the running daemon is doing with its capacity, and whether a restart
+/// would change it. Capacity follows connected agents; memory is the limit.
 fn format_running_settings(
     running: Option<&Value>,
     configured: Option<&crate::daemon_settings::DaemonSettings>,
 ) -> (String, bool) {
     let Some(running) = running.filter(|running| running.is_object()) else {
         return (
-            "WARN running daemon does not report its settings; it predates settings reporting, so restart it to load this build".to_string(),
+            "WARN running daemon does not report its capacity; it predates capacity reporting, so restart it to load this build".to_string(),
             true,
         );
     };
-    let cap = running["max_loaded_shards"].as_u64().unwrap_or_default();
-    let loaded = running["loaded_shards"].as_u64().unwrap_or_default();
-    let pinned = running["pinned_shards"].as_u64().unwrap_or_default();
-    let source = running["max_loaded_shards_source"]
-        .as_str()
-        .unwrap_or("unknown");
-    // The real footprint, not resident size, next to uptime: slow growth in a
-    // long-lived daemon is otherwise invisible until the machine swaps.
-    let memory = running["memory_footprint_bytes"]
-        .as_u64()
-        .map_or_else(String::new, |bytes| {
-            format!(
-                "; memory {} MiB after {} h up",
-                bytes / (1024 * 1024),
-                running["uptime_secs"].as_u64().unwrap_or_default() / 3600
-            )
-        });
-    let usage = format!(
-        "running daemon: max_loaded_shards={cap} from {source}; {loaded} of {cap} shard slots loaded, {pinned} pinned by an open session or index work{memory}"
-    );
-    if let Some(configured) = configured.filter(|settings| settings.max_loaded_shards as u64 != cap)
-    {
+    if running.get("connected_workspaces").is_none() {
         return (
-            format!(
-                "WARN {usage}. A restart would use {} from {}",
-                configured.max_loaded_shards,
-                configured.max_loaded_shards_source.describe()
-            ),
+            "WARN running daemon still uses a fixed shard count; restart it to load demand-driven capacity".to_string(),
             true,
         );
     }
-    if cap > 0 && pinned >= cap {
-        return (
-            format!("WARN {usage}. Every slot is pinned, so any further workspace is deferred"),
-            true,
-        );
+    let mib = |key: &str| running[key].as_u64().map(|bytes| bytes / (1024 * 1024));
+    let ceiling = running["max_loaded_shards"].as_u64();
+    let budget = mib("memory_budget_bytes");
+    let memory = match (mib("memory_footprint_bytes"), budget) {
+        (Some(used), Some(budget)) => format!(
+            "memory {used} MiB of {budget} MiB after {} h up",
+            running["uptime_secs"].as_u64().unwrap_or_default() / 3600
+        ),
+        _ => "memory unknown".to_string(),
+    };
+    let usage = format!(
+        "running daemon: {} connected workspace(s), {} agent(s); {} shard(s) loaded, {} idle, {} connected but idle; {memory}; {}",
+        running["connected_workspaces"],
+        running["agents"],
+        running["loaded_shards"],
+        running["idle_shards"],
+        running["connected_idle_shards"],
+        describe_ceiling(
+            ceiling,
+            running["max_loaded_shards_source"].as_str().unwrap_or("unknown")
+        ),
+    );
+    match running["deferred"].as_str() {
+        Some("ceiling") => {
+            return (
+                format!("WARN {usage}. The next workspace to connect would be DEFERRED: the ceiling is reached and every loaded workspace is in use. Raise or remove max_loaded_shards in the daemon settings file"),
+                true,
+            )
+        }
+        Some("memory") => {
+            return (
+                format!("WARN {usage}. The next workspace to connect would be DEFERRED: memory is at its budget and no loaded workspace is idle. Raise memory_budget_mb or close an agent session"),
+                true,
+            )
+        }
+        _ => {}
+    }
+    if let Some(configured) = configured {
+        let configured_ceiling = configured.max_loaded_shards.map(|ceiling| ceiling as u64);
+        let configured_budget = configured.memory_budget_bytes / (1024 * 1024);
+        if configured_ceiling != ceiling || Some(configured_budget) != budget {
+            return (
+                format!(
+                    "WARN {usage}. A restart would use a memory budget of {configured_budget} MiB and {}",
+                    describe_ceiling(
+                        configured_ceiling,
+                        &configured.max_loaded_shards_source.describe()
+                    )
+                ),
+                true,
+            );
+        }
     }
     (format!("PASS {usage}"), false)
 }
@@ -509,8 +539,11 @@ fn format_index_status(root: &Path, response: &Value) -> String {
     let status = payload["status"].as_str().unwrap_or("unknown");
     if status == "deferred" {
         return format!(
-            "WARN workspace {} status=deferred index=not_loaded: every shard slot is held by another workspace, so nothing is indexing this one. Close another workspace's session or raise max_loaded_shards in the daemon settings file",
-            root.display()
+            "WARN workspace {} status=deferred index=not_loaded: {}",
+            root.display(),
+            payload["bootstrap"]["deferred_reason"]
+                .as_str()
+                .unwrap_or("the daemon could not load this workspace; see `lattice status`")
         );
     }
     let files = payload["files"].as_i64().unwrap_or_default();

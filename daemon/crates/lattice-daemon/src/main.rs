@@ -239,6 +239,11 @@ impl WorkspaceRuntime {
         self.runtime_work.begin()
     }
 
+    /// Requests and background jobs currently running against this runtime.
+    pub(crate) fn active_work(&self) -> usize {
+        self.runtime_work.active()
+    }
+
     pub(crate) async fn shutdown(mut self) {
         self.handler.auto_flush_session_state().await;
         if let Some(heartbeat) = self.storage_heartbeat.take() {
