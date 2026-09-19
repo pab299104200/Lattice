@@ -114,7 +114,45 @@ another port, `LATTICE_LIFECYCLE_LOG_DIR`).
 
 ## Rollout and rollback
 
-To be written when the branch is complete.
+Owner: the coordinator or Pete. Nothing below has been run against the live install.
+
+1. Merge: `git -C /Users/pete/Cadres/lattice merge --ff-only feature/demand-driven-shards`
+   (branch is based on `master` at `71552ca`).
+2. Remove the ceiling written on 2026-09-19. It is honoured by the new build and would bring back
+   count-based deferral (reported, but still deferral): delete the line `max_loaded_shards = 6`
+   from `~/.config/lattice/daemon.toml`. Leave `memory_budget_mb` unset unless there is a reason;
+   the default on this 16 GiB machine is 5,461 MiB.
+3. Build: `cargo build --release --manifest-path /Users/pete/Cadres/lattice/daemon/Cargo.toml`.
+   This replaces the hook adapter for every live session at once, because `~/.local/bin/lattice`
+   links into that target directory.
+4. `lattice doctor` must print `WARN running daemon still uses a fixed shard count; restart it`.
+5. Restart: `pkill -f 'lattice --daemon'`. Effect on the open sessions (relay, synapse, beacon,
+   keystone, portal): each proxy restarts the daemon on its next request; shards reload from their
+   persisted indexes, so answers are partial for seconds, not minutes; hook session state is on
+   disk and survives. The live daemon also gives back its 1.6 GiB.
+6. Verify: `lattice doctor` shows `PASS running daemon: N connected workspace(s) …; no shard
+   ceiling`; `lattice status --workspace /Users/pete/Cadres/relay` shows the `shard_capacity`
+   line; after a few hours `grep shard_memory_released ~/.lattice/logs/lifecycle.jsonl` shows the
+   footprint falling at each unload. Expected, from the private-daemon runs (not yet observed
+   live): about 300 MiB with the embedding model loaded, plus the loaded shards.
+7. Optional clean-up of the dead test entries in the real registries (while the daemon is
+   stopped, between steps 5 and its restart, to avoid the registry lock):
+   ```bash
+   python3 - <<'PY'
+   import json, os, pathlib
+   p = pathlib.Path.home() / ".local/state/lattice/memory-retention-stores.json"
+   d = json.loads(p.read_text()); before = len(d["stores"])
+   d["stores"] = [s for s in d["stores"] if os.path.exists(s)]
+   p.write_text(json.dumps(d)); print(before, "->", len(d["stores"]))
+   PY
+   ```
+   `resource-budget-homes.json` is keyed by repository id, not path; leave it to Lattice's own
+   cache GC.
+
+**Rollback:** remove `memory_budget_mb` from `daemon.toml` if it was added (the old binary
+rejects unknown keys and will not start), restore `max_loaded_shards = 6`,
+`git -C /Users/pete/Cadres/lattice reset --hard 71552ca` on `master` (or check out that commit),
+rebuild as in step 3, and restart as in step 5.
 
 ## Lattice's own tools
 
