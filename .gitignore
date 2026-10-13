@@ -45,3 +45,5 @@ daemon/models/
 # Python harness bytecode caches
 __pycache__/
 *.py[cod]
+
+.kiro/
