@@ -901,7 +901,13 @@ impl QueryEngine {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                // Fully stable tie-break: name alone collides for overloads and
+                // re-exports, which would let equal-scored results reorder
+                // across index rebuilds. File and byte offset make the identity
+                // unique, so the same store always yields the same order.
                 .then_with(|| a.node.name.cmp(&b.node.name))
+                .then_with(|| a.node.file.cmp(&b.node.file))
+                .then_with(|| a.node.id.byte_offset.cmp(&b.node.id.byte_offset))
         });
         #[cfg(test)]
         run_test_post_scoring_delay();

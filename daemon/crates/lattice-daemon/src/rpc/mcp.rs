@@ -2214,6 +2214,7 @@ impl McpHandler {
             "docs" => self.tool_find_stale_docs(args).await,
             "memory" => self.tool_list_stale_memories(args).await,
             "conflicts" => self.tool_list_memory_conflicts(args).await,
+            "freshness" => self.tool_path_freshness(args).await,
             "index" | _ => self.tool_index_status(args).await,
         }
     }
@@ -3658,14 +3659,71 @@ impl McpHandler {
         let query_owned = query.to_string();
         let workspace_root = self.workspace_root.to_string_lossy().to_string();
         let deadline = request_control::current().map(|control| control.deadline());
+        // Q2: opt-in to the principled retrieval_v1 ranker for the context tool,
+        // adapted into the same capsule schema. Default OFF — the heuristic
+        // engine remains authoritative until a fixture comparison justifies the
+        // switch (docs/plans/2026-09-30-q2-r2-design.md). When ON, we need the
+        // file manifest to resolve anchors; load it once, outside the job.
+        let use_retrieval_v1 = retrieval_v1_for_context_enabled();
+        let workspace_id = self.memory_workspace_id.clone();
+        let bridge_file_index = if use_retrieval_v1 {
+            Some(load_incremental_manifest(&self.graph_store).await)
+        } else {
+            None
+        };
+        // Q2 input parity: feed the principled ranker the SAME inputs the
+        // heuristic/semantic path gets — the query embedding (semantic
+        // candidates), the memory store (memory candidates), and the vector
+        // index — so a Phase-2 fixture comparison measures ranking quality, not
+        // a ranker running blind. Compute the embedding here (sync, outside the
+        // blocking job); move an Arc<Mutex<MemoryStore>> clone and the vector
+        // index into the job and lock the store inside, matching run_query_job's
+        // Send + 'static bound.
+        let bridge_embedding = if use_retrieval_v1 {
+            self.embed_query_for_fallback(query)
+        } else {
+            None
+        };
+        let bridge_memory_store = use_retrieval_v1.then(|| Arc::clone(&self.memory_store));
+        let bridge_vector_index = if use_retrieval_v1 {
+            self.vector_index.clone()
+        } else {
+            None
+        };
         let (mut bundle, seed, progress) = match self
             .run_query_job(move || {
-                let (capsule, progress) = engine.query_with_progress(
-                    &query_owned,
-                    None,
-                    matches!(render_choice, WorkflowRenderChoice::Focused),
-                    deadline,
-                );
+                let (capsule, progress) = if let Some(file_index) = bridge_file_index {
+                    // Principled path: retrieval_v1 → ContextCapsule adapter.
+                    let memory_guard = bridge_memory_store.as_ref().map(|store| store.blocking_lock());
+                    let resources = lattice_core::retrieval_v1::context_bridge::ContextBridgeResources {
+                        workspace_id: &workspace_id,
+                        graph: engine.graph(),
+                        file_index: &file_index,
+                        memory_store: memory_guard.as_deref(),
+                        vector_index: bridge_vector_index.as_deref(),
+                    };
+                    let capsule = lattice_core::retrieval_v1::context_bridge::context_capsule_via_retrieval_v1(
+                        &query_owned,
+                        &resources,
+                        bridge_embedding.as_deref(),
+                        if matches!(render_choice, WorkflowRenderChoice::Focused) { 160 } else { 320 },
+                    );
+                    drop(memory_guard);
+                    // The bridge runs to completion, so report all stages done
+                    // and no deadline overrun.
+                    let progress = QueryProgress {
+                        completed_stages: Vec::new(),
+                        deadline_reached: false,
+                    };
+                    (capsule, progress)
+                } else {
+                    engine.query_with_progress(
+                        &query_owned,
+                        None,
+                        matches!(render_choice, WorkflowRenderChoice::Focused),
+                        deadline,
+                    )
+                };
                 let request = workflow_v2::WorkflowRequest {
                     input: query_owned,
                     entry_files: Vec::new(),
@@ -6612,16 +6670,27 @@ impl McpHandler {
 
         match node {
             Some(n) => {
-                let dependents = engine.graph().get_dependents(&n.id);
+                let dependents = engine.graph().get_dependents_with_confidence(&n.id);
+                let name_only_count = dependents
+                    .iter()
+                    .filter(|(_, _, confidence)| {
+                        *confidence == lattice_core::graph::EdgeConfidence::NameOnly
+                    })
+                    .count();
                 let dep_values: Vec<Value> = dependents
                     .iter()
-                    .map(|(dep, edge)| {
+                    .map(|(dep, edge, confidence)| {
                         json!({
                             "s": dep.name,
                             "k": dep.kind.short_code(),
                             "f": dep.file,
                             "l": dep.line,
-                            "e": edge.short_code()
+                            "e": edge.short_code(),
+                            // Confidence that this edge points at the real
+                            // target: "resolved" (structural/import/same-file or
+                            // unique name) vs "name_only" (cross-file match on an
+                            // ambiguous name — may be the wrong same-named symbol).
+                            "c": confidence.as_str()
                         })
                     })
                     .collect();
@@ -6630,7 +6699,8 @@ impl McpHandler {
                     "symbol": name,
                     "file": file,
                     "dependents": dep_values,
-                    "count": dep_values.len()
+                    "count": dep_values.len(),
+                    "name_only_count": name_only_count
                 })))
             }
             None => Ok(wrap_tool_result(json!({
@@ -7489,6 +7559,68 @@ impl McpHandler {
         }
 
         Ok(wrap_tool_result(result))
+    }
+
+    /// Freshness contract: for each requested repository-relative path, report
+    /// whether Lattice's indexed view is current, so an agent can branch on a
+    /// definitive answer instead of guessing whether to re-read. A path is:
+    ///   - "current": in the indexed manifest and its on-disk content hash
+    ///     matches what was indexed;
+    ///   - "stale": indexed, but the file on disk now differs (an edit the
+    ///     graph has not absorbed yet), or indexing is in flight;
+    ///   - "unindexed": not present in the indexed manifest;
+    ///   - "unreadable": the path could not be read under the workspace policy.
+    async fn tool_path_freshness(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let paths = parse_string_array(args, "paths");
+        if paths.is_empty() {
+            return Ok(wrap_tool_result(json!({
+                "error": "status --scope freshness requires a non-empty `paths` array of repository-relative paths"
+            })));
+        }
+        let is_indexing = self.is_indexing();
+        let manifest = load_incremental_manifest(&self.graph_store).await;
+
+        let mut results = Vec::with_capacity(paths.len());
+        let mut stale = 0usize;
+        for path in &paths {
+            let indexed = manifest.get(path);
+            let state = if is_indexing {
+                // A reindex is in flight; the manifest is not authoritative yet.
+                "stale"
+            } else {
+                match indexed {
+                    None => "unindexed",
+                    Some(entry) => {
+                        match lattice_core::security::workspace::read_source(
+                            &self.workspace_root,
+                            std::path::Path::new(path),
+                        ) {
+                            Ok(content) => {
+                                let current =
+                                    lattice_core::storage::content_sha256(content.as_bytes());
+                                if current == entry.content_hash {
+                                    "current"
+                                } else {
+                                    "stale"
+                                }
+                            }
+                            Err(_) => "unreadable",
+                        }
+                    }
+                }
+            };
+            if state == "stale" {
+                stale += 1;
+            }
+            results.push(json!({ "path": path, "state": state }));
+        }
+
+        Ok(wrap_tool_result(json!({
+            "indexing": is_indexing,
+            "all_current": stale == 0 && !is_indexing,
+            "stale_count": stale,
+            "paths": results
+        })))
     }
 
     async fn tool_get_session_metrics(&self, _args: &Value) -> Result<Value, (i32, String)> {
@@ -9584,6 +9716,19 @@ fn attach_retrieval_completion_metadata(
             Value::String("ranked_so_far".to_string()),
         );
     }
+}
+
+/// Q2 opt-in: route the `context` tool through the principled retrieval_v1
+/// ranker instead of the heuristic engine. Default OFF. Enabled with
+/// `LATTICE_RETRIEVAL_V1_FOR_CONTEXT=1`. See the Q2/R2 design doc for the
+/// phased rollout toward making this the default.
+fn retrieval_v1_for_context_enabled() -> bool {
+    matches!(
+        std::env::var("LATTICE_RETRIEVAL_V1_FOR_CONTEXT")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 fn attach_query_progress_metadata(value: &mut Value, progress: &QueryProgress) {

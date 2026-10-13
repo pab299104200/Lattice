@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::events::{
@@ -11,6 +12,7 @@ use crate::identity::{
 };
 use crate::memory::{Memory, MemoryScope, MemoryStore, MemoryType, MemoryVerificationStatus};
 use crate::parser::parse_file;
+use crate::query::capsule::ContextCapsule;
 use crate::retrieval_v1::{
     classify_intent, extract_anchors, resolve_anchors, retrieve_candidates, score_candidates,
     shape_retrieval_bundle, AnchorKind, DiagnosticMode, EventScoringMetadata, RankedCandidate,
@@ -20,6 +22,7 @@ use crate::retrieval_v1::{
 use crate::storage::graph_store::{
     FileIndexEntry, FILE_INDEX_PARSER_VERSION, FILE_INDEX_SCHEMA_VERSION,
 };
+use crate::storage::vector_index::SharedVectorIndex;
 use crate::storage::vector_store::VectorStore;
 use crate::symbols::{ParsedFile, SymbolId as LegacySymbolId};
 use crate::{DateTime, Utc};
@@ -81,6 +84,44 @@ impl ExpectedIdentity {
             Self::Memory(ulid) => format!("memory {ulid}"),
         }
     }
+
+    /// Code anchors (File/Symbol/Section) are the only expectations both engines
+    /// can structurally produce — the heuristic `QueryEngine` never emits a
+    /// Memory result (it returns `memories: Vec::new()`). The Q2 Phase-2
+    /// comparison scores only these, so the two engines are judged on a
+    /// dimension they can both reach. Mirrors the T2(c) parity principle.
+    pub(super) fn is_code(&self) -> bool {
+        !matches!(self, Self::Memory(_))
+    }
+
+    /// Does a capsule's top result (pivot, else first context node) match this
+    /// expected code anchor? Scored on `file` for a File expectation and
+    /// `file`+`symbol` for a Symbol/Section expectation — the fields both
+    /// engines populate in a `ContextCapsule`.
+    pub(super) fn capsule_top_matches(&self, capsule: &ContextCapsule) -> bool {
+        let top = capsule
+            .pivots
+            .first()
+            .map(|pivot| (pivot.file.as_str(), pivot.symbol.as_str()))
+            .or_else(|| {
+                capsule
+                    .context
+                    .first()
+                    .map(|node| (node.file.as_str(), node.symbol.as_str()))
+            });
+        let Some((file, symbol)) = top else {
+            return false;
+        };
+        match self {
+            Self::File(path) => file == *path,
+            Self::Symbol {
+                file: want_file,
+                qualified_name,
+            } => file == *want_file && symbol == *qualified_name,
+            Self::Section { path, heading } => file == *path && symbol.contains(heading),
+            Self::Memory(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +140,10 @@ pub(super) struct GoldenCase {
 pub(super) struct GoldenFixture {
     pub resolver: IdentityResolver<'static>,
     pub graph: &'static CodeGraph,
+    /// The same leaked file index the resolver was built from. Exposed so the
+    /// Q2 Phase-2 comparison can construct the bridge's resolver over identical
+    /// data.
+    pub file_index: &'static HashMap<String, FileIndexEntry>,
     pub memory_store: MemoryStore,
     pub vector_store: VectorStore,
     pub events: Vec<EventEnvelope>,
@@ -510,7 +555,7 @@ pub(super) fn build_fixture() -> GoldenFixture {
     );
 
     let graph = Box::leak(Box::new(graph));
-    let file_index = Box::leak(Box::new(file_index));
+    let file_index: &'static HashMap<String, FileIndexEntry> = Box::leak(Box::new(file_index));
     let parsed_files = Box::leak(Box::new(parsed_files));
     let resolver = IdentityResolver::new(
         graph,
@@ -557,6 +602,7 @@ pub(super) fn build_fixture() -> GoldenFixture {
     GoldenFixture {
         resolver,
         graph,
+        file_index,
         memory_store,
         vector_store,
         events,
@@ -575,6 +621,7 @@ pub(super) async fn execute_case(case: &GoldenCase, fixture: &GoldenFixture) -> 
         embedding_k: 6,
         event_window: 6,
         working_memory_window: 4,
+        max_merged_candidates: 64,
     };
     let ctx = RetrievalContext {
         workspace_id: WORKSPACE,
@@ -766,6 +813,15 @@ fn vector_store() -> VectorStore {
             .expect("vector upsert");
     }
     store
+}
+
+/// The same vector index as `vector_store()`, wrapped in an `Arc` so the Q2
+/// Phase-2 comparison can hand the *identical* `SharedVectorIndex` handle to
+/// both the heuristic `QueryEngine` and the `retrieval_v1` bridge. Sharing the
+/// one handle (rather than two independently built stores) guarantees any
+/// difference in results comes from ranking, never from a divergent index.
+pub(super) fn shared_vector_index() -> SharedVectorIndex {
+    Arc::new(vector_store()) as SharedVectorIndex
 }
 
 fn scoring_context(

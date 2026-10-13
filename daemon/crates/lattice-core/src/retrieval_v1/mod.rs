@@ -1,5 +1,6 @@
 pub mod anchors;
 pub mod candidates;
+pub mod context_bridge;
 pub mod diagnostic;
 pub mod inclusion_reasons;
 pub mod intent;
@@ -13,6 +14,8 @@ mod anchors_tests;
 mod benchmark;
 #[cfg(test)]
 mod candidates_tests;
+#[cfg(test)]
+mod comparison_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]
