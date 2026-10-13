@@ -5,6 +5,7 @@ mod cli;
 mod daemon_settings;
 mod disk_budget;
 mod doctor;
+mod embedding_subprocess;
 mod git_intelligence_runtime;
 mod health_facts_runtime;
 mod hook_adapter;
@@ -144,6 +145,12 @@ async fn run() -> Result<()> {
 
     if cli::is_cli_query_command() {
         std::process::exit(cli::run_from_env().await);
+    }
+
+    if has_arg("--embed-worker") {
+        // R2: the recyclable embedding child. Reads embed requests on stdin,
+        // writes responses on stdout, until the parent closes the pipe.
+        return embedding_subprocess::run_embed_worker();
     }
 
     if has_arg("--daemon") {
@@ -533,48 +540,84 @@ pub(crate) async fn build_workspace_runtime(
             let resource_budget = index_work_bg.resource_budget();
             let _ = std::fs::create_dir_all(&lattice_dir_bg);
 
-            let manifest = load_incremental_manifest(&graph_store_bg).await;
             let roots = if is_multi_repo {
                 ws_roots_bg.clone()
             } else {
                 vec![ws_root.clone()]
             };
-            let runtime_guard = runtime_work_bg.begin();
-            let child_permit = Arc::clone(&index_permit);
-            let incremental = match tokio::task::spawn_blocking(move || {
-                let (_runtime_guard, _child_permit) = (runtime_guard, child_permit);
-                build_incremental_index_for_roots_with_cache_budgeted_base(
-                    &roots,
-                    Some(&manifest),
-                    HashMap::new(),
-                    &parsed_cache_bg,
-                    Some(&resource_budget),
-                    base_reuse.as_ref(),
-                )
-            })
-            .await
-            {
-                Ok(Ok(incremental)) => incremental,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "Startup indexing was resource limited; keeping exact filesystem service and reporting partial semantic coverage");
-                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-                    index_health_bg.mark_resource_limited(error.to_string());
-                    index_readiness_bg.mark_ready();
-                    return;
-                }
-                Err(error) => {
-                    tracing::error!(%error, "Incremental indexing worker failed; keeping the previously published graph");
-                    indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-                    index_readiness_bg.mark_ready();
-                    return;
-                }
-            };
+            let mut cold_index_attempt: u32 = 0;
+            // Cold startup index with bounded exponential-backoff retry. A
+            // transient failure (a flaky worker, a persist blocked by a
+            // concurrent writer) must not leave the workspace stuck at an empty
+            // graph until an unrelated event retriggers indexing. We retry
+            // unless a usable graph is already published, in which case serving
+            // it beats churning. See `next_cold_index_retry_delay`.
+            let incremental = 'attempts: loop {
+                let graph_already_published =
+                    { engine_bg.lock().await.graph().stats().node_count > 0 };
+                let manifest = load_incremental_manifest(&graph_store_bg).await;
+                let roots = roots.clone();
+                let parsed_cache_attempt = parsed_cache_bg.clone();
+                let resource_budget = index_work_bg.resource_budget();
+                let base_reuse_attempt = base_reuse.clone();
+                let runtime_guard = runtime_work_bg.begin();
+                let child_permit = Arc::clone(&index_permit);
+                let built = tokio::task::spawn_blocking(move || {
+                    let (_runtime_guard, _child_permit) = (runtime_guard, child_permit);
+                    build_incremental_index_for_roots_with_cache_budgeted_base(
+                        &roots,
+                        Some(&manifest),
+                        HashMap::new(),
+                        &parsed_cache_attempt,
+                        Some(&resource_budget),
+                        base_reuse_attempt.as_ref(),
+                    )
+                })
+                .await;
 
-            let Some(incremental) = persist_incremental_cache(&graph_store_bg, incremental).await
-            else {
-                indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
-                index_readiness_bg.mark_ready();
-                return;
+                let retryable_error: String = match built {
+                    Ok(Ok(incremental)) => {
+                        match persist_incremental_cache(&graph_store_bg, incremental).await {
+                            Some(incremental) => break 'attempts incremental,
+                            None => "persisting the index generation failed".to_string(),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        // Resource admission is a deliberate deferral, not a
+                        // crash: keep exact filesystem service and let the
+                        // watcher retry. Do not spin the backoff loop on it.
+                        tracing::warn!(%error, "Startup indexing was resource limited; keeping exact filesystem service and reporting partial semantic coverage");
+                        indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                        index_health_bg.mark_resource_limited(error.to_string());
+                        index_readiness_bg.mark_ready();
+                        return;
+                    }
+                    Err(error) => error.to_string(),
+                };
+
+                match next_cold_index_retry_delay(cold_index_attempt, graph_already_published) {
+                    Some(delay) => {
+                        tracing::warn!(
+                            attempt = cold_index_attempt,
+                            backoff_secs = delay.as_secs(),
+                            error = %retryable_error,
+                            "Cold startup index failed; retrying after backoff"
+                        );
+                        cold_index_attempt += 1;
+                        tokio::time::sleep(delay).await;
+                        continue 'attempts;
+                    }
+                    None => {
+                        if graph_already_published {
+                            tracing::warn!(error = %retryable_error, "Cold startup index failed; serving the previously published graph");
+                        } else {
+                            tracing::error!(error = %retryable_error, attempts = cold_index_attempt, "Cold startup index failed after bounded retries; a later file event or branch change will retrigger indexing");
+                        }
+                        indexing_bg.store(false, std::sync::atomic::Ordering::Relaxed);
+                        index_readiness_bg.mark_ready();
+                        return;
+                    }
+                }
             };
             let IncrementalIndexResult {
                 graph: incremental_graph,
@@ -620,14 +663,46 @@ pub(crate) async fn build_workspace_runtime(
             }
 
             if let Some(model_path) = verified_shared_embedding_model_path() {
-                match EmbeddingEngine::new(model_path.to_string_lossy().as_ref()) {
-                    Ok(emb_engine) => {
+                // R2: when opted in, host the ONNX engine in a recyclable child
+                // process so its unreclaimable arena never inflates the daemon's
+                // footprint. On any failure to build the subprocess provider,
+                // fall back to the in-process engine so semantic retrieval still
+                // works — the flag only changes where the engine runs.
+                let subprocess_provider: Option<Arc<dyn EmbeddingProvider>> =
+                    if crate::embedding_subprocess::subprocess_embeddings_enabled() {
+                        match crate::embedding_subprocess::SubprocessEmbeddingProvider::new(
+                            model_path.to_string_lossy().as_ref(),
+                        ) {
+                            Ok(provider) => {
+                                tracing::info!(
+                                    "ONNX embedding engine running in a recyclable subprocess"
+                                );
+                                Some(Arc::new(provider))
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "Embedding subprocess unavailable; using the in-process engine");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                let in_process = if subprocess_provider.is_some() {
+                    Ok(None)
+                } else {
+                    EmbeddingEngine::new(model_path.to_string_lossy().as_ref()).map(Some)
+                };
+                match in_process {
+                    Ok(maybe_engine) => {
                         tracing::info!("ONNX embedding model loaded");
-                        let emb = cached_embedding_provider(
-                            emb_engine,
-                            &embedding_object_root_bg,
-                            &embedding_checkout_id_bg,
-                        );
+                        let emb: Arc<dyn EmbeddingProvider> = match subprocess_provider {
+                            Some(provider) => provider,
+                            None => cached_embedding_provider(
+                                maybe_engine.expect("in-process engine present when no subprocess"),
+                                &embedding_object_root_bg,
+                                &embedding_checkout_id_bg,
+                            ),
+                        };
                         if let Some(index) = vector_index_bg.as_ref() {
                             match emb.storage_identity().and_then(|identity| match identity {
                                 Some(identity) => index
@@ -931,6 +1006,35 @@ fn env_duration_secs(name: &str, fallback: std::time::Duration) -> std::time::Du
         .unwrap_or(fallback)
 }
 
+/// How many times a failed cold startup index is retried before giving up and
+/// leaving the next file event or branch change to trigger a fresh attempt.
+const MAX_COLD_INDEX_RETRIES: u32 = 5;
+/// The backoff ceiling: delays grow 1s, 2s, 4s, 8s, 16s, then hold here.
+const MAX_COLD_INDEX_BACKOFF_SECS: u64 = 30;
+
+/// Decide whether to retry a failed cold index, and after how long.
+///
+/// A cold index failure that leaves the workspace with an empty graph is the
+/// difference between "not ready, healing shortly" and "not ready until an
+/// unrelated event happens to retrigger indexing." We retry with bounded
+/// exponential backoff. But if a usable graph was already published (a warm
+/// start, or an earlier generation), serving that slightly-stale graph is
+/// strictly better than churning the CPU on retries, so we do not retry and
+/// let the normal watcher/refresh path reconcile. Returns `None` to stop.
+fn next_cold_index_retry_delay(
+    attempt: u32,
+    already_serving_graph: bool,
+) -> Option<std::time::Duration> {
+    if already_serving_graph || attempt >= MAX_COLD_INDEX_RETRIES {
+        return None;
+    }
+    let secs = 1u64
+        .checked_shl(attempt)
+        .unwrap_or(MAX_COLD_INDEX_BACKOFF_SECS)
+        .min(MAX_COLD_INDEX_BACKOFF_SECS);
+    Some(std::time::Duration::from_secs(secs))
+}
+
 fn env_u64(name: &str, fallback: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -997,28 +1101,11 @@ async fn open_graph_store_with_warm_graph(
                 "Replaced corrupt derived graph database; workspace indexing will rebuild it"
             );
         }
-        let warm_graph = if should_warm_load_graph(&graph_store, &workspace_root) {
-            match graph_store.load_index_snapshot() {
-                Ok(IndexSnapshotLoad::Ready(snapshot)) => WarmGraphLoad::Snapshot(snapshot),
-                Ok(IndexSnapshotLoad::DigestCacheMissing { graph }) => {
-                    tracing::info!(
-                        workspace = %workspace_root.display(),
-                        "Persisted graph has no digest snapshot; using graph-only warm fallback"
-                    );
-                    WarmGraphLoad::Graph(graph)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        workspace = %workspace_root.display(),
-                        %error,
-                        "Failed to load persisted graph snapshot"
-                    );
-                    WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
-                }
-            }
-        } else {
-            WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
-        };
+        let warm_graph = select_warm_graph(
+            &graph_store,
+            should_warm_load_graph(&graph_store, &workspace_root),
+            &workspace_root,
+        );
         let graph = match &warm_graph {
             WarmGraphLoad::Snapshot(snapshot) => Arc::clone(&snapshot.graph),
             WarmGraphLoad::Graph(graph) => Arc::clone(graph),
@@ -1037,6 +1124,67 @@ async fn open_graph_store_with_warm_graph(
     })
     .await
     .map_err(|error| anyhow::anyhow!("graph warm-load worker failed: {error}"))?
+}
+
+/// Choose how to warm the query engine from a persisted graph.
+///
+/// `allow_digest_snapshot` is the result of the size gate. When it is true we
+/// load the full index snapshot (graph + precomputed module digests). When it
+/// is false the repository is too large to hydrate the digest cache cheaply —
+/// but the structural graph on disk is still valid, so we warm-load it
+/// *graph-only* rather than discarding it and forcing a cold re-index. A large
+/// repository therefore answers immediately from its persisted graph after a
+/// restart; background indexing refreshes the digests. Only a genuine load
+/// error or a truly empty store falls back to an empty graph.
+fn select_warm_graph(
+    graph_store: &GraphStore,
+    allow_digest_snapshot: bool,
+    workspace_root: &Path,
+) -> WarmGraphLoad {
+    if allow_digest_snapshot {
+        return match graph_store.load_index_snapshot() {
+            Ok(IndexSnapshotLoad::Ready(snapshot)) => WarmGraphLoad::Snapshot(snapshot),
+            Ok(IndexSnapshotLoad::DigestCacheMissing { graph }) => {
+                tracing::info!(
+                    workspace = %workspace_root.display(),
+                    "Persisted graph has no digest snapshot; using graph-only warm fallback"
+                );
+                WarmGraphLoad::Graph(graph)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace_root.display(),
+                    %error,
+                    "Failed to load persisted graph snapshot"
+                );
+                WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
+            }
+        };
+    }
+    // Over the warm-load size gate: skip the expensive digest snapshot but
+    // still serve the structural graph, so a large repository is not cold on
+    // every restart.
+    match graph_store.load_graph() {
+        Ok(graph) => {
+            let graph = Arc::new(graph);
+            if graph.stats().node_count > 0 {
+                tracing::info!(
+                    workspace = %workspace_root.display(),
+                    nodes = graph.stats().node_count,
+                    "Repository exceeds the digest warm-load limit; serving the persisted graph without digests while indexing refreshes"
+                );
+            }
+            WarmGraphLoad::Graph(graph)
+        }
+        Err(error) => {
+            tracing::warn!(
+                workspace = %workspace_root.display(),
+                %error,
+                "Failed to warm-load the oversized persisted graph; starting cold"
+            );
+            WarmGraphLoad::Graph(Arc::new(CodeGraph::new()))
+        }
+    }
 }
 
 fn should_warm_load_graph(graph_store: &GraphStore, workspace_root: &Path) -> bool {
@@ -1553,7 +1701,7 @@ fn now_epoch_secs() -> u64 {
 mod tests {
     use super::{
         build_incremental_index_for_roots, build_warm_query_engine, memory_store_artifact_paths,
-        open_memory_store, MemoryStoreMode, WarmGraphLoad,
+        open_memory_store, select_warm_graph, MemoryStoreMode, WarmGraphLoad,
     };
     use lattice_core::error::LatticeError;
     use lattice_core::graph::CodeGraph;
@@ -1639,6 +1787,48 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == "module_digest"),
             "hydrated snapshots should render their precomputed module digests"
+        );
+    }
+
+    #[test]
+    fn cold_index_retry_backs_off_then_gives_up_but_never_retries_over_a_live_graph() {
+        use super::{next_cold_index_retry_delay, MAX_COLD_INDEX_RETRIES};
+        // A failed cold index with no graph published yet retries with
+        // exponential backoff: 1s, 2s, 4s, 8s, 16s, then stops.
+        let mut delays = Vec::new();
+        let mut attempt = 0;
+        while let Some(delay) = next_cold_index_retry_delay(attempt, false) {
+            delays.push(delay.as_secs());
+            attempt += 1;
+            assert!(attempt < 100, "retry policy must terminate");
+        }
+        assert_eq!(delays, vec![1, 2, 4, 8, 16]);
+        assert_eq!(attempt, MAX_COLD_INDEX_RETRIES);
+        // But when a usable graph is already published, we never retry — serving
+        // the slightly-stale graph beats churning the CPU.
+        assert!(next_cold_index_retry_delay(0, true).is_none());
+    }
+
+    #[test]
+    fn oversized_repo_warm_loads_the_graph_instead_of_starting_cold() {
+        // A1: a repository too large for the digest warm-load limit must still
+        // serve its persisted structural graph after a restart, not come up
+        // empty and force a full cold re-index (the dominant "not ready"
+        // window on large repos). `allow_digest_snapshot = false` is the
+        // over-limit case.
+        let store = GraphStore::open_in_memory().expect("in-memory graph store");
+        store
+            .save_index_snapshot(&graph_with_payment_symbol())
+            .expect("persist a graph");
+        let workspace = std::path::Path::new("/tmp/lattice-a1-oversized");
+
+        let warm_graph = select_warm_graph(&store, false, workspace);
+        let (loaded_graph, _engine) = build_warm_query_engine(warm_graph, None);
+
+        assert!(
+            loaded_graph.stats().node_count > 0,
+            "an oversized repo must warm-load its persisted graph, not start cold \
+             with an empty graph"
         );
     }
 

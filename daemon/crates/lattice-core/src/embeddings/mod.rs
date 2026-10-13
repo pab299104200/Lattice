@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod object_cache;
+pub mod subprocess_protocol;
 
 #[cfg(test)]
 mod tests;
@@ -10,6 +11,9 @@ pub use engine::{
 };
 pub use object_cache::{
     EmbeddingCacheStats, EmbeddingGcReport, EmbeddingIdentity, EmbeddingObjectCache,
+};
+pub use subprocess_protocol::{
+    decode_request, decode_response, encode_request, encode_response, EmbedRequest, EmbedResponse,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
