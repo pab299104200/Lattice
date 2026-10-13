@@ -19,6 +19,28 @@ pub enum EdgeKind {
     CoChanges,
 }
 
+/// How much to trust that a graph edge points at the real target symbol.
+///
+/// Edges resolved structurally or through an import path are `Resolved`.
+/// Cross-file edges resolved only by a bare, non-unique symbol name are
+/// `NameOnly`: the name-based resolver may have attached them to the wrong
+/// same-named definition. `impact` surfaces this so an agent can tell a
+/// certain dependent from a guessed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeConfidence {
+    Resolved,
+    NameOnly,
+}
+
+impl EdgeConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeConfidence::Resolved => "resolved",
+            EdgeConfidence::NameOnly => "name_only",
+        }
+    }
+}
+
 impl EdgeKind {
     /// Compact single-char code for token-efficient output.
     pub fn short_code(&self) -> &'static str {
@@ -218,6 +240,68 @@ impl CodeGraph {
             .filter_map(|neighbor_idx| {
                 let edge = self.graph.edges_connecting(neighbor_idx, idx).next()?;
                 Some((&self.graph[neighbor_idx], *edge.weight()))
+            })
+            .collect()
+    }
+
+    /// How much to trust that a graph edge points at the real target.
+    ///
+    /// Cross-symbol `Calls`/`Mentions` edges are resolved from a bare name:
+    /// a same-file match, else the first symbol with that name anywhere. When a
+    /// name is defined in more than one place that fallback can attach the edge
+    /// to the wrong target. `impact` must say so rather than present a guess as
+    /// a fact.
+    pub fn edge_confidence(
+        &self,
+        from: &SymbolId,
+        to: &GraphNode,
+        kind: EdgeKind,
+    ) -> EdgeConfidence {
+        // Structural and import edges are resolved precisely, not by name.
+        if !matches!(kind, EdgeKind::Calls | EdgeKind::Mentions) {
+            return EdgeConfidence::Resolved;
+        }
+        // A same-file edge is an unambiguous local resolution.
+        if from.file == to.file {
+            return EdgeConfidence::Resolved;
+        }
+        // Cross-file by name: trustworthy only if the target name is unique.
+        if self.name_is_ambiguous(&to.name) {
+            EdgeConfidence::NameOnly
+        } else {
+            EdgeConfidence::Resolved
+        }
+    }
+
+    /// True when two or more distinct nodes share this symbol name, so a
+    /// name-based edge to it could have resolved to the wrong one.
+    pub fn name_is_ambiguous(&self, name: &str) -> bool {
+        let simple = name.rsplit('.').next().unwrap_or(name);
+        self.graph
+            .node_weights()
+            .filter(|node| node.name.rsplit('.').next().unwrap_or(&node.name) == simple)
+            .take(2)
+            .count()
+            > 1
+    }
+
+    /// Incoming dependents paired with how much to trust each edge.
+    pub fn get_dependents_with_confidence(
+        &self,
+        id: &SymbolId,
+    ) -> Vec<(&GraphNode, EdgeKind, EdgeConfidence)> {
+        let Some(&idx) = self.index.get(id) else {
+            return Vec::new();
+        };
+        let target = &self.graph[idx];
+        self.graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .filter_map(|neighbor_idx| {
+                let edge = self.graph.edges_connecting(neighbor_idx, idx).next()?;
+                let kind = *edge.weight();
+                let dependent = &self.graph[neighbor_idx];
+                let confidence = self.edge_confidence(&dependent.id, target, kind);
+                Some((dependent, kind, confidence))
             })
             .collect()
     }

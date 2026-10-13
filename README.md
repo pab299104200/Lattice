@@ -409,6 +409,7 @@ Every workspace with a connected agent gets a shard, so there is no count to tun
 | `LATTICE_USER_CACHE_BUDGET_BYTES` | `8589934592`; accounting across proven repository homes |
 | `LATTICE_DISPOSABLE_CACHE_BUDGET_BYTES` | `6442450944`; disposable class budget |
 | `LATTICE_ENABLE_BACKGROUND_VECTOR_SYNC` | Disabled; set `1` for full background vector sync |
+| `LATTICE_EMBEDDING_SUBPROCESS` | Disabled (experimental); set `1` to run the ONNX embedding engine in a recyclable child process so its memory arena stays out of the daemon's footprint. Falls back to the in-process engine on any child failure. Tune with `LATTICE_EMBEDDING_SUBPROCESS_RSS_LIMIT_MB` (default `1536`) and `LATTICE_EMBEDDING_SUBPROCESS_TIMEOUT_SECS` (default `30`) |
 | `LATTICE_LIFECYCLE_LOG_DIR` | `~/.lattice/logs`; process lifecycle log directory |
 
 Admission budgets are logical reservations, not hard RSS limits. Active work or protected data can keep usage above disk watermarks. Capacity pressure remains visible instead of deleting knowledge or publishing a truncated graph as complete. See [resource budgets](docs/resource-budgets.md).

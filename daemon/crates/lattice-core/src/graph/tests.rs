@@ -1,4 +1,4 @@
-use crate::graph::model::{CodeGraph, EdgeKind};
+use crate::graph::model::{CodeGraph, EdgeConfidence, EdgeKind};
 use crate::symbols::{Language, SymbolId, SymbolKind};
 
 // ─── Short code tests ────────────────────────────────────────────────
@@ -111,6 +111,56 @@ fn test_add_edge_and_get_dependents() {
     assert_eq!(dependents.len(), 1);
     assert_eq!(dependents[0].0.name, "loginUser");
     assert_eq!(dependents[0].1, EdgeKind::Calls);
+}
+
+#[test]
+fn impact_marks_name_only_cross_file_edges_as_lower_confidence() {
+    // Q1: two different symbols share the name `handle`. A caller in a third
+    // file has a cross-file Calls edge to one of them — but because the name is
+    // ambiguous, the name-based resolver could have picked the wrong target, so
+    // impact must report that dependent as name-only (a guess), while an edge
+    // to a uniquely-named symbol is reported as resolved (certain).
+    let mut graph = CodeGraph::new();
+    let add = |graph: &mut CodeGraph, file: &str, name: &str| {
+        let id = make_id(file, name);
+        graph.add_node(
+            id.clone(),
+            SymbolKind::Function,
+            name.to_string(),
+            format!("function {name}()"),
+            format!("function {name}() {{}}"),
+            file.to_string(),
+            1,
+            3,
+            true,
+            Language::TypeScript,
+        );
+        id
+    };
+
+    let caller = add(&mut graph, "src/router.ts", "route");
+    let handle_a = add(&mut graph, "src/a.ts", "handle");
+    let _handle_b = add(&mut graph, "src/b.ts", "handle"); // makes `handle` ambiguous
+    let unique = add(&mut graph, "src/u.ts", "uniquelyNamedTarget");
+
+    graph.add_edge(&caller, &handle_a, EdgeKind::Calls);
+    graph.add_edge(&caller, &unique, EdgeKind::Calls);
+
+    let ambiguous = graph.get_dependents_with_confidence(&handle_a);
+    assert_eq!(ambiguous.len(), 1);
+    assert_eq!(
+        ambiguous[0].2,
+        EdgeConfidence::NameOnly,
+        "a cross-file edge to an ambiguously-named symbol must be name_only"
+    );
+
+    let certain = graph.get_dependents_with_confidence(&unique);
+    assert_eq!(certain.len(), 1);
+    assert_eq!(
+        certain[0].2,
+        EdgeConfidence::Resolved,
+        "a cross-file edge to a uniquely-named symbol is resolved"
+    );
 }
 
 #[test]
