@@ -94,6 +94,58 @@ fn replace_managed(
     Ok(())
 }
 
+/// Atomically and durably replace a plain (non-managed) file.
+///
+/// Writes to a sibling temp file, fsyncs its contents, renames it over the
+/// destination, then fsyncs the parent directory so the rename itself is
+/// durable. A crash at any point leaves either the previous complete file or
+/// the new complete file in place — never a torn or partially written one. This
+/// is the plain-path counterpart to `replace_managed`, used by `flush` when the
+/// index is not under the publication authority.
+fn atomic_write_plain(destination: &Path, bytes: &[u8]) -> Result<(), LatticeError> {
+    let parent = destination.parent().ok_or_else(|| {
+        LatticeError::Storage(format!(
+            "USearch destination '{}' has no parent directory",
+            destination.display()
+        ))
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            LatticeError::Storage(format!(
+                "USearch destination '{}' has no file name",
+                destination.display()
+            ))
+        })?;
+    let sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{file_name}.{}.{sequence}.tmp",
+        std::process::id()
+    ));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, destination)?;
+        // fsync the directory so the rename survives a crash.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(LatticeError::Storage(format!(
+            "atomic write of '{}' failed: {error}",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UsearchDiskMetadata {
     index_sha256: String,
@@ -606,7 +658,19 @@ impl VectorIndex for UsearchVectorIndex {
             results.push((logical_name, file.clone(), *byte_offset, similarity));
         }
 
-        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        // Stable tie-break: equal cosine scores would otherwise keep the ANN's
+        // internal return order, which is not stable across index rebuilds and
+        // then gets truncated to top_k — so the same store could drop different
+        // results run to run. Name, file, and byte offset make ties fully
+        // deterministic. (a,b) fields: 0=logical_name, 1=file, 2=byte_offset,
+        // 3=similarity.
+        results.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
         results.truncate(top_k);
         Ok(results)
     }
@@ -700,13 +764,19 @@ impl VectorIndex for UsearchVectorIndex {
             replace_managed(&directory, index_leaf, &index_bytes)?;
             replace_managed(&directory, metadata_leaf, &metadata_bytes)?;
         } else {
-            fs::write(&self.index_path, &index_bytes).map_err(|e| {
+            // Durable, atomic writes: a crash mid-flush must never leave a torn
+            // index or a sidecar that disagrees with it. Write the index first
+            // so that, at every instant, the committed sidecar still describes a
+            // complete index file (an old-index/new-sidecar skew is additionally
+            // caught by the index_sha256 check on load). See `replace_managed`
+            // for the managed-path equivalent.
+            atomic_write_plain(&self.index_path, &index_bytes).map_err(|e| {
                 LatticeError::Storage(format!(
                     "Failed to save USearch index '{}': {e}",
                     self.index_path.display()
                 ))
             })?;
-            fs::write(&self.metadata_path, metadata_bytes).map_err(|e| {
+            atomic_write_plain(&self.metadata_path, &metadata_bytes).map_err(|e| {
                 LatticeError::Storage(format!(
                     "Failed to write USearch metadata '{}': {e}",
                     self.metadata_path.display()
@@ -938,5 +1008,124 @@ mod managed_publication_tests {
             read_managed(&directory, &stage.name, 1024).unwrap(),
             b"foreign"
         );
+    }
+
+    #[test]
+    fn ann_results_with_equal_scores_are_deterministically_ordered() {
+        // A3: several symbols with the SAME vector tie at cosine 1.0. Without a
+        // stable secondary key the ANN return order is not reproducible across
+        // rebuilds and then gets truncated to top_k, so the same store could
+        // surface different results run to run. Insert in non-sorted name order
+        // and require the search to return them sorted by (name, file, offset).
+        let root = tempfile::tempdir().unwrap();
+        let ann = root.path().join("vectors.usearch");
+        let database = root.path().join("vectors.db");
+        let index = UsearchVectorIndex::open(database.to_str().unwrap(), ann).unwrap();
+        index.initialize(3).unwrap();
+        index.warm().unwrap();
+        let v = [1.0, 0.0, 0.0];
+        // Deliberately not in sorted order.
+        for (file, name) in [
+            ("src/zeta.rs", "zeta_handler"),
+            ("src/alpha.rs", "alpha_handler"),
+            ("src/mid.rs", "mid_handler"),
+        ] {
+            index.upsert_vector(file, name, 0, &v).unwrap();
+        }
+        index.flush().unwrap();
+
+        let names_of = |index: &UsearchVectorIndex| -> Vec<String> {
+            index
+                .search_in_scope(&v, 3, VectorScope::Symbol)
+                .unwrap()
+                .into_iter()
+                .map(|result| result.0)
+                .collect()
+        };
+
+        let first = names_of(&index);
+        let second = names_of(&index);
+        assert_eq!(first, second, "tied ANN scores must order identically");
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(
+            first, sorted,
+            "equal-scored ANN results must be ordered by their stable key, not ANN return order"
+        );
+    }
+
+    /// Blocker #2 (independent review): the non-publication flush path used a
+    /// plain `fs::write`, so a crash mid-flush could tear the index or desync
+    /// its sidecar. `atomic_write_plain` must replace by rename, not by
+    /// in-place truncation — the distinguishing property of an atomic write.
+    ///
+    /// A reader that opened the destination before the write keeps seeing the
+    /// complete old bytes (its handle points at the now-unlinked old inode),
+    /// which is impossible with a truncating in-place `fs::write`. We also
+    /// assert the final content is the new bytes and that no staging temp file
+    /// is left behind.
+    #[test]
+    fn atomic_write_plain_replaces_by_rename_not_in_place_truncation() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("vectors.usearch");
+        let old = vec![b'A'; 4096];
+        fs::write(&destination, &old).unwrap();
+
+        // A reader holding the pre-existing file open across the replacement.
+        let mut reader = fs::File::open(&destination).unwrap();
+
+        let new = vec![b'B'; 8192];
+        atomic_write_plain(&destination, &new).expect("atomic write must succeed");
+
+        // The pre-existing reader still sees the FULL old content: proof the
+        // destination was swapped by rename, not truncated in place.
+        let mut seen = Vec::new();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_end(&mut seen).unwrap();
+        assert_eq!(
+            seen, old,
+            "a reader open across the write must still see complete old bytes (rename, not truncation)"
+        );
+
+        // The destination now holds the complete new content.
+        assert_eq!(fs::read(&destination).unwrap(), new);
+
+        // No staging temp file left behind.
+        let residue: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "staging temp files remained: {residue:?}"
+        );
+    }
+
+    /// The plain (non-managed) flush path round-trips: an index written via the
+    /// atomic path reloads with its vectors intact and sidecar in agreement.
+    #[test]
+    fn plain_path_flush_round_trips_through_the_atomic_write() {
+        let root = tempfile::tempdir().unwrap();
+        let ann = root.path().join("vectors.usearch");
+        let database = root.path().join("vectors.db");
+        {
+            let index = UsearchVectorIndex::open(database.to_str().unwrap(), ann.clone()).unwrap();
+            index.initialize(3).unwrap();
+            index.warm().unwrap();
+            index
+                .upsert_vector("a.rs", "alpha", 0, &[1.0, 0.0, 0.0])
+                .unwrap();
+            index.flush().unwrap();
+        }
+        // Reopen from disk: the atomically written index + sidecar must load.
+        let index = UsearchVectorIndex::open(database.to_str().unwrap(), ann).unwrap();
+        index.initialize(3).unwrap();
+        index.warm().unwrap();
+        let hits = index.search(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "alpha");
     }
 }
