@@ -53,6 +53,11 @@ struct ShardEntry {
     index_work: Arc<crate::index_work::IndexWorkCoordinator>,
     active_connections: AtomicUsize,
     last_used_epoch_secs: AtomicU64,
+    /// When this shard was admitted. A shard younger than the minimum
+    /// residency is never unloaded only to make room for a peer; without this
+    /// a just-loaded shard could be evicted and immediately reloaded, the
+    /// load->evict->reload thrash that burns CPU and recreates "not ready".
+    loaded_at_epoch_secs: AtomicU64,
     /// Set when the shard has been taken out of the map to be shut down. A
     /// lease that still holds it re-acquires a fresh shard on its next
     /// request, which is what makes unloading a connected shard transparent.
@@ -78,6 +83,7 @@ impl ShardEntry {
             index_work,
             active_connections: AtomicUsize::new(0),
             last_used_epoch_secs: AtomicU64::new(now_epoch_secs()),
+            loaded_at_epoch_secs: AtomicU64::new(now_epoch_secs()),
             retired: AtomicBool::new(false),
             load_cost_bytes: AtomicU64::new(0),
             _materialization_reservation: materialization_reservation,
@@ -207,7 +213,14 @@ impl ShardEntry {
             && !self.is_bootstrapping()
             && !self.index_work.workspace_is_busy(&shard_key(&self.root))
             && !self.has_work_in_flight()
+            && self.residency_secs(now_epoch_secs) >= MIN_SHARD_RESIDENCY_SECS
             && self.idle_secs(now_epoch_secs) >= threshold_secs
+    }
+
+    /// How long this shard has been loaded. A shard younger than the minimum
+    /// residency is protected from being unloaded to make room for a peer.
+    fn residency_secs(&self, now_epoch_secs: u64) -> u64 {
+        now_epoch_secs.saturating_sub(self.loaded_at_epoch_secs.load(Ordering::Acquire))
     }
 
     /// Mark the shard retired unless a request got in first. A request takes
@@ -1388,6 +1401,13 @@ const LOAD_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 /// make room. Ten minutes is well past a pause between tool calls, and a
 /// reload costs seconds because the index is read back from disk.
 const DEFAULT_CONNECTED_IDLE_SECS: u64 = 600;
+/// A connected shard loaded more recently than this is never unloaded only to
+/// make room for a peer. Without a residency floor, two worktrees whose agents
+/// pace their calls near the idle threshold can ping-pong — load, evict,
+/// reload — which wastes CPU and recreates the "not ready" window on every
+/// reload. One minute is long past a single tool call yet short enough that a
+/// genuinely abandoned workspace still frees its memory promptly.
+const MIN_SHARD_RESIDENCY_SECS: u64 = 60;
 
 pub(crate) struct GlobalDaemon {
     shards: Mutex<HashMap<String, Arc<ShardEntry>>>,
@@ -1398,6 +1418,12 @@ pub(crate) struct GlobalDaemon {
     connected: Arc<StdMutex<HashMap<String, ConnectedWorkspace>>>,
     loading: Arc<AtomicUsize>,
     footprint: FootprintProbe,
+    /// Bytes attributed to shards that have since been unloaded but whose
+    /// pages the OS/allocator never returned (the macOS ORT-arena + allocator
+    /// ratchet). Subtracted from raw RSS when sizing memory pressure, so an
+    /// unloaded worktree stops counting against the budget forever and a fresh
+    /// worktree is not locked out behind ghost pages it could never evict.
+    reclaimed_ghost_bytes: Arc<AtomicU64>,
     memory_budget_bytes: u64,
     connected_idle_secs: u64,
     /// Set while the daemon is over budget with nothing left to unload, so
@@ -1450,6 +1476,7 @@ impl GlobalDaemon {
             connected: Arc::new(StdMutex::new(HashMap::new())),
             loading: Arc::new(AtomicUsize::new(0)),
             footprint: Arc::new(crate::daemon_settings::process_memory_footprint_bytes),
+            reclaimed_ghost_bytes: Arc::new(AtomicU64::new(0)),
             memory_budget_bytes: settings.memory_budget_bytes,
             over_budget_reported: AtomicBool::new(false),
             connected_idle_secs: env_duration_secs(
@@ -1766,6 +1793,35 @@ impl GlobalDaemon {
         }))
     }
 
+    /// The footprint to budget against: raw process RSS minus the pages that
+    /// belong to shards already unloaded but never returned to the OS. On
+    /// macOS the allocator and the ORT arena keep freed pages, so raw RSS only
+    /// ever rises; charging those ghost pages against the budget would lock out
+    /// every new worktree behind memory nothing live owns. Floored at the live
+    /// loaded working set's attributed cost so the estimate never claims less
+    /// than what loaded shards actually hold.
+    fn effective_footprint_bytes(&self, shards: &HashMap<String, Arc<ShardEntry>>) -> Option<u64> {
+        let raw = (self.footprint)()?;
+        let ghost = self.reclaimed_ghost_bytes.load(Ordering::Acquire);
+        let live_attributed: u64 = shards
+            .values()
+            .filter(|entry| entry.is_loaded())
+            .map(|entry| entry.load_cost_bytes.load(Ordering::Acquire))
+            .sum();
+        Some(raw.saturating_sub(ghost).max(live_attributed))
+    }
+
+    /// Credit an unloaded shard's attributed cost to the ghost-page tally, so
+    /// pages the OS will not reclaim stop counting against the budget. Called
+    /// at every point a shard leaves the loaded set. Idempotent per shard: the
+    /// cost is read once and zeroed so a double shutdown cannot credit twice.
+    fn credit_ghost_bytes(&self, entry: &ShardEntry) {
+        let cost = entry.load_cost_bytes.swap(0, Ordering::AcqRel);
+        if cost > 0 {
+            self.reclaimed_ghost_bytes.fetch_add(cost, Ordering::AcqRel);
+        }
+    }
+
     /// What, if anything, stands in the way of loading one more shard.
     fn pressure(&self, shards: &HashMap<String, Arc<ShardEntry>>) -> Option<DeferralKind> {
         if self
@@ -1774,7 +1830,7 @@ impl GlobalDaemon {
         {
             return Some(DeferralKind::Ceiling);
         }
-        let footprint = (self.footprint)()?;
+        let footprint = self.effective_footprint_bytes(shards)?;
         (footprint.saturating_add(LOAD_HEADROOM_BYTES) > self.memory_budget_bytes)
             .then_some(DeferralKind::Memory)
     }
@@ -1890,6 +1946,7 @@ impl GlobalDaemon {
                     ),
                 ],
             );
+            self.credit_ghost_bytes(&victim);
             victim.shutdown().await;
         }
 
@@ -1937,7 +1994,11 @@ impl GlobalDaemon {
     /// evicts on demand in the meantime.
     async fn relieve_memory_pressure(&self) {
         let _lifecycle = self.lifecycle_gate.lock().await;
-        let Some(footprint) = (self.footprint)() else {
+        let footprint = {
+            let shards = self.shards.lock().await;
+            self.effective_footprint_bytes(&shards)
+        };
+        let Some(footprint) = footprint else {
             return;
         };
         if footprint <= self.memory_budget_bytes {
@@ -1977,6 +2038,7 @@ impl GlobalDaemon {
                 ("budget_bytes", serde_json::json!(self.memory_budget_bytes)),
             ],
         );
+        self.credit_ghost_bytes(&entry);
         entry.shutdown().await;
     }
 
@@ -2011,6 +2073,7 @@ impl GlobalDaemon {
                 "shard_evicted_idle",
                 &[("shard_key", serde_json::json!(key.clone()))],
             );
+            self.credit_ghost_bytes(&entry);
             entry.shutdown().await;
         }
     }
@@ -2599,10 +2662,17 @@ mod tests {
     }
 
     /// Make a shard look as if nothing has asked it for anything for a while.
+    /// Also backdates its load time: a shard idle for `secs` has necessarily
+    /// been resident at least that long, so aging past the residency floor is
+    /// the realistic state and keeps the connected-idle eviction path testable.
     fn age(entry: &ShardEntry, secs: u64) {
+        let backdated = now_epoch_secs().saturating_sub(secs);
         entry
             .last_used_epoch_secs
-            .store(now_epoch_secs().saturating_sub(secs), Ordering::Release);
+            .store(backdated, Ordering::Release);
+        entry
+            .loaded_at_epoch_secs
+            .store(backdated, Ordering::Release);
     }
 
     async fn loaded_keys(daemon: &GlobalDaemon) -> Vec<String> {
@@ -2980,6 +3050,134 @@ mod tests {
         );
         drop(leases);
         drop(starved);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn ghost_pages_from_unloaded_shards_do_not_lock_out_a_new_worktree() {
+        // The real failure on macOS: the ORT arena and the system allocator do
+        // not return freed pages, so process RSS only ever rises. When a shard
+        // is unloaded its pages stay resident, so raw RSS still counts them.
+        //
+        // The painful case for an operator with several active worktrees: one
+        // live busy shard keeps the "nothing is loaded" escape hatch from
+        // applying, while the ghost pages of worktrees that were ALREADY
+        // unloaded push raw RSS over budget. A new worktree is then deferred as
+        // "not ready" — yet the only thing it could evict is the one busy
+        // shard, which it must not. Admission must size pressure on the LIVE
+        // loaded working set (plus a stable process baseline), not on raw RSS
+        // that still carries ghost pages. This test NEVER lowers `used`.
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        used.store(64 * TEST_MIB, Ordering::Release);
+        let roots = capacity_roots("ghost-lockout", 3);
+
+        // roots[0]: a small, permanently busy shard (~200 MiB).
+        let busy = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        wait_for_shard_published(&daemon, &roots[0]).await;
+        used.fetch_add(200 * TEST_MIB, Ordering::AcqRel);
+        daemon.shards.lock().await[&shard_key(&roots[0])]
+            .load_cost_bytes
+            .store(200 * TEST_MIB, Ordering::Release);
+
+        // roots[1]: a large shard (~1500 MiB) that then goes idle and is
+        // evicted. Its pages stay resident (we never lower `used`), so after
+        // eviction RSS is 64 + 200 + 1500 = 1764 MiB with only the ~200 MiB
+        // busy shard actually live.
+        let transient = daemon
+            .handler_for_client(&request_for(&roots[1]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        wait_for_shard_published(&daemon, &roots[1]).await;
+        used.fetch_add(1_500 * TEST_MIB, Ordering::AcqRel);
+        daemon.shards.lock().await[&shard_key(&roots[1])]
+            .load_cost_bytes
+            .store(1_500 * TEST_MIB, Ordering::Release);
+        let transient_shard = Arc::clone(&daemon.shards.lock().await[&shard_key(&roots[1])]);
+        drop(transient);
+        wait_for_shard_evictable(&daemon, &roots[1]).await;
+        age(&transient_shard, daemon.idle_ttl.as_secs() + 10);
+        daemon.evict_idle().await;
+        assert_eq!(
+            loaded_keys(&daemon).await,
+            vec![shard_key(&roots[0])],
+            "only the busy shard is live; the large one was unloaded"
+        );
+
+        // A third worktree asks for a shard. The live working set is ~200 MiB
+        // plus the newcomer — comfortably inside 2048 MiB. But raw RSS is 1764;
+        // 1764 + 512 headroom = 2276 > 2048, and the only loaded shard is busy,
+        // so the "nothing loaded" escape hatch does not apply. Today it defers.
+        let newcomer = daemon
+            .handler_for_client(&request_for(&roots[2]), ClientKind::StdioProxy)
+            .await
+            .expect("a connected workspace must get a lease");
+        assert_eq!(
+            retained_shard_count(&newcomer.retained_shards),
+            1,
+            "a fresh worktree was locked out as 'not ready' even though the live \
+             loaded working set fits the budget — raw RSS still carries ghost \
+             pages from a shard that was already unloaded (the macOS ratchet \
+             lockout)"
+        );
+        assert!(
+            loaded_keys(&daemon).await.contains(&shard_key(&roots[2])),
+            "newcomer shard must be loaded"
+        );
+
+        drop(busy);
+        drop(newcomer);
+        cleanup(&daemon, roots).await;
+    }
+
+    #[tokio::test]
+    async fn a_just_loaded_shard_is_not_evicted_to_make_room_for_a_peer() {
+        // Thrash guard: two worktrees whose agents pace calls near the idle
+        // line must not ping-pong load->evict->reload. A shard loaded within
+        // the minimum residency window is protected from being unloaded only
+        // to make room, even if it looks idle.
+        let (daemon, used) = daemon_with_memory(None, 2 * 1024);
+        let roots = capacity_roots("residency", 2);
+
+        // First worktree loads and is attributed ~1500 MiB; footprint climbs
+        // and stays there (monotonic, as on macOS).
+        let first = daemon
+            .handler_for_client(&request_for(&roots[0]), ClientKind::StdioProxy)
+            .await
+            .unwrap();
+        wait_for_shard_published(&daemon, &roots[0]).await;
+        used.fetch_add(1_500 * TEST_MIB, Ordering::AcqRel);
+        daemon.shards.lock().await[&shard_key(&roots[0])]
+            .load_cost_bytes
+            .store(1_500 * TEST_MIB, Ordering::Release);
+
+        // It looks idle by last-use (agent paused between calls) but it has
+        // JUST been loaded, so its residency is near zero. Backdate only the
+        // last-use clock, not the load time.
+        daemon.shards.lock().await[&shard_key(&roots[0])]
+            .last_used_epoch_secs
+            .store(now_epoch_secs().saturating_sub(7_200), Ordering::Release);
+
+        // A second worktree needs room (1500 + newcomer brushes the budget).
+        // The first shard is idle-by-last-use but inside its residency window,
+        // so it must NOT be chosen as a victim. The newcomer still gets a lease
+        // (admission falls back to the "nothing evictable" healing path), but
+        // the just-loaded shard survives.
+        let second = daemon
+            .handler_for_client(&request_for(&roots[1]), ClientKind::StdioProxy)
+            .await
+            .expect("a connected workspace must get a lease");
+        let _ = &second;
+        assert!(
+            loaded_keys(&daemon).await.contains(&shard_key(&roots[0])),
+            "a shard loaded seconds ago must not be evicted to make room — that \
+             is the load/evict/reload thrash"
+        );
+
+        drop(first);
+        drop(second);
         cleanup(&daemon, roots).await;
     }
 

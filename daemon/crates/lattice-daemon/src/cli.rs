@@ -2230,13 +2230,21 @@ fn parse_status(parser: &mut ArgParser) -> Result<CliRequest> {
         .take_flag_value("--scope")?
         .unwrap_or_else(|| "index".to_string());
     let files = parser.take_repeated("--files")?;
+    let mut paths = parser.take_repeated("--path")?;
     let query = parser.join_positionals();
+    // For the freshness scope, positionals are the paths to check.
+    if scope == "freshness" && paths.is_empty() && !query.trim().is_empty() {
+        paths = query.split_whitespace().map(str::to_string).collect();
+    }
     let mut arguments = json!({ "scope": scope });
-    if !query.trim().is_empty() {
+    if !query.trim().is_empty() && scope != "freshness" {
         set_value(&mut arguments, "query", json!(query));
     }
     if !files.is_empty() {
         set_value(&mut arguments, "files", json!(files));
+    }
+    if !paths.is_empty() {
+        set_value(&mut arguments, "paths", json!(paths));
     }
     Ok(parser.request("status", arguments))
 }

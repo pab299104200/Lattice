@@ -844,5 +844,6 @@ fn widen_budget(budget: &RetrievalBudget) -> RetrievalBudget {
         embedding_k: budget.embedding_k.saturating_mul(2).max(1),
         event_window: budget.event_window.saturating_mul(2).max(1),
         working_memory_window: budget.working_memory_window.saturating_mul(2).max(1),
+        max_merged_candidates: budget.max_merged_candidates.saturating_mul(2).max(1),
     }
 }

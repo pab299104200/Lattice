@@ -134,6 +134,66 @@ fn make_id(file: &str, name: &str, offset: usize) -> SymbolId {
     }
 }
 
+#[test]
+fn ranking_order_is_stable_for_name_colliding_symbols() {
+    // A3: three functions share the name `handle` across different files — the
+    // overload/re-export collision case. With a name-only tie-break, equal
+    // scores could reorder across index rebuilds (and then truncate to a
+    // different top-k). The query is run twice over independent graph builds;
+    // the ranked file+symbol order must be byte-for-byte identical, and the
+    // colliding names must appear in a stable (file, offset) order.
+    fn colliding_graph() -> CodeGraph {
+        let mut graph = CodeGraph::new();
+        for file in ["src/zeta.ts", "src/alpha.ts", "src/mid.ts"] {
+            let id = make_id(file, "handle", 0);
+            graph.add_node(
+                id,
+                SymbolKind::Function,
+                "handle".to_string(),
+                "function handle(req: Request): Response".to_string(),
+                "function handle(req) { return route(req); }".to_string(),
+                file.to_string(),
+                1,
+                5,
+                true,
+                Language::TypeScript,
+            );
+        }
+        graph
+    }
+
+    let order = |capsule: &crate::query::ContextCapsule| -> Vec<(String, String)> {
+        capsule
+            .context
+            .iter()
+            .map(|node| (node.file.clone(), node.symbol.clone()))
+            .collect()
+    };
+
+    let mut first_engine = QueryEngine::new(colliding_graph(), None);
+    let first = order(&first_engine.query("handle request", None, false));
+    let mut second_engine = QueryEngine::new(colliding_graph(), None);
+    let second = order(&second_engine.query("handle request", None, false));
+
+    assert_eq!(
+        first, second,
+        "ranking of name-colliding symbols must be identical across runs"
+    );
+    // The three `handle` entries that survive ranking must be file-ordered,
+    // never in the graph's insertion order (zeta, alpha, mid).
+    let handle_files: Vec<&String> = first
+        .iter()
+        .filter(|(_, symbol)| symbol == "handle")
+        .map(|(file, _)| file)
+        .collect();
+    let mut sorted = handle_files.clone();
+    sorted.sort();
+    assert_eq!(
+        handle_files, sorted,
+        "equal-scored colliding symbols must be ordered by file, deterministically"
+    );
+}
+
 fn build_test_graph() -> CodeGraph {
     let mut graph = CodeGraph::new();
 

@@ -410,7 +410,7 @@ fn extract_references_from_body(node: Node, source: &[u8]) -> Vec<String> {
     let mut refs = Vec::new();
 
     if let Some(body_node) = node.child_by_field_name("body") {
-        collect_call_identifiers(body_node, source, &mut refs);
+        collect_call_identifiers(body_node, source, &mut refs, 0);
     }
 
     refs.sort();
@@ -419,7 +419,13 @@ fn extract_references_from_body(node: Node, source: &[u8]) -> Vec<String> {
 }
 
 /// Recursively collect identifiers from method invocations.
-fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>) {
+///
+/// `depth` guards against stack overflow on crafted deeply-nested input; see
+/// `super::MAX_REFERENCE_WALK_DEPTH`.
+fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>, depth: usize) {
+    if depth >= super::MAX_REFERENCE_WALK_DEPTH {
+        return;
+    }
     if node.kind() == "method_invocation" {
         if let Some(name_node) = node.child_by_field_name("name") {
             refs.push(node_text(name_node, source));
@@ -433,7 +439,7 @@ fn collect_call_identifiers(node: Node, source: &[u8], refs: &mut Vec<String>) {
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_call_identifiers(child, source, refs);
+        collect_call_identifiers(child, source, refs, depth + 1);
     }
 }
 

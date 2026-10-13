@@ -85,6 +85,91 @@ async fn budgets_are_enforced_for_large_graphs() {
     assert_eq!(graph_count, 3);
 }
 
+/// T1 (independent review): per-source truncation used to drop candidates
+/// before the global scorer ran, so a candidate ranked low by its own source
+/// could never be rescued by exact-identifier or graph-proximity signals. The
+/// merged pool handed onward must now be able to exceed any single source's
+/// cap — the cut is cross-source, after scoring, not per source.
+#[tokio::test]
+async fn merged_pool_spans_sources_beyond_a_single_source_cap() {
+    // Graph source alone would fill its per-source cap; combined with working
+    // memory, the merged pool must hold candidates from both, exceeding the
+    // per-source cap. A pre-truncation design capped the whole result at the
+    // per-source bound per source, but could never show cross-source breadth
+    // above it in a single pool for the scorer to rank.
+    let graph = large_graph();
+    let working = vec![
+        Identity::File(file_id("src/a.rs")),
+        Identity::File(file_id("src/b.rs")),
+        Identity::File(file_id("src/c.rs")),
+    ];
+    let anchors = vec![resolved_symbol_anchor("src/root.rs", "root")];
+    let intent = classify_intent("refactor root");
+    let budget = RetrievalBudget {
+        max_candidates_per_source: 3,
+        working_memory_window: 3,
+        max_merged_candidates: 256,
+        ..RetrievalBudget::default()
+    };
+    let ctx = empty_context()
+        .with_graph(&graph)
+        .with_working_memory(&working);
+
+    let candidates = retrieve_candidates(&intent, &anchors, &budget, &ctx).await;
+
+    let graph_count = candidates
+        .iter()
+        .filter(|c| c.source == CandidateSource::CodeGraphTraversal)
+        .count();
+    let working_count = candidates
+        .iter()
+        .filter(|c| c.source == CandidateSource::RecentActiveWorkingMemory)
+        .count();
+
+    // Each source keeps its gather cap, and the merged pool carries both —
+    // more than any single per-source cap, with nothing dropped pre-scoring.
+    assert_eq!(graph_count, 3, "graph source keeps its gather cap");
+    assert_eq!(working_count, 3, "working memory keeps its items");
+    assert!(
+        candidates.len() > budget.max_candidates_per_source,
+        "merged pool must span sources beyond a single per-source cap, got {}",
+        candidates.len()
+    );
+    // Within budget: no candidate is marked exhausted by the merged cap.
+    assert!(
+        candidates.iter().all(|c| !c.budget_exhausted),
+        "a merged pool within budget must not be truncated"
+    );
+}
+
+/// When the merged pool genuinely exceeds the cross-source budget, it is
+/// truncated — but only here, after every source has contributed, and the
+/// survivors are flagged so the shortfall is visible in diagnostics.
+#[tokio::test]
+async fn merged_pool_over_budget_truncates_and_flags_exhaustion() {
+    let graph = large_graph(); // 20 graph neighbours available
+    let anchors = vec![resolved_symbol_anchor("src/root.rs", "root")];
+    let intent = classify_intent("refactor root");
+    let budget = RetrievalBudget {
+        max_candidates_per_source: 20,
+        max_merged_candidates: 5,
+        ..RetrievalBudget::default()
+    };
+    let ctx = empty_context().with_graph(&graph);
+
+    let candidates = retrieve_candidates(&intent, &anchors, &budget, &ctx).await;
+
+    assert_eq!(
+        candidates.len(),
+        5,
+        "merged cap governs the final pool size"
+    );
+    assert!(
+        candidates.iter().all(|c| c.budget_exhausted),
+        "truncated survivors must be flagged budget_exhausted"
+    );
+}
+
 #[tokio::test]
 async fn intent_gating_skips_disqualified_event_sources() {
     let events = vec![event(

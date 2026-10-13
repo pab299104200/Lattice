@@ -13,6 +13,21 @@ use crate::error::LatticeError;
 use crate::symbols::{Language, ParsedFile};
 use complexity_profile::LanguageComplexityProfile;
 
+/// Hard cap on how deep the per-language reference walkers
+/// (`collect_call_identifiers`, Python's `collect_string_model_refs`) descend
+/// into a function body's syntax tree.
+///
+/// Those walkers recurse once per AST level with a native stack frame each, and
+/// Lattice parses arbitrary untrusted repository content. Without a cap, a
+/// crafted source file (a few KB of deeply-nested calls or brackets) drives the
+/// recursion as deep as the AST and overflows the thread stack, aborting the
+/// whole process. Reference extraction is best-effort — the symbol graph is
+/// still correct without the deepest call edges — so stopping the descent at a
+/// bound is a safe, non-fatal truncation. The bound is far above any realistic
+/// hand-written or generated nesting (hundreds of levels) yet far below the
+/// stack budget, so legitimate code is never truncated in practice.
+pub(crate) const MAX_REFERENCE_WALK_DEPTH: usize = 512;
+
 /// The tree-sitter grammar backing a language, when one is vendored.
 ///
 /// Single source of truth for grammar selection so fact producers parse with

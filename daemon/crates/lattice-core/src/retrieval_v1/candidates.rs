@@ -52,6 +52,12 @@ pub struct RetrievalBudget {
     pub embedding_k: usize,
     pub event_window: usize,
     pub working_memory_window: usize,
+    /// Cap on the *merged* candidate pool handed to the scorer, applied after
+    /// flattening every source. The per-source caps are a gather bound (one
+    /// source can't flood the pool); this is the only budget that truncates
+    /// across sources, and it does so *after* the 13-signal scorer has ranked
+    /// everything — never before. See `enforce_merged_budget`.
+    pub max_merged_candidates: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +68,7 @@ pub struct RetrievalBudgetConfig {
     pub embedding_k: Option<usize>,
     pub event_window: Option<usize>,
     pub working_memory_window: Option<usize>,
+    pub max_merged_candidates: Option<usize>,
 }
 
 pub struct RetrievalContext<'a> {
@@ -77,12 +84,20 @@ pub struct RetrievalContext<'a> {
 impl Default for RetrievalBudgetConfig {
     fn default() -> Self {
         Self {
-            max_candidates_per_source: Some(24),
+            // Per-source gather caps are raised from their original tight
+            // values (24/12) so a candidate ranked low by its own source still
+            // reaches the global scorer, which is the component meant to do the
+            // cutting (fork plan `## 7`, steps 7–9: bounded expansion, then
+            // score, then compress). The merged cap below is the real gate.
+            max_candidates_per_source: Some(48),
             max_graph_hops: Some(2),
-            max_fts_rows: Some(24),
-            embedding_k: Some(12),
+            max_fts_rows: Some(48),
+            embedding_k: Some(32),
             event_window: Some(32),
             working_memory_window: Some(12),
+            // Generous enough that the merged pool is normally scored in full;
+            // it only truncates a pathological flood, and only after scoring.
+            max_merged_candidates: Some(256),
         }
     }
 }
@@ -102,6 +117,10 @@ impl RetrievalBudget {
             working_memory_window: config
                 .working_memory_window
                 .or(defaults.working_memory_window)
+                .unwrap(),
+            max_merged_candidates: config
+                .max_merged_candidates
+                .or(defaults.max_merged_candidates)
                 .unwrap(),
         }
     }
@@ -136,14 +155,52 @@ pub async fn retrieve_candidates(
     let grouped = [
         exact, graph, docs, fts, embeddings, events, memory, workflow, working,
     ];
-    let total = grouped.iter().map(Vec::len).sum::<usize>();
+    let gathered = grouped.iter().map(Vec::len).sum::<usize>();
+    // Merge every source into one pool, then apply the single cross-source
+    // budget. This is the fix for the per-source truncation that used to drop a
+    // candidate ranked low by one source before the global scorer could rescue
+    // it on exact-identifier or graph-proximity signals (fork plan `## 7`,
+    // steps 7–9: expand, then score, then compress — the cut belongs after
+    // scoring, not per source).
+    let merged: Vec<Candidate> = grouped.into_iter().flatten().collect();
+    let merged = enforce_merged_budget(merged, budget.max_merged_candidates);
     debug!(
-        candidate_sources = grouped.len(),
-        candidate_total = total,
+        candidate_sources = 9,
+        candidate_gathered = gathered,
+        candidate_merged = merged.len(),
+        merged_cap = budget.max_merged_candidates,
         elapsed_ms = started.elapsed().as_millis(),
         "retrieval_v1 candidate retrieval completed"
     );
-    grouped.into_iter().flatten().collect()
+    merged
+}
+
+/// Cap the merged, cross-source candidate pool. Unlike `enforce_budget` (a
+/// per-source gather bound), this runs on the flattened pool. It preserves
+/// every candidate when the pool is within budget — the common case, so the
+/// full set reaches the scorer. Only a pathological flood is truncated, and
+/// then by `raw_score` as a last resort, with the survivors marked
+/// `budget_exhausted` so the shortfall is visible in diagnostics.
+///
+/// Deliberately *not* a pre-scoring quality filter: the 13-signal scorer does
+/// the real ranking downstream. This only bounds work, and only when needed.
+fn enforce_merged_budget(mut candidates: Vec<Candidate>, cap: usize) -> Vec<Candidate> {
+    if candidates.len() <= cap {
+        return candidates;
+    }
+    // Stable, deterministic last-resort ordering: higher raw_score first, then
+    // by identity to break ties reproducibly across runs.
+    candidates.sort_by(|a, b| {
+        b.raw_score
+            .partial_cmp(&a.raw_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.identity.to_string().cmp(&b.identity.to_string()))
+    });
+    candidates.truncate(cap);
+    for candidate in &mut candidates {
+        candidate.budget_exhausted = true;
+    }
+    candidates
 }
 
 async fn retrieve_exact_lookup(

@@ -769,3 +769,66 @@ class HypervisorDiscovery(Base):
         host.references
     );
 }
+
+/// Blocker #1 (independent review): the per-language reference walkers recurse
+/// once per AST level, and Lattice parses arbitrary untrusted repo content. A
+/// crafted, deeply-nested source file must not overflow the stack and abort the
+/// process. The walk is now capped at `super::MAX_REFERENCE_WALK_DEPTH`.
+///
+/// Each case runs on a thread with a deliberately small (512 KiB) stack: the
+/// previous unbounded recursion overflowed and aborted at this nesting on such
+/// a stack, whereas the capped walk stays within it. The assertion is simply
+/// that parsing returns `Ok` without the worker thread panicking/aborting.
+#[test]
+fn deeply_nested_input_does_not_overflow_the_stack() {
+    // Far beyond the depth cap (512) and beyond what a 512 KiB stack tolerates
+    // under the old unbounded recursion.
+    const NESTING: usize = 8000;
+
+    fn nested_calls(open: &str, close: &str) -> String {
+        let mut body = String::from("x");
+        for _ in 0..NESTING {
+            body = format!("{open}{body}{close}");
+        }
+        body
+    }
+
+    // file name, source: a single function whose body holds one hugely nested
+    // call/paren expression, so the reference walk descends `NESTING` levels.
+    let paren = nested_calls("f(", ")");
+    let cases: Vec<(&str, String)> = vec![
+        ("deep.rs", format!("fn deep() {{ let _ = {paren}; }}")),
+        (
+            "deep.ts",
+            format!("function deep() {{ const _ = {paren}; }}"),
+        ),
+        (
+            "deep.js",
+            format!("function deep() {{ const _ = {paren}; }}"),
+        ),
+        ("deep.py", format!("def deep():\n    _ = {paren}\n")),
+        (
+            "deep.go",
+            format!("package p\nfunc deep() {{ _ = {paren} }}"),
+        ),
+        (
+            "Deep.java",
+            format!("class Deep {{ void deep() {{ Object _o = {paren}; }} }}"),
+        ),
+    ];
+
+    for (name, source) in cases {
+        let name = name.to_string();
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                // Must not overflow/abort; a torn/partial parse is acceptable,
+                // a crash is not. parse_file returns Ok for valid syntax.
+                let _ = parse_file(&name, &source);
+            })
+            .expect("spawn parse worker");
+        handle
+            .join()
+            .expect("parsing deeply-nested input must not crash the worker thread");
+    }
+}
